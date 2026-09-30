@@ -4,6 +4,10 @@ use rusqlite::Connection;
 use tempfile::tempdir;
 
 use crate::{
+    crypto::{
+        derive_password_key, encrypt, key_wrap_aad, legacy_record_aad, legacy_revision_id,
+        random_array, KdfConfig,
+    },
     generate_password, preview_import, totp_code, Error, ImportFormat, Item, PasswordPolicy,
     RecoveryKey, Vault,
 };
@@ -123,7 +127,9 @@ fn sqlite_contains_no_item_plaintext_and_tampering_is_detected() {
     drop(connection);
     let mut vault = Vault::open(&path).unwrap();
     vault.unlock("password").unwrap();
-    assert!(matches!(vault.get(&item_id), Err(Error::Crypto)));
+    // The author signature covers the ciphertext, so tampering is caught
+    // before decryption is attempted.
+    assert!(matches!(vault.get(&item_id), Err(Error::InvalidSignature)));
 }
 
 #[test]
@@ -304,4 +310,276 @@ fn oversized_import_rolls_back_every_item() {
         Err(Error::InvalidItem(_))
     ));
     assert!(vault.list().unwrap().is_empty());
+}
+
+#[test]
+fn revisions_are_signed_by_the_local_device_and_forgeries_rejected() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    let device_id = vault.device_id().unwrap();
+    vault.put(login("Signed")).unwrap();
+    let wire = vault.encrypted_revisions().unwrap().remove(0);
+    assert_eq!(wire.author_device_id, device_id);
+    assert_eq!(wire.signature.len(), 64);
+
+    let mut forged = wire.clone();
+    forged.signature[0] ^= 1;
+    assert!(matches!(
+        vault.apply_encrypted_revision(forged, None),
+        Err(Error::InvalidSignature)
+    ));
+    let mut unknown = wire.clone();
+    unknown.author_device_id = [0xAA; 16];
+    assert!(matches!(
+        vault.apply_encrypted_revision(unknown, None),
+        Err(Error::UnknownAuthor)
+    ));
+    let mut truncated = wire.clone();
+    truncated.signature.pop();
+    assert!(matches!(
+        vault.apply_encrypted_revision(truncated, None),
+        Err(Error::Crypto)
+    ));
+    // The untouched revision still replays idempotently.
+    vault.apply_encrypted_revision(wire, None).unwrap();
+
+    // The signing identity survives lock and reopen.
+    vault.lock();
+    drop(vault);
+    let mut reopened = Vault::open(&path).unwrap();
+    assert_eq!(reopened.device_id(), Some(device_id));
+    reopened.unlock("password").unwrap();
+    assert_eq!(reopened.list().unwrap().len(), 1);
+}
+
+#[test]
+fn restored_vault_signs_as_a_new_device_and_unknown_authors_are_rejected() {
+    let dir = tempdir().unwrap();
+    let original_path = dir.path().join("original.db");
+    let backup_path = dir.path().join("vault.osmbak");
+    let restored_path = dir.path().join("restored.db");
+    let (mut original, recovery) = Vault::create(&original_path, "password").unwrap();
+    let item = login("Shared");
+    let item_id = item.id.clone();
+    let first = original.put(item).unwrap();
+    original.export_backup(&backup_path).unwrap();
+
+    let mut restored =
+        Vault::restore_backup(&backup_path, &restored_path, &recovery, "new password").unwrap();
+    assert_ne!(restored.device_id(), original.device_id());
+    // Revisions written by the source device still verify after restore.
+    let mut changed = restored.get(&item_id).unwrap().item;
+    changed.password = "edited on restored device".into();
+    let second = restored.update(changed, &first.revision).unwrap();
+    let edit = restored
+        .encrypted_revisions()
+        .unwrap()
+        .into_iter()
+        .find(|revision| revision.revision_id() == second.revision)
+        .unwrap();
+    assert_eq!(Some(edit.author_device_id), restored.device_id());
+
+    // The original vault has never authorized the restored device.
+    assert!(matches!(
+        original.apply_encrypted_revision(edit.clone(), Some(&first.revision)),
+        Err(Error::UnknownAuthor)
+    ));
+    original
+        .authorize_device(
+            restored.device_id().unwrap(),
+            restored.device_public_key().unwrap(),
+        )
+        .unwrap();
+    original
+        .apply_encrypted_revision(edit, Some(&first.revision))
+        .unwrap();
+    assert_eq!(
+        original.get(&item_id).unwrap().item.password,
+        "edited on restored device"
+    );
+}
+
+#[test]
+fn tampered_device_authorization_fails_closed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (vault, _) = Vault::create(&path, "password").unwrap();
+    drop(vault);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO devices(device_id,public_key,authorization) VALUES(?,?,?)",
+            rusqlite::params![
+                [7_u8; 16].as_slice(),
+                [9_u8; 32].as_slice(),
+                [0_u8; 32].as_slice()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let mut vault = Vault::open(&path).unwrap();
+    assert!(matches!(vault.unlock("password"), Err(Error::Crypto)));
+    assert!(!vault.is_unlocked());
+}
+
+const LEGACY_SCHEMA: &str = r#"
+CREATE TABLE vault_meta (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    format_version INTEGER NOT NULL,
+    vault_id BLOB NOT NULL, kdf_memory_kib INTEGER NOT NULL, kdf_iterations INTEGER NOT NULL,
+    kdf_parallelism INTEGER NOT NULL, password_salt BLOB NOT NULL, password_nonce BLOB NOT NULL,
+    password_wrapped_key BLOB NOT NULL, recovery_nonce BLOB NOT NULL, recovery_wrapped_key BLOB NOT NULL
+) STRICT;
+CREATE TABLE revisions (
+    revision TEXT PRIMARY KEY, format_version INTEGER NOT NULL, vault_id BLOB NOT NULL,
+    item_id TEXT NOT NULL, parent_revision TEXT, key_epoch INTEGER NOT NULL, nonce BLOB NOT NULL,
+    ciphertext BLOB NOT NULL, tombstone INTEGER NOT NULL
+) STRICT;
+CREATE INDEX revisions_item_id ON revisions(item_id);
+CREATE TRIGGER revisions_no_update BEFORE UPDATE ON revisions
+BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END;
+CREATE TRIGGER revisions_no_delete BEFORE DELETE ON revisions
+BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END;
+CREATE TABLE heads (
+    item_id TEXT PRIMARY KEY, revision TEXT NOT NULL REFERENCES revisions(revision),
+    tombstone INTEGER NOT NULL
+) STRICT;
+"#;
+
+/// Writes a format 1 vault exactly as the pre-signing core did.
+fn write_legacy_vault(path: &std::path::Path, password: &str, revisions: &[(&Item, bool)]) {
+    let connection = Connection::open(path).unwrap();
+    connection.execute_batch(LEGACY_SCHEMA).unwrap();
+    let vault_id = random_array::<32>();
+    let master = random_array::<32>();
+    let salt = random_array::<16>();
+    let nonce = random_array::<24>();
+    let kdf = KdfConfig::default();
+    let wrapped = encrypt(
+        &derive_password_key(password, &salt, kdf).unwrap(),
+        &nonce,
+        &key_wrap_aad(&vault_id, b"password"),
+        &master,
+    )
+    .unwrap();
+    let recovery_nonce = random_array::<24>();
+    let recovery_wrapped = encrypt(
+        &random_array::<32>(),
+        &recovery_nonce,
+        &key_wrap_aad(&vault_id, b"recovery"),
+        &master,
+    )
+    .unwrap();
+    connection
+        .execute(
+            "INSERT INTO vault_meta VALUES (1,1,?,?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                vault_id.as_slice(),
+                kdf.memory_kib,
+                kdf.iterations,
+                kdf.parallelism,
+                salt.as_slice(),
+                nonce.as_slice(),
+                wrapped,
+                recovery_nonce.as_slice(),
+                recovery_wrapped
+            ],
+        )
+        .unwrap();
+    let mut heads = std::collections::BTreeMap::<String, String>::new();
+    for (item, tombstone) in revisions {
+        let parent = heads.get(&item.id).cloned();
+        let aad = legacy_record_aad(&vault_id, &item.id, parent.as_deref(), 1, *tombstone);
+        let plaintext = if *tombstone {
+            Vec::new()
+        } else {
+            serde_json::to_vec(item).unwrap()
+        };
+        let nonce = random_array::<24>();
+        let ciphertext = encrypt(&master, &nonce, &aad, &plaintext).unwrap();
+        let id = legacy_revision_id(&aad, &nonce, &ciphertext);
+        connection
+            .execute(
+                "INSERT INTO revisions VALUES (?,1,?,?,?,1,?,?,?)",
+                rusqlite::params![
+                    id,
+                    vault_id.as_slice(),
+                    item.id,
+                    parent,
+                    nonce.as_slice(),
+                    ciphertext,
+                    tombstone
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO heads VALUES (?,?,?) ON CONFLICT(item_id) DO UPDATE SET revision=excluded.revision,tombstone=excluded.tombstone",
+                rusqlite::params![item.id, id, tombstone],
+            )
+            .unwrap();
+        heads.insert(item.id.clone(), id);
+    }
+}
+
+#[test]
+fn legacy_vault_migrates_to_signed_revisions_on_first_unlock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let kept = login("Kept");
+    let mut edited = kept.clone();
+    edited.password = "second password".into();
+    let removed = login("Removed");
+    write_legacy_vault(
+        &path,
+        "password",
+        &[
+            (&kept, false),
+            (&edited, false),
+            (&removed, false),
+            (&removed, true),
+        ],
+    );
+
+    let mut vault = Vault::open(&path).unwrap();
+    assert_eq!(vault.device_id(), None);
+    assert!(matches!(vault.list(), Err(Error::Locked)));
+    assert!(matches!(
+        vault.unlock("wrong"),
+        Err(Error::InvalidCredentials)
+    ));
+    vault.unlock("password").unwrap();
+    let device_id = vault.device_id().unwrap();
+
+    let current = vault.get(&kept.id).unwrap();
+    assert_eq!(current.item.password, "second password");
+    assert!(matches!(vault.get(&removed.id), Err(Error::NotFound)));
+    let revisions = vault.encrypted_revisions().unwrap();
+    assert_eq!(revisions.len(), 4);
+    assert!(revisions
+        .iter()
+        .all(|revision| revision.format_version == 2 && revision.author_device_id == device_id));
+    // History and ancestry survive: the edit still points at the original.
+    let head = revisions
+        .iter()
+        .find(|revision| revision.revision_id() == current.revision)
+        .unwrap();
+    let parent = head.parent_revision.as_deref().unwrap();
+    assert!(revisions
+        .iter()
+        .any(|revision| revision.revision_id() == parent && revision.parent_revision.is_none()));
+
+    // Writing continues from the migrated head, and the result persists.
+    let mut next = current.item;
+    next.title = "Kept after migration".into();
+    vault.update(next, &current.revision).unwrap();
+    drop(vault);
+    let mut reopened = Vault::open(&path).unwrap();
+    assert_eq!(reopened.device_id(), Some(device_id));
+    reopened.unlock("password").unwrap();
+    assert_eq!(
+        reopened.get(&kept.id).unwrap().item.title,
+        "Kept after migration"
+    );
 }

@@ -761,6 +761,7 @@ dependencies = [
  "base64ct",
  "chacha20poly1305",
  "csv",
+ "ed25519-dalek",
  "hmac 0.12.1",
  "rand",
  "rusqlite",

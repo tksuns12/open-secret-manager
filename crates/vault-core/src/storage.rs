@@ -1,24 +1,29 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 use base64ct::{Base64UrlUnpadded, Encoding};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
-        decrypt, derive_password_key, encrypt, key_wrap_aad, random_array, record_aad, revision_id,
-        KdfConfig, SecretKey, KEY_LEN, NONCE_LEN, SALT_LEN,
+        decrypt, derive_password_key, device_authorization, device_key_aad, encrypt, key_wrap_aad,
+        legacy_record_aad, legacy_revision_id, random_array, record_aad, revision_id,
+        revision_signature_message, verify_device_authorization, KdfConfig, SecretKey,
+        DEVICE_ID_LEN, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
     Error, Item, ItemSummary, RecoveryKey, Result, RevisionInfo, VaultItem,
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+/// Unsigned revisions without an author; migrated on first unlock.
+const LEGACY_FORMAT_VERSION: u32 = 1;
 const KEY_EPOCH: u64 = 1;
 const MAX_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 16 * 1024 * 1024;
@@ -35,18 +40,31 @@ CREATE TABLE vault_meta (
     password_nonce BLOB NOT NULL CHECK(length(password_nonce) = 24),
     password_wrapped_key BLOB NOT NULL CHECK(length(password_wrapped_key) = 48),
     recovery_nonce BLOB NOT NULL CHECK(length(recovery_nonce) = 24),
-    recovery_wrapped_key BLOB NOT NULL CHECK(length(recovery_wrapped_key) = 48)
+    recovery_wrapped_key BLOB NOT NULL CHECK(length(recovery_wrapped_key) = 48),
+    device_id BLOB NOT NULL CHECK(length(device_id) = 16),
+    device_public_key BLOB NOT NULL CHECK(length(device_public_key) = 32),
+    device_key_nonce BLOB NOT NULL CHECK(length(device_key_nonce) = 24),
+    device_wrapped_signing_key BLOB NOT NULL CHECK(length(device_wrapped_signing_key) = 48)
 ) STRICT;
+CREATE TABLE devices (
+    device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
+    public_key BLOB NOT NULL UNIQUE CHECK(length(public_key) = 32),
+    authorization BLOB NOT NULL CHECK(length(authorization) = 32)
+) STRICT;
+CREATE TRIGGER devices_no_update BEFORE UPDATE ON devices
+BEGIN SELECT RAISE(ABORT, 'device authorizations are immutable'); END;
 CREATE TABLE revisions (
     revision TEXT PRIMARY KEY CHECK(length(revision) = 64),
-    format_version INTEGER NOT NULL CHECK(format_version = 1),
+    format_version INTEGER NOT NULL CHECK(format_version = 2),
     vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
     item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
     parent_revision TEXT CHECK(parent_revision IS NULL OR length(parent_revision) = 64),
     key_epoch INTEGER NOT NULL CHECK(key_epoch = 1),
+    author_device_id BLOB NOT NULL CHECK(length(author_device_id) = 16) REFERENCES devices(device_id),
     nonce BLOB NOT NULL CHECK(length(nonce) = 24),
     ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 16 AND 16777232),
-    tombstone INTEGER NOT NULL CHECK(tombstone IN (0, 1))
+    tombstone INTEGER NOT NULL CHECK(tombstone IN (0, 1)),
+    signature BLOB NOT NULL CHECK(length(signature) = 64)
 ) STRICT;
 CREATE INDEX revisions_item_id ON revisions(item_id);
 CREATE TRIGGER revisions_no_update BEFORE UPDATE ON revisions
@@ -60,6 +78,12 @@ CREATE TABLE heads (
 ) STRICT;
 "#;
 
+const REVISION_COLUMNS: &str =
+    "r.format_version,r.vault_id,r.item_id,r.parent_revision,r.key_epoch,\
+     r.author_device_id,r.nonce,r.ciphertext,r.tombstone,r.signature";
+
+/// A sealed revision: ciphertext bound by AEAD to its header, signed by the
+/// author device over that header and ciphertext.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncryptedRevision {
     pub format_version: u32,
@@ -67,9 +91,12 @@ pub struct EncryptedRevision {
     pub item_id: String,
     pub parent_revision: Option<String>,
     pub key_epoch: u64,
+    pub author_device_id: [u8; DEVICE_ID_LEN],
     pub nonce: [u8; NONCE_LEN],
     pub ciphertext: Vec<u8>,
     pub tombstone: bool,
+    /// Ed25519 signature (64 bytes) by `author_device_id`.
+    pub signature: Vec<u8>,
 }
 
 impl std::fmt::Debug for EncryptedRevision {
@@ -80,6 +107,7 @@ impl std::fmt::Debug for EncryptedRevision {
             .field("item_id", &self.item_id)
             .field("parent_revision", &self.parent_revision)
             .field("key_epoch", &self.key_epoch)
+            .field("author_device_id", &self.author_device_id)
             .field("nonce", &"[REDACTED]")
             .field("ciphertext_len", &self.ciphertext.len())
             .field("tombstone", &self.tombstone)
@@ -89,14 +117,18 @@ impl std::fmt::Debug for EncryptedRevision {
 
 impl EncryptedRevision {
     pub fn revision_id(&self) -> String {
-        let aad = record_aad(
+        revision_id(&self.aad(), &self.nonce, &self.ciphertext, &self.signature)
+    }
+
+    fn aad(&self) -> Vec<u8> {
+        record_aad(
             &self.vault_id,
             &self.item_id,
             self.parent_revision.as_deref(),
             self.key_epoch,
+            &self.author_device_id,
             self.tombstone,
-        );
-        revision_id(&aad, &self.nonce, &self.ciphertext)
+        )
     }
 
     fn validate_shape(&self, expected_vault_id: &[u8; 32]) -> Result<()> {
@@ -108,6 +140,7 @@ impl EncryptedRevision {
             || self.item_id.len() > 128
             || self.ciphertext.len() < 16
             || self.ciphertext.len() > MAX_ITEM_BYTES + 16
+            || self.signature.len() != SIGNATURE_LEN
             || self.parent_revision.as_ref().is_some_and(|parent| {
                 parent.len() != 64
                     || !parent
@@ -126,6 +159,7 @@ impl EncryptedRevision {
 
 #[derive(Clone)]
 struct Header {
+    format_version: u32,
     vault_id: [u8; 32],
     kdf: KdfConfig,
     password_salt: [u8; SALT_LEN],
@@ -133,6 +167,23 @@ struct Header {
     password_wrapped_key: Vec<u8>,
     recovery_nonce: [u8; NONCE_LEN],
     recovery_wrapped_key: Vec<u8>,
+    /// `None` only for a format 1 vault that has not been unlocked yet.
+    device: Option<DeviceHeader>,
+}
+
+#[derive(Clone)]
+struct DeviceHeader {
+    device_id: [u8; DEVICE_ID_LEN],
+    public_key: [u8; PUBLIC_KEY_LEN],
+    key_nonce: [u8; NONCE_LEN],
+    wrapped_signing_key: Vec<u8>,
+}
+
+/// Public device identity carried in backups so restored revisions verify.
+#[derive(Serialize, Deserialize)]
+struct DeviceRecord {
+    device_id: [u8; DEVICE_ID_LEN],
+    public_key: [u8; PUBLIC_KEY_LEN],
 }
 
 pub struct Vault {
@@ -140,6 +191,54 @@ pub struct Vault {
     connection: Connection,
     header: Header,
     master_key: Option<SecretKey>,
+    signing_key: Option<SigningKey>,
+    /// Authorized revision authors, loaded and authenticated at unlock.
+    devices: BTreeMap<[u8; DEVICE_ID_LEN], VerifyingKey>,
+}
+
+/// Seals revisions for one author. Borrowing the keys separately from the
+/// connection lets callers seal while holding a write transaction.
+struct RevisionSigner<'a> {
+    key: &'a SecretKey,
+    signing_key: &'a SigningKey,
+    vault_id: [u8; 32],
+    author: [u8; DEVICE_ID_LEN],
+}
+
+impl RevisionSigner<'_> {
+    fn seal(
+        &self,
+        item_id: &str,
+        parent_revision: Option<String>,
+        tombstone: bool,
+        plaintext: &[u8],
+    ) -> Result<EncryptedRevision> {
+        let nonce = random_array::<NONCE_LEN>();
+        let aad = record_aad(
+            &self.vault_id,
+            item_id,
+            parent_revision.as_deref(),
+            KEY_EPOCH,
+            &self.author,
+            tombstone,
+        );
+        let ciphertext = encrypt(self.key, &nonce, &aad, plaintext)?;
+        let signature =
+            self.signing_key
+                .sign(&revision_signature_message(&aad, &nonce, &ciphertext));
+        Ok(EncryptedRevision {
+            format_version: FORMAT_VERSION,
+            vault_id: self.vault_id,
+            item_id: item_id.to_owned(),
+            parent_revision,
+            key_epoch: KEY_EPOCH,
+            author_device_id: self.author,
+            nonce,
+            ciphertext,
+            tombstone,
+            signature: signature.to_bytes().to_vec(),
+        })
+    }
 }
 
 impl std::fmt::Debug for Vault {
@@ -188,43 +287,42 @@ impl Vault {
             &key_wrap_aad(&vault_id, b"recovery"),
             master_key.as_ref(),
         )?;
-        connection.execute(
-            "INSERT INTO vault_meta VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                FORMAT_VERSION,
-                vault_id.as_slice(),
-                kdf.memory_kib,
-                kdf.iterations,
-                kdf.parallelism,
-                password_salt.as_slice(),
-                password_nonce.as_slice(),
-                password_wrapped_key,
-                recovery_nonce.as_slice(),
-                recovery_wrapped_key,
-            ],
-        )?;
+        let (device, _) = generate_device(&master_key, &vault_id)?;
+        let header = Header {
+            format_version: FORMAT_VERSION,
+            vault_id,
+            kdf,
+            password_salt,
+            password_nonce,
+            password_wrapped_key,
+            recovery_nonce,
+            recovery_wrapped_key,
+            device: Some(device),
+        };
+        insert_header(&connection, &header)?;
+        insert_device_authorization(&connection, &master_key, &header, &header.device_record()?)?;
         let header = read_header(&connection)?;
-        Ok((
-            Self {
-                path: path.to_path_buf(),
-                connection,
-                header,
-                master_key: Some(master_key),
-            },
-            recovery,
-        ))
+        let mut vault = Self::from_parts(path, connection, header);
+        vault.activate(master_key)?;
+        Ok((vault, recovery))
+    }
+
+    fn from_parts(path: &Path, connection: Connection, header: Header) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            connection,
+            header,
+            master_key: None,
+            signing_key: None,
+            devices: BTreeMap::new(),
+        }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let connection = open_connection(path)?;
         let header = read_header(&connection)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            connection,
-            header,
-            master_key: None,
-        })
+        Ok(Self::from_parts(path, connection, header))
     }
 
     pub fn vault_id(&self) -> [u8; 32] {
@@ -235,6 +333,14 @@ impl Vault {
     }
     pub fn is_unlocked(&self) -> bool {
         self.master_key.is_some()
+    }
+    /// This device's revision-signing identity. `None` until a format 1
+    /// vault has been unlocked and migrated.
+    pub fn device_id(&self) -> Option<[u8; DEVICE_ID_LEN]> {
+        self.header.device.as_ref().map(|device| device.device_id)
+    }
+    pub fn device_public_key(&self) -> Option<[u8; PUBLIC_KEY_LEN]> {
+        self.header.device.as_ref().map(|device| device.public_key)
     }
 
     pub fn unlock(&mut self, password: &str) -> Result<()> {
@@ -250,8 +356,7 @@ impl Vault {
             &self.header.password_wrapped_key,
         )
         .map_err(|_| Error::InvalidCredentials)?;
-        self.master_key = Some(to_key(&master)?);
-        Ok(())
+        self.activate(to_key(&master)?)
     }
 
     pub fn unlock_with_recovery(&mut self, recovery: &RecoveryKey) -> Result<()> {
@@ -265,12 +370,186 @@ impl Vault {
             &self.header.recovery_wrapped_key,
         )
         .map_err(|_| Error::InvalidCredentials)?;
-        self.master_key = Some(to_key(&master)?);
-        Ok(())
+        self.activate(to_key(&master)?)
     }
 
     pub fn lock(&mut self) {
         self.master_key = None;
+        self.signing_key = None;
+        self.devices.clear();
+    }
+
+    /// Completes an unlock: migrates a format 1 vault, then loads the device
+    /// signing key and the authenticated author set. The vault stays locked
+    /// if any step fails.
+    fn activate(&mut self, master_key: SecretKey) -> Result<()> {
+        if self.header.format_version == LEGACY_FORMAT_VERSION {
+            self.migrate_legacy(&master_key)?;
+        }
+        let device = self.header.device.as_ref().ok_or(Error::Crypto)?;
+        let seed = decrypt(
+            &master_key,
+            &device.key_nonce,
+            &device_key_aad(&self.header.vault_id, &device.device_id, &device.public_key),
+            &device.wrapped_signing_key,
+        )
+        .map_err(|_| Error::Crypto)?;
+        let seed = Zeroizing::new(array::<32>(&seed)?);
+        let signing_key = SigningKey::from_bytes(&seed);
+        if signing_key.verifying_key().to_bytes() != device.public_key {
+            return Err(Error::Crypto);
+        }
+        let devices = load_devices(&self.connection, &master_key, &self.header.vault_id)?;
+        if devices.get(&device.device_id).map(VerifyingKey::to_bytes) != Some(device.public_key) {
+            return Err(Error::Crypto);
+        }
+        self.master_key = Some(master_key);
+        self.signing_key = Some(signing_key);
+        self.devices = devices;
+        Ok(())
+    }
+
+    /// Rewrites a format 1 vault as format 2 in one transaction. Every
+    /// revision is decrypted, re-sealed, and signed by a new identity for
+    /// this device; parent links are remapped so each item's history is kept.
+    fn migrate_legacy(&mut self, master_key: &SecretKey) -> Result<()> {
+        let vault_id = self.header.vault_id;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Another connection may have migrated since this one read the header.
+        let version: u32 = transaction.query_row(
+            "SELECT format_version FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == LEGACY_FORMAT_VERSION {
+            let legacy = legacy_revisions(&transaction, &vault_id)?;
+            let heads = {
+                let mut statement =
+                    transaction.prepare("SELECT item_id,revision,tombstone FROM heads")?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let (device, signing_key) = generate_device(master_key, &vault_id)?;
+            let mut header = self.header.clone();
+            header.format_version = FORMAT_VERSION;
+            header.device = Some(device);
+
+            transaction
+                .execute_batch("DROP TABLE heads; DROP TABLE revisions; DROP TABLE vault_meta;")?;
+            transaction.execute_batch(SCHEMA)?;
+            insert_header(&transaction, &header)?;
+            let record = header.device_record()?;
+            insert_device_authorization(&transaction, master_key, &header, &record)?;
+
+            let signer = RevisionSigner {
+                key: master_key,
+                signing_key: &signing_key,
+                vault_id,
+                author: record.device_id,
+            };
+            let mut renamed = BTreeMap::<String, String>::new();
+            for old in legacy {
+                let aad = legacy_record_aad(
+                    &vault_id,
+                    &old.item_id,
+                    old.parent_revision.as_deref(),
+                    old.key_epoch,
+                    old.tombstone,
+                );
+                if legacy_revision_id(&aad, &old.nonce, &old.ciphertext) != old.revision {
+                    return Err(Error::Crypto);
+                }
+                let plaintext = decrypt(master_key, &old.nonce, &aad, &old.ciphertext)
+                    .map_err(|_| Error::Crypto)?;
+                let parent = old
+                    .parent_revision
+                    .map(|parent| renamed.get(&parent).cloned().ok_or(Error::Crypto))
+                    .transpose()?;
+                let revision = signer.seal(&old.item_id, parent, old.tombstone, &plaintext)?;
+                let id = revision.revision_id();
+                insert_revision(&transaction, &revision, &id)?;
+                renamed.insert(old.revision, id);
+            }
+            for (item_id, old_revision, tombstone) in heads {
+                let revision = renamed.get(&old_revision).ok_or(Error::Crypto)?;
+                transaction.execute(
+                    "INSERT INTO heads(item_id,revision,tombstone) VALUES(?,?,?)",
+                    params![item_id, revision, tombstone],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(())
+    }
+
+    fn signer(&self) -> Result<RevisionSigner<'_>> {
+        Ok(RevisionSigner {
+            key: self.key()?,
+            signing_key: self.signing_key.as_ref().ok_or(Error::Locked)?,
+            vault_id: self.header.vault_id,
+            author: self.header.device.as_ref().ok_or(Error::Locked)?.device_id,
+        })
+    }
+
+    /// Verifies the author's signature, then decrypts. The author must be in
+    /// the authenticated device set; a key carried by the revision is never
+    /// trusted.
+    fn open_revision(&self, revision: &EncryptedRevision) -> Result<Zeroizing<Vec<u8>>> {
+        let key = self.key()?;
+        let author = self
+            .devices
+            .get(&revision.author_device_id)
+            .ok_or(Error::UnknownAuthor)?;
+        let signature =
+            Signature::from_slice(&revision.signature).map_err(|_| Error::InvalidSignature)?;
+        let aad = revision.aad();
+        author
+            .verify_strict(
+                &revision_signature_message(&aad, &revision.nonce, &revision.ciphertext),
+                &signature,
+            )
+            .map_err(|_| Error::InvalidSignature)?;
+        decrypt(key, &revision.nonce, &aad, &revision.ciphertext).map_err(|_| Error::Crypto)
+    }
+
+    fn open_item(&self, revision: &EncryptedRevision) -> Result<Item> {
+        let plaintext = self.open_revision(revision)?;
+        serde_json::from_slice(&plaintext).map_err(|_| Error::Crypto)
+    }
+
+    /// Adds another device's signing key to the authorized author set.
+    /// Enrollment must eventually go through committed membership; until
+    /// then this is only reachable from tests.
+    #[cfg(test)]
+    pub(crate) fn authorize_device(
+        &mut self,
+        device_id: [u8; DEVICE_ID_LEN],
+        public_key: [u8; PUBLIC_KEY_LEN],
+    ) -> Result<()> {
+        let key = self.key()?.clone();
+        let verifying = VerifyingKey::from_bytes(&public_key).map_err(|_| Error::Crypto)?;
+        insert_device_authorization(
+            &self.connection,
+            &key,
+            &self.header,
+            &DeviceRecord {
+                device_id,
+                public_key,
+            },
+        )?;
+        self.devices.insert(device_id, verifying);
+        Ok(())
     }
 
     pub fn change_password(&mut self, current_password: &str, new_password: &str) -> Result<()> {
@@ -308,12 +587,12 @@ impl Vault {
     }
 
     pub fn get(&self, item_id: &str) -> Result<VaultItem> {
-        let key = self.key()?;
+        self.key()?;
         let revision = self.head_revision(item_id)?.ok_or(Error::NotFound)?;
         if revision.tombstone {
             return Err(Error::NotFound);
         }
-        let item = decrypt_item(key, &revision)?;
+        let item = self.open_item(&revision)?;
         Ok(VaultItem {
             item,
             revision: revision.revision_id(),
@@ -358,7 +637,7 @@ impl Vault {
 
     /// Commits an import as one SQLite transaction after validating every item.
     pub(crate) fn put_items_atomic(&mut self, items: Vec<Item>) -> Result<Vec<RevisionInfo>> {
-        let key = self.key()?.clone();
+        self.key()?;
         let mut ids = BTreeSet::new();
         for item in &items {
             item.validate()?;
@@ -370,25 +649,21 @@ impl Vault {
             }
         }
 
+        let sealed = {
+            let signer = self.signer()?;
+            items
+                .iter()
+                .map(|item| {
+                    let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
+                    signer.seal(&item.id, None, false, &plaintext)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut revisions = Vec::with_capacity(items.len());
-        for item in items {
-            let nonce = random_array::<NONCE_LEN>();
-            let aad = record_aad(&self.header.vault_id, &item.id, None, KEY_EPOCH, false);
-            let plaintext = Zeroizing::new(serde_json::to_vec(&item)?);
-            let ciphertext = encrypt(&key, &nonce, &aad, &plaintext)?;
-            let revision = EncryptedRevision {
-                format_version: FORMAT_VERSION,
-                vault_id: self.header.vault_id,
-                item_id: item.id.clone(),
-                parent_revision: None,
-                key_epoch: KEY_EPOCH,
-                nonce,
-                ciphertext,
-                tombstone: false,
-            };
+        let mut revisions = Vec::with_capacity(sealed.len());
+        for revision in sealed {
             let revision_id = revision.revision_id();
             insert_revision(&transaction, &revision, &revision_id)?;
             transaction.execute(
@@ -425,7 +700,7 @@ impl Vault {
         expected: Option<&str>,
         tombstone: bool,
     ) -> Result<RevisionInfo> {
-        let key = self.key()?.clone();
+        self.key()?;
         let actual = self
             .head_revision(&item.id)?
             .map(|revision| revision.revision_id());
@@ -447,14 +722,6 @@ impl Vault {
             (None, Some(_)) => return Err(Error::AlreadyExists),
         }
         let parent_revision = actual;
-        let nonce = random_array::<NONCE_LEN>();
-        let aad = record_aad(
-            &self.header.vault_id,
-            &item.id,
-            parent_revision.as_deref(),
-            KEY_EPOCH,
-            tombstone,
-        );
         let plaintext = if tombstone {
             Zeroizing::new(Vec::new())
         } else {
@@ -463,25 +730,17 @@ impl Vault {
         if plaintext.len() > MAX_ITEM_BYTES {
             return Err(Error::InvalidItem("serialized item is too large".into()));
         }
-        let ciphertext = encrypt(&key, &nonce, &aad, &plaintext)?;
-        let revision = EncryptedRevision {
-            format_version: FORMAT_VERSION,
-            vault_id: self.header.vault_id,
-            item_id: item.id.clone(),
-            parent_revision,
-            key_epoch: KEY_EPOCH,
-            nonce,
-            ciphertext,
-            tombstone,
-        };
+        let revision = self
+            .signer()?
+            .seal(&item.id, parent_revision, tombstone, &plaintext)?;
         self.apply_encrypted_revision(revision, expected)
     }
 
     pub fn encrypted_revisions(&self) -> Result<Vec<EncryptedRevision>> {
         self.key()?;
-        let mut statement = self.connection.prepare(
-            "SELECT format_version,vault_id,item_id,parent_revision,key_epoch,nonce,ciphertext,tombstone FROM revisions ORDER BY rowid"
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {REVISION_COLUMNS} FROM revisions r ORDER BY r.rowid"
+        ))?;
         let revisions = statement
             .query_map([], row_to_revision)?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -492,6 +751,14 @@ impl Vault {
     pub fn export_backup(&self, path: impl AsRef<Path>) -> Result<()> {
         let key = self.key()?;
         let payload = BackupPayload {
+            devices: self
+                .devices
+                .iter()
+                .map(|(device_id, public_key)| DeviceRecord {
+                    device_id: *device_id,
+                    public_key: public_key.to_bytes(),
+                })
+                .collect(),
             revisions: self.encrypted_revisions()?,
         };
         let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
@@ -570,7 +837,7 @@ impl Vault {
             .map_err(|_| Error::InvalidBackup("authentication failed".into()))?;
         let payload: BackupPayload = serde_json::from_slice(&plaintext)
             .map_err(|_| Error::InvalidBackup("invalid payload".into()))?;
-        if payload.revisions.len() > 1_000_000 {
+        if payload.revisions.len() > 1_000_000 || payload.devices.len() > 10_000 {
             return Err(Error::InvalidBackup("too many revisions".into()));
         }
         if payload
@@ -594,7 +861,7 @@ impl Vault {
             master_key,
             recovery_nonce,
             recovery_wrapped_key,
-            payload.revisions,
+            payload,
         );
         if result.is_err() {
             let _ = std::fs::remove_file(vault_path);
@@ -609,7 +876,7 @@ impl Vault {
         master_key: SecretKey,
         recovery_nonce: [u8; NONCE_LEN],
         recovery_wrapped_key: Vec<u8>,
-        revisions: Vec<EncryptedRevision>,
+        payload: BackupPayload,
     ) -> Result<Self> {
         let connection = open_connection(path)?;
         connection.execute_batch(SCHEMA)?;
@@ -623,29 +890,30 @@ impl Vault {
             &key_wrap_aad(&vault_id, b"password"),
             master_key.as_ref(),
         )?;
-        connection.execute(
-            "INSERT INTO vault_meta VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                FORMAT_VERSION,
-                vault_id.as_slice(),
-                kdf.memory_kib,
-                kdf.iterations,
-                kdf.parallelism,
-                password_salt.as_slice(),
-                password_nonce.as_slice(),
-                password_wrapped_key,
-                recovery_nonce.as_slice(),
-                recovery_wrapped_key,
-            ],
-        )?;
-        let header = read_header(&connection)?;
-        let mut vault = Self {
-            path: path.to_path_buf(),
-            connection,
-            header,
-            master_key: Some(master_key),
+        // A restored vault is a new writer: it gets a fresh signing identity
+        // and never reuses the source device's key. The source authors stay
+        // authorized so their revisions in the backup still verify.
+        let (device, _) = generate_device(&master_key, &vault_id)?;
+        let header = Header {
+            format_version: FORMAT_VERSION,
+            vault_id,
+            kdf,
+            password_salt,
+            password_nonce,
+            password_wrapped_key,
+            recovery_nonce,
+            recovery_wrapped_key,
+            device: Some(device),
         };
-        for revision in revisions {
+        insert_header(&connection, &header)?;
+        insert_device_authorization(&connection, &master_key, &header, &header.device_record()?)?;
+        for record in &payload.devices {
+            insert_device_authorization(&connection, &master_key, &header, record)?;
+        }
+        let header = read_header(&connection)?;
+        let mut vault = Self::from_parts(path, connection, header);
+        vault.activate(master_key)?;
+        for revision in payload.revisions {
             let expected = revision.parent_revision.clone();
             vault.apply_encrypted_revision(revision, expected.as_deref())?;
         }
@@ -657,16 +925,16 @@ impl Vault {
         revision: EncryptedRevision,
         expected_head: Option<&str>,
     ) -> Result<RevisionInfo> {
-        let key = self.key()?.clone();
+        self.key()?;
         revision.validate_shape(&self.header.vault_id)?;
         if !revision.tombstone {
-            let item = decrypt_item(&key, &revision)?;
+            let item = self.open_item(&revision)?;
             item.validate()?;
             if item.id != revision.item_id {
                 return Err(Error::Crypto);
             }
         } else {
-            decrypt_revision(&key, &revision)?;
+            self.open_revision(&revision)?;
         }
 
         let id = revision.revision_id();
@@ -730,31 +998,33 @@ impl Vault {
     }
 
     fn head_revision(&self, item_id: &str) -> Result<Option<EncryptedRevision>> {
-        self.connection.query_row(
-            "SELECT r.format_version,r.vault_id,r.item_id,r.parent_revision,r.key_epoch,r.nonce,r.ciphertext,r.tombstone \
-             FROM heads h JOIN revisions r ON r.revision=h.revision WHERE h.item_id=?",
-            [item_id],
-            row_to_revision,
-        ).optional().map_err(Into::into)
+        head_revision(&self.connection, item_id)
     }
 }
 
 fn revision_by_id(connection: &Connection, revision_id: &str) -> Result<Option<EncryptedRevision>> {
-    connection.query_row(
-            "SELECT format_version,vault_id,item_id,parent_revision,key_epoch,nonce,ciphertext,tombstone \
-             FROM revisions WHERE revision=?",
+    connection
+        .query_row(
+            &format!("SELECT {REVISION_COLUMNS} FROM revisions r WHERE r.revision=?"),
             [revision_id],
             row_to_revision,
-        ).optional().map_err(Into::into)
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn head_revision(connection: &Connection, item_id: &str) -> Result<Option<EncryptedRevision>> {
-    connection.query_row(
-        "SELECT r.format_version,r.vault_id,r.item_id,r.parent_revision,r.key_epoch,r.nonce,r.ciphertext,r.tombstone \
-         FROM heads h JOIN revisions r ON r.revision=h.revision WHERE h.item_id=?",
-        [item_id],
-        row_to_revision,
-    ).optional().map_err(Into::into)
+    connection
+        .query_row(
+            &format!(
+                "SELECT {REVISION_COLUMNS} FROM heads h JOIN revisions r ON r.revision=h.revision \
+                 WHERE h.item_id=?"
+            ),
+            [item_id],
+            row_to_revision,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 impl Vault {
@@ -765,6 +1035,7 @@ impl Vault {
 
 #[derive(Serialize, Deserialize)]
 struct BackupPayload {
+    devices: Vec<DeviceRecord>,
     revisions: Vec<EncryptedRevision>,
 }
 
@@ -827,37 +1098,245 @@ fn open_connection(path: &Path) -> Result<Connection> {
 }
 
 fn read_header(connection: &Connection) -> Result<Header> {
+    let version: u32 = connection.query_row(
+        "SELECT format_version FROM vault_meta WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
+        return Err(Error::UnsupportedVersion(version));
+    }
+    let device_columns = if version == FORMAT_VERSION {
+        "device_id,device_public_key,device_key_nonce,device_wrapped_signing_key"
+    } else {
+        "NULL,NULL,NULL,NULL"
+    };
     let row = connection.query_row(
-        "SELECT format_version,vault_id,kdf_memory_kib,kdf_iterations,kdf_parallelism,password_salt,password_nonce,password_wrapped_key,recovery_nonce,recovery_wrapped_key FROM vault_meta WHERE singleton=1",
+        &format!(
+            "SELECT vault_id,kdf_memory_kib,kdf_iterations,kdf_parallelism,password_salt,\
+             password_nonce,password_wrapped_key,recovery_nonce,recovery_wrapped_key,{device_columns} \
+             FROM vault_meta WHERE singleton=1"
+        ),
         [],
         |row| Ok((
-            row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, u32>(2)?, row.get::<_, u32>(3)?, row.get::<_, u32>(4)?,
-            row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, Vec<u8>>(7)?,
-            row.get::<_, Vec<u8>>(8)?, row.get::<_, Vec<u8>>(9)?,
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, u32>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?,
+            row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, Vec<u8>>(7)?, row.get::<_, Vec<u8>>(8)?,
+            row.get::<_, Option<Vec<u8>>>(9)?, row.get::<_, Option<Vec<u8>>>(10)?,
+            row.get::<_, Option<Vec<u8>>>(11)?, row.get::<_, Option<Vec<u8>>>(12)?,
         )),
     )?;
-    if row.0 != FORMAT_VERSION {
-        return Err(Error::UnsupportedVersion(row.0));
-    }
+    let device = match (row.9, row.10, row.11, row.12) {
+        (Some(device_id), Some(public_key), Some(key_nonce), Some(wrapped_signing_key)) => {
+            Some(DeviceHeader {
+                device_id: array(&device_id)?,
+                public_key: array(&public_key)?,
+                key_nonce: array(&key_nonce)?,
+                wrapped_signing_key,
+            })
+        }
+        (None, None, None, None) if version == LEGACY_FORMAT_VERSION => None,
+        _ => return Err(Error::Crypto),
+    };
     Ok(Header {
-        vault_id: array(&row.1)?,
+        format_version: version,
+        vault_id: array(&row.0)?,
         kdf: KdfConfig {
-            memory_kib: row.2,
-            iterations: row.3,
-            parallelism: row.4,
+            memory_kib: row.1,
+            iterations: row.2,
+            parallelism: row.3,
         },
-        password_salt: array(&row.5)?,
-        password_nonce: array(&row.6)?,
-        password_wrapped_key: row.7,
-        recovery_nonce: array(&row.8)?,
-        recovery_wrapped_key: row.9,
+        password_salt: array(&row.4)?,
+        password_nonce: array(&row.5)?,
+        password_wrapped_key: row.6,
+        recovery_nonce: array(&row.7)?,
+        recovery_wrapped_key: row.8,
+        device,
     })
+}
+
+fn insert_header(connection: &Connection, header: &Header) -> Result<()> {
+    let device = header.device.as_ref().ok_or(Error::Crypto)?;
+    connection.execute(
+        "INSERT INTO vault_meta(singleton,format_version,vault_id,kdf_memory_kib,kdf_iterations,\
+         kdf_parallelism,password_salt,password_nonce,password_wrapped_key,recovery_nonce,\
+         recovery_wrapped_key,device_id,device_public_key,device_key_nonce,device_wrapped_signing_key) \
+         VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![
+            header.format_version,
+            header.vault_id.as_slice(),
+            header.kdf.memory_kib,
+            header.kdf.iterations,
+            header.kdf.parallelism,
+            header.password_salt.as_slice(),
+            header.password_nonce.as_slice(),
+            header.password_wrapped_key,
+            header.recovery_nonce.as_slice(),
+            header.recovery_wrapped_key,
+            device.device_id.as_slice(),
+            device.public_key.as_slice(),
+            device.key_nonce.as_slice(),
+            device.wrapped_signing_key,
+        ],
+    )?;
+    Ok(())
+}
+
+impl Header {
+    fn device_record(&self) -> Result<DeviceRecord> {
+        let device = self.device.as_ref().ok_or(Error::Crypto)?;
+        Ok(DeviceRecord {
+            device_id: device.device_id,
+            public_key: device.public_key,
+        })
+    }
+}
+
+/// Creates a random device identity whose signing key is wrapped by the
+/// vault master key.
+fn generate_device(
+    master_key: &SecretKey,
+    vault_id: &[u8; 32],
+) -> Result<(DeviceHeader, SigningKey)> {
+    let seed = Zeroizing::new(random_array::<32>());
+    let signing_key = SigningKey::from_bytes(&seed);
+    let device_id = random_array::<DEVICE_ID_LEN>();
+    let public_key = signing_key.verifying_key().to_bytes();
+    let key_nonce = random_array::<NONCE_LEN>();
+    let wrapped_signing_key = encrypt(
+        master_key,
+        &key_nonce,
+        &device_key_aad(vault_id, &device_id, &public_key),
+        seed.as_ref(),
+    )?;
+    Ok((
+        DeviceHeader {
+            device_id,
+            public_key,
+            key_nonce,
+            wrapped_signing_key,
+        },
+        signing_key,
+    ))
+}
+
+fn insert_device_authorization(
+    connection: &Connection,
+    master_key: &SecretKey,
+    header: &Header,
+    record: &DeviceRecord,
+) -> Result<()> {
+    let authorization = device_authorization(
+        master_key,
+        &header.vault_id,
+        &record.device_id,
+        &record.public_key,
+    )?;
+    connection.execute(
+        "INSERT INTO devices(device_id,public_key,authorization) VALUES(?,?,?)",
+        params![
+            record.device_id.as_slice(),
+            record.public_key.as_slice(),
+            authorization.as_slice(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Loads the authorized author set, failing closed if any row was not
+/// written by a holder of the master key.
+fn load_devices(
+    connection: &Connection,
+    master_key: &SecretKey,
+    vault_id: &[u8; 32],
+) -> Result<BTreeMap<[u8; DEVICE_ID_LEN], VerifyingKey>> {
+    let mut statement =
+        connection.prepare("SELECT device_id,public_key,authorization FROM devices")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut devices = BTreeMap::new();
+    for (device_id, public_key, authorization) in rows {
+        let device_id = array::<DEVICE_ID_LEN>(&device_id)?;
+        let public_key = array::<PUBLIC_KEY_LEN>(&public_key)?;
+        verify_device_authorization(
+            master_key,
+            vault_id,
+            &device_id,
+            &public_key,
+            &authorization,
+        )?;
+        let verifying = VerifyingKey::from_bytes(&public_key).map_err(|_| Error::Crypto)?;
+        devices.insert(device_id, verifying);
+    }
+    Ok(devices)
+}
+
+/// A format 1 row, read only while migrating.
+struct LegacyRevision {
+    revision: String,
+    item_id: String,
+    parent_revision: Option<String>,
+    key_epoch: u64,
+    nonce: [u8; NONCE_LEN],
+    ciphertext: Vec<u8>,
+    tombstone: bool,
+}
+
+/// Returns format 1 revisions in insertion order, so every parent precedes
+/// its children.
+fn legacy_revisions(connection: &Connection, vault_id: &[u8; 32]) -> Result<Vec<LegacyRevision>> {
+    let mut statement = connection.prepare(
+        "SELECT revision,format_version,vault_id,item_id,parent_revision,key_epoch,nonce,ciphertext,tombstone \
+         FROM revisions ORDER BY rowid",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                LegacyRevision {
+                    revision: String::new(),
+                    item_id: row.get(3)?,
+                    parent_revision: row.get(4)?,
+                    key_epoch: u64::try_from(row.get::<_, i64>(5)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    nonce: row
+                        .get::<_, Vec<u8>>(6)?
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    ciphertext: row.get(7)?,
+                    tombstone: row.get(8)?,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(revision, version, row_vault_id, mut legacy)| {
+            if version != LEGACY_FORMAT_VERSION
+                || row_vault_id.as_slice() != vault_id.as_slice()
+                || legacy.key_epoch != KEY_EPOCH
+            {
+                return Err(Error::Crypto);
+            }
+            legacy.revision = revision;
+            Ok(legacy)
+        })
+        .collect()
 }
 
 fn row_to_revision(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncryptedRevision> {
     let vault_id: Vec<u8> = row.get(1)?;
-    let nonce: Vec<u8> = row.get(5)?;
+    let author_device_id: Vec<u8> = row.get(5)?;
+    let nonce: Vec<u8> = row.get(6)?;
     Ok(EncryptedRevision {
         format_version: row.get(0)?,
         vault_id: vault_id
@@ -867,40 +1346,37 @@ fn row_to_revision(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncryptedRevisio
         parent_revision: row.get(3)?,
         key_epoch: u64::try_from(row.get::<_, i64>(4)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        author_device_id: author_device_id
+            .try_into()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
         nonce: nonce
             .try_into()
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
-        ciphertext: row.get(6)?,
-        tombstone: row.get(7)?,
+        ciphertext: row.get(7)?,
+        tombstone: row.get(8)?,
+        signature: row.get(9)?,
     })
 }
 
 fn insert_revision(connection: &Connection, revision: &EncryptedRevision, id: &str) -> Result<()> {
     connection.execute(
-        "INSERT INTO revisions(revision,format_version,vault_id,item_id,parent_revision,key_epoch,nonce,ciphertext,tombstone) VALUES(?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO revisions(revision,format_version,vault_id,item_id,parent_revision,key_epoch,\
+         author_device_id,nonce,ciphertext,tombstone,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         params![
-            id, revision.format_version, revision.vault_id.as_slice(), revision.item_id,
-            revision.parent_revision, i64::try_from(revision.key_epoch).map_err(|_| Error::Crypto)?, revision.nonce.as_slice(),
-            revision.ciphertext, revision.tombstone,
+            id,
+            revision.format_version,
+            revision.vault_id.as_slice(),
+            revision.item_id,
+            revision.parent_revision,
+            i64::try_from(revision.key_epoch).map_err(|_| Error::Crypto)?,
+            revision.author_device_id.as_slice(),
+            revision.nonce.as_slice(),
+            revision.ciphertext,
+            revision.tombstone,
+            revision.signature,
         ],
     )?;
     Ok(())
-}
-
-fn decrypt_revision(key: &SecretKey, revision: &EncryptedRevision) -> Result<Zeroizing<Vec<u8>>> {
-    let aad = record_aad(
-        &revision.vault_id,
-        &revision.item_id,
-        revision.parent_revision.as_deref(),
-        revision.key_epoch,
-        revision.tombstone,
-    );
-    decrypt(key, &revision.nonce, &aad, &revision.ciphertext).map_err(|_| Error::Crypto)
-}
-
-fn decrypt_item(key: &SecretKey, revision: &EncryptedRevision) -> Result<Item> {
-    let plaintext = decrypt_revision(key, revision)?;
-    serde_json::from_slice(&plaintext).map_err(|_| Error::Crypto)
 }
 
 fn array<const N: usize>(value: &[u8]) -> Result<[u8; N]> {

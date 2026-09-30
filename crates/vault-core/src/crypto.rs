@@ -4,6 +4,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -13,6 +14,9 @@ use crate::{Error, Result};
 pub(crate) const KEY_LEN: usize = 32;
 pub(crate) const NONCE_LEN: usize = 24;
 pub(crate) const SALT_LEN: usize = 16;
+pub(crate) const DEVICE_ID_LEN: usize = 16;
+pub(crate) const PUBLIC_KEY_LEN: usize = 32;
+pub(crate) const SIGNATURE_LEN: usize = 64;
 
 pub(crate) type SecretKey = Zeroizing<[u8; KEY_LEN]>;
 
@@ -117,7 +121,106 @@ pub(crate) fn key_wrap_aad(vault_id: &[u8; 32], method: &[u8]) -> Vec<u8> {
     aad
 }
 
+/// Wraps a device signing key under the vault master key.
+pub(crate) fn device_key_aad(
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    public_key: &[u8; PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    let mut aad = b"osm-device-signing-key-v1\0".to_vec();
+    aad.extend_from_slice(vault_id);
+    aad.extend_from_slice(device_id);
+    aad.extend_from_slice(public_key);
+    aad
+}
+
+/// Authenticates a row of the local authorized-author table so that write
+/// access to the SQLite file alone cannot add a signer.
+pub(crate) fn device_authorization(
+    key: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    public_key: &[u8; PUBLIC_KEY_LEN],
+) -> Result<[u8; 32]> {
+    Ok(
+        device_authorization_mac(key, vault_id, device_id, public_key)?
+            .finalize()
+            .into_bytes()
+            .into(),
+    )
+}
+
+pub(crate) fn verify_device_authorization(
+    key: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    public_key: &[u8; PUBLIC_KEY_LEN],
+    tag: &[u8],
+) -> Result<()> {
+    device_authorization_mac(key, vault_id, device_id, public_key)?
+        .verify_slice(tag)
+        .map_err(|_| Error::Crypto)
+}
+
+fn device_authorization_mac(
+    key: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    public_key: &[u8; PUBLIC_KEY_LEN],
+) -> Result<Hmac<Sha256>> {
+    // Derive a separate subkey so the master key is never used directly as
+    // both an AEAD key and a MAC key.
+    let mut derive = <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| Error::Crypto)?;
+    derive.update(b"osm-device-authorization-key-v1");
+    let subkey = Zeroizing::new(<[u8; 32]>::from(derive.finalize().into_bytes()));
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(subkey.as_ref()).map_err(|_| Error::Crypto)?;
+    mac.update(b"osm-device-authorization-v1\0");
+    mac.update(vault_id);
+    mac.update(device_id);
+    mac.update(public_key);
+    Ok(mac)
+}
+
 pub(crate) fn record_aad(
+    vault_id: &[u8; 32],
+    item_id: &str,
+    parent: Option<&str>,
+    key_epoch: u64,
+    author_device_id: &[u8; DEVICE_ID_LEN],
+    tombstone: bool,
+) -> Vec<u8> {
+    let mut aad = b"osm-item-revision-v2\0".to_vec();
+    aad.extend_from_slice(vault_id);
+    push_field(&mut aad, item_id.as_bytes());
+    push_field(&mut aad, parent.unwrap_or("").as_bytes());
+    aad.extend_from_slice(&key_epoch.to_be_bytes());
+    aad.extend_from_slice(author_device_id);
+    aad.push(u8::from(tombstone));
+    aad
+}
+
+/// The exact bytes the author device signs with Ed25519.
+pub(crate) fn revision_signature_message(aad: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let mut message = b"osm-revision-signature-v2\0".to_vec();
+    push_field(&mut message, aad);
+    push_field(&mut message, nonce);
+    push_field(&mut message, ciphertext);
+    message
+}
+
+pub(crate) fn revision_id(aad: &[u8], nonce: &[u8], ciphertext: &[u8], signature: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"osm-revision-id-v2\0");
+    push_field_digest(&mut hasher, aad);
+    push_field_digest(&mut hasher, nonce);
+    push_field_digest(&mut hasher, ciphertext);
+    push_field_digest(&mut hasher, signature);
+    hex_encode(&hasher.finalize())
+}
+
+/// Format 1 record AAD, kept only to read vaults during migration.
+pub(crate) fn legacy_record_aad(
     vault_id: &[u8; 32],
     item_id: &str,
     parent: Option<&str>,
@@ -133,7 +236,8 @@ pub(crate) fn record_aad(
     aad
 }
 
-pub(crate) fn revision_id(aad: &[u8], nonce: &[u8], ciphertext: &[u8]) -> String {
+/// Format 1 revision ID, kept only to validate vaults during migration.
+pub(crate) fn legacy_revision_id(aad: &[u8], nonce: &[u8], ciphertext: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"osm-revision-id-v1\0");
     push_field_digest(&mut hasher, aad);

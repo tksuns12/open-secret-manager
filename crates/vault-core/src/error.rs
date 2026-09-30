@@ -18,6 +18,10 @@ pub enum Error {
     AlreadyExists,
     #[error("revision conflict (expected {expected}, actual {actual})")]
     Conflict { expected: String, actual: String },
+    #[error("revision author is not an authorized device")]
+    UnknownAuthor,
+    #[error("revision signature is invalid")]
+    InvalidSignature,
     #[error("invalid item: {0}")]
     InvalidItem(String),
     #[error("invalid import: {0}")]
