@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Open Secret Manager",
+  "version": "0.1.0",
+  "identifier": "org.opensecretmanager.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{ "title": "Open Secret Manager", "width": 1200, "height": 760, "minWidth": 960, "minHeight": 680 }],
+    "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png"]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Open Secret Manager",
+  "version": "0.1.0",
+  "description": "Explicit, origin-bound autofill for Open Secret Manager.",
+  "permissions": ["contextMenus", "nativeMessaging", "tabs"],
+  "host_permissions": ["https://*/*"],
+  "background": { "service_worker": "dist/background.js", "type": "module" },
+  "content_scripts": [{ "matches": ["https://*/*"], "js": ["dist/content.js"], "run_at": "document_idle", "all_frames": false }]
+}

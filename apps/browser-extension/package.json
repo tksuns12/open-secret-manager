@@ -1,0 +1,9 @@
+{
+  "name": "open-secret-manager-extension",
+  "private": true,
+  "version": "0.1.0",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": { "typecheck": "tsc --noEmit" },
+  "devDependencies": { "@types/chrome": "^0.0.280", "typescript": "^5.7.2" }
+}

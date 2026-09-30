@@ -1,0 +1,33 @@
+[package]
+name = "open-secret-manager"
+version = "0.1.0"
+description = "Owner-controlled local vault desktop shell"
+authors = ["Open Secret Manager contributors"]
+edition = "2021"
+license = "GPL-3.0-only"
+
+[lib]
+name = "open_secret_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0.0", features = [] }
+dirs = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+osm-vault-core = { path = "../../../crates/vault-core" }
+zeroize = "1.8"
+arboard = "3.4"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Tauri bundles platform-specific dependencies and is checked separately from
+# the UI-independent Rust workspace.
+[workspace]

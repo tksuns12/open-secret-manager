@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vault-core",
+    "crates/vault-sync",
+    "apps/native-host",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
