@@ -326,12 +326,15 @@ fn revisions_are_signed_by_the_local_device_and_forgeries_rejected() {
         vault.apply_encrypted_revision(forged),
         Err(Error::InvalidSignature)
     ));
+    // The author is bound into the AEAD, so relabeling it cannot even
+    // produce a revision that qualifies for quarantine.
     let mut unknown = wire.clone();
     unknown.author_device_id = [0xAA; 16];
     assert!(matches!(
         vault.apply_encrypted_revision(unknown),
-        Err(Error::UnknownAuthor)
+        Err(Error::Crypto)
     ));
+    assert!(vault.quarantined().unwrap().is_empty());
     let mut truncated = wire.clone();
     truncated.signature.pop();
     assert!(matches!(
@@ -351,7 +354,7 @@ fn revisions_are_signed_by_the_local_device_and_forgeries_rejected() {
 }
 
 #[test]
-fn restored_vault_signs_as_a_new_device_and_unknown_authors_are_rejected() {
+fn restored_vault_signs_as_a_new_device_and_unknown_authors_are_quarantined() {
     let dir = tempdir().unwrap();
     let original_path = dir.path().join("original.db");
     let backup_path = dir.path().join("vault.osmbak");
@@ -377,11 +380,13 @@ fn restored_vault_signs_as_a_new_device_and_unknown_authors_are_rejected() {
         .unwrap();
     assert_eq!(Some(edit.author_device_id), restored.device_id());
 
-    // The original vault has never authorized the restored device.
+    // The original vault has never authorized the restored device, so the
+    // edit is held, not merged.
     assert!(matches!(
         original.apply_encrypted_revision(edit.clone()),
-        Err(Error::UnknownAuthor)
+        Err(Error::Quarantined)
     ));
+    assert_eq!(original.quarantined().unwrap().len(), 1);
     original
         .authorize_device(
             restored.device_id().unwrap(),
@@ -389,6 +394,9 @@ fn restored_vault_signs_as_a_new_device_and_unknown_authors_are_rejected() {
         )
         .unwrap();
     original.apply_encrypted_revision(edit).unwrap();
+    // Once its author is authorized the exact signed revision applies and
+    // the held copy is released.
+    assert!(original.quarantined().unwrap().is_empty());
     assert_eq!(
         original.get(&item_id).unwrap().item.password,
         "edited on restored device"
@@ -582,6 +590,20 @@ fn legacy_vault_migrates_to_signed_revisions_on_first_unlock() {
 /// Two copies of one vault that each trust the other's device, sharing one
 /// item at `base` revision. Returns (original, copy, item, base revision).
 fn two_copies(dir: &std::path::Path) -> (Vault, Vault, Item, String) {
+    let (mut first, second, item, base, _) = untrusted_copy(dir);
+    first
+        .authorize_device(
+            second.device_id().unwrap(),
+            second.device_public_key().unwrap(),
+        )
+        .unwrap();
+    (first, second, item, base)
+}
+
+/// Like `two_copies`, but the original has not authorized the copy's device,
+/// so the copy's revisions are unknown-author revisions to it. Also returns
+/// the vault's recovery key.
+fn untrusted_copy(dir: &std::path::Path) -> (Vault, Vault, Item, String, RecoveryKey) {
     let (mut first, recovery) = Vault::create(dir.join("a.db"), "password").unwrap();
     let item = login("Shared");
     let base = first.put(item.clone()).unwrap().revision;
@@ -593,13 +615,7 @@ fn two_copies(dir: &std::path::Path) -> (Vault, Vault, Item, String) {
         "password",
     )
     .unwrap();
-    first
-        .authorize_device(
-            second.device_id().unwrap(),
-            second.device_public_key().unwrap(),
-        )
-        .unwrap();
-    (first, second, item, base)
+    (first, second, item, base, recovery)
 }
 
 fn edit(vault: &mut Vault, item: &Item, base: &str, password: &str) -> crate::EncryptedRevision {
@@ -830,7 +846,8 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
-            "DROP TRIGGER revisions_no_update; DROP TRIGGER revisions_no_delete;
+            "DROP TRIGGER quarantine_no_update; DROP TABLE quarantine;
+             DROP TRIGGER revisions_no_update; DROP TRIGGER revisions_no_delete;
              DROP INDEX revisions_item_id; DROP INDEX heads_item_id;
              ALTER TABLE heads RENAME TO multi_heads;
              ALTER TABLE revisions RENAME TO multi_revisions;
@@ -868,6 +885,8 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
     assert_eq!(current.revision, second.revision);
     assert!(!current.conflict);
     migrated.update(current.item, &current.revision).unwrap();
+    // The chained 2 -> 3 -> 4 migration created the quarantine.
+    assert!(migrated.quarantined().unwrap().is_empty());
     drop(migrated);
     let version: u32 = Connection::open(&path)
         .unwrap()
@@ -875,5 +894,157 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
+}
+
+#[test]
+fn unknown_author_revisions_are_held_not_merged() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base, _) = untrusted_copy(dir.path());
+    let foreign = edit(&mut b, &item, &base, "from unknown device");
+    let foreign_id = foreign.revision_id();
+
+    assert!(matches!(
+        a.apply_encrypted_revision(foreign.clone()),
+        Err(Error::Quarantined)
+    ));
+    // Nothing is materialized: heads, content, and history are untouched.
+    assert_eq!(head_set(&a, &item.id), std::slice::from_ref(&base));
+    assert_eq!(a.get(&item.id).unwrap().item.password, item.password);
+    assert!(a
+        .encrypted_revisions()
+        .unwrap()
+        .iter()
+        .all(|revision| revision.revision_id() != foreign_id));
+
+    let held = a.quarantined().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].revision, foreign_id);
+    assert_eq!(Some(held[0].author_device_id), b.device_id());
+    assert_eq!(held[0].parents, std::slice::from_ref(&base));
+    assert_eq!(
+        held[0].item.as_ref().unwrap().password,
+        "from unknown device"
+    );
+
+    // Replays are deduplicated and the hold survives a restart.
+    assert!(matches!(
+        a.apply_encrypted_revision(foreign),
+        Err(Error::Quarantined)
+    ));
+    drop(a);
+    let mut a = Vault::open(dir.path().join("a.db")).unwrap();
+    a.unlock("password").unwrap();
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+
+    // Ciphertext the vault key did not produce is rejected, not held.
+    let head = b.get(&item.id).unwrap().revision;
+    let mut forged = edit(&mut b, &item, &head, "x");
+    forged.ciphertext[0] ^= 1;
+    assert!(matches!(
+        a.apply_encrypted_revision(forged),
+        Err(Error::Crypto)
+    ));
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+}
+
+#[test]
+fn accepting_reauthors_content_and_never_overrides_local_edits() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base, _) = untrusted_copy(dir.path());
+    let foreign = edit(&mut b, &item, &base, "from unknown device");
+    let foreign_id = foreign.revision_id();
+    assert!(matches!(
+        a.apply_encrypted_revision(foreign),
+        Err(Error::Quarantined)
+    ));
+    // A local edit made while the foreign one is held.
+    edit(&mut a, &item, &base, "local edit");
+
+    let accepted = a.accept_quarantined(&foreign_id).unwrap();
+    assert_eq!(accepted.parents, [base]);
+    assert_ne!(accepted.revision, foreign_id);
+    let reauthored = wire(&a, &accepted.revision);
+    assert_eq!(Some(reauthored.author_device_id), a.device_id());
+    assert!(a.quarantined().unwrap().is_empty());
+    assert!(a
+        .encrypted_revisions()
+        .unwrap()
+        .iter()
+        .all(|revision| Some(revision.author_device_id) != b.device_id()));
+
+    // Accepted content joins as a concurrent head; the owner still decides.
+    assert!(a.get(&item.id).unwrap().conflict);
+    let mut passwords: Vec<_> = a
+        .versions(&item.id)
+        .unwrap()
+        .into_iter()
+        .map(|version| version.item.unwrap().password.clone())
+        .collect();
+    passwords.sort();
+    assert_eq!(passwords, ["from unknown device", "local edit"]);
+    assert!(matches!(
+        a.accept_quarantined(&foreign_id),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn discard_and_missing_parents_leave_the_vault_unchanged() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base, _) = untrusted_copy(dir.path());
+    let first = edit(&mut b, &item, &base, "first");
+    let second = edit(&mut b, &item, &first.revision_id(), "second");
+
+    // A held child whose parent never arrived cannot be accepted yet.
+    assert!(matches!(
+        a.apply_encrypted_revision(second.clone()),
+        Err(Error::Quarantined)
+    ));
+    assert!(matches!(
+        a.accept_quarantined(&second.revision_id()),
+        Err(Error::MissingParent)
+    ));
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+    assert_eq!(head_set(&a, &item.id), [base]);
+
+    a.discard_quarantined(&second.revision_id()).unwrap();
+    assert!(a.quarantined().unwrap().is_empty());
+    assert!(matches!(
+        a.discard_quarantined(&second.revision_id()),
+        Err(Error::NotFound)
+    ));
+    // A discarded revision received again is held again, not dropped.
+    assert!(matches!(
+        a.apply_encrypted_revision(second),
+        Err(Error::Quarantined)
+    ));
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+}
+
+#[test]
+fn held_revisions_survive_backup_and_restore() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base, recovery) = untrusted_copy(dir.path());
+    let foreign = edit(&mut b, &item, &base, "held through backup");
+    let foreign_id = foreign.revision_id();
+    assert!(matches!(
+        a.apply_encrypted_revision(foreign),
+        Err(Error::Quarantined)
+    ));
+    let backup_path = dir.path().join("with-quarantine.osmbak");
+    a.export_backup(&backup_path).unwrap();
+
+    let restored = Vault::restore_backup(
+        &backup_path,
+        dir.path().join("restored.db"),
+        &recovery,
+        "password",
+    )
+    .unwrap();
+    // The hold is carried over, still unmerged, and still reviewable.
+    let held = restored.quarantined().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].revision, foreign_id);
+    assert_eq!(head_set(&restored, &item.id), [base]);
 }

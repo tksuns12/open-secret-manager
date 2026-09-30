@@ -18,11 +18,15 @@ use crate::{
         revision_signature_message, verify_device_authorization, KdfConfig, SecretKey,
         DEVICE_ID_LEN, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    Error, Item, ItemSummary, ItemVersion, RecoveryKey, Result, RevisionInfo, VaultItem,
+    Error, Item, ItemSummary, ItemVersion, QuarantinedRevision, RecoveryKey, Result, RevisionInfo,
+    VaultItem,
 };
 
-/// Storage layout: signed revisions with a multi-head set per item.
-const VAULT_FORMAT_VERSION: u32 = 3;
+/// Storage layout: multi-head revisions plus a quarantine for revisions
+/// from unauthorized devices.
+const VAULT_FORMAT_VERSION: u32 = 4;
+/// Multi-head layout without a quarantine table; migrated on first unlock.
+const MULTI_HEAD_FORMAT_VERSION: u32 = 3;
 /// Signed revisions with one head per item; migrated by SQL on first unlock.
 const SINGLE_HEAD_FORMAT_VERSION: u32 = 2;
 /// Unsigned revisions without an author; migrated on first unlock.
@@ -33,6 +37,8 @@ const RECORD_FORMAT_VERSION: u32 = 2;
 const BACKUP_FORMAT_VERSION: u32 = 3;
 /// Upper bound on heads one revision may supersede.
 const MAX_PARENTS: usize = 16;
+/// Upper bound on held revisions awaiting owner review.
+const MAX_QUARANTINE: i64 = 10_000;
 const KEY_EPOCH: u64 = 1;
 const MAX_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 16 * 1024 * 1024;
@@ -92,6 +98,27 @@ CREATE TABLE heads (
     tombstone INTEGER NOT NULL CHECK(tombstone IN (0, 1))
 ) STRICT;
 CREATE INDEX heads_item_id ON heads(item_id);
+"#;
+
+/// Revisions from devices outside the authorized set, with their exact
+/// signed bytes. They are never materialized; the owner accepts (re-authors)
+/// or discards each one.
+const QUARANTINE_SCHEMA: &str = r#"
+CREATE TABLE quarantine (
+    revision TEXT PRIMARY KEY CHECK(length(revision) = 64),
+    format_version INTEGER NOT NULL CHECK(format_version = 2),
+    vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
+    item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
+    parents TEXT NOT NULL CHECK(length(parents) % 64 = 0 AND length(parents) <= 1024),
+    key_epoch INTEGER NOT NULL CHECK(key_epoch = 1),
+    author_device_id BLOB NOT NULL CHECK(length(author_device_id) = 16),
+    nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+    ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 16 AND 16777232),
+    tombstone INTEGER NOT NULL CHECK(tombstone IN (0, 1)),
+    signature BLOB NOT NULL CHECK(length(signature) = 64)
+) STRICT;
+CREATE TRIGGER quarantine_no_update BEFORE UPDATE ON quarantine
+BEGIN SELECT RAISE(ABORT, 'quarantined revisions are immutable'); END;
 "#;
 
 const REVISION_COLUMNS: &str = "r.format_version,r.vault_id,r.item_id,r.parents,r.key_epoch,\
@@ -406,6 +433,9 @@ impl Vault {
         if self.header.format_version == SINGLE_HEAD_FORMAT_VERSION {
             self.migrate_single_head()?;
         }
+        if self.header.format_version == MULTI_HEAD_FORMAT_VERSION {
+            self.migrate_add_quarantine()?;
+        }
         let device = self.header.device.as_ref().ok_or(Error::Crypto)?;
         let seed = decrypt(
             &master_key,
@@ -499,7 +529,7 @@ impl Vault {
                     .collect();
                 let revision = signer.seal(&old.item_id, parents, old.tombstone, &plaintext)?;
                 let id = revision.revision_id();
-                insert_revision(&transaction, &revision, &id)?;
+                insert_revision(&transaction, "revisions", &revision, &id)?;
                 renamed.insert(old.revision, id);
             }
             for (item_id, old_revision, tombstone) in heads {
@@ -549,6 +579,28 @@ impl Vault {
             )?;
             transaction.execute(
                 "UPDATE vault_meta SET format_version=? WHERE singleton=1",
+                [MULTI_HEAD_FORMAT_VERSION],
+            )?;
+        }
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(())
+    }
+
+    /// Adds the quarantine table to a format 3 vault. Purely additive.
+    fn migrate_add_quarantine(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = transaction.query_row(
+            "SELECT format_version FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == MULTI_HEAD_FORMAT_VERSION {
+            transaction.execute_batch(QUARANTINE_SCHEMA)?;
+            transaction.execute(
+                "UPDATE vault_meta SET format_version=? WHERE singleton=1",
                 [VAULT_FORMAT_VERSION],
             )?;
         }
@@ -570,7 +622,6 @@ impl Vault {
     /// the authenticated device set; a key carried by the revision is never
     /// trusted.
     fn open_revision(&self, revision: &EncryptedRevision) -> Result<Zeroizing<Vec<u8>>> {
-        let key = self.key()?;
         let author = self
             .devices
             .get(&revision.author_device_id)
@@ -584,7 +635,19 @@ impl Vault {
                 &signature,
             )
             .map_err(|_| Error::InvalidSignature)?;
-        decrypt(key, &revision.nonce, &aad, &revision.ciphertext).map_err(|_| Error::Crypto)
+        self.decrypt_unverified(revision)
+    }
+
+    /// AEAD decryption only. This proves the revision was produced by a
+    /// holder of the vault key, not which device authored it.
+    fn decrypt_unverified(&self, revision: &EncryptedRevision) -> Result<Zeroizing<Vec<u8>>> {
+        decrypt(
+            self.key()?,
+            &revision.nonce,
+            &revision.aad(),
+            &revision.ciphertext,
+        )
+        .map_err(|_| Error::Crypto)
     }
 
     fn open_item(&self, revision: &EncryptedRevision) -> Result<Item> {
@@ -761,7 +824,7 @@ impl Vault {
         let mut revisions = Vec::with_capacity(sealed.len());
         for revision in sealed {
             let revision_id = revision.revision_id();
-            insert_revision(&transaction, &revision, &revision_id)?;
+            insert_revision(&transaction, "revisions", &revision, &revision_id)?;
             transaction.execute(
                 "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,0)",
                 params![revision_id, revision.item_id],
@@ -857,7 +920,7 @@ impl Vault {
         let revision = self
             .signer()?
             .seal(&item.id, parents, tombstone, &plaintext)?;
-        self.commit_revision(revision, Some(kind))
+        self.commit_revision(revision, Some(kind), None)
     }
 
     pub fn encrypted_revisions(&self) -> Result<Vec<EncryptedRevision>> {
@@ -884,6 +947,7 @@ impl Vault {
                 })
                 .collect(),
             revisions: self.encrypted_revisions()?,
+            quarantine: quarantined_revisions(&self.connection)?,
         };
         let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
         if plaintext.len() as u64 > MAX_BACKUP_BYTES {
@@ -961,7 +1025,10 @@ impl Vault {
             .map_err(|_| Error::InvalidBackup("authentication failed".into()))?;
         let payload: BackupPayload = serde_json::from_slice(&plaintext)
             .map_err(|_| Error::InvalidBackup("invalid payload".into()))?;
-        if payload.revisions.len() > 1_000_000 || payload.devices.len() > 10_000 {
+        if payload.revisions.len() > 1_000_000
+            || payload.devices.len() > 10_000
+            || payload.quarantine.len() as i64 > MAX_QUARANTINE
+        {
             return Err(Error::InvalidBackup("too many revisions".into()));
         }
         if payload
@@ -1042,6 +1109,12 @@ impl Vault {
         for revision in payload.revisions {
             vault.apply_encrypted_revision(revision)?;
         }
+        for held in payload.quarantine {
+            match vault.apply_encrypted_revision(held) {
+                Ok(_) | Err(Error::Quarantined) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(vault)
     }
 
@@ -1050,21 +1123,113 @@ impl Vault {
     /// becomes an additional head. Replaying a stored revision is a no-op.
     /// `MissingParent` means nothing was written and the caller should retry
     /// once the parent has been applied.
+    ///
+    /// A revision whose author is not an authorized device is held in the
+    /// quarantine and `Quarantined` is returned: it is not merged. Only a
+    /// well-formed revision that decrypts with the vault key is held.
     pub fn apply_encrypted_revision(
         &mut self,
         revision: EncryptedRevision,
     ) -> Result<RevisionInfo> {
-        self.commit_revision(revision, None)
+        self.key()?;
+        revision.validate_shape(&self.header.vault_id)?;
+        if !self.devices.contains_key(&revision.author_device_id) {
+            self.quarantine(revision)?;
+            return Err(Error::Quarantined);
+        }
+        self.commit_revision(revision, None, None)
+    }
+
+    fn quarantine(&mut self, revision: EncryptedRevision) -> Result<()> {
+        let plaintext = self.decrypt_unverified(&revision)?;
+        if !revision.tombstone {
+            let item: Item = serde_json::from_slice(&plaintext).map_err(|_| Error::Crypto)?;
+            item.validate()?;
+            if item.id != revision.item_id {
+                return Err(Error::Crypto);
+            }
+        }
+        let id = revision.revision_id();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if quarantined_by_id(&transaction, &id)?.is_none() {
+            let held: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM quarantine", [], |row| row.get(0))?;
+            if held >= MAX_QUARANTINE {
+                return Err(Error::QuarantineFull);
+            }
+            insert_revision(&transaction, "quarantine", &revision, &id)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Revisions held for owner review, oldest first, decrypted.
+    pub fn quarantined(&self) -> Result<Vec<QuarantinedRevision>> {
+        self.key()?;
+        quarantined_revisions(&self.connection)?
+            .iter()
+            .map(|revision| {
+                let plaintext = self.decrypt_unverified(revision)?;
+                let item = if revision.tombstone {
+                    None
+                } else {
+                    Some(serde_json::from_slice(&plaintext).map_err(|_| Error::Crypto)?)
+                };
+                Ok(QuarantinedRevision {
+                    revision: revision.revision_id(),
+                    item_id: revision.item_id.clone(),
+                    author_device_id: revision.author_device_id,
+                    parents: revision.parents.clone(),
+                    item,
+                })
+            })
+            .collect()
+    }
+
+    /// Accepts a held revision by re-authoring its content as this device
+    /// against the same parents; the unauthorized signature is never
+    /// trusted. The result may be a concurrent head to resolve. The held
+    /// entry is released in the same transaction; on `MissingParent` it
+    /// stays held.
+    pub fn accept_quarantined(&mut self, revision_id: &str) -> Result<RevisionInfo> {
+        self.key()?;
+        let held = quarantined_by_id(&self.connection, revision_id)?.ok_or(Error::NotFound)?;
+        let plaintext = self.decrypt_unverified(&held)?;
+        let revision = self.signer()?.seal(
+            &held.item_id,
+            held.parents.clone(),
+            held.tombstone,
+            &plaintext,
+        )?;
+        self.commit_revision(revision, None, Some(revision_id))
+    }
+
+    /// Drops a held revision. If the same revision is received again it is
+    /// held again rather than silently ignored.
+    pub fn discard_quarantined(&mut self, revision_id: &str) -> Result<()> {
+        self.key()?;
+        let removed = self
+            .connection
+            .execute("DELETE FROM quarantine WHERE revision=?", [revision_id])?;
+        if removed == 0 {
+            return Err(Error::NotFound);
+        }
+        Ok(())
     }
 
     /// Verifies, stores, and materializes a revision. `local` carries the
     /// head-set precondition for writes made on this device; it is checked
     /// in the same IMMEDIATE transaction that updates the heads, so two
     /// processes editing one head cannot both succeed.
+    /// `release` names a quarantined revision to remove in the same
+    /// transaction, so accepting one cannot apply it twice.
     fn commit_revision(
         &mut self,
         revision: EncryptedRevision,
         local: Option<LocalWrite>,
+        release: Option<&str>,
     ) -> Result<RevisionInfo> {
         self.key()?;
         revision.validate_shape(&self.header.vault_id)?;
@@ -1109,7 +1274,12 @@ impl Vault {
             )?;
         }
 
-        insert_revision(&transaction, &revision, &id)?;
+        insert_revision(&transaction, "revisions", &revision, &id)?;
+        // Release the entry being accepted, and the same signed revision if
+        // it was held earlier while its author was not yet authorized.
+        for held in release.into_iter().chain([id.as_str()]) {
+            transaction.execute("DELETE FROM quarantine WHERE revision=?", [held])?;
+        }
         // Parents always arrive before children, so a new revision is never
         // an ancestor of a stored one. Removing only the named parents keeps
         // every concurrent head.
@@ -1193,7 +1363,32 @@ fn is_revision_id(value: &str) -> bool {
 fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(META_SCHEMA)?;
     connection.execute_batch(RECORD_SCHEMA)?;
+    connection.execute_batch(QUARANTINE_SCHEMA)?;
     Ok(())
+}
+
+fn quarantined_by_id(
+    connection: &Connection,
+    revision_id: &str,
+) -> Result<Option<EncryptedRevision>> {
+    connection
+        .query_row(
+            &format!("SELECT {REVISION_COLUMNS} FROM quarantine r WHERE r.revision=?"),
+            [revision_id],
+            row_to_revision,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn quarantined_revisions(connection: &Connection) -> Result<Vec<EncryptedRevision>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {REVISION_COLUMNS} FROM quarantine r ORDER BY r.rowid"
+    ))?;
+    let held = statement
+        .query_map([], row_to_revision)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(held)
 }
 
 fn revision_by_id(connection: &Connection, revision_id: &str) -> Result<Option<EncryptedRevision>> {
@@ -1239,6 +1434,9 @@ impl Vault {
 struct BackupPayload {
     devices: Vec<DeviceRecord>,
     revisions: Vec<EncryptedRevision>,
+    /// Held revisions, so pending owner review survives a restore.
+    #[serde(default)]
+    quarantine: Vec<EncryptedRevision>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1307,7 +1505,10 @@ fn read_header(connection: &Connection) -> Result<Header> {
     )?;
     if !matches!(
         version,
-        LEGACY_FORMAT_VERSION | SINGLE_HEAD_FORMAT_VERSION | VAULT_FORMAT_VERSION
+        LEGACY_FORMAT_VERSION
+            | SINGLE_HEAD_FORMAT_VERSION
+            | MULTI_HEAD_FORMAT_VERSION
+            | VAULT_FORMAT_VERSION
     ) {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -1575,10 +1776,18 @@ fn split_parents(joined: &str) -> Option<Vec<String>> {
     )
 }
 
-fn insert_revision(connection: &Connection, revision: &EncryptedRevision, id: &str) -> Result<()> {
+/// `table` is `revisions` or `quarantine`; both hold the same columns.
+fn insert_revision(
+    connection: &Connection,
+    table: &'static str,
+    revision: &EncryptedRevision,
+    id: &str,
+) -> Result<()> {
     connection.execute(
-        "INSERT INTO revisions(revision,format_version,vault_id,item_id,parents,key_epoch,\
-         author_device_id,nonce,ciphertext,tombstone,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        &format!(
+            "INSERT INTO {table}(revision,format_version,vault_id,item_id,parents,key_epoch,\
+             author_device_id,nonce,ciphertext,tombstone,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         params![
             id,
             revision.format_version,

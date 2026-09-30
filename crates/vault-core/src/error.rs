@@ -28,6 +28,10 @@ pub enum Error {
     UnknownAuthor,
     #[error("revision signature is invalid")]
     InvalidSignature,
+    #[error("revision from an unauthorized device was quarantined for owner review")]
+    Quarantined,
+    #[error("quarantine is full; review or discard held revisions")]
+    QuarantineFull,
     #[error("invalid item: {0}")]
     InvalidItem(String),
     #[error("invalid import: {0}")]

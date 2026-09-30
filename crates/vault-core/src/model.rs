@@ -136,6 +136,33 @@ impl fmt::Debug for VaultItem {
     }
 }
 
+/// A revision held because its author is not an authorized device. It was
+/// encrypted with the vault key but is not part of the item's history until
+/// the owner accepts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct QuarantinedRevision {
+    pub revision: String,
+    pub item_id: String,
+    pub author_device_id: [u8; 16],
+    /// Parents named by the unauthorized author; accepting re-authors the
+    /// content against these.
+    pub parents: Vec<String>,
+    /// `None` when the held revision deletes the item.
+    pub item: Option<Item>,
+}
+
+impl fmt::Debug for QuarantinedRevision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuarantinedRevision")
+            .field("revision", &self.revision)
+            .field("item_id", &self.item_id)
+            .field("author_device_id", &self.author_device_id)
+            .field("parents", &self.parents)
+            .field("deleted", &self.item.is_none())
+            .finish()
+    }
+}
+
 /// One current head of an item, for reviewing a conflict.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ItemVersion {
