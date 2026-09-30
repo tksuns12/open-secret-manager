@@ -33,7 +33,7 @@ fn locked_lifecycle_and_revision_conflicts() {
     let item_id = item.id.clone();
     let first = vault.put(item.clone()).unwrap();
     let first_wire = vault.encrypted_revisions().unwrap().remove(0);
-    let replay = vault.apply_encrypted_revision(first_wire, None).unwrap();
+    let replay = vault.apply_encrypted_revision(first_wire).unwrap();
     assert_eq!(replay.revision, first.revision);
     assert!(matches!(vault.put(item.clone()), Err(Error::AlreadyExists)));
     assert_eq!(vault.get(&item_id).unwrap().item.password, item.password);
@@ -42,10 +42,7 @@ fn locked_lifecycle_and_revision_conflicts() {
     let mut changed = item;
     changed.password = "updated password".into();
     let second = vault.update(changed.clone(), &first.revision).unwrap();
-    assert_eq!(
-        second.parent_revision.as_deref(),
-        Some(first.revision.as_str())
-    );
+    assert_eq!(second.parents, vec![first.revision.clone()]);
     assert!(matches!(
         vault.update(changed, &first.revision),
         Err(Error::Conflict { .. })
@@ -326,23 +323,23 @@ fn revisions_are_signed_by_the_local_device_and_forgeries_rejected() {
     let mut forged = wire.clone();
     forged.signature[0] ^= 1;
     assert!(matches!(
-        vault.apply_encrypted_revision(forged, None),
+        vault.apply_encrypted_revision(forged),
         Err(Error::InvalidSignature)
     ));
     let mut unknown = wire.clone();
     unknown.author_device_id = [0xAA; 16];
     assert!(matches!(
-        vault.apply_encrypted_revision(unknown, None),
+        vault.apply_encrypted_revision(unknown),
         Err(Error::UnknownAuthor)
     ));
     let mut truncated = wire.clone();
     truncated.signature.pop();
     assert!(matches!(
-        vault.apply_encrypted_revision(truncated, None),
+        vault.apply_encrypted_revision(truncated),
         Err(Error::Crypto)
     ));
     // The untouched revision still replays idempotently.
-    vault.apply_encrypted_revision(wire, None).unwrap();
+    vault.apply_encrypted_revision(wire).unwrap();
 
     // The signing identity survives lock and reopen.
     vault.lock();
@@ -382,7 +379,7 @@ fn restored_vault_signs_as_a_new_device_and_unknown_authors_are_rejected() {
 
     // The original vault has never authorized the restored device.
     assert!(matches!(
-        original.apply_encrypted_revision(edit.clone(), Some(&first.revision)),
+        original.apply_encrypted_revision(edit.clone()),
         Err(Error::UnknownAuthor)
     ));
     original
@@ -391,9 +388,7 @@ fn restored_vault_signs_as_a_new_device_and_unknown_authors_are_rejected() {
             restored.device_public_key().unwrap(),
         )
         .unwrap();
-    original
-        .apply_encrypted_revision(edit, Some(&first.revision))
-        .unwrap();
+    original.apply_encrypted_revision(edit).unwrap();
     assert_eq!(
         original.get(&item_id).unwrap().item.password,
         "edited on restored device"
@@ -565,10 +560,10 @@ fn legacy_vault_migrates_to_signed_revisions_on_first_unlock() {
         .iter()
         .find(|revision| revision.revision_id() == current.revision)
         .unwrap();
-    let parent = head.parent_revision.as_deref().unwrap();
+    let parent = head.parents[0].as_str();
     assert!(revisions
         .iter()
-        .any(|revision| revision.revision_id() == parent && revision.parent_revision.is_none()));
+        .any(|revision| revision.revision_id() == parent && revision.parents.is_empty()));
 
     // Writing continues from the migrated head, and the result persists.
     let mut next = current.item;
@@ -582,4 +577,303 @@ fn legacy_vault_migrates_to_signed_revisions_on_first_unlock() {
         reopened.get(&kept.id).unwrap().item.title,
         "Kept after migration"
     );
+}
+
+/// Two copies of one vault that each trust the other's device, sharing one
+/// item at `base` revision. Returns (original, copy, item, base revision).
+fn two_copies(dir: &std::path::Path) -> (Vault, Vault, Item, String) {
+    let (mut first, recovery) = Vault::create(dir.join("a.db"), "password").unwrap();
+    let item = login("Shared");
+    let base = first.put(item.clone()).unwrap().revision;
+    first.export_backup(dir.join("a.osmbak")).unwrap();
+    let second = Vault::restore_backup(
+        dir.join("a.osmbak"),
+        dir.join("b.db"),
+        &recovery,
+        "password",
+    )
+    .unwrap();
+    first
+        .authorize_device(
+            second.device_id().unwrap(),
+            second.device_public_key().unwrap(),
+        )
+        .unwrap();
+    (first, second, item, base)
+}
+
+fn edit(vault: &mut Vault, item: &Item, base: &str, password: &str) -> crate::EncryptedRevision {
+    let mut changed = item.clone();
+    changed.password = password.into();
+    let info = vault.update(changed, base).unwrap();
+    wire(vault, &info.revision)
+}
+
+fn wire(vault: &Vault, revision: &str) -> crate::EncryptedRevision {
+    vault
+        .encrypted_revisions()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.revision_id() == revision)
+        .unwrap()
+}
+
+fn head_set(vault: &Vault, item_id: &str) -> Vec<String> {
+    vault
+        .versions(item_id)
+        .unwrap()
+        .into_iter()
+        .map(|version| version.revision)
+        .collect()
+}
+
+#[test]
+fn concurrent_edits_keep_both_heads_in_either_order_until_resolved() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let from_a = edit(&mut a, &item, &base, "from A");
+    let from_b = edit(&mut b, &item, &base, "from B");
+    // Each copy receives the other's edit after its own: both orders.
+    a.apply_encrypted_revision(from_b.clone()).unwrap();
+    b.apply_encrypted_revision(from_a.clone()).unwrap();
+
+    for vault in [&a, &b] {
+        let shown = vault.get(&item.id).unwrap();
+        assert!(shown.conflict);
+        assert!(vault.list().unwrap()[0].conflict);
+        let versions = vault.versions(&item.id).unwrap();
+        assert_eq!(versions.len(), 2);
+        let mut passwords: Vec<_> = versions
+            .iter()
+            .map(|version| version.item.as_ref().unwrap().password.clone())
+            .collect();
+        passwords.sort();
+        assert_eq!(passwords, ["from A", "from B"]);
+    }
+    assert_eq!(head_set(&a, &item.id), head_set(&b, &item.id));
+    // Both copies show the same version while conflicted.
+    assert_eq!(
+        a.get(&item.id).unwrap().revision,
+        b.get(&item.id).unwrap().revision
+    );
+
+    let shown = a.get(&item.id).unwrap();
+    assert!(matches!(
+        a.update(shown.item.clone(), &shown.revision),
+        Err(Error::Unresolved)
+    ));
+    assert!(matches!(
+        a.delete(&item.id, &shown.revision),
+        Err(Error::Unresolved)
+    ));
+
+    // The conflict survives a restart.
+    drop(a);
+    let mut a = Vault::open(dir.path().join("a.db")).unwrap();
+    a.unlock("password").unwrap();
+    assert!(a.get(&item.id).unwrap().conflict);
+
+    let heads = head_set(&a, &item.id);
+    let mut kept = item.clone();
+    kept.password = "merged".into();
+    let resolution = a.resolve(&item.id, Some(kept), &heads).unwrap();
+    assert_eq!(resolution.parents, heads);
+    let resolved = a.get(&item.id).unwrap();
+    assert!(!resolved.conflict);
+    assert_eq!(resolved.item.password, "merged");
+
+    b.apply_encrypted_revision(wire(&a, &resolution.revision))
+        .unwrap();
+    assert_eq!(
+        head_set(&b, &item.id),
+        std::slice::from_ref(&resolution.revision)
+    );
+    // Replaying an already superseded revision is a no-op, not a new head.
+    b.apply_encrypted_revision(from_a).unwrap();
+    assert_eq!(head_set(&b, &item.id), [resolution.revision]);
+    // Ordinary editing resumes after resolution.
+    let current = b.get(&item.id).unwrap();
+    b.update(current.item, &current.revision).unwrap();
+}
+
+#[test]
+fn resolution_supersedes_only_the_named_heads() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let from_a = edit(&mut a, &item, &base, "from A");
+    let from_b = edit(&mut b, &item, &base, "from B");
+    a.apply_encrypted_revision(from_b).unwrap();
+    let reviewed = head_set(&a, &item.id);
+    assert_eq!(reviewed.len(), 2);
+
+    // A third concurrent edit arrives after the owner reviewed the conflict.
+    let mut late_item = item.clone();
+    late_item.password = "late".into();
+    let late = b
+        .seal_for_test(&late_item, vec![base.clone()], false)
+        .unwrap();
+    let late_id = late.revision_id();
+    a.apply_encrypted_revision(late).unwrap();
+    assert_eq!(head_set(&a, &item.id).len(), 3);
+
+    let resolution = a.resolve(&item.id, Some(item.clone()), &reviewed).unwrap();
+    let mut remaining = vec![resolution.revision.clone(), late_id];
+    remaining.sort();
+    assert_eq!(head_set(&a, &item.id), remaining);
+    assert!(a.get(&item.id).unwrap().conflict);
+
+    // A resolution naming a head that is no longer current is stale.
+    assert!(matches!(
+        a.resolve(&item.id, None, &[from_a.revision_id()]),
+        Err(Error::Conflict { .. })
+    ));
+    assert!(matches!(
+        a.resolve(&item.id, None, &[]),
+        Err(Error::InvalidItem(_))
+    ));
+}
+
+#[test]
+fn delete_edit_race_keeps_the_edit_visible_until_resolved() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let deleted = a.delete(&item.id, &base).unwrap();
+    let deletion = wire(&a, &deleted.revision);
+    let edited = edit(&mut b, &item, &base, "edited while deleted");
+    a.apply_encrypted_revision(edited).unwrap();
+    b.apply_encrypted_revision(deletion).unwrap();
+
+    for vault in [&a, &b] {
+        let shown = vault.get(&item.id).unwrap();
+        assert!(shown.conflict);
+        assert_eq!(shown.item.password, "edited while deleted");
+        assert_eq!(vault.list().unwrap().len(), 1);
+        assert_eq!(
+            vault
+                .versions(&item.id)
+                .unwrap()
+                .iter()
+                .filter(|version| version.item.is_none())
+                .count(),
+            1
+        );
+    }
+
+    let heads = head_set(&a, &item.id);
+    let resolution = a.resolve(&item.id, None, &heads).unwrap();
+    assert!(matches!(a.get(&item.id), Err(Error::NotFound)));
+    assert!(a.list().unwrap().is_empty());
+    b.apply_encrypted_revision(wire(&a, &resolution.revision))
+        .unwrap();
+    assert!(matches!(b.get(&item.id), Err(Error::NotFound)));
+}
+
+#[test]
+fn invalid_ancestry_is_rejected_and_missing_parents_can_be_retried() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let other = login("Other");
+    let other_head = a.put(other.clone()).unwrap().revision;
+
+    let cross = a.seal_for_test(&item, vec![other_head], false).unwrap();
+    assert!(matches!(
+        a.apply_encrypted_revision(cross),
+        Err(Error::InvalidParent)
+    ));
+    let unknown = a.seal_for_test(&item, vec!["a".repeat(64)], false).unwrap();
+    assert!(matches!(
+        a.apply_encrypted_revision(unknown),
+        Err(Error::MissingParent)
+    ));
+    for parents in [
+        vec!["b".repeat(64), "a".repeat(64)],
+        vec!["a".repeat(64), "a".repeat(64)],
+        vec!["A".repeat(64)],
+    ] {
+        let malformed = a.seal_for_test(&item, parents, false).unwrap();
+        assert!(matches!(
+            a.apply_encrypted_revision(malformed),
+            Err(Error::Crypto)
+        ));
+    }
+    assert_eq!(head_set(&a, &item.id), std::slice::from_ref(&base));
+
+    // A child that arrives before its parent is refused without side
+    // effects and accepted once the parent has been applied.
+    let first = edit(&mut a, &item, &base, "first");
+    let second = edit(&mut a, &item, &first.revision_id(), "second");
+    assert!(matches!(
+        b.apply_encrypted_revision(second.clone()),
+        Err(Error::MissingParent)
+    ));
+    assert_eq!(head_set(&b, &item.id), [base]);
+    b.apply_encrypted_revision(first).unwrap();
+    b.apply_encrypted_revision(second.clone()).unwrap();
+    assert_eq!(head_set(&b, &item.id), [second.revision_id()]);
+    assert_eq!(b.get(&item.id).unwrap().item.password, "second");
+}
+
+#[test]
+fn single_head_vault_migrates_without_changing_signed_revisions() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v2.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    let item = login("Before migration");
+    let first = vault.put(item.clone()).unwrap();
+    let mut changed = item.clone();
+    changed.password = "changed".into();
+    let second = vault.update(changed, &first.revision).unwrap();
+    let before = vault.encrypted_revisions().unwrap();
+    drop(vault);
+
+    // Rebuild the format 2 layout: single parent column, one head per item.
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER revisions_no_update; DROP TRIGGER revisions_no_delete;
+             DROP INDEX revisions_item_id; DROP INDEX heads_item_id;
+             ALTER TABLE heads RENAME TO multi_heads;
+             ALTER TABLE revisions RENAME TO multi_revisions;
+             CREATE TABLE revisions (
+                 revision TEXT PRIMARY KEY, format_version INTEGER NOT NULL, vault_id BLOB NOT NULL,
+                 item_id TEXT NOT NULL, parent_revision TEXT, key_epoch INTEGER NOT NULL,
+                 author_device_id BLOB NOT NULL REFERENCES devices(device_id), nonce BLOB NOT NULL,
+                 ciphertext BLOB NOT NULL, tombstone INTEGER NOT NULL, signature BLOB NOT NULL
+             ) STRICT;
+             CREATE INDEX revisions_item_id ON revisions(item_id);
+             CREATE TRIGGER revisions_no_update BEFORE UPDATE ON revisions
+             BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END;
+             CREATE TRIGGER revisions_no_delete BEFORE DELETE ON revisions
+             BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END;
+             INSERT INTO revisions SELECT revision,format_version,vault_id,item_id,NULLIF(parents,''),
+                 key_epoch,author_device_id,nonce,ciphertext,tombstone,signature
+                 FROM multi_revisions ORDER BY rowid;
+             CREATE TABLE heads (
+                 item_id TEXT PRIMARY KEY, revision TEXT NOT NULL REFERENCES revisions(revision),
+                 tombstone INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO heads SELECT item_id,revision,tombstone FROM multi_heads;
+             DROP TABLE multi_heads; DROP TABLE multi_revisions;
+             UPDATE vault_meta SET format_version=2;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut migrated = Vault::open(&path).unwrap();
+    assert!(migrated.device_id().is_some());
+    migrated.unlock("password").unwrap();
+    // Signed bytes, and therefore revision IDs, are unchanged.
+    assert_eq!(migrated.encrypted_revisions().unwrap(), before);
+    let current = migrated.get(&item.id).unwrap();
+    assert_eq!(current.revision, second.revision);
+    assert!(!current.conflict);
+    migrated.update(current.item, &current.revision).unwrap();
+    drop(migrated);
+    let version: u32 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT format_version FROM vault_meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 3);
 }

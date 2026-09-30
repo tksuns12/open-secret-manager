@@ -18,17 +18,26 @@ use crate::{
         revision_signature_message, verify_device_authorization, KdfConfig, SecretKey,
         DEVICE_ID_LEN, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    Error, Item, ItemSummary, RecoveryKey, Result, RevisionInfo, VaultItem,
+    Error, Item, ItemSummary, ItemVersion, RecoveryKey, Result, RevisionInfo, VaultItem,
 };
 
-const FORMAT_VERSION: u32 = 2;
+/// Storage layout: signed revisions with a multi-head set per item.
+const VAULT_FORMAT_VERSION: u32 = 3;
+/// Signed revisions with one head per item; migrated by SQL on first unlock.
+const SINGLE_HEAD_FORMAT_VERSION: u32 = 2;
 /// Unsigned revisions without an author; migrated on first unlock.
 const LEGACY_FORMAT_VERSION: u32 = 1;
+/// Signed revision envelope. Unchanged by the multi-head layout because a
+/// single parent encodes identically.
+const RECORD_FORMAT_VERSION: u32 = 2;
+const BACKUP_FORMAT_VERSION: u32 = 3;
+/// Upper bound on heads one revision may supersede.
+const MAX_PARENTS: usize = 16;
 const KEY_EPOCH: u64 = 1;
 const MAX_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 16 * 1024 * 1024;
 
-const SCHEMA: &str = r#"
+const META_SCHEMA: &str = r#"
 CREATE TABLE vault_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     format_version INTEGER NOT NULL,
@@ -53,12 +62,18 @@ CREATE TABLE devices (
 ) STRICT;
 CREATE TRIGGER devices_no_update BEFORE UPDATE ON devices
 BEGIN SELECT RAISE(ABORT, 'device authorizations are immutable'); END;
+"#;
+
+/// `parents` holds the sorted parent IDs concatenated (64 characters each).
+/// `heads` holds every revision of an item that no stored revision names as
+/// a parent; more than one row for an item is an unresolved conflict.
+const RECORD_SCHEMA: &str = r#"
 CREATE TABLE revisions (
     revision TEXT PRIMARY KEY CHECK(length(revision) = 64),
     format_version INTEGER NOT NULL CHECK(format_version = 2),
     vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
     item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
-    parent_revision TEXT CHECK(parent_revision IS NULL OR length(parent_revision) = 64),
+    parents TEXT NOT NULL CHECK(length(parents) % 64 = 0 AND length(parents) <= 1024),
     key_epoch INTEGER NOT NULL CHECK(key_epoch = 1),
     author_device_id BLOB NOT NULL CHECK(length(author_device_id) = 16) REFERENCES devices(device_id),
     nonce BLOB NOT NULL CHECK(length(nonce) = 24),
@@ -72,14 +87,14 @@ BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END;
 CREATE TRIGGER revisions_no_delete BEFORE DELETE ON revisions
 BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END;
 CREATE TABLE heads (
-    item_id TEXT PRIMARY KEY CHECK(length(item_id) BETWEEN 1 AND 128),
-    revision TEXT NOT NULL REFERENCES revisions(revision),
+    revision TEXT PRIMARY KEY REFERENCES revisions(revision),
+    item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
     tombstone INTEGER NOT NULL CHECK(tombstone IN (0, 1))
 ) STRICT;
+CREATE INDEX heads_item_id ON heads(item_id);
 "#;
 
-const REVISION_COLUMNS: &str =
-    "r.format_version,r.vault_id,r.item_id,r.parent_revision,r.key_epoch,\
+const REVISION_COLUMNS: &str = "r.format_version,r.vault_id,r.item_id,r.parents,r.key_epoch,\
      r.author_device_id,r.nonce,r.ciphertext,r.tombstone,r.signature";
 
 /// A sealed revision: ciphertext bound by AEAD to its header, signed by the
@@ -89,7 +104,10 @@ pub struct EncryptedRevision {
     pub format_version: u32,
     pub vault_id: [u8; 32],
     pub item_id: String,
-    pub parent_revision: Option<String>,
+    /// Sorted, unique revision IDs of the same item that this revision
+    /// supersedes: none for a new item, one for an edit, several for a
+    /// conflict resolution.
+    pub parents: Vec<String>,
     pub key_epoch: u64,
     pub author_device_id: [u8; DEVICE_ID_LEN],
     pub nonce: [u8; NONCE_LEN],
@@ -105,7 +123,7 @@ impl std::fmt::Debug for EncryptedRevision {
             .field("format_version", &self.format_version)
             .field("vault_id", &"[REDACTED]")
             .field("item_id", &self.item_id)
-            .field("parent_revision", &self.parent_revision)
+            .field("parents", &self.parents)
             .field("key_epoch", &self.key_epoch)
             .field("author_device_id", &self.author_device_id)
             .field("nonce", &"[REDACTED]")
@@ -124,7 +142,7 @@ impl EncryptedRevision {
         record_aad(
             &self.vault_id,
             &self.item_id,
-            self.parent_revision.as_deref(),
+            &self.parents,
             self.key_epoch,
             &self.author_device_id,
             self.tombstone,
@@ -132,7 +150,7 @@ impl EncryptedRevision {
     }
 
     fn validate_shape(&self, expected_vault_id: &[u8; 32]) -> Result<()> {
-        if self.format_version != FORMAT_VERSION {
+        if self.format_version != RECORD_FORMAT_VERSION {
             return Err(Error::UnsupportedVersion(self.format_version));
         }
         if &self.vault_id != expected_vault_id
@@ -141,12 +159,11 @@ impl EncryptedRevision {
             || self.ciphertext.len() < 16
             || self.ciphertext.len() > MAX_ITEM_BYTES + 16
             || self.signature.len() != SIGNATURE_LEN
-            || self.parent_revision.as_ref().is_some_and(|parent| {
-                parent.len() != 64
-                    || !parent
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+            || self.parents.len() > MAX_PARENTS
+            || !self.parents.iter().all(|parent| is_revision_id(parent))
+            // Strictly increasing: sorted and free of duplicates, so every
+            // device derives the same AAD bytes for the same parent set.
+            || self.parents.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Error::Crypto);
         }
@@ -209,7 +226,7 @@ impl RevisionSigner<'_> {
     fn seal(
         &self,
         item_id: &str,
-        parent_revision: Option<String>,
+        parents: Vec<String>,
         tombstone: bool,
         plaintext: &[u8],
     ) -> Result<EncryptedRevision> {
@@ -217,7 +234,7 @@ impl RevisionSigner<'_> {
         let aad = record_aad(
             &self.vault_id,
             item_id,
-            parent_revision.as_deref(),
+            &parents,
             KEY_EPOCH,
             &self.author,
             tombstone,
@@ -227,10 +244,10 @@ impl RevisionSigner<'_> {
             self.signing_key
                 .sign(&revision_signature_message(&aad, &nonce, &ciphertext));
         Ok(EncryptedRevision {
-            format_version: FORMAT_VERSION,
+            format_version: RECORD_FORMAT_VERSION,
             vault_id: self.vault_id,
             item_id: item_id.to_owned(),
-            parent_revision,
+            parents,
             key_epoch: KEY_EPOCH,
             author_device_id: self.author,
             nonce,
@@ -266,7 +283,7 @@ impl Vault {
 
     fn initialize_created(path: &Path, password: &str) -> Result<(Self, RecoveryKey)> {
         let connection = open_connection(path)?;
-        connection.execute_batch(SCHEMA)?;
+        create_schema(&connection)?;
         let vault_id = random_array::<32>();
         let master_key = Zeroizing::new(random_array::<KEY_LEN>());
         let password_salt = random_array::<SALT_LEN>();
@@ -289,7 +306,7 @@ impl Vault {
         )?;
         let (device, _) = generate_device(&master_key, &vault_id)?;
         let header = Header {
-            format_version: FORMAT_VERSION,
+            format_version: VAULT_FORMAT_VERSION,
             vault_id,
             kdf,
             password_salt,
@@ -379,12 +396,15 @@ impl Vault {
         self.devices.clear();
     }
 
-    /// Completes an unlock: migrates a format 1 vault, then loads the device
+    /// Completes an unlock: migrates an older vault, then loads the device
     /// signing key and the authenticated author set. The vault stays locked
     /// if any step fails.
     fn activate(&mut self, master_key: SecretKey) -> Result<()> {
         if self.header.format_version == LEGACY_FORMAT_VERSION {
             self.migrate_legacy(&master_key)?;
+        }
+        if self.header.format_version == SINGLE_HEAD_FORMAT_VERSION {
+            self.migrate_single_head()?;
         }
         let device = self.header.device.as_ref().ok_or(Error::Crypto)?;
         let seed = decrypt(
@@ -409,7 +429,7 @@ impl Vault {
         Ok(())
     }
 
-    /// Rewrites a format 1 vault as format 2 in one transaction. Every
+    /// Rewrites a format 1 vault as the current format in one transaction. Every
     /// revision is decrypted, re-sealed, and signed by a new identity for
     /// this device; parent links are remapped so each item's history is kept.
     fn migrate_legacy(&mut self, master_key: &SecretKey) -> Result<()> {
@@ -441,12 +461,12 @@ impl Vault {
             };
             let (device, signing_key) = generate_device(master_key, &vault_id)?;
             let mut header = self.header.clone();
-            header.format_version = FORMAT_VERSION;
+            header.format_version = VAULT_FORMAT_VERSION;
             header.device = Some(device);
 
             transaction
                 .execute_batch("DROP TABLE heads; DROP TABLE revisions; DROP TABLE vault_meta;")?;
-            transaction.execute_batch(SCHEMA)?;
+            create_schema(&transaction)?;
             insert_header(&transaction, &header)?;
             let record = header.device_record()?;
             insert_device_authorization(&transaction, master_key, &header, &record)?;
@@ -471,11 +491,13 @@ impl Vault {
                 }
                 let plaintext = decrypt(master_key, &old.nonce, &aad, &old.ciphertext)
                     .map_err(|_| Error::Crypto)?;
-                let parent = old
+                let parents = old
                     .parent_revision
                     .map(|parent| renamed.get(&parent).cloned().ok_or(Error::Crypto))
-                    .transpose()?;
-                let revision = signer.seal(&old.item_id, parent, old.tombstone, &plaintext)?;
+                    .transpose()?
+                    .into_iter()
+                    .collect();
+                let revision = signer.seal(&old.item_id, parents, old.tombstone, &plaintext)?;
                 let id = revision.revision_id();
                 insert_revision(&transaction, &revision, &id)?;
                 renamed.insert(old.revision, id);
@@ -483,10 +505,52 @@ impl Vault {
             for (item_id, old_revision, tombstone) in heads {
                 let revision = renamed.get(&old_revision).ok_or(Error::Crypto)?;
                 transaction.execute(
-                    "INSERT INTO heads(item_id,revision,tombstone) VALUES(?,?,?)",
-                    params![item_id, revision, tombstone],
+                    "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,?)",
+                    params![revision, item_id, tombstone],
                 )?;
             }
+        }
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(())
+    }
+
+    /// Converts the single-head format 2 layout to the multi-head layout in
+    /// one transaction. Signed revision bytes are copied unchanged: one
+    /// parent encodes identically in the parent list, so IDs and signatures
+    /// stay valid.
+    fn migrate_single_head(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = transaction.query_row(
+            "SELECT format_version FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == SINGLE_HEAD_FORMAT_VERSION {
+            transaction.execute_batch(
+                "DROP TRIGGER revisions_no_update; DROP TRIGGER revisions_no_delete;
+                 DROP INDEX revisions_item_id;
+                 ALTER TABLE heads RENAME TO single_heads;
+                 ALTER TABLE revisions RENAME TO single_revisions;",
+            )?;
+            transaction.execute_batch(RECORD_SCHEMA)?;
+            transaction.execute_batch(
+                "INSERT INTO revisions(revision,format_version,vault_id,item_id,parents,key_epoch,
+                     author_device_id,nonce,ciphertext,tombstone,signature)
+                 SELECT revision,format_version,vault_id,item_id,COALESCE(parent_revision,''),
+                     key_epoch,author_device_id,nonce,ciphertext,tombstone,signature
+                 FROM single_revisions ORDER BY rowid;
+                 INSERT INTO heads(revision,item_id,tombstone)
+                 SELECT revision,item_id,tombstone FROM single_heads;
+                 DROP TABLE single_heads;
+                 DROP TABLE single_revisions;",
+            )?;
+            transaction.execute(
+                "UPDATE vault_meta SET format_version=? WHERE singleton=1",
+                [VAULT_FORMAT_VERSION],
+            )?;
         }
         transaction.commit()?;
         self.header = read_header(&self.connection)?;
@@ -586,24 +650,56 @@ impl Vault {
         Ok(())
     }
 
+    /// Returns the item's current content. While heads conflict, this is the
+    /// live head with the greatest revision ID, a deterministic choice so
+    /// every device shows the same version, and `conflict` is set. A deletion
+    /// never silently wins: the item stays visible until it is resolved.
     pub fn get(&self, item_id: &str) -> Result<VaultItem> {
         self.key()?;
-        let revision = self.head_revision(item_id)?.ok_or(Error::NotFound)?;
-        if revision.tombstone {
+        let heads = item_heads(&self.connection, item_id)?;
+        let shown = heads
+            .iter()
+            .rev()
+            .find(|revision| !revision.tombstone)
+            .ok_or(Error::NotFound)?;
+        Ok(VaultItem {
+            item: self.open_item(shown)?,
+            revision: shown.revision_id(),
+            conflict: heads.len() > 1,
+        })
+    }
+
+    /// Every current head of an item, ordered by revision ID, for reviewing
+    /// a conflict. Each head is verified and decrypted.
+    pub fn versions(&self, item_id: &str) -> Result<Vec<ItemVersion>> {
+        self.key()?;
+        let heads = item_heads(&self.connection, item_id)?;
+        if heads.is_empty() {
             return Err(Error::NotFound);
         }
-        let item = self.open_item(&revision)?;
-        Ok(VaultItem {
-            item,
-            revision: revision.revision_id(),
-        })
+        heads
+            .iter()
+            .map(|revision| {
+                let item = if revision.tombstone {
+                    self.open_revision(revision)?;
+                    None
+                } else {
+                    Some(self.open_item(revision)?)
+                };
+                Ok(ItemVersion {
+                    revision: revision.revision_id(),
+                    author_device_id: revision.author_device_id,
+                    item,
+                })
+            })
+            .collect()
     }
 
     pub fn list(&self) -> Result<Vec<ItemSummary>> {
         self.key()?;
         let mut statement = self
             .connection
-            .prepare("SELECT item_id FROM heads WHERE tombstone=0 ORDER BY item_id")?;
+            .prepare("SELECT DISTINCT item_id FROM heads WHERE tombstone=0 ORDER BY item_id")?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -629,10 +725,10 @@ impl Vault {
 
     pub fn put(&mut self, item: Item) -> Result<RevisionInfo> {
         item.validate()?;
-        if self.head_revision(&item.id)?.is_some() {
+        if !head_ids(&self.connection, &item.id)?.is_empty() {
             return Err(Error::AlreadyExists);
         }
-        self.write_item(item, None, false)
+        self.write_item(item, Vec::new(), false, LocalWrite::Create)
     }
 
     /// Commits an import as one SQLite transaction after validating every item.
@@ -644,7 +740,7 @@ impl Vault {
             if serde_json::to_vec(item)?.len() > MAX_ITEM_BYTES {
                 return Err(Error::InvalidItem("serialized item is too large".into()));
             }
-            if !ids.insert(item.id.clone()) || self.head_revision(&item.id)?.is_some() {
+            if !ids.insert(item.id.clone()) || !head_ids(&self.connection, &item.id)?.is_empty() {
                 return Err(Error::AlreadyExists);
             }
         }
@@ -655,7 +751,7 @@ impl Vault {
                 .iter()
                 .map(|item| {
                     let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
-                    signer.seal(&item.id, None, false, &plaintext)
+                    signer.seal(&item.id, Vec::new(), false, &plaintext)
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -667,22 +763,30 @@ impl Vault {
             let revision_id = revision.revision_id();
             insert_revision(&transaction, &revision, &revision_id)?;
             transaction.execute(
-                "INSERT INTO heads(item_id,revision,tombstone) VALUES(?,?,0)",
-                params![revision.item_id, revision_id],
+                "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,0)",
+                params![revision_id, revision.item_id],
             )?;
             revisions.push(RevisionInfo {
                 item_id: revision.item_id,
                 revision: revision_id,
-                parent_revision: None,
+                parents: Vec::new(),
             });
         }
         transaction.commit()?;
         Ok(revisions)
     }
 
+    /// Edits an item with one head. Fails with `Unresolved` while the item
+    /// has concurrent heads, and with `Conflict` if `expected_revision` is no
+    /// longer the head.
     pub fn update(&mut self, item: Item, expected_revision: &str) -> Result<RevisionInfo> {
         item.validate()?;
-        self.write_item(item, Some(expected_revision), false)
+        self.write_item(
+            item,
+            vec![expected_revision.to_owned()],
+            false,
+            LocalWrite::Edit,
+        )
     }
 
     pub fn delete(&mut self, item_id: &str, expected_revision: &str) -> Result<RevisionInfo> {
@@ -691,37 +795,57 @@ impl Vault {
         }
         let mut item = Item::new("deleted");
         item.id = item_id.to_owned();
-        self.write_item(item, Some(expected_revision), true)
+        self.write_item(
+            item,
+            vec![expected_revision.to_owned()],
+            true,
+            LocalWrite::Edit,
+        )
+    }
+
+    /// Supersedes the named heads of an item with one revision: `Some` keeps
+    /// that content and `None` deletes the item. Every named head must still
+    /// be current. A head that arrived after the owner reviewed the conflict
+    /// is not named, so it stays visible and the item stays in conflict.
+    pub fn resolve(
+        &mut self,
+        item_id: &str,
+        resolution: Option<Item>,
+        heads: &[String],
+    ) -> Result<RevisionInfo> {
+        let mut parents = heads.to_vec();
+        parents.sort();
+        parents.dedup();
+        if parents.is_empty() || parents.len() > MAX_PARENTS {
+            return Err(Error::InvalidItem(format!(
+                "a resolution must name between 1 and {MAX_PARENTS} heads"
+            )));
+        }
+        let (item, tombstone) = match resolution {
+            Some(item) => {
+                item.validate()?;
+                if item.id != item_id {
+                    return Err(Error::InvalidItem("resolution is for another item".into()));
+                }
+                (item, false)
+            }
+            None => {
+                let mut item = Item::new("deleted");
+                item.id = item_id.to_owned();
+                (item, true)
+            }
+        };
+        self.write_item(item, parents, tombstone, LocalWrite::Resolve)
     }
 
     fn write_item(
         &mut self,
         item: Item,
-        expected: Option<&str>,
+        parents: Vec<String>,
         tombstone: bool,
+        kind: LocalWrite,
     ) -> Result<RevisionInfo> {
         self.key()?;
-        let actual = self
-            .head_revision(&item.id)?
-            .map(|revision| revision.revision_id());
-        match (expected, actual.as_deref()) {
-            (None, None) => {}
-            (Some(expected), Some(actual)) if expected == actual => {}
-            (Some(expected), Some(actual)) => {
-                return Err(Error::Conflict {
-                    expected: expected.into(),
-                    actual: actual.into(),
-                })
-            }
-            (Some(expected), None) => {
-                return Err(Error::Conflict {
-                    expected: expected.into(),
-                    actual: "<missing>".into(),
-                })
-            }
-            (None, Some(_)) => return Err(Error::AlreadyExists),
-        }
-        let parent_revision = actual;
         let plaintext = if tombstone {
             Zeroizing::new(Vec::new())
         } else {
@@ -732,8 +856,8 @@ impl Vault {
         }
         let revision = self
             .signer()?
-            .seal(&item.id, parent_revision, tombstone, &plaintext)?;
-        self.apply_encrypted_revision(revision, expected)
+            .seal(&item.id, parents, tombstone, &plaintext)?;
+        self.commit_revision(revision, Some(kind))
     }
 
     pub fn encrypted_revisions(&self) -> Result<Vec<EncryptedRevision>> {
@@ -776,7 +900,7 @@ impl Vault {
         let ciphertext = encrypt(key, &nonce, &aad, &plaintext)?;
         let envelope = BackupEnvelope {
             magic: "OSM-BACKUP".into(),
-            format_version: FORMAT_VERSION,
+            format_version: BACKUP_FORMAT_VERSION,
             vault_id: encode(&self.header.vault_id),
             recovery_nonce,
             recovery_wrapped_key,
@@ -807,7 +931,7 @@ impl Vault {
         if envelope.magic != "OSM-BACKUP" {
             return Err(Error::InvalidBackup("invalid magic".into()));
         }
-        if envelope.format_version != FORMAT_VERSION {
+        if envelope.format_version != BACKUP_FORMAT_VERSION {
             return Err(Error::UnsupportedVersion(envelope.format_version));
         }
         let vault_id = decode_array::<32>(&envelope.vault_id)?;
@@ -879,7 +1003,7 @@ impl Vault {
         payload: BackupPayload,
     ) -> Result<Self> {
         let connection = open_connection(path)?;
-        connection.execute_batch(SCHEMA)?;
+        create_schema(&connection)?;
         let kdf = KdfConfig::default();
         let password_salt = random_array::<SALT_LEN>();
         let password_nonce = random_array::<NONCE_LEN>();
@@ -895,7 +1019,7 @@ impl Vault {
         // authorized so their revisions in the backup still verify.
         let (device, _) = generate_device(&master_key, &vault_id)?;
         let header = Header {
-            format_version: FORMAT_VERSION,
+            format_version: VAULT_FORMAT_VERSION,
             vault_id,
             kdf,
             password_salt,
@@ -913,17 +1037,34 @@ impl Vault {
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
         vault.activate(master_key)?;
+        // Revisions are exported in insertion order, so parents precede
+        // children and the head set is rebuilt exactly.
         for revision in payload.revisions {
-            let expected = revision.parent_revision.clone();
-            vault.apply_encrypted_revision(revision, expected.as_deref())?;
+            vault.apply_encrypted_revision(revision)?;
         }
         Ok(vault)
     }
 
+    /// Accepts a revision from another copy of the vault. It supersedes only
+    /// the parents it names; a revision concurrent with the current heads
+    /// becomes an additional head. Replaying a stored revision is a no-op.
+    /// `MissingParent` means nothing was written and the caller should retry
+    /// once the parent has been applied.
     pub fn apply_encrypted_revision(
         &mut self,
         revision: EncryptedRevision,
-        expected_head: Option<&str>,
+    ) -> Result<RevisionInfo> {
+        self.commit_revision(revision, None)
+    }
+
+    /// Verifies, stores, and materializes a revision. `local` carries the
+    /// head-set precondition for writes made on this device; it is checked
+    /// in the same IMMEDIATE transaction that updates the heads, so two
+    /// processes editing one head cannot both succeed.
+    fn commit_revision(
+        &mut self,
+        revision: EncryptedRevision,
+        local: Option<LocalWrite>,
     ) -> Result<RevisionInfo> {
         self.key()?;
         revision.validate_shape(&self.header.vault_id)?;
@@ -938,6 +1079,11 @@ impl Vault {
         }
 
         let id = revision.revision_id();
+        let info = RevisionInfo {
+            item_id: revision.item_id.clone(),
+            revision: id.clone(),
+            parents: revision.parents.clone(),
+        };
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -945,61 +1091,109 @@ impl Vault {
             if stored != revision {
                 return Err(Error::Crypto);
             }
-            return Ok(RevisionInfo {
-                item_id: revision.item_id,
-                revision: id,
-                parent_revision: revision.parent_revision,
-            });
+            return Ok(info);
         }
-
-        // Read the head while holding the same IMMEDIATE transaction that writes
-        // it. Two processes editing one ancestor therefore cannot both pass the
-        // compare-and-swap check and overwrite the materialized head.
-        let actual =
-            head_revision(&transaction, &revision.item_id)?.map(|value| value.revision_id());
-        match (expected_head, actual.as_deref()) {
-            (None, None) => {}
-            (Some(expected), Some(actual)) if expected == actual => {}
-            (_, Some(actual)) => {
-                return Err(Error::Conflict {
-                    expected: expected_head.unwrap_or("<missing>").into(),
-                    actual: actual.into(),
-                })
-            }
-            (Some(expected), None) => {
-                return Err(Error::Conflict {
-                    expected: expected.into(),
-                    actual: "<missing>".into(),
-                })
+        for parent in &revision.parents {
+            match revision_by_id(&transaction, parent)? {
+                None => return Err(Error::MissingParent),
+                Some(stored) if stored.item_id != revision.item_id => {
+                    return Err(Error::InvalidParent)
+                }
+                Some(_) => {}
             }
         }
-        if revision.parent_revision.as_deref() != actual.as_deref() {
-            return Err(Error::Conflict {
-                expected: revision
-                    .parent_revision
-                    .clone()
-                    .unwrap_or_else(|| "<missing>".into()),
-                actual: actual.unwrap_or_else(|| "<missing>".into()),
-            });
+        if let Some(kind) = local {
+            kind.check(
+                &head_ids(&transaction, &revision.item_id)?,
+                &revision.parents,
+            )?;
         }
 
         insert_revision(&transaction, &revision, &id)?;
+        // Parents always arrive before children, so a new revision is never
+        // an ancestor of a stored one. Removing only the named parents keeps
+        // every concurrent head.
+        for parent in &revision.parents {
+            transaction.execute("DELETE FROM heads WHERE revision=?", [parent])?;
+        }
         transaction.execute(
-            "INSERT INTO heads(item_id,revision,tombstone) VALUES(?,?,?) \
-             ON CONFLICT(item_id) DO UPDATE SET revision=excluded.revision,tombstone=excluded.tombstone",
-            params![revision.item_id, id, revision.tombstone],
+            "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,?)",
+            params![id, revision.item_id, revision.tombstone],
         )?;
         transaction.commit()?;
-        Ok(RevisionInfo {
-            item_id: revision.item_id,
-            revision: id,
-            parent_revision: revision.parent_revision,
-        })
+        Ok(info)
     }
 
-    fn head_revision(&self, item_id: &str) -> Result<Option<EncryptedRevision>> {
-        head_revision(&self.connection, item_id)
+    /// Seals an arbitrary revision as this device, bypassing head checks, so
+    /// tests can construct invalid ancestry.
+    #[cfg(test)]
+    pub(crate) fn seal_for_test(
+        &self,
+        item: &Item,
+        parents: Vec<String>,
+        tombstone: bool,
+    ) -> Result<EncryptedRevision> {
+        let plaintext = if tombstone {
+            Vec::new()
+        } else {
+            serde_json::to_vec(item)?
+        };
+        self.signer()?
+            .seal(&item.id, parents, tombstone, &plaintext)
     }
+}
+
+/// Head-set precondition for a write made on this device.
+#[derive(Clone, Copy)]
+enum LocalWrite {
+    /// A new item: it must have no heads.
+    Create,
+    /// An ordinary edit or delete of the single named head.
+    Edit,
+    /// A conflict resolution: every named head must still be current.
+    Resolve,
+}
+
+impl LocalWrite {
+    fn check(self, heads: &[String], parents: &[String]) -> Result<()> {
+        let describe = |heads: &[String]| {
+            if heads.is_empty() {
+                "<missing>".to_owned()
+            } else {
+                heads.join(",")
+            }
+        };
+        match self {
+            Self::Create if heads.is_empty() => Ok(()),
+            Self::Create => Err(Error::AlreadyExists),
+            Self::Edit if heads.len() > 1 => Err(Error::Unresolved),
+            Self::Edit if heads == parents => Ok(()),
+            Self::Edit => Err(Error::Conflict {
+                expected: describe(parents),
+                actual: describe(heads),
+            }),
+            Self::Resolve => match parents.iter().find(|parent| !heads.contains(parent)) {
+                None => Ok(()),
+                Some(stale) => Err(Error::Conflict {
+                    expected: stale.clone(),
+                    actual: describe(heads),
+                }),
+            },
+        }
+    }
+}
+
+fn is_revision_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn create_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(META_SCHEMA)?;
+    connection.execute_batch(RECORD_SCHEMA)?;
+    Ok(())
 }
 
 fn revision_by_id(connection: &Connection, revision_id: &str) -> Result<Option<EncryptedRevision>> {
@@ -1013,18 +1207,26 @@ fn revision_by_id(connection: &Connection, revision_id: &str) -> Result<Option<E
         .map_err(Into::into)
 }
 
-fn head_revision(connection: &Connection, item_id: &str) -> Result<Option<EncryptedRevision>> {
-    connection
-        .query_row(
-            &format!(
-                "SELECT {REVISION_COLUMNS} FROM heads h JOIN revisions r ON r.revision=h.revision \
-                 WHERE h.item_id=?"
-            ),
-            [item_id],
-            row_to_revision,
-        )
-        .optional()
-        .map_err(Into::into)
+/// Current head IDs of an item, sorted.
+fn head_ids(connection: &Connection, item_id: &str) -> Result<Vec<String>> {
+    let mut statement =
+        connection.prepare("SELECT revision FROM heads WHERE item_id=? ORDER BY revision")?;
+    let ids = statement
+        .query_map([item_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Current head revisions of an item, ordered by revision ID.
+fn item_heads(connection: &Connection, item_id: &str) -> Result<Vec<EncryptedRevision>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {REVISION_COLUMNS} FROM heads h JOIN revisions r ON r.revision=h.revision \
+         WHERE h.item_id=? ORDER BY h.revision"
+    ))?;
+    let heads = statement
+        .query_map([item_id], row_to_revision)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(heads)
 }
 
 impl Vault {
@@ -1103,10 +1305,13 @@ fn read_header(connection: &Connection) -> Result<Header> {
         [],
         |row| row.get(0),
     )?;
-    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
+    if !matches!(
+        version,
+        LEGACY_FORMAT_VERSION | SINGLE_HEAD_FORMAT_VERSION | VAULT_FORMAT_VERSION
+    ) {
         return Err(Error::UnsupportedVersion(version));
     }
-    let device_columns = if version == FORMAT_VERSION {
+    let device_columns = if version != LEGACY_FORMAT_VERSION {
         "device_id,device_public_key,device_key_nonce,device_wrapped_signing_key"
     } else {
         "NULL,NULL,NULL,NULL"
@@ -1343,7 +1548,7 @@ fn row_to_revision(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncryptedRevisio
             .try_into()
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         item_id: row.get(2)?,
-        parent_revision: row.get(3)?,
+        parents: split_parents(&row.get::<_, String>(3)?).ok_or(rusqlite::Error::InvalidQuery)?,
         key_epoch: u64::try_from(row.get::<_, i64>(4)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         author_device_id: author_device_id
@@ -1358,16 +1563,28 @@ fn row_to_revision(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncryptedRevisio
     })
 }
 
+fn split_parents(joined: &str) -> Option<Vec<String>> {
+    let chunks = joined.as_bytes().chunks_exact(64);
+    if !chunks.remainder().is_empty() || !joined.is_ascii() {
+        return None;
+    }
+    Some(
+        chunks
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect(),
+    )
+}
+
 fn insert_revision(connection: &Connection, revision: &EncryptedRevision, id: &str) -> Result<()> {
     connection.execute(
-        "INSERT INTO revisions(revision,format_version,vault_id,item_id,parent_revision,key_epoch,\
+        "INSERT INTO revisions(revision,format_version,vault_id,item_id,parents,key_epoch,\
          author_device_id,nonce,ciphertext,tombstone,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         params![
             id,
             revision.format_version,
             revision.vault_id.as_slice(),
             revision.item_id,
-            revision.parent_revision,
+            revision.parents.concat(),
             i64::try_from(revision.key_epoch).map_err(|_| Error::Crypto)?,
             revision.author_device_id.as_slice(),
             revision.nonce.as_slice(),

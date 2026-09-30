@@ -38,6 +38,17 @@ export type EntryInput = {
   totpSecret?: string;
 };
 
+/** One side of a conflict. Secrets are never included. */
+export type VersionSummary = {
+  revision: string;
+  deleted: boolean;
+  title: string;
+  username: string;
+  url: string;
+  device: string;
+  thisDevice: boolean;
+};
+
 export type SyncState = "connected" | "received" | "offline";
 
 export type DesktopBridge = {
@@ -51,4 +62,6 @@ export type DesktopBridge = {
   getEntry: (id: string) => Promise<EntryDetail>;
   createEntry: (input: EntryInput) => Promise<VaultEntry>;
   updateEntry: (id: string, expectedRevision: string, input: EntryInput) => Promise<VaultEntry>;
+  listVersions: (id: string) => Promise<VersionSummary[]>;
+  resolveEntry: (id: string, keepRevision: string, heads: string[]) => Promise<void>;
 };

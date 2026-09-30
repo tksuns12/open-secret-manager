@@ -112,13 +112,18 @@ impl Item {
 pub struct RevisionInfo {
     pub item_id: String,
     pub revision: String,
-    pub parent_revision: Option<String>,
+    /// Sorted revision IDs this revision supersedes; more than one for a
+    /// conflict resolution.
+    pub parents: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultItem {
     pub item: Item,
     pub revision: String,
+    /// The item has concurrent heads. `item` and `revision` are then one
+    /// deterministic live head, and changes must go through `Vault::resolve`.
+    pub conflict: bool,
 }
 
 impl fmt::Debug for VaultItem {
@@ -126,6 +131,26 @@ impl fmt::Debug for VaultItem {
         f.debug_struct("VaultItem")
             .field("item", &self.item)
             .field("revision", &self.revision)
+            .field("conflict", &self.conflict)
+            .finish()
+    }
+}
+
+/// One current head of an item, for reviewing a conflict.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ItemVersion {
+    pub revision: String,
+    pub author_device_id: [u8; 16],
+    /// `None` when this head deletes the item.
+    pub item: Option<Item>,
+}
+
+impl fmt::Debug for ItemVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ItemVersion")
+            .field("revision", &self.revision)
+            .field("author_device_id", &self.author_device_id)
+            .field("deleted", &self.item.is_none())
             .finish()
     }
 }
@@ -139,6 +164,7 @@ pub struct ItemSummary {
     pub url: String,
     pub favorite: bool,
     pub revision: String,
+    pub conflict: bool,
 }
 
 impl fmt::Debug for ItemSummary {
@@ -149,13 +175,18 @@ impl fmt::Debug for ItemSummary {
             .field("favorite", &self.favorite)
             .field("contents", &"[REDACTED]")
             .field("revision", &self.revision)
+            .field("conflict", &self.conflict)
             .finish()
     }
 }
 
 impl From<VaultItem> for ItemSummary {
     fn from(value: VaultItem) -> Self {
-        let VaultItem { item, revision } = value;
+        let VaultItem {
+            item,
+            revision,
+            conflict,
+        } = value;
         Self {
             id: item.id.clone(),
             title: item.title.clone(),
@@ -164,6 +195,7 @@ impl From<VaultItem> for ItemSummary {
             url: item.url.clone(),
             favorite: item.favorite,
             revision,
+            conflict,
         }
     }
 }

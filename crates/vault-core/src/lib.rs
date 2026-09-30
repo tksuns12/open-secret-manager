@@ -11,8 +11,8 @@ pub use crypto::RecoveryKey;
 pub use error::{Error, Result};
 pub use import::preview_import;
 pub use model::{
-    ImportFormat, ImportPreview, ImportWarning, Item, ItemKind, ItemSummary, PasswordPolicy,
-    RevisionInfo, VaultItem,
+    ImportFormat, ImportPreview, ImportWarning, Item, ItemKind, ItemSummary, ItemVersion,
+    PasswordPolicy, RevisionInfo, VaultItem,
 };
 pub use storage::{EncryptedRevision, Vault};
 pub use util::{generate_password, totp_code};

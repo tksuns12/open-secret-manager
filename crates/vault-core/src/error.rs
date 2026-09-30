@@ -18,6 +18,12 @@ pub enum Error {
     AlreadyExists,
     #[error("revision conflict (expected {expected}, actual {actual})")]
     Conflict { expected: String, actual: String },
+    #[error("item has concurrent revisions; resolve them before editing")]
+    Unresolved,
+    #[error("revision parent is not stored yet")]
+    MissingParent,
+    #[error("revision parent belongs to a different item")]
+    InvalidParent,
     #[error("revision author is not an authorized device")]
     UnknownAuthor,
     #[error("revision signature is invalid")]

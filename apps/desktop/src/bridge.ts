@@ -1,4 +1,4 @@
-import type { DesktopBridge, EntryDetail, EntryInput, VaultEntry } from "./types";
+import type { DesktopBridge, EntryDetail, EntryInput, VaultEntry, VersionSummary } from "./types";
 
 let previewEntries: VaultEntry[] = [
   { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", updatedAt: "Today, 09:42", favorite: true },
@@ -91,5 +91,17 @@ export const bridge: DesktopBridge = {
     const entry = previewEntries.find((existing) => existing.id === id);
     if (!entry) throw new Error("not_found");
     return savePreview(id, input, previewDetail(entry));
+  },
+  // Conflicts only arise from revisions received from another device, so
+  // the browser preview has none to review.
+  async listVersions(id) {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) return (await invoke("list_versions", { id })) as VersionSummary[];
+    throw new Error("preview");
+  },
+  async resolveEntry(id, keepRevision, heads) {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) await invoke("resolve_entry", { id, keepRevision, heads });
+    else throw new Error("preview");
   },
 };

@@ -182,10 +182,13 @@ fn device_authorization_mac(
     Ok(mac)
 }
 
+/// `parents` are sorted, unique 64-character revision IDs joined into one
+/// length-prefixed field. Zero or one parent therefore encodes exactly as the
+/// original single-parent layout, so existing signatures and IDs stay valid.
 pub(crate) fn record_aad(
     vault_id: &[u8; 32],
     item_id: &str,
-    parent: Option<&str>,
+    parents: &[String],
     key_epoch: u64,
     author_device_id: &[u8; DEVICE_ID_LEN],
     tombstone: bool,
@@ -193,7 +196,7 @@ pub(crate) fn record_aad(
     let mut aad = b"osm-item-revision-v2\0".to_vec();
     aad.extend_from_slice(vault_id);
     push_field(&mut aad, item_id.as_bytes());
-    push_field(&mut aad, parent.unwrap_or("").as_bytes());
+    push_field(&mut aad, parents.concat().as_bytes());
     aad.extend_from_slice(&key_epoch.to_be_bytes());
     aad.extend_from_slice(author_device_id);
     aad.push(u8::from(tombstone));

@@ -25,6 +25,7 @@ impl From<osm_vault_core::Error> for CommandError {
             osm_vault_core::Error::NotFound => "not_found",
             osm_vault_core::Error::Conflict { .. } => "conflict",
             osm_vault_core::Error::InvalidItem(_) => "invalid_item",
+            osm_vault_core::Error::Unresolved => "unresolved",
             _ => "vault_error",
         };
         Self {
@@ -197,7 +198,7 @@ fn get_entry(id: String, state: tauri::State<'_, AppState>) -> Result<EntryDetai
         code: "locked",
         message: "vault is locked".into(),
     })?;
-    let VaultItem { item, revision } = vault.get(&id)?;
+    let VaultItem { item, revision, .. } = vault.get(&id)?;
     Ok(EntryDetail {
         id: item.id.clone(),
         title: item.title.clone(),
@@ -253,6 +254,101 @@ fn update_entry(
     input.apply_to(&mut item);
     vault.update(item, &expected_revision)?;
     Ok(vault.get(&id)?.into())
+}
+
+/// One side of a conflict as shown to the owner. Secrets stay in Rust; the
+/// kept version's password and TOTP secret are copied there on resolve.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionSummary {
+    revision: String,
+    deleted: bool,
+    title: String,
+    username: String,
+    url: String,
+    /// Short hex prefix of the author device ID.
+    device: String,
+    this_device: bool,
+}
+
+#[tauri::command]
+fn list_versions(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<VersionSummary>, CommandError> {
+    let vault = state.vault.lock().map_err(|_| CommandError {
+        code: "state",
+        message: "vault state unavailable".into(),
+    })?;
+    let vault = vault.as_ref().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    let this_device = vault.device_id();
+    Ok(vault
+        .versions(&id)?
+        .into_iter()
+        .map(|version| VersionSummary {
+            deleted: version.item.is_none(),
+            title: version
+                .item
+                .as_ref()
+                .map(|item| item.title.clone())
+                .unwrap_or_default(),
+            username: version
+                .item
+                .as_ref()
+                .map(|item| item.username.clone())
+                .unwrap_or_default(),
+            url: version
+                .item
+                .as_ref()
+                .map(|item| item.url.clone())
+                .unwrap_or_default(),
+            device: version.author_device_id[..4]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            this_device: Some(version.author_device_id) == this_device,
+            revision: version.revision,
+        })
+        .collect())
+}
+
+/// Resolves a conflict by keeping one of the versions the owner reviewed.
+/// `heads` is the set that was shown, so a version that arrived since stays
+/// visible instead of being silently discarded.
+#[tauri::command]
+fn resolve_entry(
+    id: String,
+    keep_revision: String,
+    heads: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().map_err(|_| CommandError {
+        code: "state",
+        message: "vault state unavailable".into(),
+    })?;
+    let vault = vault.as_mut().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    if !heads.contains(&keep_revision) {
+        return Err(CommandError {
+            code: "invalid_item",
+            message: "the kept version must be one of the reviewed versions".into(),
+        });
+    }
+    let kept = vault
+        .versions(&id)?
+        .into_iter()
+        .find(|version| version.revision == keep_revision)
+        .ok_or(osm_vault_core::Error::Conflict {
+            expected: keep_revision,
+            actual: "<superseded>".into(),
+        })?;
+    vault.resolve(&id, kept.item, &heads)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -311,7 +407,9 @@ pub fn run() {
             unlock_vault,
             get_entry,
             create_entry,
-            update_entry
+            update_entry,
+            list_versions,
+            resolve_entry
         ])
         .run(tauri::generate_context!())
         .expect("error while running Open Secret Manager");
