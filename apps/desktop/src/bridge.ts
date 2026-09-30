@@ -1,12 +1,33 @@
-import type { DesktopBridge, VaultEntry } from "./types";
+import type { DesktopBridge, EntryDetail, EntryInput, VaultEntry } from "./types";
 
-const previewEntries: VaultEntry[] = [
+let previewEntries: VaultEntry[] = [
   { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", updatedAt: "Today, 09:42", favorite: true },
   { id: "2", title: "GitHub", kind: "login", username: "northstar-labs", url: "github.com", updatedAt: "Yesterday, 18:10", favorite: true },
   { id: "3", title: "Banking — checking", kind: "login", username: "•••• 4821", url: "secure.bank.example", updatedAt: "Sep 18", favorite: false },
   { id: "4", title: "Recovery codes", kind: "secure_note", updatedAt: "Sep 12", favorite: false },
   { id: "5", title: "Studio Wi-Fi", kind: "login", username: "studio", url: "network", updatedAt: "Aug 27", favorite: false },
 ];
+
+const previewDetails = new Map<string, EntryDetail>();
+
+function previewDetail(entry: VaultEntry): EntryDetail {
+  return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, revision: entry.revision ?? "preview" };
+}
+
+/** Preview writes stay in memory and never retain the password or TOTP secret. */
+function savePreview(id: string, input: EntryInput, previous?: EntryDetail): VaultEntry {
+  const revision = crypto.randomUUID();
+  const detail: EntryDetail = {
+    id, title: input.title, kind: input.kind, username: input.username, url: input.url, notes: input.notes, favorite: input.favorite,
+    hasPassword: input.password !== undefined ? input.password.length > 0 : Boolean(previous?.hasPassword),
+    hasTotp: input.totpSecret !== undefined ? input.totpSecret.trim().length > 0 : Boolean(previous?.hasTotp),
+    revision,
+  };
+  previewDetails.set(id, detail);
+  const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, updatedAt: "Just now", favorite: input.favorite, revision };
+  previewEntries = [entry, ...previewEntries.filter((existing) => existing.id !== id)];
+  return entry;
+}
 
 export function hasNativeBridge(): boolean {
   return Boolean((globalThis as { __TAURI__?: { core?: { invoke?: unknown } } }).__TAURI__?.core?.invoke);
@@ -51,5 +72,24 @@ export const bridge: DesktopBridge = {
   async copyTotp(id) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) await invoke("copy_totp", { id });
+  },
+  async getEntry(id) {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) return (await invoke("get_entry", { id })) as EntryDetail;
+    const entry = previewEntries.find((existing) => existing.id === id);
+    if (!entry) throw new Error("not_found");
+    return previewDetail(entry);
+  },
+  async createEntry(input) {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) return (await invoke("create_entry", { input })) as VaultEntry;
+    return savePreview(crypto.randomUUID(), input);
+  },
+  async updateEntry(id, expectedRevision, input) {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) return (await invoke("update_entry", { id, expectedRevision, input })) as VaultEntry;
+    const entry = previewEntries.find((existing) => existing.id === id);
+    if (!entry) throw new Error("not_found");
+    return savePreview(id, input, previewDetail(entry));
   },
 };
