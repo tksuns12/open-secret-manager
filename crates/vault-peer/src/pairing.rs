@@ -23,13 +23,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{Error, PeerStore, Result};
+use crate::{Error, Peer, PeerStore, Result};
 
 const PAIRING_VERSION: u8 = 1;
 const INVITATION_PREFIX: &str = "OSM-PAIR1-";
 const MAX_INVITATION_CODE_LEN: usize = 512;
 const MAX_GRANT_DEVICES: usize = 64;
 const RECOVERY_WRAPPED_KEY_LEN: usize = 48;
+const MAX_ADDRESSES: usize = 4;
+const MAX_ADDRESS_LEN: usize = 128;
 
 /// Invitations are shown on screen and must be used promptly.
 pub const MAX_INVITATION_TTL_SECS: u64 = 15 * 60;
@@ -40,6 +42,11 @@ struct InvitationBody {
     vault_id: [u8; 32],
     inviter_device_id: [u8; 16],
     inviter_public_key: [u8; 32],
+    /// SHA-256 of the inviter's TLS certificate; the joiner pins it.
+    inviter_transport_pin: [u8; 32],
+    /// Where the inviter listens. Advisory: the pin, not the address,
+    /// authenticates the inviter.
+    addresses: Vec<String>,
     token: [u8; 32],
     expires_at: u64,
 }
@@ -96,6 +103,9 @@ impl Invitation {
         if invitation.body.version != PAIRING_VERSION {
             return Err(Error::UnsupportedVersion);
         }
+        if !valid_addresses(&invitation.body.addresses) {
+            return Err(Error::InvalidInvitation);
+        }
         Ok(invitation)
     }
 
@@ -105,6 +115,14 @@ impl Invitation {
 
     pub fn expires_at(&self) -> u64 {
         self.body.expires_at
+    }
+
+    pub fn inviter_transport_pin(&self) -> [u8; 32] {
+        self.body.inviter_transport_pin
+    }
+
+    pub fn addresses(&self) -> &[String] {
+        &self.body.addresses
     }
 }
 
@@ -117,6 +135,9 @@ pub struct JoinRequest {
     joiner_device_id: [u8; 16],
     joiner_public_key: [u8; 32],
     joiner_hpke_key: [u8; 32],
+    /// SHA-256 of the joiner's TLS certificate. The inviter checks it
+    /// against the certificate the connection presented.
+    joiner_transport_pin: [u8; 32],
     /// Joiner's pairing signature over the transcript.
     signature: Vec<u8>,
 }
@@ -128,6 +149,10 @@ impl Drop for JoinRequest {
 }
 
 impl JoinRequest {
+    pub fn joiner_transport_pin(&self) -> [u8; 32] {
+        self.joiner_transport_pin
+    }
+
     #[cfg(test)]
     pub(crate) fn tamper_signature(&mut self) {
         self.signature[0] ^= 1;
@@ -205,18 +230,23 @@ impl JoinReview {
 }
 
 /// Issues a pairing invitation valid for `ttl_secs` (at most
-/// [`MAX_INVITATION_TTL_SECS`]).
+/// [`MAX_INVITATION_TTL_SECS`]) naming the addresses this device listens on.
 pub fn invite(
     vault: &Vault,
     invitations: &mut InvitationStore,
-    peers: &PeerStore,
+    peers: &mut PeerStore,
+    addresses: Vec<String>,
     now: u64,
     ttl_secs: u64,
 ) -> Result<Invitation> {
     if ttl_secs == 0 || ttl_secs > MAX_INVITATION_TTL_SECS {
         return Err(Error::InvalidInvitation);
     }
+    if !valid_addresses(&addresses) {
+        return Err(Error::InvalidAddress);
+    }
     peers.ensure_capacity()?;
+    let transport_pin = peers.transport_identity()?.pin();
     let (device_id, public_key) = own_identity(vault)?;
     let expires_at = now.checked_add(ttl_secs).ok_or(Error::InvalidInvitation)?;
     let token = invitations.issue_pairing(VaultId(vault.vault_id()), now, expires_at)?;
@@ -226,6 +256,8 @@ pub fn invite(
             vault_id: vault.vault_id(),
             inviter_device_id: device_id,
             inviter_public_key: public_key,
+            inviter_transport_pin: transport_pin,
+            addresses,
             token: *token.expose_secret(),
             expires_at,
         },
@@ -238,9 +270,11 @@ pub fn invite(
 pub fn review_join(
     vault: &Vault,
     invitations: &InvitationStore,
+    peers: &mut PeerStore,
     request: JoinRequest,
     now: u64,
 ) -> Result<JoinReview> {
+    let inviter_pin = peers.transport_identity()?.pin();
     if request.version != PAIRING_VERSION {
         return Err(Error::UnsupportedVersion);
     }
@@ -253,13 +287,14 @@ pub fn review_join(
     }
     let (inviter_id, inviter_key) = own_identity(vault)?;
     let transcript = transcript(
-        &request.vault_id,
-        &inviter_id,
-        &inviter_key,
-        &request.token,
-        &request.joiner_device_id,
-        &request.joiner_public_key,
-        &request.joiner_hpke_key,
+        &Inviter {
+            vault_id: &request.vault_id,
+            device_id: &inviter_id,
+            public_key: &inviter_key,
+            transport_pin: &inviter_pin,
+            token: &request.token,
+        },
+        &request,
     );
     verify_pairing_signature(
         &request.joiner_public_key,
@@ -322,7 +357,13 @@ pub fn approve_join(
         now,
     )?;
     vault.authorize_device(request.joiner_device_id, request.joiner_public_key)?;
-    peers.add(request.joiner_device_id, request.joiner_public_key, now)?;
+    peers.add(&Peer {
+        device_id: request.joiner_device_id,
+        public_key: request.joiner_public_key,
+        transport_pin: request.joiner_transport_pin,
+        address: None,
+        paired_at: now,
+    })?;
     Ok(grant)
 }
 
@@ -336,31 +377,39 @@ pub struct Joiner {
 
 impl Joiner {
     /// Creates this device's identity and the request to send.
-    pub fn start(invitation: Invitation, now: u64) -> Result<(Self, JoinRequest)> {
+    /// `transport_pin` is this device's TLS certificate hash.
+    pub fn start(
+        invitation: Invitation,
+        transport_pin: [u8; 32],
+        now: u64,
+    ) -> Result<(Self, JoinRequest)> {
         if now >= invitation.body.expires_at {
             return Err(Error::InvitationExpired);
         }
         let device = PendingDevice::generate();
         let hpke = HpkeKeyPair::generate()?;
         let body = &invitation.body;
-        let transcript = transcript(
-            &body.vault_id,
-            &body.inviter_device_id,
-            &body.inviter_public_key,
-            &body.token,
-            &device.device_id(),
-            &device.public_key(),
-            &hpke.public().as_bytes(),
-        );
-        let request = JoinRequest {
+        let mut request = JoinRequest {
             version: PAIRING_VERSION,
             vault_id: body.vault_id,
             token: body.token,
             joiner_device_id: device.device_id(),
             joiner_public_key: device.public_key(),
             joiner_hpke_key: hpke.public().as_bytes(),
-            signature: device.sign_pairing(&request_message(&transcript)).to_vec(),
+            joiner_transport_pin: transport_pin,
+            signature: Vec::new(),
         };
+        let transcript = transcript(
+            &Inviter {
+                vault_id: &body.vault_id,
+                device_id: &body.inviter_device_id,
+                public_key: &body.inviter_public_key,
+                transport_pin: &body.inviter_transport_pin,
+                token: &body.token,
+            },
+            &request,
+        );
+        request.signature = device.sign_pairing(&request_message(&transcript)).to_vec();
         Ok((
             Self {
                 invitation,
@@ -440,9 +489,15 @@ impl Joiner {
                 .map(|device| (device.device_id, device.public_key))
                 .collect(),
         };
-        let (inviter_id, inviter_key) = (inviter.device_id, inviter.public_key);
+        let peer = Peer {
+            device_id: inviter.device_id,
+            public_key: inviter.public_key,
+            transport_pin: body.inviter_transport_pin,
+            address: body.addresses.first().cloned(),
+            paired_at: now,
+        };
         let vault = Vault::join(path, password, self.device, material)?;
-        peers.add(inviter_id, inviter_key, now)?;
+        peers.add(&peer)?;
         Ok(vault)
     }
 }
@@ -456,31 +511,43 @@ fn own_identity(vault: &Vault) -> Result<([u8; 16], [u8; 32])> {
     ))
 }
 
-/// Hash of everything both sides must agree on. Every field is fixed length.
-fn transcript(
-    vault_id: &[u8; 32],
-    inviter_device_id: &[u8; 16],
-    inviter_public_key: &[u8; 32],
-    token: &[u8; 32],
-    joiner_device_id: &[u8; 16],
-    joiner_public_key: &[u8; 32],
-    joiner_hpke_key: &[u8; 32],
-) -> [u8; 32] {
+/// The inviter's half of the transcript, from the invitation.
+struct Inviter<'a> {
+    vault_id: &'a [u8; 32],
+    device_id: &'a [u8; 16],
+    public_key: &'a [u8; 32],
+    transport_pin: &'a [u8; 32],
+    token: &'a [u8; 32],
+}
+
+/// Hash of everything both sides must agree on, including both TLS pins, so
+/// the short code also confirms the transport identities. Every field is
+/// fixed length.
+fn transcript(inviter: &Inviter<'_>, request: &JoinRequest) -> [u8; 32] {
     let token_digest = Sha256::new()
         .chain_update(b"osm-pairing-token-v1\0")
-        .chain_update(token)
+        .chain_update(inviter.token)
         .finalize();
     Sha256::new()
         .chain_update(b"osm-pairing-transcript-v1\0")
-        .chain_update(vault_id)
-        .chain_update(inviter_device_id)
-        .chain_update(inviter_public_key)
+        .chain_update(inviter.vault_id)
+        .chain_update(inviter.device_id)
+        .chain_update(inviter.public_key)
+        .chain_update(inviter.transport_pin)
         .chain_update(token_digest)
-        .chain_update(joiner_device_id)
-        .chain_update(joiner_public_key)
-        .chain_update(joiner_hpke_key)
+        .chain_update(request.joiner_device_id)
+        .chain_update(request.joiner_public_key)
+        .chain_update(request.joiner_hpke_key)
+        .chain_update(request.joiner_transport_pin)
         .finalize()
         .into()
+}
+
+fn valid_addresses(addresses: &[String]) -> bool {
+    addresses.len() <= MAX_ADDRESSES
+        && addresses
+            .iter()
+            .all(|address| !address.is_empty() && address.len() <= MAX_ADDRESS_LEN)
 }
 
 fn request_message(transcript: &[u8; 32]) -> Vec<u8> {

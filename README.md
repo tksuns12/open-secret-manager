@@ -13,8 +13,9 @@ The repository is deliberately split at the security boundary:
   plaintext record. Direct TLS sockets and the OpenRaft adapter are explicit
   integration work, not hidden behind this crate.
 - `crates/vault-peer` owns owner-confirmed pairing and the revision sync
-  protocol as sans-IO steps over bounded frames. It is exercised over an
-  in-memory transport; the TLS transport is the next milestone.
+  protocol as sans-IO steps over bounded frames, carried over TLS 1.3 with
+  both device certificates pinned. The `osm-peer` binary is a development
+  CLI for pairing and syncing two vaults from separate processes.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
   route from the interface to the Rust core.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and
@@ -23,11 +24,11 @@ The repository is deliberately split at the security boundary:
   desktop session adapter is installed.
 
 The prototype is intentionally offline-first. Local vault use does not depend
-on a peer or a network. The sync crate can authenticate and persist opaque
-ciphertext frames while locked, but it does not claim a complete peer session,
-TLS pinning, or consensus integration. Membership changes and key rotation
-remain blocked at the OpenRaft integration boundary until a committed majority
-adapter exists.
+on a peer or a network. Two devices can pair (owner-confirmed, one peer until
+committed membership exists) and sync over pinned TLS while both are unlocked;
+receiving while locked, discovery, and the desktop pairing interface are not
+done. Membership changes and key rotation remain blocked at the OpenRaft
+integration boundary until a committed majority adapter exists.
 
 ## Development
 

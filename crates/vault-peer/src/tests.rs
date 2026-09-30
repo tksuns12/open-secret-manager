@@ -12,6 +12,12 @@ use crate::{
 };
 
 const NOW: u64 = 1_800_000_000;
+/// The sans-IO tests never open a TLS connection, so any pin will do.
+const JOINER_PIN: [u8; 32] = [7; 32];
+
+fn address() -> Vec<String> {
+    vec!["127.0.0.1:1".to_owned()]
+}
 
 struct Device {
     vault: Vault,
@@ -45,10 +51,26 @@ fn over_wire<T: serde::Serialize + serde::de::DeserializeOwned>(message: &T) -> 
 
 /// Runs the full owner-confirmed pairing and returns the joined device.
 fn pair(dir: &Path, a: &mut Device) -> Device {
-    let invitation = invite(&a.vault, &mut a.invitations, &a.peers, NOW, 300).unwrap();
+    let invitation = invite(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        address(),
+        NOW,
+        300,
+    )
+    .unwrap();
     let code = invitation.encode().unwrap();
-    let (joiner, request) = Joiner::start(Invitation::decode(&code).unwrap(), NOW + 1).unwrap();
-    let review = review_join(&a.vault, &a.invitations, over_wire(&request), NOW + 2).unwrap();
+    let (joiner, request) =
+        Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW + 1).unwrap();
+    let review = review_join(
+        &a.vault,
+        &a.invitations,
+        &mut a.peers,
+        over_wire(&request),
+        NOW + 2,
+    )
+    .unwrap();
     assert_eq!(review.sas(), joiner.sas());
     let grant = approve_join(
         &mut a.vault,
@@ -388,35 +410,61 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
     let mut a = inviter(dir.path());
 
     // Expired invitations are refused on both sides.
-    let invitation = invite(&a.vault, &mut a.invitations, &a.peers, NOW, 60).unwrap();
+    let invitation = invite(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        address(),
+        NOW,
+        60,
+    )
+    .unwrap();
     let code = invitation.encode().unwrap();
     assert!(matches!(
-        Joiner::start(Invitation::decode(&code).unwrap(), NOW + 60),
+        Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW + 60),
         Err(Error::InvitationExpired)
     ));
-    let (_, request) = Joiner::start(Invitation::decode(&code).unwrap(), NOW + 59).unwrap();
+    let (_, request) =
+        Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW + 59).unwrap();
     assert!(matches!(
-        review_join(&a.vault, &a.invitations, request, NOW + 60),
+        review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW + 60),
         Err(Error::Sync(osm_vault_sync::Error::InvitationExpired))
     ));
-    assert!(invite(&a.vault, &mut a.invitations, &a.peers, NOW, 16 * 60).is_err());
+    assert!(invite(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        address(),
+        NOW,
+        16 * 60
+    )
+    .is_err());
     assert!(Invitation::decode("OSM-PAIR1-not-base64!").is_err());
 
     // A request whose signature does not match the key it names.
-    let invitation = invite(&a.vault, &mut a.invitations, &a.peers, NOW, 300).unwrap();
+    let invitation = invite(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        address(),
+        NOW,
+        300,
+    )
+    .unwrap();
     let code = invitation.encode().unwrap();
-    let (_, request) = Joiner::start(Invitation::decode(&code).unwrap(), NOW).unwrap();
+    let (_, request) = Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
     let mut forged: JoinRequest = over_wire(&request);
     forged.tamper_signature();
     assert!(matches!(
-        review_join(&a.vault, &a.invitations, forged, NOW),
+        review_join(&a.vault, &a.invitations, &mut a.peers, forged, NOW),
         Err(Error::InvalidSignature)
     ));
 
     // The joiner refuses a grant that was altered in transit, and one the
     // owner did not confirm; no vault file is created either way.
-    let (joiner, request) = Joiner::start(Invitation::decode(&code).unwrap(), NOW).unwrap();
-    let review = review_join(&a.vault, &a.invitations, request, NOW).unwrap();
+    let (joiner, request) =
+        Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
+    let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
     let grant = approve_join(&mut a.vault, &mut a.invitations, &mut a.peers, review, NOW).unwrap();
     let mut tampered: JoinGrant = over_wire(&grant);
     tampered.tamper_devices();
@@ -427,15 +475,22 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
     assert!(!path.exists());
 
     // The token was consumed by the approval: it cannot be replayed.
-    let (_, replay) = Joiner::start(Invitation::decode(&code).unwrap(), NOW).unwrap();
+    let (_, replay) = Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
     assert!(matches!(
-        review_join(&a.vault, &a.invitations, replay, NOW),
+        review_join(&a.vault, &a.invitations, &mut a.peers, replay, NOW),
         Err(Error::Sync(osm_vault_sync::Error::InvitationReplay))
     ));
 
     // One paired device is the limit until committed membership exists.
     assert!(matches!(
-        invite(&a.vault, &mut a.invitations, &a.peers, NOW, 300),
+        invite(
+            &a.vault,
+            &mut a.invitations,
+            &mut a.peers,
+            address(),
+            NOW,
+            300
+        ),
         Err(Error::PeerLimit)
     ));
 }
@@ -444,13 +499,22 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
 fn the_joiner_requires_owner_confirmation() {
     let dir = tempdir().unwrap();
     let mut a = inviter(dir.path());
-    let invitation = invite(&a.vault, &mut a.invitations, &a.peers, NOW, 300).unwrap();
+    let invitation = invite(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        address(),
+        NOW,
+        300,
+    )
+    .unwrap();
     let (joiner, request) = Joiner::start(
         Invitation::decode(&invitation.encode().unwrap()).unwrap(),
+        JOINER_PIN,
         NOW,
     )
     .unwrap();
-    let review = review_join(&a.vault, &a.invitations, request, NOW).unwrap();
+    let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
     let grant = approve_join(&mut a.vault, &mut a.invitations, &mut a.peers, review, NOW).unwrap();
     let path = dir.path().join("b.db");
     let mut peers = PeerStore::open_in_memory().unwrap();

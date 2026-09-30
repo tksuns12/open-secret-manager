@@ -33,4 +33,20 @@ pub enum Error {
     ProtocolViolation,
     #[error("peer sent a revision that failed validation: {0}")]
     InvalidRevision(osm_vault_core::Error),
+    #[error("invalid peer address")]
+    InvalidAddress,
+    #[error("no paired device")]
+    NotPaired,
+    #[error("the peer's TLS certificate does not match its pin")]
+    PinMismatch,
+    #[error("TLS handshake failed")]
+    Handshake,
+    #[error("the connection closed unexpectedly")]
+    ConnectionClosed,
+    #[error("the peer did not respond in time")]
+    Timeout,
+    #[error("network: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("transport: {0}")]
+    Transport(&'static str),
 }

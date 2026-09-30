@@ -1,8 +1,9 @@
 //! Pairing and revision synchronization between two copies of a vault.
 //!
-//! Everything here is sans-IO: pairing steps and [`SyncSession`] consume and
-//! produce messages, and the caller moves [`wire`] frames over an
-//! authenticated channel. Revisions are self-authenticating (signed by their
+//! Pairing steps and [`SyncSession`] are sans-IO: they consume and produce
+//! messages. The TLS transport (`accept_pairing`, `start_pairing`,
+//! `serve_sync`, `connect_sync`) moves them as [`wire`] frames over TLS 1.3
+//! with both certificates pinned. Revisions are self-authenticating (signed by their
 //! author and verified by the core), so the channel protects confidentiality
 //! of metadata and liveness, not revision integrity.
 //!
@@ -14,6 +15,7 @@ mod error;
 mod pairing;
 mod peers;
 mod session;
+mod transport;
 pub mod wire;
 
 pub use error::{Error, Result};
@@ -21,8 +23,11 @@ pub use pairing::{
     approve_join, invite, review_join, DeviceEntry, Invitation, JoinGrant, JoinRequest, JoinReview,
     Joiner, MAX_INVITATION_TTL_SECS,
 };
-pub use peers::{Peer, PeerStore, MAX_PEERS};
+pub use peers::{Peer, PeerStore, TransportIdentity, MAX_PEERS};
 pub use session::{SyncMessage, SyncReport, SyncSession, PROTOCOL_VERSION};
+pub use transport::{accept_pairing, connect_sync, serve_sync, start_pairing, PairingConnection};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transport_tests;
