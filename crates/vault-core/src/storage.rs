@@ -656,10 +656,11 @@ impl Vault {
     }
 
     /// Adds another device's signing key to the authorized author set.
-    /// Enrollment must eventually go through committed membership; until
-    /// then this is only reachable from tests.
-    #[cfg(test)]
-    pub(crate) fn authorize_device(
+    ///
+    /// This is the interim enrollment authority: call it only after the
+    /// owner has confirmed pairing with that device. Committed membership
+    /// replaces it in Phase 4.
+    pub fn authorize_device(
         &mut self,
         device_id: [u8; DEVICE_ID_LEN],
         public_key: [u8; PUBLIC_KEY_LEN],
@@ -1740,17 +1741,23 @@ fn legacy_revisions(connection: &Connection, vault_id: &[u8; 32]) -> Result<Vec<
 }
 
 fn row_to_revision(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncryptedRevision> {
-    let vault_id: Vec<u8> = row.get(1)?;
-    let author_device_id: Vec<u8> = row.get(5)?;
-    let nonce: Vec<u8> = row.get(6)?;
+    row_to_revision_at(row, 0)
+}
+
+/// Reads `REVISION_COLUMNS` starting at column `at`.
+fn row_to_revision_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<EncryptedRevision> {
+    let vault_id: Vec<u8> = row.get(at + 1)?;
+    let author_device_id: Vec<u8> = row.get(at + 5)?;
+    let nonce: Vec<u8> = row.get(at + 6)?;
     Ok(EncryptedRevision {
-        format_version: row.get(0)?,
+        format_version: row.get(at)?,
         vault_id: vault_id
             .try_into()
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
-        item_id: row.get(2)?,
-        parents: split_parents(&row.get::<_, String>(3)?).ok_or(rusqlite::Error::InvalidQuery)?,
-        key_epoch: u64::try_from(row.get::<_, i64>(4)?)
+        item_id: row.get(at + 2)?,
+        parents: split_parents(&row.get::<_, String>(at + 3)?)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        key_epoch: u64::try_from(row.get::<_, i64>(at + 4)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         author_device_id: author_device_id
             .try_into()
@@ -1758,9 +1765,9 @@ fn row_to_revision(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncryptedRevisio
         nonce: nonce
             .try_into()
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
-        ciphertext: row.get(7)?,
-        tombstone: row.get(8)?,
-        signature: row.get(9)?,
+        ciphertext: row.get(at + 7)?,
+        tombstone: row.get(at + 8)?,
+        signature: row.get(at + 9)?,
     })
 }
 
@@ -1811,4 +1818,258 @@ fn array<const N: usize>(value: &[u8]) -> Result<[u8; N]> {
 
 fn to_key(value: &[u8]) -> Result<SecretKey> {
     Ok(Zeroizing::new(array(value)?))
+}
+
+/// Prepended to every pairing signature so one can never be mistaken for a
+/// revision signature made with the same device key.
+pub const PAIRING_SIGNATURE_DOMAIN: &[u8] = b"osm-pairing-signature-v1\0";
+
+fn pairing_signature(key: &SigningKey, message: &[u8]) -> [u8; SIGNATURE_LEN] {
+    let mut signed = PAIRING_SIGNATURE_DOMAIN.to_vec();
+    signed.extend_from_slice(message);
+    key.sign(&signed).to_bytes()
+}
+
+/// Verifies a signature from `Vault::sign_pairing` or
+/// `PendingDevice::sign_pairing`.
+pub fn verify_pairing_signature(
+    public_key: &[u8; PUBLIC_KEY_LEN],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| Error::InvalidSignature)?;
+    let signature = Signature::from_slice(signature).map_err(|_| Error::InvalidSignature)?;
+    let mut signed = PAIRING_SIGNATURE_DOMAIN.to_vec();
+    signed.extend_from_slice(message);
+    key.verify_strict(&signed, &signature)
+        .map_err(|_| Error::InvalidSignature)
+}
+
+/// A device identity created before the device holds the vault key. Its
+/// signing key is wrapped by the master key only when `Vault::join` runs.
+pub struct PendingDevice {
+    device_id: [u8; DEVICE_ID_LEN],
+    seed: Zeroizing<[u8; 32]>,
+}
+
+impl PendingDevice {
+    pub fn generate() -> Self {
+        Self {
+            device_id: random_array(),
+            seed: Zeroizing::new(random_array()),
+        }
+    }
+
+    pub fn device_id(&self) -> [u8; DEVICE_ID_LEN] {
+        self.device_id
+    }
+
+    pub fn public_key(&self) -> [u8; PUBLIC_KEY_LEN] {
+        SigningKey::from_bytes(&self.seed)
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// Signs a pairing message; `PAIRING_SIGNATURE_DOMAIN` is prepended.
+    pub fn sign_pairing(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {
+        pairing_signature(&SigningKey::from_bytes(&self.seed), message)
+    }
+}
+
+impl std::fmt::Debug for PendingDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingDevice")
+            .field("device_id", &self.device_id)
+            .field("seed", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// What a newly paired device needs to open this vault besides its own
+/// password. `master_key` must leave this process only sealed to the joiner.
+pub struct EnrollmentMaterial {
+    pub vault_id: [u8; 32],
+    pub key_epoch: u64,
+    pub master_key: SecretKey,
+    pub recovery_nonce: [u8; NONCE_LEN],
+    pub recovery_wrapped_key: Vec<u8>,
+    /// Authorized authors as (device ID, public key), including this device.
+    pub devices: Vec<([u8; DEVICE_ID_LEN], [u8; PUBLIC_KEY_LEN])>,
+}
+
+impl std::fmt::Debug for EnrollmentMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentMaterial")
+            .field("key_epoch", &self.key_epoch)
+            .field("master_key", &"[REDACTED]")
+            .field("devices", &self.devices.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Vault {
+    /// Signs a pairing message with this device's key;
+    /// `PAIRING_SIGNATURE_DOMAIN` is prepended.
+    pub fn sign_pairing(&self, message: &[u8]) -> Result<[u8; SIGNATURE_LEN]> {
+        let key = self.signing_key.as_ref().ok_or(Error::Locked)?;
+        Ok(pairing_signature(key, message))
+    }
+
+    /// Authorized revision authors as (device ID, public key).
+    pub fn authorized_devices(&self) -> Result<Vec<([u8; DEVICE_ID_LEN], [u8; PUBLIC_KEY_LEN])>> {
+        self.key()?;
+        Ok(self
+            .devices
+            .iter()
+            .map(|(device_id, key)| (*device_id, key.to_bytes()))
+            .collect())
+    }
+
+    /// Exports what a paired device needs to open this vault. Call only for
+    /// an owner-confirmed pairing, and seal `master_key` to the joiner.
+    pub fn enrollment_material(&self) -> Result<EnrollmentMaterial> {
+        Ok(EnrollmentMaterial {
+            vault_id: self.header.vault_id,
+            key_epoch: KEY_EPOCH,
+            master_key: self.key()?.clone(),
+            recovery_nonce: self.header.recovery_nonce,
+            recovery_wrapped_key: self.header.recovery_wrapped_key.clone(),
+            devices: self.authorized_devices()?,
+        })
+    }
+
+    /// Creates this device's copy of a vault from pairing material. The
+    /// device keeps its own identity and password; revisions arrive by sync.
+    pub fn join(
+        path: impl AsRef<Path>,
+        password: &str,
+        device: PendingDevice,
+        material: EnrollmentMaterial,
+    ) -> Result<Self> {
+        if material.key_epoch != KEY_EPOCH {
+            return Err(Error::UnsupportedVersion(material.key_epoch as u32));
+        }
+        if material.recovery_wrapped_key.len() != KEY_LEN + 16 {
+            return Err(Error::Crypto);
+        }
+        let path = path.as_ref();
+        let placeholder = OpenOptions::new().write(true).create_new(true).open(path)?;
+        drop(placeholder);
+        let result = Self::initialize_joined(path, password, device, material);
+        if result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
+    fn initialize_joined(
+        path: &Path,
+        password: &str,
+        device: PendingDevice,
+        material: EnrollmentMaterial,
+    ) -> Result<Self> {
+        let connection = open_connection(path)?;
+        create_schema(&connection)?;
+        let vault_id = material.vault_id;
+        let kdf = KdfConfig::default();
+        let password_salt = random_array::<SALT_LEN>();
+        let password_nonce = random_array::<NONCE_LEN>();
+        let wrapping_key = derive_password_key(password, &password_salt, kdf)?;
+        let password_wrapped_key = encrypt(
+            &wrapping_key,
+            &password_nonce,
+            &key_wrap_aad(&vault_id, b"password"),
+            material.master_key.as_ref(),
+        )?;
+        let public_key = device.public_key();
+        let key_nonce = random_array::<NONCE_LEN>();
+        let wrapped_signing_key = encrypt(
+            &material.master_key,
+            &key_nonce,
+            &device_key_aad(&vault_id, &device.device_id, &public_key),
+            device.seed.as_ref(),
+        )?;
+        let header = Header {
+            format_version: VAULT_FORMAT_VERSION,
+            vault_id,
+            kdf,
+            password_salt,
+            password_nonce,
+            password_wrapped_key,
+            recovery_nonce: material.recovery_nonce,
+            recovery_wrapped_key: material.recovery_wrapped_key.clone(),
+            device: Some(DeviceHeader {
+                device_id: device.device_id,
+                public_key,
+                key_nonce,
+                wrapped_signing_key,
+            }),
+        };
+        insert_header(&connection, &header)?;
+        insert_device_authorization(
+            &connection,
+            &material.master_key,
+            &header,
+            &header.device_record()?,
+        )?;
+        for (device_id, key) in &material.devices {
+            if *device_id == device.device_id {
+                // The inviter may already list this device; it must be the
+                // same key.
+                if *key != public_key {
+                    return Err(Error::Crypto);
+                }
+                continue;
+            }
+            insert_device_authorization(
+                &connection,
+                &material.master_key,
+                &header,
+                &DeviceRecord {
+                    device_id: *device_id,
+                    public_key: *key,
+                },
+            )?;
+        }
+        let header = read_header(&connection)?;
+        let mut vault = Self::from_parts(path, connection, header);
+        vault.activate(material.master_key.clone())?;
+        Ok(vault)
+    }
+
+    /// IDs of every accepted revision in insertion order, so parents always
+    /// precede children.
+    pub fn revision_ids(&self) -> Result<Vec<String>> {
+        self.key()?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT revision FROM revisions ORDER BY rowid")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The accepted revisions among `ids`, parents first. Unknown IDs are
+    /// skipped.
+    pub fn revisions_by_id(&self, ids: &[String]) -> Result<Vec<EncryptedRevision>> {
+        self.key()?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT r.rowid,{REVISION_COLUMNS} FROM revisions r WHERE r.revision=?"
+        ))?;
+        let mut found = Vec::new();
+        for id in ids {
+            let row = statement
+                .query_row([id], |row| {
+                    let rowid: i64 = row.get(0)?;
+                    let revision = row_to_revision_at(row, 1)?;
+                    Ok((rowid, revision))
+                })
+                .optional()?;
+            found.extend(row);
+        }
+        found.sort_by_key(|(rowid, _)| *rowid);
+        found.dedup_by_key(|(rowid, _)| *rowid);
+        Ok(found.into_iter().map(|(_, revision)| revision).collect())
+    }
 }

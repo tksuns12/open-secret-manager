@@ -1,0 +1,23 @@
+[package]
+name = "osm-vault-peer"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.85"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64ct = { version = "1.8.3", features = ["alloc"] }
+osm-vault-core = { path = "../vault-core" }
+osm-vault-sync = { path = "../vault-sync" }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.24.0"

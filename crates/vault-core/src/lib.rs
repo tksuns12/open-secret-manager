@@ -14,7 +14,10 @@ pub use model::{
     ImportFormat, ImportPreview, ImportWarning, Item, ItemKind, ItemSummary, ItemVersion,
     PasswordPolicy, QuarantinedRevision, RevisionInfo, VaultItem,
 };
-pub use storage::{EncryptedRevision, Vault};
+pub use storage::{
+    verify_pairing_signature, EncryptedRevision, EnrollmentMaterial, PendingDevice, Vault,
+    PAIRING_SIGNATURE_DOMAIN,
+};
 pub use util::{generate_password, totp_code};
 
 impl Vault {

@@ -12,6 +12,9 @@ The repository is deliberately split at the security boundary:
   invitations, locked receipt, and epoch key envelopes. It never receives a
   plaintext record. Direct TLS sockets and the OpenRaft adapter are explicit
   integration work, not hidden behind this crate.
+- `crates/vault-peer` owns owner-confirmed pairing and the revision sync
+  protocol as sans-IO steps over bounded frames. It is exercised over an
+  in-memory transport; the TLS transport is the next milestone.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
   route from the interface to the Rust core.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and

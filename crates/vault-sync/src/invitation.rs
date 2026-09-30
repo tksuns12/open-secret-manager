@@ -86,7 +86,7 @@ impl InvitationStore {
              CREATE TABLE IF NOT EXISTS invitations (
                  token_hash BLOB PRIMARY KEY CHECK(length(token_hash) = 32),
                  vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
-                 recipient BLOB NOT NULL CHECK(length(recipient) = 32),
+                 recipient BLOB CHECK(recipient IS NULL OR length(recipient) = 32),
                  created_at INTEGER NOT NULL,
                  expires_at INTEGER NOT NULL,
                  used_at INTEGER
@@ -100,6 +100,28 @@ impl InvitationStore {
         &mut self,
         vault_id: VaultId,
         recipient: DeviceId,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<InvitationToken> {
+        self.insert(vault_id, Some(recipient), now, expires_at)
+    }
+
+    /// Issues a pairing token before the joining device's identity is known.
+    /// The first successful approval binds it to the claiming device and
+    /// consumes it, so it stays single-use.
+    pub fn issue_pairing(
+        &mut self,
+        vault_id: VaultId,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<InvitationToken> {
+        self.insert(vault_id, None, now, expires_at)
+    }
+
+    fn insert(
+        &mut self,
+        vault_id: VaultId,
+        recipient: Option<DeviceId>,
         now: u64,
         expires_at: u64,
     ) -> Result<InvitationToken> {
@@ -118,13 +140,47 @@ impl InvitationStore {
                 "INSERT OR IGNORE INTO invitations
                  (token_hash, vault_id, recipient, created_at, expires_at, used_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                params![token.digest(), vault_id.0, recipient.0, now, expires_at],
+                params![
+                    token.digest(),
+                    vault_id.0,
+                    recipient.map(|recipient| recipient.0),
+                    now,
+                    expires_at
+                ],
             )?;
             if changed == 1 {
                 return Ok(token);
             }
         }
         Err(Error::Randomness)
+    }
+
+    /// Checks that a token is known, unused, and unexpired without consuming
+    /// it, so an owner is only asked to confirm a pairing that can succeed.
+    pub fn check(&self, token: &InvitationToken, now: u64) -> Result<VaultId> {
+        let now = sql_time(now)?;
+        let (vault_id, expires_at, used_at) = self
+            .connection
+            .query_row(
+                "SELECT vault_id, expires_at, used_at FROM invitations WHERE token_hash = ?1",
+                [token.digest()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(Error::InvalidInvitation)?;
+        if used_at.is_some() {
+            return Err(Error::InvitationReplay);
+        }
+        if now >= expires_at {
+            return Err(Error::InvitationExpired);
+        }
+        Ok(VaultId(fixed_32(vault_id)?))
     }
 
     /// Atomically approves and consumes an invitation.
@@ -150,7 +206,7 @@ impl InvitationStore {
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<i64>>(3)?,
                     ))
@@ -160,10 +216,13 @@ impl InvitationStore {
             .ok_or(Error::InvalidInvitation)?;
 
         let vault_id = VaultId(fixed_32(record.0)?);
-        let recipient = DeviceId(fixed_32(record.1)?);
-        if recipient != claiming_recipient {
-            return Err(Error::InvitationRecipientMismatch);
+        // An unbound pairing token accepts whichever device claims it first.
+        if let Some(bound) = record.1 {
+            if DeviceId(fixed_32(bound)?) != claiming_recipient {
+                return Err(Error::InvitationRecipientMismatch);
+            }
         }
+        let recipient = claiming_recipient;
         if record.3.is_some() {
             return Err(Error::InvitationReplay);
         }
@@ -172,9 +231,9 @@ impl InvitationStore {
         }
 
         let changed = transaction.execute(
-            "UPDATE invitations SET used_at = ?1
+            "UPDATE invitations SET used_at = ?1, recipient = ?3
              WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1",
-            params![now, digest],
+            params![now, digest, recipient.0],
         )?;
         if changed != 1 {
             return Err(Error::InvitationReplay);
@@ -219,6 +278,34 @@ mod tests {
         assert!(matches!(
             store.approve(&token, DeviceId([2; 32]), 151),
             Err(Error::InvitationReplay)
+        ));
+    }
+
+    #[test]
+    fn pairing_token_binds_to_the_first_claimant_and_is_single_use() {
+        let mut store = InvitationStore::open_in_memory(InvitationPolicy::default()).unwrap();
+        let token = store.issue_pairing(VaultId([1; 32]), 100, 200).unwrap();
+        let expired = store.issue_pairing(VaultId([1; 32]), 100, 110).unwrap();
+        assert!(matches!(
+            store.approve(&expired, DeviceId([2; 32]), 110),
+            Err(Error::InvitationExpired)
+        ));
+        assert_eq!(store.check(&token, 150).unwrap(), VaultId([1; 32]));
+        let approved = store.approve(&token, DeviceId([2; 32]), 150).unwrap();
+        assert_eq!(approved.recipient, DeviceId([2; 32]));
+        assert!(matches!(
+            store.check(&token, 150),
+            Err(Error::InvitationReplay)
+        ));
+        // Once consumed the token is bound: the same device sees a replay and
+        // any other device a recipient mismatch.
+        assert!(matches!(
+            store.approve(&token, DeviceId([2; 32]), 151),
+            Err(Error::InvitationReplay)
+        ));
+        assert!(matches!(
+            store.approve(&token, DeviceId([3; 32]), 151),
+            Err(Error::InvitationRecipientMismatch)
         ));
     }
 
