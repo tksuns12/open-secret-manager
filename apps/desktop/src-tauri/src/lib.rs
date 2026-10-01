@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
 
-/// Lock order, where both are needed: `vault`, then the network's peer
-/// store. Network waits (handshakes, the owner reading a pairing code) never
-/// hold either.
+/// Lock order, where more than one is needed: `vault`, then the network's
+/// invitation store, then its peer store. Network waits (handshakes, the
+/// owner reading a pairing code) never hold any of them.
 struct AppState {
     vault: Mutex<Option<Vault>>,
     path: PathBuf,
@@ -346,44 +346,52 @@ async fn resolve_entry(
 }
 
 #[tauri::command]
-async fn create_vault(
+async fn create_vault<R: tauri::Runtime>(
     password: String,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle<R>,
 ) -> Result<String, CommandError> {
-    let mut vault = state.vault.lock().await;
-    if vault.is_some() {
-        return Err(CommandError {
-            code: "vault_exists",
-            message: "vault is already configured".into(),
-        });
-    }
-    if let Some(parent) = state.path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| CommandError {
-            code: "storage",
-            message: error.to_string(),
-        })?;
-    }
-    let (created, recovery) = Vault::create(&state.path, &password).map_err(CommandError::from)?;
-    *vault = Some(created);
-    Ok(recovery.to_string())
+    let recovery = {
+        let mut vault = state.vault.lock().await;
+        if vault.is_some() {
+            return Err(CommandError {
+                code: "vault_exists",
+                message: "vault is already configured".into(),
+            });
+        }
+        if let Some(parent) = state.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| CommandError {
+                code: "storage",
+                message: error.to_string(),
+            })?;
+        }
+        let (created, recovery) =
+            Vault::create(&state.path, &password).map_err(CommandError::from)?;
+        *vault = Some(created);
+        recovery.to_string()
+    };
+    network::after_create(&app).await;
+    Ok(recovery)
 }
 
 #[tauri::command]
-async fn unlock_vault(
+async fn unlock_vault<R: tauri::Runtime>(
     password: String,
     state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
 ) -> Result<(), CommandError> {
-    let mut vault = state.vault.lock().await;
-    let vault = vault.as_mut().ok_or_else(|| CommandError {
-        code: "vault_missing",
-        message: "vault has not been configured".into(),
-    })?;
-    vault.unlock(&password)?;
-    // Revisions received while locked are verified now, then the peer is
-    // caught up.
-    let processed = vault.process_staged()?;
-    network::after_unlock(&app, &processed);
+    {
+        let mut vault = state.vault.lock().await;
+        let vault = vault.as_mut().ok_or_else(|| CommandError {
+            code: "vault_missing",
+            message: "vault has not been configured".into(),
+        })?;
+        vault.unlock(&password)?;
+    }
+    // The vault is brought in line with committed membership before
+    // anything received while locked is verified; then this device catches
+    // up with the others.
+    network::after_unlock(&app).await;
     Ok(())
 }
 
@@ -425,7 +433,7 @@ pub fn run() {
             network,
         })
         .setup(|app| {
-            network::start_listener(app.handle());
+            network::start(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -445,6 +453,10 @@ pub fn run() {
             enable_recovery,
             network::sync_status,
             network::sync_now,
+            network::devices,
+            network::found_control_plane,
+            network::remove_device,
+            network::cancel_enrollment,
             network::start_invite,
             network::confirm_invite,
             network::cancel_invite,

@@ -41,21 +41,47 @@ pub fn local_node(vault: &Vault, peers: &mut PeerStore) -> Result<(DeviceId, Dev
     ))
 }
 
+/// Everything needed to found a vault's control plane, taken from the
+/// unlocked vault. Committing it does not need the vault.
+pub struct Founding {
+    device: DeviceId,
+    node: DeviceNode,
+    genesis: SignedRequest,
+}
+
+impl Founding {
+    pub fn prepare(vault: &Vault, peers: &mut PeerStore) -> Result<Self> {
+        let (device, node) = local_node(vault, peers)?;
+        Ok(Self {
+            device,
+            node,
+            genesis: genesis_request(vault)?,
+        })
+    }
+
+    /// Forms a cluster with this device as its only voter and commits
+    /// genesis. Doing it again after an interruption finishes what is
+    /// missing.
+    pub async fn commit(self, node: &ControlNode) -> Result<()> {
+        let initialized = node
+            .raft()
+            .is_initialized()
+            .await
+            .map_err(osm_vault_membership::Error::from)?;
+        if !initialized {
+            node.initialize(BTreeMap::from([(self.device, self.node)]))
+                .await?;
+        }
+        submit(node, self.genesis).await
+    }
+}
+
 /// Founds the vault's control plane on this device: a cluster with this
 /// device as its only voter, and genesis recording the vault's epochs and
 /// authors. Every later member joins through enrollment. Calling it again
 /// after an interruption finishes what is missing.
 pub async fn found(vault: &Vault, peers: &mut PeerStore, node: &ControlNode) -> Result<()> {
-    let (device, info) = local_node(vault, peers)?;
-    let initialized = node
-        .raft()
-        .is_initialized()
-        .await
-        .map_err(osm_vault_membership::Error::from)?;
-    if !initialized {
-        node.initialize(BTreeMap::from([(device, info)])).await?;
-    }
-    submit(node, genesis_request(vault)?).await
+    Founding::prepare(vault, peers)?.commit(node).await
 }
 
 /// The genesis request: the vault's current epoch, the check of every epoch

@@ -1,37 +1,29 @@
-//! Development CLI for pairing and syncing vaults over the network.
+//! Development CLI that runs one device of a vault as a process.
 //!
-//! It exists to exercise the transport with real processes; it is not the
-//! product interface. The vault password is read from `OSM_PASSWORD`. Output
-//! lines start with a keyword so scripts and tests can follow along:
+//! It exists to exercise the transport and the control plane with real
+//! processes; it is not the product interface. The vault password is read
+//! from `OSM_PASSWORD`. Output lines start with a keyword so scripts and
+//! tests can follow along:
 //!
 //! ```text
 //! osm-peer create <vault>
 //! osm-peer add <vault> <title>
 //! osm-peer list <vault>                                ITEM <title>
-//! osm-peer invite <vault> <peers.db> <listen-addr>     LISTEN, INVITE, SAS, PAIRED
-//! osm-peer join <code> <vault> <peers.db>              SAS, JOINED
-//! osm-peer serve <vault> <peers.db> <listen-addr>      LISTEN, SYNCED
-//! osm-peer sync <vault> <peers.db> <address>           SYNCED
-//! osm-peer serve-locked <vault> <peers.db> <listen>    LISTEN, SYNCED
-//! osm-peer sync-locked <vault> <peers.db> <address>    SYNCED
 //! osm-peer device <vault> <peers.db> <control.db> <listen-addr|->
+//! osm-peer device-locked <vault> <peers.db> <control.db> <listen-addr|->
 //! osm-peer join-device <code> <vault> <peers.db> <control.db> <listen-addr>
 //! ```
 //!
-//! The `-locked` forms open the vault without its password: received
-//! revisions are staged unverified and processed at the next unlock. Every
-//! command that unlocks processes staged revisions first and prints
-//! `PROCESSED` when there were any.
+//! `add` and `list` unlock the vault for one operation and leave received
+//! revisions that are still staged alone: a running device verifies those,
+//! after it has brought the vault in line with committed membership, and
+//! prints `PROCESSED` when there were any.
 //!
-//! `invite` and `join` are the interim pairing of two devices. They print
-//! the short code and wait for `y` on stdin: the owner must compare the
-//! codes on both devices before either confirms.
-//!
-//! `device` runs one device of a vault with a control plane until `quit`
-//! or the end of stdin: its control-plane node, a listener for the other
-//! members (none with `-`), and a loop that keeps the vault in line with
-//! committed membership and grants new members the epoch keys. It prints
-//! `READY <device>` and then takes commands on stdin, one per line:
+//! `device` runs one device until `quit` or the end of stdin: its
+//! control-plane node, a listener for the other members (none with `-`),
+//! and a loop that keeps the vault in line with committed membership and
+//! grants new members the epoch keys. It prints `READY <device>` and then
+//! takes commands on stdin, one per line:
 //!
 //! ```text
 //! found                 FOUNDED
@@ -46,10 +38,12 @@
 //! ```
 //!
 //! A command that fails prints `FAILED <command>: <reason>` and the device
-//! keeps running. `join-device` pairs with an inviting device (`SAS`, answer
-//! `y`), waits to be enrolled, creates its vault, prints `JOINED <device>`,
-//! and then runs as `device` does. Devices are named by their 32-digit hex
-//! IDs.
+//! keeps running. `device-locked` is the same device without its password,
+//! as an app that is open but locked: it takes part in the control plane
+//! and stores what it receives, but can read, write, or sign nothing.
+//! `join-device` pairs with an inviting device (`SAS`, answer `y`), waits to
+//! be enrolled, creates its vault, prints `JOINED <device>`, and then runs
+//! as `device` does. Devices are named by their 32-digit hex IDs.
 
 use std::{
     io::BufRead,
@@ -63,9 +57,8 @@ use osm_vault_membership::{
     device_id_from_bytes, device_id_to_bytes, ControlNode, DeviceId, NodeOptions,
 };
 use osm_vault_peer::{
-    accept_pairing, connect_sync, control, invite, serve_members, serve_sync, start_node,
-    start_pairing, AddressBook, Invitation, MemberEndpoint, MemberSync, PairingListener, PeerStore,
-    SyncReport, MAX_INVITATION_TTL_SECS,
+    control, invite, serve_members, start_node, start_pairing, AddressBook, Invitation,
+    MemberEndpoint, MemberSync, PairingListener, PeerStore, SyncReport, MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::{
@@ -105,79 +98,12 @@ async fn run(args: &[String]) -> CliResult {
             }
             Ok(())
         }
-        ["invite", vault, peers, listen] => {
-            let mut vault = unlock(vault)?;
-            let mut peers = PeerStore::open(peers)?;
-            // Invitations live only as long as this process waits for a joiner.
-            let mut invitations = InvitationStore::open_in_memory(InvitationPolicy::default())?;
-            let listener = PairingListener::bind(listen, &mut peers).await?;
-            let address = listener.local_addr()?.to_string();
-            println!("LISTEN {address}");
-            let invitation = invite(
-                &vault,
-                &mut invitations,
-                &mut peers,
-                vec![address],
-                now(),
-                MAX_INVITATION_TTL_SECS,
-            )?;
-            println!("INVITE {}", invitation.encode()?.as_str());
-            accept_pairing(
-                &listener,
-                &mut vault,
-                &mut invitations,
-                &mut peers,
-                |sas| async move {
-                    println!("SAS {sas}");
-                    confirmed().await
-                },
-                now,
-            )
-            .await?;
-            println!("PAIRED");
-            Ok(())
-        }
-        ["join", code, vault, peers] => {
-            let mut peers = PeerStore::open(peers)?;
-            let connection = start_pairing(Invitation::decode(code)?, &mut peers, now()).await?;
-            println!("SAS {}", connection.sas());
-            let owner_confirmed = confirmed().await;
-            let (joiner, grant) = connection.receive_grant().await?;
-            joiner.finish(
-                &grant,
-                owner_confirmed,
-                vault,
-                &password()?,
-                &mut peers,
-                now(),
-            )?;
-            println!("JOINED");
-            Ok(())
-        }
-        ["serve" | "serve-locked", vault, peers, listen] => {
-            let mut vault = if args[0] == "serve" {
+        ["device" | "device-locked", vault, peers, control, listen] => {
+            let vault = if args[0] == "device" {
                 unlock(vault)?
             } else {
                 Vault::open(vault)?
             };
-            let mut peers = PeerStore::open(peers)?;
-            let listener = TcpListener::bind(listen).await?;
-            println!("LISTEN {}", listener.local_addr()?);
-            report(&serve_sync(&listener, &mut vault, &mut peers).await?);
-            Ok(())
-        }
-        ["sync" | "sync-locked", vault, peers, address] => {
-            let mut vault = if args[0] == "sync" {
-                unlock(vault)?
-            } else {
-                Vault::open(vault)?
-            };
-            let mut peers = PeerStore::open(peers)?;
-            report(&connect_sync(address, &mut vault, &mut peers).await?);
-            Ok(())
-        }
-        ["device", vault, peers, control, listen] => {
-            let vault = unlock(vault)?;
             let mut peers = PeerStore::open(peers)?;
             let device = device_id_from_bytes(vault.device_id().ok_or("the vault has no device")?);
             let (endpoint, node) = start_control(
@@ -247,7 +173,7 @@ const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(120);
 /// address book is kept in the same file.
 fn peers_path<'a>(args: &[&'a str]) -> &'a str {
     match args {
-        ["device", _, peers, ..] | ["join-device", _, _, peers, ..] => peers,
+        ["device" | "device-locked", _, peers, ..] | ["join-device", _, _, peers, ..] => peers,
         _ => "",
     }
 }
@@ -378,7 +304,19 @@ impl Device {
                 }
                 Err(error) => eprintln!("RECONCILE-FAILED {error}"),
             }
-            let _ = vault.process_staged();
+            // Only now are received revisions judged: against the authors
+            // and removals just reconciled.
+            if let Ok(processed) = vault.process_staged() {
+                if processed.applied + processed.quarantined + processed.rejected > 0 {
+                    println!(
+                        "PROCESSED applied={} quarantined={} rejected={} pending={}",
+                        processed.applied,
+                        processed.quarantined,
+                        processed.rejected,
+                        processed.pending
+                    );
+                }
+            }
             control::grant_requests(&vault, &state).unwrap_or_default()
         };
         for request in grants {
@@ -407,8 +345,7 @@ impl Device {
                 while let Some(connection) = incoming.recv().await {
                     let from = hex(connection.device());
                     let state = node.state();
-                    let mut vault = vault.lock().await;
-                    match connection.run(&mut vault, &state).await {
+                    match connection.run_shared(&*vault, &state).await {
                         Ok(report) => println!("RECEIVED device={from} {}", counts(&report)),
                         Err(error) => println!("RECEIVE-FAILED device={from} {error}"),
                     }
@@ -483,7 +420,10 @@ impl Device {
                     state.epoch,
                     vault.current_epoch(),
                     state.members().len(),
-                    vault.quarantined()?.len(),
+                    // Held revisions can be read only while unlocked.
+                    vault
+                        .quarantined()
+                        .map_or("locked".to_owned(), |held| held.len().to_string()),
                     vault.staged_revision_ids()?.len(),
                     self.endpoint.told_removed() || state.removed.contains_key(&self.node.device()),
                 );
@@ -496,9 +436,9 @@ impl Device {
 
     async fn sync_with(&self, device: DeviceId) -> Result<SyncReport, osm_vault_peer::Error> {
         let connection = self.endpoint.connect_sync(device).await?;
-        let state = self.node.state();
-        let mut vault = self.vault.lock().await;
-        connection.run(&mut vault, &state).await
+        connection
+            .run_shared(&*self.vault, &self.node.state())
+            .await
     }
 
     /// Invites one device: the owner compares the short codes and answers
@@ -586,13 +526,6 @@ fn password() -> Result<String, Box<dyn std::error::Error>> {
 fn unlock(path: &str) -> Result<Vault, Box<dyn std::error::Error>> {
     let mut vault = Vault::open(path)?;
     vault.unlock(&password()?)?;
-    if !vault.staged_revision_ids()?.is_empty() {
-        let processed = vault.process_staged()?;
-        println!(
-            "PROCESSED applied={} quarantined={} rejected={} pending={}",
-            processed.applied, processed.quarantined, processed.rejected, processed.pending
-        );
-    }
     Ok(vault)
 }
 
@@ -601,18 +534,4 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
-}
-
-/// Waits for the owner to type `y` after comparing the short codes.
-async fn confirmed() -> bool {
-    tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line).is_ok() && line.trim() == "y"
-    })
-    .await
-    .unwrap_or(false)
-}
-
-fn report(report: &SyncReport) {
-    println!("SYNCED {}", counts(report));
 }

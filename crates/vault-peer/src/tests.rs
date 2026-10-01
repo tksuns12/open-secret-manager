@@ -1,14 +1,15 @@
 use std::path::Path;
 
-use osm_vault_core::{Item, Vault};
+use osm_vault_core::{Item, PendingDevice, Vault};
+use osm_vault_membership::ControlState;
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tempfile::tempdir;
 
 use crate::{
-    approve_join, invite, review_join,
+    approve_enrollment, invite, review_join,
     wire::{decode_body, encode_frame, FrameDecoder, MAX_FRAME_BYTES},
-    Error, Invitation, JoinGrant, JoinRequest, Joiner, PeerStore, SyncMessage, SyncReport,
-    SyncSession,
+    EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, MemberContact, PeerStore, SyncMessage,
+    SyncReport, SyncSession,
 };
 
 pub(crate) const NOW: u64 = 1_800_000_000;
@@ -49,54 +50,30 @@ pub(crate) fn over_wire<T: serde::Serialize + serde::de::DeserializeOwned>(messa
     decode_body(&decoder.next_body().unwrap().unwrap()).unwrap()
 }
 
-/// Runs the full owner-confirmed pairing and returns the joined device.
+/// Gives `a`'s vault a second device, as a completed enrollment does: the
+/// new device has its own identity, password, and root key, holds the
+/// vault's epoch keys, and each device accepts the other's revisions.
 fn pair(dir: &Path, a: &mut Device) -> Device {
-    let invitation = invite(
-        &a.vault,
-        &mut a.invitations,
-        &mut a.peers,
-        address(),
-        NOW,
-        300,
-    )
-    .unwrap();
-    let code = invitation.encode().unwrap();
-    let (joiner, request) =
-        Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW + 1).unwrap();
-    let review = review_join(
-        &a.vault,
-        &a.invitations,
-        &mut a.peers,
-        over_wire(&request),
-        NOW + 2,
-    )
-    .unwrap();
-    assert_eq!(review.sas(), joiner.sas());
-    let grant = approve_join(
-        &mut a.vault,
-        &mut a.invitations,
-        &mut a.peers,
-        review,
-        Some(47820),
-        NOW + 3,
-    )
-    .unwrap();
-    let mut peers = PeerStore::open_in_memory().unwrap();
-    let vault = joiner
-        .finish(
-            &over_wire(&grant),
-            true,
-            dir.join("b.db"),
-            "joiner password",
-            &mut peers,
-            NOW + 4,
-        )
+    let device = PendingDevice::generate();
+    let material = a.vault.enrollment_material().unwrap();
+    a.vault
+        .authorize_device(device.device_id(), device.public_key())
         .unwrap();
+    let vault = Vault::join(dir.join("b.db"), "joiner password", device, material).unwrap();
     Device {
         vault,
         invitations: InvitationStore::open_in_memory(InvitationPolicy::default()).unwrap(),
-        peers,
+        peers: PeerStore::open_in_memory().unwrap(),
     }
+}
+
+/// This device as the only member an enrollment grant names.
+fn own_contact(device: &mut Device) -> Vec<MemberContact> {
+    vec![MemberContact {
+        device_id: device.vault.device_id().unwrap(),
+        transport_pin: device.peers.transport_identity().unwrap().pin(),
+        address: None,
+    }]
 }
 
 /// What the in-memory transport does to one framed message.
@@ -186,21 +163,6 @@ fn paired_devices_sync_in_both_directions() {
     let mut b = pair(dir.path(), &mut a);
     assert_eq!(b.vault.vault_id(), a.vault.vault_id());
     assert_ne!(b.vault.device_id(), a.vault.device_id());
-    assert_eq!(
-        a.peers.peers().unwrap()[0].device_id,
-        b.vault.device_id().unwrap()
-    );
-    assert_eq!(
-        b.peers.peers().unwrap()[0].device_id,
-        a.vault.device_id().unwrap()
-    );
-    // The joiner reaches the inviter at its sync port from the signed grant,
-    // not at the pairing port from the invitation, which closes after pairing.
-    assert_eq!(
-        b.peers.peers().unwrap()[0].address.as_deref(),
-        Some("127.0.0.1:47820")
-    );
-
     // Initial sync copies the vault to the new device.
     let (to_b, _) = sync(&mut a.vault, &mut b.vault);
     assert_eq!(to_b.sent, 2);
@@ -468,25 +430,34 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
         Err(Error::InvalidSignature)
     ));
 
-    // The joiner refuses a grant that was altered in transit, and one the
-    // owner did not confirm; no vault file is created either way.
+    // The joiner refuses a grant that was altered in transit: it neither
+    // accepts the members it names nor creates a vault.
     let (joiner, request) =
         Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
     let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
-    let grant = approve_join(
-        &mut a.vault,
+    let members = own_contact(&mut a);
+    let (_, grant) = approve_enrollment(
+        &a.vault,
         &mut a.invitations,
-        &mut a.peers,
         review,
-        None,
+        members,
+        Some(47820),
         NOW,
     )
     .unwrap();
-    let mut tampered: JoinGrant = over_wire(&grant);
-    tampered.tamper_devices();
-    let mut peers = PeerStore::open_in_memory().unwrap();
+    let grant: EnrollmentGrant = over_wire(&grant);
+    let members = joiner.members(&grant).unwrap();
+    // The inviter is reached at its pairing host with the port the signed
+    // grant names; the pairing port itself closes after pairing.
+    assert_eq!(members[0].address.as_deref(), Some("127.0.0.1:47820"));
+    let mut tampered: EnrollmentGrant = over_wire(&grant);
+    tampered.tamper_members();
+    assert!(matches!(
+        joiner.members(&tampered),
+        Err(Error::InvalidSignature)
+    ));
     let path = dir.path().join("b.db");
-    let result = joiner.finish(&tampered, true, &path, "p", &mut peers, NOW);
+    let result = joiner.finish_enrollment(&tampered, true, &ControlState::default(), &path, "p");
     assert!(matches!(result, Err(Error::InvalidSignature)));
     assert!(!path.exists());
 
@@ -497,9 +468,7 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
         Err(Error::Sync(osm_vault_sync::Error::InvitationReplay))
     ));
 
-    // Interim pairing allows one paired device; enrollment through the
-    // control plane has no such limit, so inviting still works.
-    assert!(matches!(a.peers.ensure_capacity(), Err(Error::PeerLimit)));
+    // Any number of devices may be invited.
     assert!(invite(
         &a.vault,
         &mut a.invitations,
@@ -531,23 +500,15 @@ fn the_joiner_requires_owner_confirmation() {
     )
     .unwrap();
     let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
-    let grant = approve_join(
-        &mut a.vault,
-        &mut a.invitations,
-        &mut a.peers,
-        review,
-        None,
-        NOW,
-    )
-    .unwrap();
+    let members = own_contact(&mut a);
+    let (_, grant) =
+        approve_enrollment(&a.vault, &mut a.invitations, review, members, None, NOW).unwrap();
     let path = dir.path().join("b.db");
-    let mut peers = PeerStore::open_in_memory().unwrap();
     assert!(matches!(
-        joiner.finish(&grant, false, &path, "p", &mut peers, NOW),
+        joiner.finish_enrollment(&grant, false, &ControlState::default(), &path, "p"),
         Err(Error::NotConfirmed)
     ));
     assert!(!path.exists());
-    assert!(peers.peers().unwrap().is_empty());
 }
 
 #[test]
@@ -644,7 +605,7 @@ fn staged_revisions_are_processed_when_the_next_session_starts_unlocked() {
 }
 
 #[test]
-fn pairing_sends_every_epoch_key_but_never_the_root() {
+fn a_joined_device_holds_every_epoch_key_under_its_own_root() {
     let dir = tempdir().unwrap();
     let (vault, recovery) = Vault::create(dir.path().join("a.db"), "inviter password").unwrap();
     let mut a = Device {
@@ -664,7 +625,7 @@ fn pairing_sends_every_epoch_key_but_never_the_root() {
     assert_eq!(b.vault.list().unwrap().len(), 2);
 
     // The joiner has its own root, so recovery starts off; the vault's
-    // recovery key, checked against the grant's recovery check, turns it on.
+    // recovery key, checked against the vault's recovery check, turns it on.
     assert!(!b.vault.recovery_enabled());
     b.vault.enable_recovery(&recovery).unwrap();
 }

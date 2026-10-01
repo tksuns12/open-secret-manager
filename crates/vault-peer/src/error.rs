@@ -30,8 +30,6 @@ pub enum Error {
     VaultMismatch,
     #[error("pairing signature is invalid")]
     InvalidSignature,
-    #[error("this vault already has a paired device")]
-    PeerLimit,
     #[error("unsupported protocol version")]
     UnsupportedVersion,
     #[error("frame exceeds the size limit")]
@@ -52,8 +50,6 @@ pub enum Error {
     InvalidAddress,
     #[error("no address is known for that device")]
     AddressUnknown,
-    #[error("no paired device")]
-    NotPaired,
     #[error("the peer's TLS certificate does not match its pin")]
     PinMismatch,
     #[error("TLS handshake failed")]

@@ -30,7 +30,7 @@ pub use network::{
     verify_rpc_sender, ControlReply, ControlRpc, Dialer, Directory, Link, LinkError, Router,
     RouterDialer, RouterLink, SenderMismatch, SubmitRefusal,
 };
-pub use node::{default_config, ControlNode, NodeOptions};
+pub use node::{default_config, timing, ControlNode, NodeOptions};
 pub use state::{ControlState, PendingChange};
 pub use store::{CrashPlan, CrashPoint};
 pub use types::{

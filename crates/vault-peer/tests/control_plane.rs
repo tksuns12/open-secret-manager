@@ -1,7 +1,7 @@
-//! Four devices of one vault, each a separate `osm-peer device` process with
-//! its own vault file, peer store, control-plane database, and listener on
+//! Devices of one vault, each a separate `osm-peer device` process with its
+//! own vault file, peer store, control-plane database, and listener on
 //! localhost. They enroll through the control plane, sync with one another,
-//! remove a device, and lose quorum.
+//! remove a device, lose quorum, and take part while locked.
 
 use std::{path::Path, thread, time::Duration};
 
@@ -216,4 +216,85 @@ fn devices_enroll_sync_remove_and_lose_quorum_across_processes() {
     );
     wait_status(&mut a, &["epoch=2", "vault_epoch=2", "members=3"]);
     quit(a);
+}
+
+#[test]
+fn a_declined_code_enrolls_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a_files, b_files) = (Files::new(dir.path(), "a"), Files::new(dir.path(), "b"));
+    run(&["create", &a_files.vault]);
+    let (mut a, _) = a_files.start("127.0.0.1:0");
+    command(&mut a, "found", "FOUNDED");
+
+    let code = command(&mut a, "invite", "INVITE");
+    let mut joiner = Running::start(&[
+        "join-device",
+        &code,
+        &b_files.vault,
+        &b_files.peers,
+        &b_files.control,
+        "127.0.0.1:0",
+    ]);
+    joiner.expect("SAS");
+    a.expect("SAS");
+    // The owner sees a mismatch on the inviter and declines.
+    a.answer("n");
+    joiner.answer("y");
+    let failure = a.expect("FAILED");
+    assert!(failure.contains("declined"), "{failure}");
+    assert!(!joiner.child.wait().unwrap().success());
+    assert!(!Path::new(&b_files.vault).exists());
+    // Nothing was proposed: A is still the only member, with nothing pending.
+    wait_status(&mut a, &["epoch=1", "members=1"]);
+    quit(a);
+}
+
+#[test]
+fn a_locked_device_takes_part_and_receives_without_its_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = |name| Files::new(dir.path(), name);
+    let (a_files, b_files, c_files) = (files("a"), files("b"), files("c"));
+    run(&["create", &a_files.vault]);
+    let (mut a, _) = a_files.start("127.0.0.1:0");
+    command(&mut a, "found", "FOUNDED");
+    command(&mut a, "add Mail", "ADDED");
+    let (mut b, b_id) = join(&mut a, &b_files);
+    sync(&mut b, None);
+    assert_eq!(items(&mut b), ["Mail"]);
+    quit(b);
+
+    // B runs again as an app that is open but locked: this process never
+    // has the password.
+    let mut b = Running::start_without_password(&[
+        "device-locked",
+        &b_files.vault,
+        &b_files.peers,
+        &b_files.control,
+        "127.0.0.1:0",
+    ]);
+    assert_eq!(b.expect("READY"), b_id);
+    b.answer("list");
+    assert!(b.expect("FAILED").contains("locked"));
+
+    // With two voters every change needs both. A third device enrolls, so
+    // B's node voted and replicated while locked.
+    let (mut c, _) = join(&mut a, &c_files);
+    for device in [&mut a, &mut b, &mut c] {
+        wait_status(device, &["epoch=1", "members=3"]);
+    }
+
+    // A's edit reaches B, which can only store the ciphertext.
+    command(&mut a, "add Locker", "ADDED");
+    let outcomes = sync(&mut a, Some(&b_id));
+    assert!(outcomes[0].contains("sent=1"), "{outcomes:?}");
+    wait_status(&mut b, &["staged=1", "held=locked"]);
+    quit(b);
+
+    // Unlocked again, B verifies and applies it.
+    let (mut b, _) = b_files.start("127.0.0.1:0");
+    wait_status(&mut b, &["staged=0", "held=0"]);
+    assert_eq!(items(&mut b), ["Locker", "Mail"]);
+    for device in [a, b, c] {
+        quit(device);
+    }
 }

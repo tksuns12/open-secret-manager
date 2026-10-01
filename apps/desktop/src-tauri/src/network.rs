@@ -1,82 +1,139 @@
-//! Pairing and sync for the desktop shell.
+//! Devices, pairing, and sync for the desktop shell.
 //!
-//! While the app is open and paired, a listener accepts sync connections
-//! from the paired device only (its pinned certificate; anything else fails
-//! the TLS handshake before the vault is touched). A locked vault still
-//! receives: revisions are staged and verified at the next unlock. This
-//! device dials its peer shortly after a local change, at unlock, and when
-//! the owner asks. Status reaches the interface as `sync-status` events.
+//! Which devices belong to a vault is decided by its control plane, in
+//! which a majority of the devices must agree to every change. While the
+//! app is open, locked or unlocked, this device runs its control-plane node
+//! and one listener for the other members. Only their certificates are
+//! accepted; anything else fails the TLS handshake before the vault is
+//! touched. A locked vault still takes part in decisions and still
+//! receives: revisions are staged and verified at the next unlock.
 //!
-//! Network waits never hold the vault: handshakes happen first, and while
-//! the owner compares pairing codes nothing is locked.
+//! Whenever committed membership changes, and right after unlock before
+//! anything received is verified, the vault is brought in line with it:
+//! authors, removed devices, and key epochs. This device syncs with every
+//! member shortly after a local change, at unlock, and when the owner asks.
+//! Status reaches the interface as `sync-status` and `devices-changed`
+//! events.
+//!
+//! Network waits never hold the vault: handshakes happen first, a sync
+//! session takes the vault one message at a time, and while the owner
+//! compares pairing codes nothing is locked.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
-        Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use osm_vault_core::IngressReport;
+use osm_vault_membership::{
+    device_id_from_bytes, device_id_to_bytes, ControlNode, DeviceId, MembershipChange, NodeOptions,
+    Rejection,
+};
 use osm_vault_peer::{
-    invite, Invitation, PairingConnection, PairingListener, PeerStore, PendingJoin, SyncEndpoint,
+    control, invite, serve_members, start_node, AddressBook, Invitation, MemberEndpoint,
+    MemberSync, PairingConnection, PairingListener, PeerStore, PendingJoin, PreparedJoin,
     MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, Manager, Runtime};
 use tokio::{
     net::TcpListener,
-    sync::{oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex},
 };
 
 use crate::{AppState, CommandError};
 
-/// Preferred sync port; another is used if it is taken.
+/// Preferred port for the other members; another is used if it is taken.
 const SYNC_PORT: u16 = 47_820;
 /// Wait after a local change before dialing, so a burst of edits syncs once.
 const SYNC_DELAY: Duration = Duration::from_secs(2);
+/// How long a joining device waits to be enrolled and given the keys once
+/// the inviting device has accepted it.
+const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often a device with nothing else to do checks whether a member has
+/// told it that it was removed.
+const WATCH_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 5 });
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
-    /// `unpaired`, `idle`, `syncing`, `synced`, `received`, or `error`.
+    /// `local` (no other device to sync with), `idle`, `syncing`, `synced`,
+    /// `received`, `error`, or `removed`.
     state: &'static str,
     last_synced_at: Option<u64>,
     message: Option<String>,
-    /// First four bytes of the paired device's ID, in hex.
-    peer: Option<String>,
-    peer_address: Option<String>,
+    /// How many other devices this one syncs with.
+    devices: usize,
     /// Revisions received while locked, waiting for unlock.
     pending: usize,
 }
 
+/// This device's running control plane: its node, its endpoint, and the
+/// tasks serving them.
+struct Control {
+    device: DeviceId,
+    endpoint: MemberEndpoint,
+    node: Arc<ControlNode>,
+    tasks: StdMutex<Vec<JoinHandle<()>>>,
+}
+
+impl Control {
+    fn stop_tasks(&self) {
+        let tasks = std::mem::take(
+            &mut *self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    async fn stop(&self) {
+        self.stop_tasks();
+        self.node.shutdown().await;
+    }
+}
+
 pub struct Network {
+    directory: PathBuf,
     peers: Mutex<PeerStore>,
     invitations: Mutex<InvitationStore>,
+    addresses: AddressBook,
     status: StdMutex<SyncStatus>,
+    control: Mutex<Option<Arc<Control>>>,
     /// The inviter's pending decision, while a joiner waits.
     invite: Mutex<Option<InviteState>>,
-    join: Mutex<Option<PairingConnection>>,
-    /// Serializes binding the sync listener; `listen_port` is 0 until bound.
-    binding: Mutex<()>,
-    listen_port: AtomicU16,
+    /// This device's own join, between showing the code and finishing.
+    join: Mutex<Option<JoinState>>,
+    /// A member said this device was removed, or committed state does.
+    removed: AtomicBool,
     syncing: AtomicBool,
     sync_generation: AtomicU64,
 }
 
 struct InviteState {
     decision: Option<oneshot::Sender<bool>>,
-    task: tauri::async_runtime::JoinHandle<()>,
+    task: JoinHandle<()>,
+}
+
+struct JoinState {
+    connection: PairingConnection,
+    control: Arc<Control>,
 }
 
 impl Network {
     pub fn open(vault_path: &Path) -> Result<Self, CommandError> {
-        let directory = vault_path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(directory).map_err(storage_error)?;
-        let peers = PeerStore::open(directory.join("peers.sqlite3")).map_err(network_error)?;
+        let directory = vault_path.parent().unwrap_or(Path::new(".")).to_owned();
+        std::fs::create_dir_all(&directory).map_err(storage_error)?;
+        let peers_path = directory.join("peers.sqlite3");
+        let peers = PeerStore::open(&peers_path).map_err(network_error)?;
+        let addresses = AddressBook::open(&peers_path).map_err(network_error)?;
         // One-use invitation tokens are recorded durably so a restart
         // cannot make a used token valid again.
         let invitations = InvitationStore::open(
@@ -84,37 +141,41 @@ impl Network {
             InvitationPolicy::default(),
         )
         .map_err(|error| network_error(error.into()))?;
-        let status = initial_status(&peers);
         Ok(Self {
+            directory,
             peers: Mutex::new(peers),
             invitations: Mutex::new(invitations),
-            status: StdMutex::new(status),
+            addresses,
+            status: StdMutex::new(SyncStatus {
+                state: "local",
+                ..SyncStatus::default()
+            }),
+            control: Mutex::new(None),
             invite: Mutex::new(None),
             join: Mutex::new(None),
-            binding: Mutex::new(()),
-            listen_port: AtomicU16::new(0),
+            removed: AtomicBool::new(false),
             syncing: AtomicBool::new(false),
             sync_generation: AtomicU64::new(0),
         })
     }
-}
 
-fn initial_status(peers: &PeerStore) -> SyncStatus {
-    match peers
-        .peers()
-        .ok()
-        .and_then(|peers| peers.into_iter().next())
-    {
-        Some(peer) => SyncStatus {
-            state: "idle",
-            peer: Some(short_id(&peer.device_id)),
-            peer_address: peer.address,
-            ..SyncStatus::default()
-        },
-        None => SyncStatus {
-            state: "unpaired",
-            ..SyncStatus::default()
-        },
+    fn control_path(&self) -> PathBuf {
+        self.directory.join("control.sqlite3")
+    }
+
+    async fn control(&self) -> Option<Arc<Control>> {
+        self.control.lock().await.clone()
+    }
+
+    /// Deletes the control-plane database of a node that never became part
+    /// of a control plane.
+    fn delete_control_database(&self) {
+        let path = self.control_path();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(file);
+        }
     }
 }
 
@@ -134,157 +195,450 @@ fn update_status<R: Runtime>(app: &AppHandle<R>, change: impl FnOnce(&mut SyncSt
     let _ = app.emit("sync-status", snapshot);
 }
 
-/// Starts the sync listener at launch if this device is paired.
-pub fn start_listener<R: Runtime>(app: &AppHandle<R>) {
+fn node_options() -> NodeOptions {
+    if cfg!(test) {
+        // Tests run several shells in one process and should not wait out
+        // production election timeouts.
+        NodeOptions {
+            config: osm_vault_membership::timing(100, 600, 1200)
+                .expect("test Raft timing is valid"),
+            write_timeout: Duration::from_secs(4),
+            ..NodeOptions::default()
+        }
+    } else {
+        NodeOptions::default()
+    }
+}
+
+/// Starts this device's control-plane node and listener, if they are not
+/// running: the node under `device` in the control plane of `vault_id`.
+async fn start_control<R: Runtime>(
+    app: &AppHandle<R>,
+    vault_id: [u8; 32],
+    device: DeviceId,
+) -> Result<Arc<Control>, CommandError> {
+    let net = network(app);
+    let mut slot = net.control.lock().await;
+    if let Some(control) = slot.as_ref() {
+        return Ok(control.clone());
+    }
+    let endpoint = {
+        let mut peers = net.peers.lock().await;
+        MemberEndpoint::new(vault_id, &mut peers, net.addresses.clone()).map_err(network_error)?
+    };
+    let node = start_node(net.control_path(), device, &endpoint, node_options())
+        .await
+        .map_err(network_error)?;
+    let listener = match TcpListener::bind(("0.0.0.0", SYNC_PORT)).await {
+        Ok(listener) => listener,
+        Err(_) => TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .map_err(storage_error)?,
+    };
+    endpoint.set_listen_port(listener.local_addr().map_err(storage_error)?.port());
+    let control = Arc::new(Control {
+        device,
+        endpoint: endpoint.clone(),
+        node: node.clone(),
+        tasks: StdMutex::new(Vec::new()),
+    });
+    let (sync, incoming) = mpsc::channel(4);
+    let tasks = vec![
+        tauri::async_runtime::spawn(serve_members(listener, endpoint, node, Some(sync))),
+        tauri::async_runtime::spawn(receive(app.clone(), control.clone(), incoming)),
+        tauri::async_runtime::spawn(watch(app.clone(), control.clone())),
+    ];
+    *control
+        .tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = tasks;
+    *slot = Some(control.clone());
+    drop(slot);
+    // Tell the members this device already knows where it listens now.
+    let announcer = control.clone();
+    tauri::async_runtime::spawn(async move {
+        announcer.endpoint.announce_all().await;
+    });
+    Ok(control)
+}
+
+/// Stops the control plane and forgets a node that never joined one. Used
+/// when a join is abandoned.
+async fn abandon_control<R: Runtime>(app: &AppHandle<R>) {
+    let net = network(app);
+    if let Some(control) = net.control.lock().await.take() {
+        control.stop().await;
+    }
+    net.delete_control_database();
+}
+
+/// Stops this device's control plane, as closing the app does.
+#[cfg(test)]
+pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(control) = network(app).control.lock().await.take() {
+        control.stop().await;
+    }
+}
+
+/// At launch: resumes the control plane this device belongs to, locked or
+/// not, and clears what an abandoned join left behind.
+pub fn start<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let paired = network(&app)
-            .peers
-            .lock()
-            .await
-            .peers()
-            .map(|peers| !peers.is_empty())
-            .unwrap_or(false);
-        if paired {
-            ensure_listener(&app).await;
+        let net = network(&app);
+        let identity = {
+            let app_state = app.state::<AppState>();
+            let vault = app_state.vault.lock().await;
+            vault
+                .as_ref()
+                .and_then(|vault| Some((vault.vault_id(), vault.device_id()?)))
+        };
+        let Some((vault_id, device)) = identity else {
+            // Without a vault, a control database is what an unfinished
+            // join left: its device identity is gone.
+            net.delete_control_database();
+            return;
+        };
+        if !net.control_path().exists() {
+            return;
         }
+        let Ok(control) = start_control(&app, vault_id, device_id_from_bytes(device)).await else {
+            return;
+        };
+        // A node that was never initialized and received nothing belongs
+        // to no control plane: an in-place join was abandoned.
+        let initialized = control.node.raft().is_initialized().await.unwrap_or(true);
+        if !initialized && control.node.state().epoch == 0 {
+            abandon_control(&app).await;
+            return;
+        }
+        maintain(&app, &control).await;
     });
 }
 
-/// Binds the sync listener if it is not running and returns its port. Until
-/// a device is paired every connection fails the handshake, since there is
-/// no certificate to accept.
-pub async fn ensure_listener<R: Runtime>(app: &AppHandle<R>) -> Option<u16> {
-    let net = network(app);
-    let _binding = net.binding.lock().await;
-    let port = net.listen_port.load(Ordering::SeqCst);
-    if port != 0 {
-        return Some(port);
-    }
-    let listener = match TcpListener::bind(("0.0.0.0", SYNC_PORT)).await {
-        Ok(listener) => listener,
-        Err(_) => match TcpListener::bind(("0.0.0.0", 0)).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                update_status(app, |status| {
-                    status.state = "error";
-                    status.message = Some(format!("cannot listen for sync: {error}"));
-                });
-                return None;
-            }
-        },
-    };
-    let port = listener.local_addr().ok()?.port();
-    net.listen_port.store(port, Ordering::SeqCst);
-    tauri::async_runtime::spawn(accept_loop(app.clone(), listener));
-    Some(port)
-}
-
-async fn accept_loop<R: Runtime>(app: AppHandle<R>, listener: TcpListener) {
-    let net = network(&app);
-    loop {
-        let Ok((tcp, _)) = listener.accept().await else {
-            continue;
-        };
-        let endpoint = {
-            let mut peers = net.peers.lock().await;
-            match SyncEndpoint::load(&mut peers) {
-                Ok(endpoint) => endpoint,
-                Err(_) => continue,
-            }
-        };
-        // The handshake runs before the vault is locked, so a stranger
-        // cannot stall the app; it fails unless the certificate is the
-        // paired device's.
-        let Ok(connection) = endpoint.accept(tcp).await else {
-            continue;
-        };
-        run_session(&app, connection, endpoint.peer().device_id).await;
-    }
-}
-
-/// Runs one session over an authenticated connection, holding the vault for
-/// its duration.
-async fn run_session<R: Runtime>(
-    app: &AppHandle<R>,
-    connection: osm_vault_peer::SyncConnection,
-    peer_device: [u8; 16],
+/// Runs the sync connections other members open to this device.
+async fn receive<R: Runtime>(
+    app: AppHandle<R>,
+    control: Arc<Control>,
+    mut incoming: mpsc::Receiver<MemberSync>,
 ) {
-    let state = app.state::<AppState>();
-    let net = &state.network;
-    update_status(app, |status| status.state = "syncing");
-    let port = net.listen_port.load(Ordering::SeqCst);
-    let result = {
-        let mut vault = state.vault.lock().await;
-        match vault.as_mut() {
-            Some(vault) => connection
-                .run(vault, (port != 0).then_some(port))
-                .await
-                .map(|outcome| (outcome, vault.is_unlocked())),
-            None => {
-                update_status(app, |status| status.state = "idle");
-                return;
+    while let Some(connection) = incoming.recv().await {
+        update_status(&app, |status| status.state = "syncing");
+        let state = app.state::<AppState>();
+        let result = connection
+            .run_shared(&state.vault, &control.node.state())
+            .await;
+        finish_sync(&app, result.map(|report| vec![report])).await;
+    }
+}
+
+/// Keeps the vault in line with committed membership: whenever applied
+/// state changes, and at intervals in case a member said this device was
+/// removed. Ends, stopping the control plane, once it was.
+async fn watch<R: Runtime>(app: AppHandle<R>, control: Arc<Control>) {
+    let mut applied = control.node.subscribe();
+    loop {
+        tokio::select! {
+            changed = applied.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                maintain(&app, &control).await;
+            }
+            _ = tokio::time::sleep(WATCH_INTERVAL) => {
+                if control.endpoint.told_removed() {
+                    maintain(&app, &control).await;
+                }
             }
         }
-    };
-    match result {
-        Ok((outcome, unlocked)) => {
-            if let Some(address) = &outcome.peer_address {
-                let _ = net.peers.lock().await.set_address(&peer_device, address);
+        if network(&app).removed.load(Ordering::SeqCst) {
+            // Nothing this device says is accepted any more.
+            let tasks = std::mem::take(
+                &mut *control
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            control.node.shutdown().await;
+            for task in tasks {
+                // This task is among them; it ends here either way.
+                task.abort();
             }
-            let report = outcome.report;
+            return;
+        }
+    }
+}
+
+/// Brings the vault in line with committed control state. While locked
+/// that only stops writes under a superseded key. Unlocked, it also takes
+/// in authors, removals, and epoch keys, then verifies what was received
+/// and waiting, and gives members the keys they lack.
+async fn maintain<R: Runtime>(app: &AppHandle<R>, control: &Control) {
+    let net = network(app);
+    let state = control.node.state();
+    let app_state = app.state::<AppState>();
+    let mut removed = control.endpoint.told_removed();
+    let mut grants = Vec::new();
+    let mut vault_changed = false;
+    let mut pending = None;
+    let mut failure = None;
+    {
+        let mut vault = app_state.vault.lock().await;
+        if let Some(vault) = vault.as_mut() {
+            match control::reconcile(vault, &state) {
+                Ok(reconciled) => removed |= reconciled.removed,
+                Err(error) => failure = Some(error.to_string()),
+            }
+            if failure.is_none() && !removed && vault.is_unlocked() {
+                match vault.process_staged() {
+                    Ok(processed) => {
+                        vault_changed = processed.applied > 0 || processed.quarantined > 0;
+                        pending = Some(processed.pending);
+                        if processed.rejected > 0 {
+                            failure = Some(format!(
+                                "{} received revisions failed verification and were discarded",
+                                processed.rejected
+                            ));
+                        }
+                    }
+                    Err(error) => failure = Some(error.to_string()),
+                }
+                grants = control::grant_requests(vault, &state).unwrap_or_default();
+            }
+        }
+    }
+    for request in grants {
+        // Every unlocked member offers the same grant; all but one are
+        // refused or recognized as already made.
+        let _ = control::submit(&control.node, request).await;
+    }
+    if removed {
+        net.removed.store(true, Ordering::SeqCst);
+    }
+    let devices = control.endpoint.sync_peers().len();
+    update_status(app, |status| {
+        status.devices = devices;
+        if let Some(pending) = pending {
+            status.pending = pending;
+            if status.state == "received" {
+                status.state = "synced";
+            }
+        }
+        if removed {
+            status.state = "removed";
+            status.message = Some("this device was removed from the vault".into());
+        } else if let Some(failure) = failure {
+            status.state = "error";
+            status.message = Some(failure);
+        } else if devices == 0 {
+            status.state = "local";
+        } else if status.state == "local" {
+            status.state = "idle";
+        }
+    });
+    let _ = app.emit("devices-changed", ());
+    if vault_changed {
+        let _ = app.emit("vault-changed", ());
+    }
+}
+
+/// Founds the vault's control plane with this device as its first member.
+async fn found<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<Control>, CommandError> {
+    let net = network(app);
+    let (vault_id, device, founding) = {
+        // Both guards first: a `&Vault` cannot be held across an await.
+        let app_state = app.state::<AppState>();
+        let vault = app_state.vault.lock().await;
+        let mut peers = net.peers.lock().await;
+        let vault = vault
+            .as_ref()
+            .filter(|vault| vault.is_unlocked())
+            .ok_or_else(locked)?;
+        let device = vault.device_id().ok_or_else(locked)?;
+        let founding = control::Founding::prepare(vault, &mut peers).map_err(network_error)?;
+        (vault.vault_id(), device_id_from_bytes(device), founding)
+    };
+    let control = start_control(app, vault_id, device).await?;
+    founding
+        .commit(&control.node)
+        .await
+        .map_err(network_error)?;
+    // The device paired with before is an author from genesis on; it joins
+    // as a member by invitation.
+    net.peers
+        .lock()
+        .await
+        .clear_legacy_peers()
+        .map_err(network_error)?;
+    maintain(app, &control).await;
+    Ok(control)
+}
+
+/// Whether this device was paired by an older build, before vaults had a
+/// control plane. The owner then chooses which of the two devices founds
+/// it; the other joins with the vault it has.
+async fn paired_before<R: Runtime>(app: &AppHandle<R>) -> bool {
+    network(app)
+        .peers
+        .lock()
+        .await
+        .legacy_peers()
+        .is_ok_and(|peers| !peers.is_empty())
+}
+
+/// Sets this vault up for device management if nothing stands in the way:
+/// a vault that was never paired is founded here without asking.
+async fn ensure_control<R: Runtime>(app: &AppHandle<R>) -> Option<Arc<Control>> {
+    let net = network(app);
+    if let Some(control) = net.control().await {
+        // Founding was interrupted before genesis: finish it.
+        let joining = net.join.lock().await.is_some();
+        if control.node.state().epoch == 0 && !joining {
+            let _ = found(app).await;
+        }
+        return Some(control);
+    }
+    if net.join.lock().await.is_some() || paired_before(app).await {
+        return None;
+    }
+    found(app).await.ok()
+}
+
+/// After this device creates a vault: its control plane starts with this
+/// device as the only member. If that fails now, the next unlock does it.
+pub async fn after_create<R: Runtime>(app: &AppHandle<R>) {
+    let _ = ensure_control(app).await;
+}
+
+/// After unlock: the vault is first brought in line with committed
+/// membership, only then is what arrived while locked verified, and then
+/// this device catches up with the others.
+pub async fn after_unlock<R: Runtime>(app: &AppHandle<R>) {
+    match ensure_control(app).await {
+        Some(control) => maintain(app, &control).await,
+        None => {
+            // No control plane yet, so no membership to judge against.
+            let app_state = app.state::<AppState>();
+            let mut vault = app_state.vault.lock().await;
+            if let Some(vault) = vault.as_mut().filter(|vault| vault.is_unlocked()) {
+                let _ = vault.process_staged();
+            }
+        }
+    }
+    let _ = app.emit("vault-changed", ());
+    schedule_sync(app);
+}
+
+/// Records how a sync ended, for one or more sessions.
+async fn finish_sync<R: Runtime>(
+    app: &AppHandle<R>,
+    result: Result<Vec<osm_vault_peer::SyncReport>, osm_vault_peer::Error>,
+) {
+    let unlocked = app
+        .state::<AppState>()
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|vault| vault.is_unlocked());
+    match result {
+        Ok(reports) => {
+            let received: usize = reports.iter().map(|report| report.received).sum();
+            let changed = reports
+                .iter()
+                .any(|report| report.applied > 0 || report.quarantined > 0);
+            let pending = reports.iter().map(|report| report.pending).max();
             update_status(app, |status| {
-                status.state = if unlocked || report.received == 0 {
+                if status.state == "removed" {
+                    return;
+                }
+                status.state = if unlocked || received == 0 {
                     "synced"
                 } else {
                     "received"
                 };
                 status.last_synced_at = Some(now());
                 status.message = None;
-                status.pending = report.pending;
-                if outcome.peer_address.is_some() {
-                    status.peer_address = outcome.peer_address.clone();
+                if let Some(pending) = pending {
+                    status.pending = pending;
                 }
             });
-            if report.applied > 0 || report.quarantined > 0 {
+            if changed {
                 let _ = app.emit("vault-changed", ());
             }
         }
+        Err(osm_vault_peer::Error::Removed) => {
+            network(app).removed.store(true, Ordering::SeqCst);
+            update_status(app, |status| {
+                status.state = "removed";
+                status.message = Some("this device was removed from the vault".into());
+            });
+            let _ = app.emit("devices-changed", ());
+        }
         Err(error) => update_status(app, |status| {
-            status.state = "error";
-            status.message = Some(error.to_string());
+            if status.state != "removed" {
+                status.state = "error";
+                status.message = Some(error.to_string());
+            }
         }),
     }
 }
 
-/// Dials the paired device and syncs. At most one outgoing sync runs at a
-/// time.
-async fn sync_with_peer<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
+/// Syncs with every other member. At most one round runs at a time.
+async fn sync_with_members<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
     let net = network(app);
+    let Some(control) = net.control().await else {
+        return Ok(());
+    };
+    if net.removed.load(Ordering::SeqCst) {
+        return Err(network_error(osm_vault_peer::Error::Removed));
+    }
     if net.syncing.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let result: Result<(), CommandError> = async {
-        let endpoint = SyncEndpoint::load(&mut *net.peers.lock().await).map_err(network_error)?;
-        let address = endpoint.peer().address.clone().ok_or(CommandError {
-            code: "peer_address",
-            message: "the other device's address is not known yet; sync from that device once"
-                .into(),
-        })?;
+    let peers = control.endpoint.sync_peers();
+    let mut reports = Vec::new();
+    let mut failure = None;
+    if !peers.is_empty() {
         update_status(app, |status| status.state = "syncing");
-        let connection = endpoint.connect(&address).await.map_err(network_error)?;
-        run_session(app, connection, endpoint.peer().device_id).await;
-        Ok(())
     }
-    .await;
+    for device in peers {
+        let session = async {
+            let connection = control.endpoint.connect_sync(device).await?;
+            let state = app.state::<AppState>();
+            connection
+                .run_shared(&state.vault, &control.node.state())
+                .await
+        };
+        match session.await {
+            Ok(report) => reports.push(report),
+            Err(osm_vault_peer::Error::Removed) => {
+                failure = Some(osm_vault_peer::Error::Removed);
+                break;
+            }
+            Err(error) => failure = Some(error),
+        }
+    }
     net.syncing.store(false, Ordering::SeqCst);
-    if let Err(error) = &result {
-        update_status(app, |status| {
-            status.state = "error";
-            status.message = Some(error.message.clone());
-        });
+    // One member being away is not a failed sync if another answered.
+    let result = match failure {
+        Some(osm_vault_peer::Error::Removed) => Err(osm_vault_peer::Error::Removed),
+        Some(error) if reports.is_empty() => Err(error),
+        _ => Ok(reports),
+    };
+    let outcome = match &result {
+        Err(osm_vault_peer::Error::Removed) => Err(network_error(osm_vault_peer::Error::Removed)),
+        Err(error) => Err(CommandError {
+            code: "network",
+            message: error.to_string(),
+        }),
+        Ok(_) => Ok(()),
+    };
+    if control.endpoint.sync_peers().is_empty() && result.is_ok() {
+        return Ok(());
     }
-    result
+    finish_sync(app, result).await;
+    outcome
 }
 
 /// Syncs shortly after a local change. A newer change restarts the wait.
@@ -295,30 +649,9 @@ pub fn schedule_sync<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(SYNC_DELAY).await;
         if network(&app).sync_generation.load(Ordering::SeqCst) == generation {
-            let _ = sync_with_peer(&app).await;
+            let _ = sync_with_members(&app).await;
         }
     });
-}
-
-/// Reports what unlock verified, then catches up with the peer.
-pub fn after_unlock<R: Runtime>(app: &AppHandle<R>, processed: &IngressReport) {
-    update_status(app, |status| {
-        status.pending = processed.pending;
-        if status.state == "received" {
-            status.state = "synced";
-        }
-        if processed.rejected > 0 {
-            status.state = "error";
-            status.message = Some(format!(
-                "{} received revisions failed verification and were discarded",
-                processed.rejected
-            ));
-        }
-    });
-    if processed.applied > 0 || processed.quarantined > 0 {
-        let _ = app.emit("vault-changed", ());
-    }
-    schedule_sync(app);
 }
 
 #[tauri::command]
@@ -333,7 +666,215 @@ pub async fn sync_status(state: tauri::State<'_, AppState>) -> Result<SyncStatus
 
 #[tauri::command]
 pub async fn sync_now<R: Runtime>(app: AppHandle<R>) -> Result<(), CommandError> {
-    sync_with_peer(&app).await
+    sync_with_members(&app).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberInfo {
+    /// The device ID in hex.
+    pub(crate) id: String,
+    pub(crate) this_device: bool,
+    address: Option<String>,
+    leader: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInfo {
+    /// `enroll` or `remove`.
+    pub(crate) kind: &'static str,
+    pub(crate) device: String,
+    /// An enrollment that was cancelled and is being undone.
+    cancelled: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicesInfo {
+    /// `none`: no vault. `unmanaged`: a vault without device management,
+    /// set up at the next unlock. `paired-before`: paired by an older
+    /// build; the owner chooses which device sets management up. `joining`,
+    /// `ready`, or `removed`.
+    pub(crate) setup: &'static str,
+    pub(crate) this_device: Option<String>,
+    pub(crate) members: Vec<MemberInfo>,
+    pub(crate) pending: Option<PendingInfo>,
+    /// The key epoch committed membership has reached.
+    pub(crate) epoch: u64,
+    /// How many members must be reachable for any change.
+    pub(crate) quorum: usize,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_device(text: &str) -> Result<[u8; 16], CommandError> {
+    let invalid = || CommandError {
+        code: "invalid_device",
+        message: "that is not a device of this vault".into(),
+    };
+    if text.len() != 32 || !text.is_ascii() {
+        return Err(invalid());
+    }
+    let mut device = [0; 16];
+    for (index, byte) in device.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).map_err(|_| invalid())?;
+    }
+    Ok(device)
+}
+
+/// The vault's devices as committed membership records them.
+#[tauri::command]
+pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, CommandError> {
+    let net = network(&app);
+    let this_device = app
+        .state::<AppState>()
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|vault| vault.device_id());
+    let has_vault = this_device.is_some();
+    let joining = net.join.lock().await.is_some();
+    let empty = |setup| DevicesInfo {
+        setup,
+        this_device: this_device.map(|device| hex(&device)),
+        members: Vec::new(),
+        pending: None,
+        epoch: 0,
+        quorum: 0,
+    };
+    let Some(control) = net.control().await else {
+        return Ok(empty(if !has_vault {
+            "none"
+        } else if paired_before(&app).await {
+            "paired-before"
+        } else {
+            "unmanaged"
+        }));
+    };
+    let state = control.node.state();
+    if joining || state.epoch == 0 {
+        return Ok(empty("joining"));
+    }
+    let leader = control.node.current_leader();
+    let members: Vec<MemberInfo> = state
+        .members()
+        .into_iter()
+        .map(|device| MemberInfo {
+            id: hex(&device_id_to_bytes(device)),
+            this_device: device == control.device,
+            address: control.endpoint.addresses().get(device),
+            leader: leader == Some(device),
+        })
+        .collect();
+    let pending = state.pending.as_ref().map(|pending| PendingInfo {
+        kind: match pending.change {
+            MembershipChange::Enroll { .. } => "enroll",
+            MembershipChange::Remove { .. } => "remove",
+        },
+        device: hex(&device_id_to_bytes(pending.subject())),
+        cancelled: pending.cancelled,
+    });
+    Ok(DevicesInfo {
+        setup: if net.removed.load(Ordering::SeqCst) {
+            "removed"
+        } else {
+            "ready"
+        },
+        this_device: this_device.map(|device| hex(&device)),
+        quorum: state.voters().len() / 2 + 1,
+        members,
+        pending,
+        epoch: state.epoch,
+    })
+}
+
+/// The running control plane of a vault that is unlocked and still a
+/// member, for commands that change membership.
+async fn member_control<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<Control>, CommandError> {
+    let net = network(app);
+    if net.removed.load(Ordering::SeqCst) {
+        return Err(network_error(osm_vault_peer::Error::Removed));
+    }
+    net.control().await.ok_or(CommandError {
+        code: "unmanaged",
+        message: "this vault is not set up for more than one device yet".into(),
+    })
+}
+
+/// Sets device management up on this device, for a vault that was paired
+/// by an older build. Do this on one of the two devices only; the other
+/// joins by invitation, keeping its vault.
+#[tauri::command]
+pub async fn found_control_plane<R: Runtime>(app: AppHandle<R>) -> Result<(), CommandError> {
+    let net = network(&app);
+    if net.control().await.is_some() || net.join.lock().await.is_some() {
+        return Err(CommandError {
+            code: "already_managed",
+            message: "device management is already set up or being joined".into(),
+        });
+    }
+    found(&app).await.map(|_| ())
+}
+
+/// Removes a device: the others agree on it and move to a new key, which
+/// the removed device never receives.
+#[tauri::command]
+pub async fn remove_device<R: Runtime>(
+    device: String,
+    app: AppHandle<R>,
+) -> Result<(), CommandError> {
+    let control = member_control(&app).await?;
+    let device = parse_device(&device)?;
+    let request = {
+        let app_state = app.state::<AppState>();
+        let vault = app_state.vault.lock().await;
+        let vault = vault
+            .as_ref()
+            .filter(|vault| vault.is_unlocked())
+            .ok_or_else(locked)?;
+        control::removal_request(vault, &control.node.state(), device).map_err(network_error)?
+    };
+    control::submit(&control.node, request)
+        .await
+        .map_err(network_error)?;
+    let _ = app.emit("devices-changed", ());
+    Ok(())
+}
+
+/// Abandons an enrollment whose device never caught up. It never received
+/// a key.
+#[tauri::command]
+pub async fn cancel_enrollment<R: Runtime>(app: AppHandle<R>) -> Result<(), CommandError> {
+    let control = member_control(&app).await?;
+    let pending = control
+        .node
+        .state()
+        .pending
+        .filter(|pending| {
+            matches!(pending.change, MembershipChange::Enroll { .. }) && !pending.cancelled
+        })
+        .ok_or(CommandError {
+            code: "no_enrollment",
+            message: "no device is waiting to be enrolled".into(),
+        })?;
+    let request = {
+        let app_state = app.state::<AppState>();
+        let vault = app_state.vault.lock().await;
+        let vault = vault
+            .as_ref()
+            .filter(|vault| vault.is_unlocked())
+            .ok_or_else(locked)?;
+        control::cancel_request(vault, pending.request_id).map_err(network_error)?
+    };
+    control::submit(&control.node, request)
+        .await
+        .map_err(network_error)?;
+    let _ = app.emit("devices-changed", ());
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -352,11 +893,7 @@ pub async fn start_invite<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<InviteInfo, CommandError> {
     let net = &state.network;
-    // The grant tells the joiner where to sync, so listen before inviting.
-    ensure_listener(&app).await.ok_or(CommandError {
-        code: "network",
-        message: "cannot listen for sync connections".into(),
-    })?;
+    let control = member_control(&app).await?;
     let mut invite_slot = net.invite.lock().await;
     if let Some(previous) = invite_slot.take() {
         previous.task.abort();
@@ -367,7 +904,6 @@ pub async fn start_invite<R: Runtime>(
         let vault = state.vault.lock().await;
         let mut invitations = net.invitations.lock().await;
         let mut peers = net.peers.lock().await;
-        peers.ensure_capacity().map_err(network_error)?;
         let listener = PairingListener::bind("0.0.0.0:0", &mut peers)
             .await
             .map_err(network_error)?;
@@ -375,10 +911,7 @@ pub async fn start_invite<R: Runtime>(
         let vault = vault
             .as_ref()
             .filter(|vault| vault.is_unlocked())
-            .ok_or(CommandError {
-                code: "locked",
-                message: "unlock the vault to invite a device".into(),
-            })?;
+            .ok_or_else(locked)?;
         let invitation = invite(
             vault,
             &mut invitations,
@@ -395,7 +928,8 @@ pub async fn start_invite<R: Runtime>(
         expires_at: invitation.expires_at(),
     };
     let (decision, decided) = oneshot::channel();
-    let task = tauri::async_runtime::spawn(wait_for_joiner(app.clone(), listener, decided));
+    let task =
+        tauri::async_runtime::spawn(wait_for_joiner(app.clone(), control, listener, decided));
     *invite_slot = Some(InviteState {
         decision: Some(decision),
         task,
@@ -405,52 +939,54 @@ pub async fn start_invite<R: Runtime>(
 
 async fn wait_for_joiner<R: Runtime>(
     app: AppHandle<R>,
+    control: Arc<Control>,
     listener: PairingListener,
     decided: oneshot::Receiver<bool>,
 ) {
     let outcome = tokio::time::timeout(
         Duration::from_secs(MAX_INVITATION_TTL_SECS),
-        pair_one(&app, &listener, decided),
+        pair_one(&app, &control, &listener, decided),
     )
     .await
-    .unwrap_or_else(|_| Err("the invitation expired".into()));
-    if outcome.is_ok() {
-        update_status(&app, |status| {
-            *status = SyncStatus {
-                state: "idle",
-                ..status.clone()
-            }
-        });
-        refresh_peer(&app).await;
-    }
+    .unwrap_or_else(|_| {
+        Err(CommandError {
+            code: "invitation_expired",
+            message: "the invitation expired".into(),
+        })
+    });
     let _ = app.emit(
         "pairing-finished",
         PairingFinished {
             paired: outcome.is_ok(),
-            message: outcome.err(),
+            code: outcome.as_ref().err().map(|error| error.code),
+            message: outcome.err().map(|error| error.message),
         },
     );
+    let _ = app.emit("devices-changed", ());
     *network(&app).invite.lock().await = None;
 }
 
+/// Reviews one joiner, asks the owner, and proposes the enrollment. It
+/// succeeds once the vault's devices accepted the proposal and the joiner
+/// was told; the joiner then catches up and becomes a member on its own.
 async fn pair_one<R: Runtime>(
     app: &AppHandle<R>,
+    control: &Control,
     listener: &PairingListener,
     decided: oneshot::Receiver<bool>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let state = app.state::<AppState>();
     let net = &state.network;
+    let gone = || CommandError {
+        code: "locked",
+        message: "unlock the vault to finish pairing".into(),
+    };
     let pending: PendingJoin = loop {
-        let incoming = listener
-            .next_request()
-            .await
-            .map_err(|error| error.to_string())?;
+        let incoming = listener.next_request().await.map_err(network_error)?;
         let vault = state.vault.lock().await;
         let invitations = net.invitations.lock().await;
         let mut peers = net.peers.lock().await;
-        let Some(vault) = vault.as_ref() else {
-            return Err("the vault is no longer available".into());
-        };
+        let vault = vault.as_ref().ok_or_else(gone)?;
         let reviewed = incoming.review(vault, &invitations, &mut peers, now());
         if let Ok(pending) = reviewed {
             break pending;
@@ -460,33 +996,38 @@ async fn pair_one<R: Runtime>(
     // Nothing is locked while the owner compares the codes.
     if !decided.await.unwrap_or(false) {
         let _ = pending.decline().await;
-        return Err("pairing was declined".into());
+        return Err(network_error(osm_vault_peer::Error::NotConfirmed));
     }
-    let approved = {
-        let mut vault = state.vault.lock().await;
+    let (proposal, approved) = {
+        let vault = state.vault.lock().await;
         let mut invitations = net.invitations.lock().await;
-        let mut peers = net.peers.lock().await;
         let vault = vault
-            .as_mut()
+            .as_ref()
             .filter(|vault| vault.is_unlocked())
-            .ok_or("unlock the vault to finish pairing")?;
-        let sync_port = net.listen_port.load(Ordering::SeqCst);
+            .ok_or_else(gone)?;
         pending
-            .approve(
+            .approve_enrollment(
                 vault,
                 &mut invitations,
-                &mut peers,
-                (sync_port != 0).then_some(sync_port),
+                control.endpoint.roster(),
+                control.endpoint.listen_port(),
                 now(),
             )
-            .map_err(|error| error.to_string())?
+            .map_err(network_error)?
     };
-    approved.send().await.map_err(|error| error.to_string())
+    // The owner's confirmation becomes a proposal that a majority of the
+    // vault's devices must accept.
+    if let Err(error) = control::submit(&control.node, proposal).await {
+        let _ = approved.refuse().await;
+        return Err(network_error(error));
+    }
+    approved.send().await.map_err(network_error)
 }
 
 #[derive(Clone, Serialize)]
 struct PairingFinished {
     paired: bool,
+    code: Option<&'static str>,
     message: Option<String>,
 }
 
@@ -520,93 +1061,187 @@ pub async fn cancel_invite(state: tauri::State<'_, AppState>) -> Result<(), Comm
 #[serde(rename_all = "camelCase")]
 pub struct JoinInfo {
     pub(crate) sas: String,
+    /// This device already holds the vault and keeps it.
+    pub(crate) keeps_vault: bool,
 }
 
-/// Connects to the inviting device from an invitation code. Only possible
-/// before this device has a vault.
+/// Connects to the inviting device from an invitation code. A device
+/// without a vault joins as a new device. A device that was paired by an
+/// older build joins with the vault it has, which must be unlocked.
 #[tauri::command]
-pub async fn join_start(
+pub async fn join_start<R: Runtime>(
     code: String,
     state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
 ) -> Result<JoinInfo, CommandError> {
-    if state.vault.lock().await.is_some() {
+    let net = &state.network;
+    if net.join.lock().await.take().is_some() {
+        abandon_control(&app).await;
+    }
+    if net.control().await.is_some() {
         return Err(CommandError {
             code: "vault_exists",
-            message: "this device already has a vault".into(),
+            message: "this device already belongs to a vault's devices".into(),
         });
     }
     let invitation = Invitation::decode(&code).map_err(network_error)?;
-    let connection = {
-        let mut peers = state.network.peers.lock().await;
-        osm_vault_peer::start_pairing(invitation, &mut peers, now())
-            .await
-            .map_err(network_error)?
+    let (prepared, keeps_vault) = {
+        let vault = state.vault.lock().await;
+        let mut peers = net.peers.lock().await;
+        match vault.as_ref() {
+            None => (PreparedJoin::new(invitation, &mut peers, now()), false),
+            Some(vault) if vault.is_unlocked() => (
+                PreparedJoin::with_vault(invitation, vault, &mut peers, now()),
+                true,
+            ),
+            Some(_) => return Err(locked()),
+        }
     };
+    let connection = prepared
+        .map_err(network_error)?
+        .connect()
+        .await
+        .map_err(network_error)?;
+    // The node runs from here on so that the leader can bring this device
+    // up to date. It accepts no one until the inviting device names the
+    // members.
+    let joiner = connection.joiner();
+    let control = start_control(&app, joiner.vault_id(), joiner.control_device()).await?;
     let sas = connection.sas();
-    *state.network.join.lock().await = Some(connection);
-    Ok(JoinInfo { sas })
+    *net.join.lock().await = Some(JoinState {
+        connection,
+        control,
+    });
+    let _ = app.emit("devices-changed", ());
+    Ok(JoinInfo { sas, keeps_vault })
 }
 
 /// Called when the owner confirms the codes match on this device. Waits for
-/// the inviting device's approval, then creates this device's vault.
+/// the inviting device's approval and for the vault's devices to enroll
+/// this one, then creates its vault, or for a device that keeps its vault,
+/// brings that vault in line.
 #[tauri::command]
 pub async fn join_finish<R: Runtime>(
-    password: String,
+    password: Option<String>,
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<(), CommandError> {
-    if password.chars().count() < 12 {
+    let net = &state.network;
+    let keeps_vault = match net.join.lock().await.as_ref() {
+        Some(join) => join.connection.joiner().has_vault(),
+        None => {
+            return Err(CommandError {
+                code: "no_pairing",
+                message: "start joining with an invitation code first".into(),
+            })
+        }
+    };
+    let password = password.unwrap_or_default();
+    if !keeps_vault && password.chars().count() < 12 {
         return Err(CommandError {
             code: "invalid_item",
             message: "use at least 12 characters for this device password".into(),
         });
     }
-    let connection = state.network.join.lock().await.take().ok_or(CommandError {
-        code: "no_pairing",
-        message: "start joining with an invitation code first".into(),
-    })?;
-    let (joiner, grant) = connection.receive_grant().await.map_err(network_error)?;
-    {
-        let mut vault = state.vault.lock().await;
+    let Some(JoinState {
+        connection,
+        control,
+    }) = net.join.lock().await.take()
+    else {
+        return Err(CommandError {
+            code: "no_pairing",
+            message: "start joining with an invitation code first".into(),
+        });
+    };
+    let joined = finish_join(&app, connection, &control, &password).await;
+    if let Err(error) = joined {
+        abandon_control(&app).await;
+        let _ = app.emit("devices-changed", ());
+        return Err(error);
+    }
+    maintain(&app, &control).await;
+    // Fetch the vault's contents right away.
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = sync_with_members(&sync_app).await;
+    });
+    Ok(())
+}
+
+async fn finish_join<R: Runtime>(
+    app: &AppHandle<R>,
+    connection: PairingConnection,
+    control: &Control,
+    password: &str,
+) -> Result<(), CommandError> {
+    let state = app.state::<AppState>();
+    let (joiner, grant) = connection
+        .receive_enrollment()
+        .await
+        .map_err(network_error)?;
+    // The grant names the members: accept them, and keep telling them where
+    // this device listens until one of them has brought it up to date.
+    let members = joiner.members(&grant).map_err(network_error)?;
+    control
+        .endpoint
+        .introduce(&members)
+        .map_err(network_error)?;
+    let deadline = tokio::time::Instant::now() + ENROLLMENT_TIMEOUT;
+    while !joiner.enrolled(&control.node.state()) {
+        if tokio::time::Instant::now() > deadline {
+            return Err(CommandError {
+                code: "enrollment_timeout",
+                message: "the vault's devices did not finish enrolling this device; \
+                          cancel the enrollment on the inviting device and try again"
+                    .into(),
+            });
+        }
+        control.endpoint.announce_all().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let committed = control.node.state();
+    let mut vault = state.vault.lock().await;
+    if joiner.has_vault() {
+        let vault = vault
+            .as_mut()
+            .filter(|vault| vault.is_unlocked())
+            .ok_or_else(locked)?;
+        joiner
+            .finish_in_place(&grant, true, &committed, vault)
+            .map_err(network_error)?;
+        state
+            .network
+            .peers
+            .lock()
+            .await
+            .clear_legacy_peers()
+            .map_err(network_error)?;
+    } else {
         if vault.is_some() {
             return Err(CommandError {
                 code: "vault_exists",
                 message: "this device already has a vault".into(),
             });
         }
-        let mut peers = state.network.peers.lock().await;
-        let joined = joiner
-            .finish(&grant, true, &state.path, &password, &mut peers, now())
-            .map_err(network_error)?;
-        *vault = Some(joined);
+        *vault = Some(
+            joiner
+                .finish_enrollment(&grant, true, &committed, &state.path, password)
+                .map_err(network_error)?,
+        );
     }
-    refresh_peer(&app).await;
-    // Listen before the first sync so it tells the inviter where to reach
-    // this device.
-    ensure_listener(&app).await;
-    // Fetch the vault's contents right away.
-    let sync_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = sync_with_peer(&sync_app).await;
-    });
     Ok(())
 }
 
 #[tauri::command]
-pub async fn cancel_join(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
-    state.network.join.lock().await.take();
+pub async fn cancel_join<R: Runtime>(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
+) -> Result<(), CommandError> {
+    if state.network.join.lock().await.take().is_some() {
+        abandon_control(&app).await;
+        let _ = app.emit("devices-changed", ());
+    }
     Ok(())
-}
-
-async fn refresh_peer<R: Runtime>(app: &AppHandle<R>) {
-    let status = initial_status(&*network(app).peers.lock().await);
-    update_status(app, |current| {
-        current.peer = status.peer;
-        current.peer_address = status.peer_address;
-        if current.state == "unpaired" {
-            current.state = status.state;
-        }
-    });
 }
 
 /// The address other devices on the local network most likely reach this
@@ -621,18 +1256,18 @@ fn primary_ip() -> std::net::IpAddr {
         .unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]))
 }
 
-fn short_id(device_id: &[u8; 16]) -> String {
-    device_id[..4]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+fn locked() -> CommandError {
+    CommandError {
+        code: "locked",
+        message: "unlock the vault first".into(),
+    }
 }
 
 fn storage_error(error: std::io::Error) -> CommandError {
@@ -643,17 +1278,26 @@ fn storage_error(error: std::io::Error) -> CommandError {
 }
 
 fn network_error(error: osm_vault_peer::Error) -> CommandError {
-    let code = match error {
-        osm_vault_peer::Error::NotConfirmed => "not_confirmed",
-        osm_vault_peer::Error::PinMismatch => "pin_mismatch",
-        osm_vault_peer::Error::InvitationExpired
-        | osm_vault_peer::Error::Sync(osm_vault_sync::Error::InvitationExpired) => {
+    use osm_vault_peer::Error;
+    let code = match &error {
+        Error::NotConfirmed => "not_confirmed",
+        Error::PinMismatch => "pin_mismatch",
+        Error::InvitationExpired | Error::Sync(osm_vault_sync::Error::InvitationExpired) => {
             "invitation_expired"
         }
-        osm_vault_peer::Error::InvalidInvitation => "invalid_invitation",
-        osm_vault_peer::Error::PeerLimit => "peer_limit",
-        osm_vault_peer::Error::NotPaired => "not_paired",
-        osm_vault_peer::Error::Timeout => "timeout",
+        Error::InvalidInvitation => "invalid_invitation",
+        Error::VaultMismatch => "vault_mismatch",
+        Error::Timeout => "timeout",
+        Error::Removed => "removed",
+        Error::EnrollmentRefused => "enrollment_refused",
+        Error::Vault(osm_vault_core::Error::Locked) => "locked",
+        Error::Membership(inner) => match **inner {
+            osm_vault_membership::Error::QuorumUnavailable
+            | osm_vault_membership::Error::NotLeader(_) => "quorum_unavailable",
+            _ => "network",
+        },
+        Error::Rejected(Rejection::ChangeInProgress) => "change_in_progress",
+        Error::Rejected(_) => "rejected",
         _ => "network",
     };
     CommandError {

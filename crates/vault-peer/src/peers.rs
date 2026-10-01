@@ -6,11 +6,9 @@ use zeroize::Zeroizing;
 
 use crate::{Error, Result};
 
-/// Until committed membership exists, owner-confirmed pairing is the only
-/// enrollment authority, so a vault may have one paired device.
-pub const MAX_PEERS: usize = 1;
-const MAX_ADDRESS_LEN: usize = 128;
-
+/// A device paired before the vault had a control plane, when the owner's
+/// confirmation alone authorized one peer. Kept only so that such a pair
+/// can be moved onto the control plane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
     pub device_id: [u8; 16],
@@ -49,7 +47,8 @@ pub(crate) fn pin_of(certificate: &[u8]) -> [u8; 32] {
     Sha256::digest(certificate).into()
 }
 
-/// This device's transport identity and the devices it has paired with.
+/// This device's transport identity. A store written before the vault had a
+/// control plane may also name the one device it was paired with.
 ///
 /// The file holds the TLS private key unencrypted, because it must be usable
 /// while the vault is locked; it is created with owner-only permissions.
@@ -121,7 +120,9 @@ impl PeerStore {
         Ok(identity)
     }
 
-    pub fn peers(&self) -> Result<Vec<Peer>> {
+    /// The device this one was paired with before the vault had a control
+    /// plane, if any. Nothing adds to this list any more.
+    pub fn legacy_peers(&self) -> Result<Vec<Peer>> {
         let mut statement = self.connection.prepare(
             "SELECT device_id, public_key, transport_pin, address, paired_at
              FROM peers ORDER BY paired_at",
@@ -154,47 +155,13 @@ impl PeerStore {
             .collect()
     }
 
-    /// Fails with `PeerLimit` if another pairing would exceed [`MAX_PEERS`].
-    pub fn ensure_capacity(&self) -> Result<()> {
-        let count: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM peers", [], |row| row.get(0))?;
-        if count as usize >= MAX_PEERS {
-            return Err(Error::PeerLimit);
-        }
-        Ok(())
-    }
-
-    /// Records where a paired device was last reachable.
-    pub fn set_address(&mut self, device_id: &[u8; 16], address: &str) -> Result<()> {
-        if address.is_empty() || address.len() > MAX_ADDRESS_LEN {
-            return Err(Error::InvalidAddress);
-        }
-        self.connection.execute(
-            "UPDATE peers SET address = ?1 WHERE device_id = ?2",
-            params![address, device_id.as_slice()],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn add(&mut self, peer: &Peer) -> Result<()> {
-        if peer
-            .address
-            .as_ref()
-            .is_some_and(|address| address.len() > MAX_ADDRESS_LEN)
-        {
-            return Err(Error::InvalidAddress);
-        }
+    /// Records a device as paired before the vault had a control plane.
+    /// Nothing in the product does this any more; it lets tests set up the
+    /// state an older build left behind.
+    #[doc(hidden)]
+    pub fn insert_legacy_peer(&mut self, peer: &Peer) -> Result<()> {
         let paired_at = i64::try_from(peer.paired_at).map_err(|_| Error::MalformedFrame)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let count: i64 =
-            transaction.query_row("SELECT COUNT(*) FROM peers", [], |row| row.get(0))?;
-        if count as usize >= MAX_PEERS {
-            return Err(Error::PeerLimit);
-        }
-        transaction.execute(
+        self.connection.execute(
             "INSERT INTO peers(device_id, public_key, transport_pin, address, paired_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -205,7 +172,13 @@ impl PeerStore {
                 paired_at
             ],
         )?;
-        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Forgets the devices paired before the vault had a control plane,
+    /// once this device is a member of it.
+    pub fn clear_legacy_peers(&mut self) -> Result<()> {
+        self.connection.execute("DELETE FROM peers", [])?;
         Ok(())
     }
 }

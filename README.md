@@ -18,15 +18,14 @@ The repository is deliberately split at the security boundary:
   plane (enrollment, removal with key rotation, reconciliation), and carries
   the control plane's own messages and sync between any two members over
   the same pinned TLS. The `osm-peer` binary is a development CLI that runs
-  a device as a process: interim pairing and sync of two vaults, or a
-  member of a vault's control plane.
+  one device of a vault as a process.
 - `crates/vault-membership` is the membership control plane on OpenRaft:
   signed enrollment and removal requests decided by a Raft majority, with
   SQLite-backed log and state. It also decides key epochs: a removal
   carries the next epoch key sealed to every remaining device, active only
   once the removal completes. Tests run it in-process, over TLS between
-  listeners in one process, and between separate device processes; running
-  it in the desktop app is the remaining Phase 4 work.
+  listeners in one process, between separate device processes, and in the
+  desktop shell.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
   route from the interface to the Rust core.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and
@@ -35,14 +34,16 @@ The repository is deliberately split at the security boundary:
   desktop session adapter is installed.
 
 The prototype is intentionally offline-first. Local vault use does not depend
-on a peer or a network. Two devices can pair and sync over pinned TLS; a
-locked device stores what it receives and verifies it at the next unlock. The
-desktop app pairs from its Devices panel (still the interim, owner-confirmed
-path with one peer) and syncs automatically on the local network; there is no
-discovery beyond the address in the invitation. In the libraries, pairing
-instead proposes the new device to the control plane, so any number of
-devices can join, and removing a device rotates the vault key; the desktop
-app adopts this in the remaining Phase 4 work.
+on a peer or a network. Devices pair by invitation and a six-digit code the
+owner compares on both screens; the vault's devices then agree, by majority,
+to enroll the new one, and any device can later be removed, which moves the
+others to a new key. The desktop app does this from its Devices panel and
+syncs with every member automatically on the local network; a locked device
+still takes part and stores what it receives until the next unlock. There is
+no discovery beyond the address in the invitation. With two devices both must
+be reachable for any change, so a lost device cannot be removed from a
+two-device vault; recovering such a vault into a new one is the remaining
+Phase 4 work.
 
 ## Development
 

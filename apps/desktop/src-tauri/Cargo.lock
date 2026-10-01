@@ -3000,6 +3000,7 @@ dependencies = [
  "arboard",
  "dirs",
  "osm-vault-core",
+ "osm-vault-membership",
  "osm-vault-peer",
  "osm-vault-sync",
  "serde",

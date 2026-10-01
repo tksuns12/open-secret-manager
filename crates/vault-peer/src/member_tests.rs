@@ -9,7 +9,7 @@ use openraft::{
     raft::{AppendEntriesRequest, VoteRequest},
     Config, ServerState, Vote,
 };
-use osm_vault_core::Vault;
+use osm_vault_core::{PendingDevice, Vault};
 use osm_vault_membership::{
     device_id_from_bytes, ControlNode, ControlReply, ControlRequest, ControlRpc, ControlState,
     DeviceId, DeviceNode, Dialer, KeySigner, Link, MembershipChange, NodeOptions, Outcome,
@@ -19,13 +19,14 @@ use osm_vault_sync::{
     seal_epoch_key, HpkeKeyPair, InvitationPolicy, InvitationStore, VaultId as SyncVaultId,
 };
 use tempfile::TempDir;
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use tokio::{io::AsyncWriteExt, net::TcpListener, sync::mpsc, task::JoinHandle};
 
 use crate::{
     control,
     control_tests::{titles, until},
-    invite, serve_members, start_node, start_pairing,
+    invite, serve_members, start_node, start_pairing, start_pairing_with_vault,
     tests::login,
+    transport::{client_config_for_tests, server_name_for_tests},
     AddressBook, Error, MemberContact, MemberEndpoint, MemberSync, PairingListener, PeerStore,
     SyncReport,
 };
@@ -645,6 +646,40 @@ async fn the_sync_channel_is_open_to_members_only() {
     assert!(c.endpoint.told_removed());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_frame_from_a_member_ends_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Bare::start(&dir, 1).await;
+    let mut b = Bare::start(&dir, 2).await;
+    a.found().await;
+    a.enroll(1, &b, &[&a]).await;
+
+    // B, a member, opens a connection of its own to A and declares a frame
+    // far beyond the limit.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let identity = b.peers.transport_identity().unwrap();
+    let (accepted, _) = tokio::join!(
+        async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            a.endpoint.accept(tcp).await.map(|_| ())
+        },
+        async {
+            let connector =
+                tokio_rustls::TlsConnector::from(client_config_for_tests(&identity, a.pin()));
+            let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut stream = connector
+                .connect(server_name_for_tests(), tcp)
+                .await
+                .unwrap();
+            stream.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    );
+    assert!(matches!(accepted, Err(Error::FrameTooLarge)));
+}
+
 #[test]
 fn the_address_book_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -686,6 +721,11 @@ impl Member {
     /// Creates a vault and founds its control plane.
     async fn found(dir: &TempDir) -> Self {
         let (vault, _) = Vault::create(dir.path().join("founder.db"), PASSWORD).unwrap();
+        Self::found_with(dir, vault).await
+    }
+
+    /// Founds the control plane of an existing vault.
+    async fn found_with(dir: &TempDir, vault: Vault) -> Self {
         let id = device_id_from_bytes(vault.device_id().unwrap());
         let mut host = Host::start(dir, id, vault.vault_id()).await;
         control::found(&vault, &mut host.peers, &host.node)
@@ -702,6 +742,19 @@ impl Member {
     /// short codes, the owner's confirmation, the enrollment proposal, and
     /// the grant. `granter` is unlocked and gives the new voter the keys.
     async fn invite(&mut self, dir: &TempDir, name: &str, granter: Option<&Member>) -> Member {
+        self.enroll(dir, name, granter, None).await
+    }
+
+    /// As [`Self::invite`]; with `existing`, the joining device already
+    /// holds that copy of the vault and joins with it instead of creating
+    /// one.
+    async fn enroll(
+        &mut self,
+        dir: &TempDir,
+        name: &str,
+        granter: Option<&Member>,
+        existing: Option<Vault>,
+    ) -> Member {
         let pairing = PairingListener::bind("127.0.0.1:0", &mut self.host.peers)
             .await
             .unwrap();
@@ -717,10 +770,12 @@ impl Member {
 
         // The joiner runs its control-plane node from the start.
         let mut peers = PeerStore::open_in_memory().unwrap();
-        let (incoming, connection) = tokio::join!(
-            pairing.next_request(),
-            start_pairing(invitation, &mut peers, NOW)
-        );
+        let (incoming, connection) = tokio::join!(pairing.next_request(), async {
+            match &existing {
+                Some(vault) => start_pairing_with_vault(invitation, vault, &mut peers, NOW).await,
+                None => start_pairing(invitation, &mut peers, NOW).await,
+            }
+        });
         let connection = connection.unwrap();
         let device = connection.joiner().control_device();
         let vault_id = connection.joiner().vault_id();
@@ -781,15 +836,24 @@ impl Member {
             joiner.enrolled(&host.state())
         })
         .await;
-        let vault = joiner
-            .finish_enrollment(
-                &grant,
-                true,
-                &host.state(),
-                dir.path().join(format!("{name}.db")),
-                PASSWORD,
-            )
-            .unwrap();
+        let vault = match existing {
+            Some(mut vault) => {
+                assert!(joiner.has_vault());
+                joiner
+                    .finish_in_place(&grant, true, &host.state(), &mut vault)
+                    .unwrap();
+                vault
+            }
+            None => joiner
+                .finish_enrollment(
+                    &grant,
+                    true,
+                    &host.state(),
+                    dir.path().join(format!("{name}.db")),
+                    PASSWORD,
+                )
+                .unwrap(),
+        };
         Member {
             host,
             vault,
@@ -900,4 +964,114 @@ async fn devices_pair_sync_and_rotate_over_tls() {
     assert_eq!(c.vault.current_epoch(), 1);
     assert_eq!(c.vault.epoch_keys().unwrap().len(), 1);
     assert_eq!(titles(&c.vault), vec!["From A", "From C"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn devices_that_dial_each_other_at_once_both_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    let mut b = a.invite(&dir, "b", None).await;
+    a.vault.put(login("From A", "a-secret")).unwrap();
+    b.vault.put(login("From B", "b-secret")).unwrap();
+
+    // Each device runs an outgoing session and serves the other's incoming
+    // one on the same vault. A session takes the vault per message, so
+    // neither waits for the other while holding it.
+    let (a_id, b_id) = (a.host.id, b.host.id);
+    let (a_state, b_state) = (a.host.state(), b.host.state());
+    let mut a_incoming = a.host.incoming.take().unwrap();
+    let mut b_incoming = b.host.incoming.take().unwrap();
+    let (a_endpoint, b_endpoint) = (a.host.endpoint.clone(), b.host.endpoint.clone());
+    let a_vault = tokio::sync::Mutex::new(&mut a.vault);
+    let b_vault = tokio::sync::Mutex::new(&mut b.vault);
+    let all = async {
+        tokio::join!(
+            async {
+                let connection = a_endpoint.connect_sync(b_id).await?;
+                connection.run_shared(&a_vault, &a_state).await
+            },
+            async {
+                let connection = b_endpoint.connect_sync(a_id).await?;
+                connection.run_shared(&b_vault, &b_state).await
+            },
+            async {
+                let connection = a_incoming.recv().await.unwrap();
+                connection.run_shared(&a_vault, &a_state).await
+            },
+            async {
+                let connection = b_incoming.recv().await.unwrap();
+                connection.run_shared(&b_vault, &b_state).await
+            },
+        )
+    };
+    let (a_out, b_out, a_in, b_in) = tokio::time::timeout(Duration::from_secs(20), all)
+        .await
+        .expect("the sessions waited on each other");
+    for report in [a_out, b_out, a_in, b_in] {
+        report.unwrap();
+    }
+    assert_eq!(titles(&a.vault), vec!["From A", "From B"]);
+    assert_eq!(titles(&b.vault), titles(&a.vault));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_paired_before_the_control_plane_joins_with_its_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    // A and B were paired when the owner's confirmation alone authorized a
+    // device: each has a vault and accepts the other's revisions, and
+    // neither has a control plane. B has an edit A has not seen.
+    let (mut a_vault, _) = Vault::create(dir.path().join("a.db"), PASSWORD).unwrap();
+    let device = PendingDevice::generate();
+    let material = a_vault.enrollment_material().unwrap();
+    a_vault
+        .authorize_device(device.device_id(), device.public_key())
+        .unwrap();
+    let mut b_vault = Vault::join(dir.path().join("b.db"), PASSWORD, device, material).unwrap();
+    a_vault.put(login("From A", "a-secret")).unwrap();
+    b_vault.put(login("Unsynced on B", "b-secret")).unwrap();
+    let b_device = b_vault.device_id().unwrap();
+    let b_key = b_vault.device_public_key().unwrap();
+
+    // A founds the control plane; B is an author from the start but not a
+    // voter, so it cannot be removed yet.
+    let mut a = Member::found_with(&dir, a_vault).await;
+    let b_id = device_id_from_bytes(b_device);
+    assert_eq!(a.host.state().authors.get(&b_id), Some(&b_key));
+    assert!(!a.host.state().is_enrolled(b_id));
+
+    // An invitation for another vault is refused before anything is sent.
+    let other = Member::found(&dir).await;
+    let mut other_inviter = other;
+    let foreign = invite(
+        &other_inviter.vault,
+        &mut other_inviter.invitations,
+        &mut other_inviter.host.peers,
+        vec!["127.0.0.1:1".to_owned()],
+        NOW,
+        300,
+    )
+    .unwrap();
+    let mut scratch = PeerStore::open_in_memory().unwrap();
+    assert!(matches!(
+        start_pairing_with_vault(foreign, &b_vault, &mut scratch, NOW).await,
+        Err(Error::VaultMismatch)
+    ));
+
+    // B joins with the vault it has: same device, same key, nothing
+    // re-created, and its unsynced edit is still there.
+    let mut b = a.enroll(&dir, "b", None, Some(b_vault)).await;
+    assert_eq!(b.vault.device_id(), Some(b_device));
+    assert_eq!(b.host.id, b_id);
+    let state = a.host.state();
+    assert!(state.is_active_member(b_id) && state.is_settled_member(b_id));
+    assert_eq!(state.members().len(), 2);
+    let (_, received) = sync(&mut b, &mut a).await;
+    assert_eq!((received.applied, received.quarantined), (1, 0));
+    assert_eq!(titles(&a.vault), vec!["From A", "Unsynced on B"]);
+    assert_eq!(titles(&b.vault), titles(&a.vault));
+
+    // Now a voter, B takes part in changes like any member: with two
+    // voters both are needed, and it can no longer be skipped.
+    let c = b.invite(&dir, "c", Some(&a)).await;
+    assert!(a.host.state().members().contains(&c.host.id));
 }

@@ -19,9 +19,10 @@ dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 osm-vault-core = { path = "../../../crates/vault-core" }
+osm-vault-membership = { path = "../../../crates/vault-membership" }
 osm-vault-peer = { path = "../../../crates/vault-peer" }
 osm-vault-sync = { path = "../../../crates/vault-sync" }
-tokio = { version = "1.53.1", features = ["net", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "sync", "time"] }
 zeroize = "1.8"
 arboard = "3.4"
 

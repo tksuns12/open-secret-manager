@@ -24,17 +24,24 @@ const DRIVE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Raft timing for devices on a local network.
 pub fn default_config() -> Arc<Config> {
-    Arc::new(
-        Config {
-            cluster_name: "osm-vault".into(),
-            heartbeat_interval: 500,
-            election_timeout_min: 1500,
-            election_timeout_max: 3000,
-            ..Config::default()
-        }
-        .validate()
-        .expect("static Raft configuration is valid"),
-    )
+    timing(500, 1500, 3000).expect("static Raft configuration is valid")
+}
+
+/// Raft timing in milliseconds: the leader's heartbeat interval and the
+/// range a follower's election timeout is drawn from. `None` if the values
+/// are inconsistent, for example a heartbeat that is not well below the
+/// election timeout.
+pub fn timing(heartbeat: u64, election_min: u64, election_max: u64) -> Option<Arc<Config>> {
+    Config {
+        cluster_name: "osm-vault".into(),
+        heartbeat_interval: heartbeat,
+        election_timeout_min: election_min,
+        election_timeout_max: election_max,
+        ..Config::default()
+    }
+    .validate()
+    .ok()
+    .map(Arc::new)
 }
 
 pub struct NodeOptions {

@@ -63,7 +63,7 @@ use crate::{
     transport::{
         client_config, handshake_error, read_frame, read_json_frame, run_session, server_config,
         server_name, with_timeout, write_frame, write_json_frame, ClientPolicy, PinPolicy,
-        CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT,
+        SharedVault, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, NO_VAULT,
     },
     Error, PeerStore, Result, SyncReport,
 };
@@ -743,12 +743,29 @@ impl MemberSync {
     /// judged against the current authors and removals. A locked vault
     /// only stages what it receives. Fails with `Removed`, exchanging
     /// nothing, if the state says this device was removed.
-    pub async fn run(self, vault: &mut Vault, state: &ControlState) -> Result<SyncReport> {
-        if control::reconcile(vault, state)?.removed {
+    ///
+    /// The vault is taken for one message at a time, so other tasks, and
+    /// other sessions, use it in between.
+    pub async fn run_shared<V: SharedVault + ?Sized>(
+        self,
+        vault: &V,
+        state: &ControlState,
+    ) -> Result<SyncReport> {
+        let reconciled = vault
+            .with(|vault| control::reconcile(vault, state))
+            .await
+            .ok_or(NO_VAULT)??;
+        if reconciled.removed {
             return Err(Error::Removed);
         }
         let (report, _) = run_session(self.stream, vault, self.listen_port).await?;
         Ok(report)
+    }
+
+    /// As [`Self::run_shared`], for a vault nothing else is using.
+    pub async fn run(self, vault: &mut Vault, state: &ControlState) -> Result<SyncReport> {
+        self.run_shared(&tokio::sync::Mutex::new(vault), state)
+            .await
     }
 }
 

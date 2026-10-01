@@ -1,4 +1,4 @@
-import type { DesktopBridge, EntryDetail, EntryInput, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { DesktopBridge, DevicesInfo, EntryDetail, EntryInput, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -117,8 +117,16 @@ export const bridge: DesktopBridge = {
   async syncStatus() {
     const invoke = native();
     if (invoke) return (await invoke("sync_status")) as SyncStatus;
-    return { state: "unpaired", pending: 0 };
+    return { state: "local", devices: 0, pending: 0 };
   },
+  async devices() {
+    const invoke = native();
+    if (invoke) return (await invoke("devices")) as DevicesInfo;
+    return { setup: "none", members: [], epoch: 0, quorum: 0 };
+  },
+  foundControlPlane: () => nativeOnly("found_control_plane"),
+  removeDevice: (device) => nativeOnly("remove_device", { device }),
+  cancelEnrollment: () => nativeOnly("cancel_enrollment"),
   async recoveryStatus() {
     const invoke = native();
     return invoke ? Boolean(await invoke("recovery_status")) : true;
@@ -129,7 +137,7 @@ export const bridge: DesktopBridge = {
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),
   cancelInvite: () => nativeOnly("cancel_invite"),
   joinStart: (code) => nativeOnly("join_start", { code }),
-  joinFinish: (password) => nativeOnly("join_finish", { password }),
+  joinFinish: (password) => nativeOnly("join_finish", { password: password ?? null }),
   cancelJoin: () => nativeOnly("cancel_join"),
   async listen(event, handler) {
     const listen = (globalThis as TauriGlobal).__TAURI__?.event?.listen;

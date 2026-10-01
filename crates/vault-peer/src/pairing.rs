@@ -20,11 +20,11 @@
 //!    joiner too, it creates its own copy of the vault from that state
 //!    ([`Joiner::finish_enrollment`]). Revisions then arrive by sync.
 //!
-//! Until the desktop app runs the control plane, it still uses the interim
-//! path: [`approve_join`] authorizes the joiner directly and returns a
-//! [`JoinGrant`] carrying the epoch keys, and [`Joiner::finish`] completes
-//! it, with at most one paired device. It must not be used on a vault whose
-//! control plane has been founded.
+//! A device that already holds a copy of the vault, paired before the vault
+//! had a control plane, joins the same way under the identity it has
+//! ([`Joiner::start_with_vault`], [`Joiner::finish_in_place`]): the owner
+//! compares the codes, the device becomes a voter, and its vault is brought
+//! in line with committed state instead of being created.
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use osm_vault_core::{
@@ -33,25 +33,20 @@ use osm_vault_core::{
 use osm_vault_membership::{
     device_id_from_bytes, device_id_to_bytes, ControlState, DeviceNode, SignedRequest,
 };
-use osm_vault_sync::{
-    open_epoch_key, seal_epoch_key, DeviceId, EpochKeyEnvelope, HpkeKeyPair, HpkePublicKey,
-    InvitationStore, InvitationToken, VaultId,
-};
+use osm_vault_sync::{DeviceId, HpkeKeyPair, InvitationStore, InvitationToken, VaultId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    control,
+    control::{self, Reconciled},
     members::{valid_contacts, MemberContact},
-    Error, Peer, PeerStore, Result,
+    Error, PeerStore, Result,
 };
 
 const PAIRING_VERSION: u8 = 1;
 const INVITATION_PREFIX: &str = "OSM-PAIR1-";
 const MAX_INVITATION_CODE_LEN: usize = 512;
-const MAX_GRANT_DEVICES: usize = 64;
-const MAX_GRANT_EPOCHS: usize = 1024;
 const MAX_ADDRESSES: usize = 4;
 const MAX_ADDRESS_LEN: usize = 128;
 
@@ -189,73 +184,6 @@ impl std::fmt::Debug for JoinRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceEntry {
-    pub device_id: [u8; 16],
-    pub public_key: [u8; 32],
-}
-
-/// Sent by the inviter after the owner confirms. `envelope` is the vault key
-/// sealed to the joiner's HPKE key; nothing here is secret without it.
-#[derive(Serialize, Deserialize)]
-pub struct JoinGrant {
-    version: u8,
-    vault_id: [u8; 32],
-    /// The epoch the joiner writes under.
-    current_epoch: u64,
-    /// One HPKE envelope per epoch key, sealed to the joiner. Each names its
-    /// epoch. The inviter's root key is never sent.
-    envelopes: Vec<Vec<u8>>,
-    /// Lets the joiner verify the recovery key before enabling recovery.
-    recovery_check: Option<[u8; 32]>,
-    devices: Vec<DeviceEntry>,
-    /// Port the inviter accepts sync connections on, if it listens. The
-    /// joiner pairs it with the inviter's address from the invitation; the
-    /// pairing port itself closes after pairing.
-    inviter_sync_port: Option<u16>,
-    /// Inviter's pairing signature over the transcript and every field.
-    signature: Vec<u8>,
-}
-
-impl JoinGrant {
-    fn signed_message(&self, transcript: &[u8; 32]) -> Vec<u8> {
-        let mut message = b"join-grant\0".to_vec();
-        message.extend_from_slice(transcript);
-        message.push(self.version);
-        message.extend_from_slice(&self.vault_id);
-        message.extend_from_slice(&self.current_epoch.to_be_bytes());
-        message.extend_from_slice(&(self.envelopes.len() as u64).to_be_bytes());
-        for envelope in &self.envelopes {
-            push_field(&mut message, envelope);
-        }
-        match &self.recovery_check {
-            Some(check) => {
-                message.push(1);
-                message.extend_from_slice(check);
-            }
-            None => message.push(0),
-        }
-        message.extend_from_slice(&(self.devices.len() as u64).to_be_bytes());
-        for device in &self.devices {
-            message.extend_from_slice(&device.device_id);
-            message.extend_from_slice(&device.public_key);
-        }
-        match self.inviter_sync_port {
-            Some(port) => {
-                message.push(1);
-                message.extend_from_slice(&port.to_be_bytes());
-            }
-            None => message.push(0),
-        }
-        message
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tamper_devices(&mut self) {
-        self.devices.pop();
-    }
-}
-
 /// Sent by the inviter once the joiner's enrollment proposal is committed.
 /// The keys themselves reach the joiner through committed control state
 /// after it has become a voter, so nothing here is secret.
@@ -312,6 +240,11 @@ impl EnrollmentGrant {
             None => message.push(0),
         }
         message
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_members(&mut self) {
+        self.members.pop();
     }
 
     /// The enrollment proposal, for cancelling it if the joiner never
@@ -469,110 +402,92 @@ pub fn approve_enrollment(
     Ok((request, grant))
 }
 
-/// Completes interim pairing on the inviter: the owner's confirmation
-/// authorizes the joiner directly, with at most one paired device. Call
-/// only after the owner confirmed that both devices show the same short
-/// code, and never on a vault with a control plane.
-///
-/// The grant is built before any side effect, then the token is consumed so
-/// it cannot be replayed, and only then is the joiner authorized.
-/// `sync_port` is where this device accepts sync connections, if it listens.
-pub fn approve_join(
-    vault: &mut Vault,
-    invitations: &mut InvitationStore,
-    peers: &mut PeerStore,
-    review: JoinReview,
-    sync_port: Option<u16>,
-    now: u64,
-) -> Result<JoinGrant> {
-    peers.ensure_capacity()?;
-    let request = &review.request;
-    let material = vault.enrollment_material()?;
-    let recipient_key = HpkePublicKey::from_bytes(request.joiner_hpke_key)?;
-    let envelopes = material
-        .epoch_keys
-        .iter()
-        .map(|(epoch, key)| {
-            Ok(seal_epoch_key(
-                VaultId(material.vault_id),
-                *epoch,
-                DeviceId(request.joiner_public_key),
-                recipient_key,
-                key,
-            )?
-            .to_bytes()
-            .to_vec())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut grant = JoinGrant {
-        version: PAIRING_VERSION,
-        vault_id: material.vault_id,
-        current_epoch: material.current_epoch,
-        envelopes,
-        recovery_check: material.recovery_check,
-        devices: material
-            .devices
-            .iter()
-            .map(|(device_id, public_key)| DeviceEntry {
-                device_id: *device_id,
-                public_key: *public_key,
-            })
-            .collect(),
-        inviter_sync_port: sync_port.filter(|port| *port != 0),
-        signature: Vec::new(),
-    };
-    grant.signature = vault
-        .sign_pairing(&grant.signed_message(&review.transcript))?
-        .to_vec();
-
-    invitations.approve(
-        &InvitationToken::from_bytes(request.token),
-        DeviceId(request.joiner_public_key),
-        now,
-    )?;
-    vault.authorize_device(request.joiner_device_id, request.joiner_public_key)?;
-    peers.add(&Peer {
-        device_id: request.joiner_device_id,
-        public_key: request.joiner_public_key,
-        transport_pin: request.joiner_transport_pin,
-        address: None,
-        paired_at: now,
-    })?;
-    Ok(grant)
-}
-
 /// The joining device's side of pairing.
 pub struct Joiner {
     invitation: Invitation,
-    device: PendingDevice,
-    /// The device's long-lived recipient key, derived from the secret its
-    /// vault will keep.
-    hpke: HpkeKeyPair,
+    device_id: [u8; 16],
+    public_key: [u8; 32],
+    /// The device's long-lived HPKE recipient key.
+    recipient_key: [u8; 32],
+    /// The identity of a device that has no vault yet, with the recipient
+    /// key pair derived from the secret its vault will keep. `None` for a
+    /// device joining with the vault it already has.
+    pending: Option<(PendingDevice, HpkeKeyPair)>,
     transport_pin: [u8; 32],
     transcript: [u8; 32],
 }
 
 impl Joiner {
-    /// Creates this device's identity and the request to send.
+    /// Creates a new device's identity and the request to send.
     /// `transport_pin` is this device's TLS certificate hash.
     pub fn start(
         invitation: Invitation,
         transport_pin: [u8; 32],
         now: u64,
     ) -> Result<(Self, JoinRequest)> {
+        let device = PendingDevice::generate();
+        let hpke = HpkeKeyPair::from_secret(&device.recipient_secret());
+        let (device_id, public_key) = (device.device_id(), device.public_key());
+        let recipient_key = hpke.public().as_bytes();
+        let signer = |message: &[u8]| Ok(device.sign_pairing(message));
+        let mut started = Self::begin(
+            invitation,
+            device_id,
+            public_key,
+            recipient_key,
+            transport_pin,
+            now,
+            signer,
+        )?;
+        started.0.pending = Some((device, hpke));
+        Ok(started)
+    }
+
+    /// Creates the request of a device that already holds a copy of the
+    /// invitation's vault and joins its control plane under the identity it
+    /// has. The vault must be unlocked.
+    pub fn start_with_vault(
+        invitation: Invitation,
+        vault: &Vault,
+        transport_pin: [u8; 32],
+        now: u64,
+    ) -> Result<(Self, JoinRequest)> {
+        if invitation.body.vault_id != vault.vault_id() {
+            return Err(Error::VaultMismatch);
+        }
+        let (device_id, public_key) = own_identity(vault)?;
+        let recipient = HpkeKeyPair::from_secret(&*vault.recipient_secret()?);
+        Self::begin(
+            invitation,
+            device_id,
+            public_key,
+            recipient.public().as_bytes(),
+            transport_pin,
+            now,
+            |message| Ok(vault.sign_pairing(message)?),
+        )
+    }
+
+    fn begin(
+        invitation: Invitation,
+        device_id: [u8; 16],
+        public_key: [u8; 32],
+        recipient_key: [u8; 32],
+        transport_pin: [u8; 32],
+        now: u64,
+        sign: impl FnOnce(&[u8]) -> Result<[u8; 64]>,
+    ) -> Result<(Self, JoinRequest)> {
         if now >= invitation.body.expires_at {
             return Err(Error::InvitationExpired);
         }
-        let device = PendingDevice::generate();
-        let hpke = HpkeKeyPair::from_secret(&device.recipient_secret());
         let body = &invitation.body;
         let mut request = JoinRequest {
             version: PAIRING_VERSION,
             vault_id: body.vault_id,
             token: body.token,
-            joiner_device_id: device.device_id(),
-            joiner_public_key: device.public_key(),
-            joiner_hpke_key: hpke.public().as_bytes(),
+            joiner_device_id: device_id,
+            joiner_public_key: public_key,
+            joiner_hpke_key: recipient_key,
             joiner_transport_pin: transport_pin,
             signature: Vec::new(),
         };
@@ -586,12 +501,14 @@ impl Joiner {
             },
             &request,
         );
-        request.signature = device.sign_pairing(&request_message(&transcript)).to_vec();
+        request.signature = sign(&request_message(&transcript))?.to_vec();
         Ok((
             Self {
                 invitation,
-                device,
-                hpke,
+                device_id,
+                public_key,
+                recipient_key,
+                pending: None,
                 transport_pin,
                 transcript,
             },
@@ -599,11 +516,24 @@ impl Joiner {
         ))
     }
 
+    /// Whether this device joins with the vault it already has.
+    pub fn has_vault(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    pub(crate) fn inviter_transport_pin(&self) -> [u8; 32] {
+        self.invitation.body.inviter_transport_pin
+    }
+
+    pub(crate) fn inviter_addresses(&self) -> &[String] {
+        &self.invitation.body.addresses
+    }
+
     /// This device's ID in the control plane. Start its control-plane node
     /// with it (and [`Joiner::vault_id`]) before the owner confirms, so the
     /// leader can bring it up to date as a learner.
     pub fn control_device(&self) -> osm_vault_membership::DeviceId {
-        device_id_from_bytes(self.device.device_id())
+        device_id_from_bytes(self.device_id)
     }
 
     pub fn vault_id(&self) -> [u8; 32] {
@@ -670,6 +600,37 @@ impl Joiner {
         Ok(members)
     }
 
+    /// Checks the grant, the owner's confirmation, and that committed state
+    /// records this device as an enrolled voter with the keys and
+    /// certificate it sent.
+    fn check_enrolled(
+        &self,
+        grant: &EnrollmentGrant,
+        owner_confirmed: bool,
+        state: &ControlState,
+    ) -> Result<()> {
+        if !owner_confirmed {
+            return Err(Error::NotConfirmed);
+        }
+        self.verify_grant(grant)?;
+        if state.vault_id != self.invitation.body.vault_id {
+            return Err(Error::VaultMismatch);
+        }
+        if !self.enrolled(state) {
+            return Err(Error::EnrollmentPending);
+        }
+        let me = self.control_device();
+        let recorded = state.node(me).ok_or(Error::EnrollmentPending)?;
+        if recorded.public_key != self.public_key
+            || recorded.recipient_key != self.recipient_key
+            || recorded.transport_pin != self.transport_pin
+            || state.authors.get(&me) != Some(&self.public_key)
+        {
+            return Err(Error::ProtocolViolation);
+        }
+        Ok(())
+    }
+
     /// Verifies the grant and creates this device's vault at `path` from
     /// committed control state: its epoch keys come from the envelopes
     /// sealed to it, each checked against the committed key check, and its
@@ -684,34 +645,17 @@ impl Joiner {
         path: impl AsRef<std::path::Path>,
         password: &str,
     ) -> Result<Vault> {
-        if !owner_confirmed {
-            return Err(Error::NotConfirmed);
-        }
-        self.verify_grant(grant)?;
-        let body = &self.invitation.body;
-        if state.vault_id != body.vault_id {
-            return Err(Error::VaultMismatch);
-        }
-        if !self.enrolled(state) {
-            return Err(Error::EnrollmentPending);
-        }
-        let me = self.control_device();
-        let public_key = self.device.public_key();
-        let recorded = state.node(me).ok_or(Error::EnrollmentPending)?;
-        if recorded.public_key != public_key
-            || recorded.recipient_key != self.hpke.public().as_bytes()
-            || recorded.transport_pin != self.transport_pin
-            || state.authors.get(&me) != Some(&public_key)
-        {
-            return Err(Error::ProtocolViolation);
-        }
+        self.check_enrolled(grant, owner_confirmed, state)?;
+        // A device that joins with its own vault finishes in place.
+        let (device, hpke) = self.pending.ok_or(Error::ProtocolViolation)?;
+        let vault_id = self.invitation.body.vault_id;
+        let me = device_id_from_bytes(self.device_id);
         let sealed = state.envelopes.get(&me).ok_or(Error::EnrollmentPending)?;
         let epoch_keys = (1..=state.epoch)
             .map(|epoch| {
                 let envelope = sealed.get(&epoch).ok_or(Error::EnrollmentPending)?;
-                let key = control::open(&body.vault_id, epoch, public_key, &self.hpke, envelope)?;
-                if state.epoch_checks.get(&epoch)
-                    != Some(&epoch_key_check(&body.vault_id, epoch, &key))
+                let key = control::open(&vault_id, epoch, self.public_key, &hpke, envelope)?;
+                if state.epoch_checks.get(&epoch) != Some(&epoch_key_check(&vault_id, epoch, &key))
                 {
                     return Err(Error::EpochKeyMismatch);
                 }
@@ -719,7 +663,7 @@ impl Joiner {
             })
             .collect::<Result<Vec<_>>>()?;
         let material = EnrollmentMaterial {
-            vault_id: body.vault_id,
+            vault_id,
             current_epoch: state.epoch,
             epoch_keys,
             recovery_check: grant.recovery_check,
@@ -734,7 +678,30 @@ impl Joiner {
                 .map(|device| device_id_to_bytes(*device))
                 .collect(),
         };
-        Ok(Vault::join(path, password, self.device, material)?)
+        Ok(Vault::join(path, password, device, material)?)
+    }
+
+    /// Finishes for a device that joined with the vault it already has
+    /// ([`Joiner::start_with_vault`]): verifies the grant and brings
+    /// `vault`, which must be that vault, unlocked, in line with committed
+    /// control state. Its epoch keys are checked against the committed
+    /// checks; nothing it holds is replaced. Fails with `EnrollmentPending`
+    /// until [`Joiner::enrolled`] holds.
+    pub fn finish_in_place(
+        self,
+        grant: &EnrollmentGrant,
+        owner_confirmed: bool,
+        state: &ControlState,
+        vault: &mut Vault,
+    ) -> Result<Reconciled> {
+        self.check_enrolled(grant, owner_confirmed, state)?;
+        if self.pending.is_some()
+            || vault.device_id() != Some(self.device_id)
+            || vault.vault_id() != self.invitation.body.vault_id
+        {
+            return Err(Error::ProtocolViolation);
+        }
+        control::reconcile(vault, state)
     }
 
     /// The short code to compare with the inviter's screen.
@@ -743,89 +710,7 @@ impl Joiner {
     }
 
     pub fn device_id(&self) -> [u8; 16] {
-        self.device.device_id()
-    }
-
-    /// Verifies an interim grant and creates this device's vault at `path`.
-    /// Call with `owner_confirmed` only after the owner compared the short
-    /// codes.
-    pub fn finish(
-        self,
-        grant: &JoinGrant,
-        owner_confirmed: bool,
-        path: impl AsRef<std::path::Path>,
-        password: &str,
-        peers: &mut PeerStore,
-        now: u64,
-    ) -> Result<Vault> {
-        if !owner_confirmed {
-            return Err(Error::NotConfirmed);
-        }
-        let body = &self.invitation.body;
-        if grant.version != PAIRING_VERSION {
-            return Err(Error::UnsupportedVersion);
-        }
-        if grant.vault_id != body.vault_id {
-            return Err(Error::VaultMismatch);
-        }
-        // The inviter's key came from the invitation, not from the channel.
-        verify_pairing_signature(
-            &body.inviter_public_key,
-            &grant.signed_message(&self.transcript),
-            &grant.signature,
-        )
-        .map_err(|_| Error::InvalidSignature)?;
-        let inviter = DeviceEntry {
-            device_id: body.inviter_device_id,
-            public_key: body.inviter_public_key,
-        };
-        if grant.devices.len() > MAX_GRANT_DEVICES
-            || !grant.devices.contains(&inviter)
-            || grant.envelopes.is_empty()
-            || grant.envelopes.len() > MAX_GRANT_EPOCHS
-        {
-            return Err(Error::ProtocolViolation);
-        }
-        // Each envelope is bound to this vault, its epoch, and this device;
-        // `Vault::join` rejects duplicate epochs or a missing current one.
-        let epoch_keys = grant
-            .envelopes
-            .iter()
-            .map(|bytes| {
-                let envelope = EpochKeyEnvelope::from_bytes(bytes)?;
-                let key = open_epoch_key(
-                    &envelope,
-                    VaultId(grant.vault_id),
-                    envelope.epoch(),
-                    DeviceId(self.device.public_key()),
-                    self.hpke.private(),
-                )?;
-                Ok((envelope.epoch(), key))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        peers.ensure_capacity()?;
-        let material = EnrollmentMaterial {
-            vault_id: grant.vault_id,
-            current_epoch: grant.current_epoch,
-            epoch_keys,
-            recovery_check: grant.recovery_check,
-            devices: grant
-                .devices
-                .iter()
-                .map(|device| (device.device_id, device.public_key))
-                .collect(),
-            revoked: Vec::new(),
-        };
-        let peer = Peer {
-            device_id: inviter.device_id,
-            public_key: inviter.public_key,
-            transport_pin: body.inviter_transport_pin,
-            address: sync_address(body.addresses.first(), grant.inviter_sync_port),
-            paired_at: now,
-        };
-        let vault = Vault::join(path, password, self.device, material)?;
-        peers.add(&peer)?;
-        Ok(vault)
+        self.device_id
     }
 }
 
@@ -870,8 +755,8 @@ fn transcript(inviter: &Inviter<'_>, request: &JoinRequest) -> [u8; 32] {
         .into()
 }
 
-/// The inviter's sync address: its pairing host with the sync port from the
-/// signed grant, or the pairing address if it named no sync port.
+/// The inviter's member address: its pairing host with the port from the
+/// signed grant.
 fn sync_address(pairing: Option<&String>, sync_port: Option<u16>) -> Option<String> {
     let pairing = pairing?;
     match (pairing.parse::<std::net::SocketAddr>(), sync_port) {
