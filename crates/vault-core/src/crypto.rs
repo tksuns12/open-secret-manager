@@ -220,6 +220,67 @@ fn recovery_check_mac(recovery: &[u8; KEY_LEN], vault_id: &[u8; 32]) -> Result<H
     Ok(mac)
 }
 
+/// Wraps this device's HPKE recipient secret under its root key.
+pub(crate) fn recipient_key_aad(vault_id: &[u8; 32], device_id: &[u8; DEVICE_ID_LEN]) -> Vec<u8> {
+    let mut aad = b"osm-recipient-key-v1\0".to_vec();
+    aad.extend_from_slice(vault_id);
+    aad.extend_from_slice(device_id);
+    aad
+}
+
+/// Marks a device as removed from the vault, keyed by a subkey of this
+/// device's root key so only a holder of it can write the mark.
+pub(crate) fn device_revocation(
+    key: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+) -> Result<[u8; 32]> {
+    Ok(device_revocation_mac(key, vault_id, device_id)?
+        .finalize()
+        .into_bytes()
+        .into())
+}
+
+pub(crate) fn verify_device_revocation(
+    key: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    tag: &[u8],
+) -> Result<()> {
+    device_revocation_mac(key, vault_id, device_id)?
+        .verify_slice(tag)
+        .map_err(|_| Error::Crypto)
+}
+
+fn device_revocation_mac(
+    key: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+) -> Result<Hmac<Sha256>> {
+    let mut derive = <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| Error::Crypto)?;
+    derive.update(b"osm-device-revocation-key-v1");
+    let subkey = Zeroizing::new(<[u8; 32]>::from(derive.finalize().into_bytes()));
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(subkey.as_ref()).map_err(|_| Error::Crypto)?;
+    mac.update(b"osm-device-revocation-v1\0");
+    mac.update(vault_id);
+    mac.update(device_id);
+    Ok(mac)
+}
+
+/// A public commitment to an epoch key: HMAC-SHA256 keyed by the epoch key
+/// over `osm-epoch-key-check-v1`, NUL, the vault ID, and the 64-bit epoch.
+/// Committed membership records it, so every member can check that the key
+/// it received is the one every other member holds. The key has 256 bits of
+/// entropy, so the check reveals nothing useful about it.
+pub fn epoch_key_check(vault_id: &[u8; 32], epoch: u64, key: &[u8; KEY_LEN]) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(b"osm-epoch-key-check-v1\0");
+    mac.update(vault_id);
+    mac.update(&epoch.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
 /// Compares two keys without an early exit.
 pub(crate) fn keys_equal(left: &[u8; KEY_LEN], right: &[u8; KEY_LEN]) -> bool {
     left.iter()

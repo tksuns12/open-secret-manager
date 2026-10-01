@@ -36,6 +36,12 @@ pub enum Error {
     UpgradeRequiresPassword,
     #[error("this device does not have the key for that epoch yet")]
     MissingEpochKey,
+    /// Committed membership moved the vault to a later key epoch that this
+    /// device has not activated yet. Writes resume once it has.
+    #[error("the vault moved to a new key epoch; unlock and update membership before writing")]
+    EpochPending,
+    #[error("invalid device: {0}")]
+    InvalidDevice(&'static str),
     #[error("quarantine is full; review or discard held revisions")]
     QuarantineFull,
     #[error("too many received revisions are waiting; unlock to process them")]

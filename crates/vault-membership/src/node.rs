@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -7,18 +7,18 @@ use std::{
 
 use openraft::{
     error::{ClientWriteError, RaftError},
-    Config, Raft, RaftNetworkFactory,
+    ChangeMembers, Config, LogId, Raft, RaftNetworkFactory,
 };
-use sha2::{Digest, Sha256};
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
     store::{self, CrashPlan},
-    ControlConfig, ControlRequest, ControlState, DeviceId, DeviceNode, Error, MembershipChange,
-    Outcome, PendingChange, RequestSigner, Result, SignedRequest,
+    ControlConfig, ControlEntry, ControlState, DeviceId, DeviceNode, Error, Forwarder,
+    MembershipChange, Outcome, PendingChange, Result, SignedRequest,
 };
 
-/// How often the leader checks for a pending change to advance.
+/// How often the leader checks for a pending change to advance, and how
+/// long a submission waits before retrying while no leader is known.
 const DRIVE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Raft timing for devices on a local network.
@@ -40,6 +40,9 @@ pub struct NodeOptions {
     pub config: Arc<Config>,
     /// How long a write may wait for a quorum before `QuorumUnavailable`.
     pub write_timeout: Duration,
+    /// Passes requests submitted on a follower to the leader. Without one,
+    /// a follower returns `NotLeader`.
+    pub forwarder: Option<Arc<dyn Forwarder>>,
     /// Test-only failure injection.
     pub crash: CrashPlan,
 }
@@ -49,7 +52,20 @@ impl Default for NodeOptions {
         Self {
             config: default_config(),
             write_timeout: Duration::from_secs(10),
+            forwarder: None,
             crash: CrashPlan::default(),
+        }
+    }
+}
+
+impl Outcome {
+    /// Accepted now, or accepted by an earlier submission of the same
+    /// request.
+    pub fn is_accepted(&self) -> bool {
+        match self {
+            Outcome::Accepted => true,
+            Outcome::AlreadyApplied(earlier) => earlier.is_accepted(),
+            _ => false,
         }
     }
 }
@@ -57,38 +73,43 @@ impl Default for NodeOptions {
 /// One device's member of the vault's control plane.
 ///
 /// Membership changes are themselves replicated commands: a signed
-/// [`ControlRequest::ProposeChange`] is committed first, and whichever node
-/// is leader then drives it (learner catch-up, joint, then uniform
-/// membership) and commits a [`ControlRequest::CompleteChange`]. Because the
+/// [`crate::ControlRequest::ProposeChange`] is committed first, and
+/// whichever node is leader then drives it (learner catch-up, joint, then
+/// uniform membership) and records [`ControlEntry::Complete`]. Because the
 /// intent lives in the log, a leader crash at any step leaves the change
-/// pending, and the next leader resumes the same request.
+/// pending, and the next leader resumes the same request. Driving a change
+/// needs no signature, so it continues while the leader's vault is locked.
 pub struct ControlNode {
     device: DeviceId,
     raft: Raft<ControlConfig>,
     state: Arc<Mutex<ControlState>>,
+    applied: watch::Receiver<Option<LogId<DeviceId>>>,
     write_timeout: Duration,
+    forwarder: Option<Arc<dyn Forwarder>>,
     stop: watch::Sender<bool>,
     driver: JoinHandle<()>,
 }
 
 impl ControlNode {
-    /// Opens the node's database at `path` and starts Raft. A node that ran
-    /// before resumes from its persisted log, vote, and state.
+    /// Opens the node's database at `path` and starts Raft as `device` in
+    /// the control plane of `vault_id`. A node that ran before resumes from
+    /// its persisted log, vote, and state; a database for another vault is
+    /// refused.
     pub async fn start(
         path: impl AsRef<Path>,
-        signer: Arc<dyn RequestSigner>,
+        device: DeviceId,
+        vault_id: [u8; 32],
         network: impl RaftNetworkFactory<ControlConfig>,
         options: NodeOptions,
     ) -> Result<Self> {
-        let device = signer.device();
-        let (log, state_machine) = store::open(path, options.crash)?;
+        let (log, state_machine) = store::open(path, vault_id, options.crash)?;
         let state = state_machine.state_handle();
+        let applied = state_machine.applied_handle();
         let raft = Raft::new(device, options.config, network, log, state_machine).await?;
         let (stop, stopped) = watch::channel(false);
         let driver = tokio::spawn(drive(
             raft.clone(),
             state.clone(),
-            signer,
             options.write_timeout,
             stopped,
         ));
@@ -96,7 +117,9 @@ impl ControlNode {
             device,
             raft,
             state,
+            applied,
             write_timeout: options.write_timeout,
+            forwarder: options.forwarder,
             stop,
             driver,
         })
@@ -118,6 +141,12 @@ impl ControlNode {
             .unwrap_or_default()
     }
 
+    /// Changes each time newly applied state is on disk, so a caller can
+    /// bring its vault up to date.
+    pub fn subscribe(&self) -> watch::Receiver<Option<LogId<DeviceId>>> {
+        self.applied.clone()
+    }
+
     pub fn current_leader(&self) -> Option<DeviceId> {
         self.raft.metrics().borrow().current_leader
     }
@@ -132,13 +161,46 @@ impl ControlNode {
     }
 
     /// Commits a signed request and returns the state machine's verdict.
+    /// On a follower the request goes to the leader through the forwarder;
+    /// while no leader is known it is retried.
     ///
-    /// Fails with `NotLeader` on a follower, and with `QuorumUnavailable`
-    /// if no quorum commits it in time. In that case the outcome is unknown
-    /// until a quorum returns; resubmitting the same request is safe because
-    /// request IDs are deduplicated.
+    /// Fails with `QuorumUnavailable` if no quorum commits it in time. In
+    /// that case the outcome is unknown until a quorum returns; resubmitting
+    /// the same request is safe because request IDs are deduplicated (see
+    /// [`Outcome::is_accepted`]).
     pub async fn submit(&self, request: SignedRequest) -> Result<Outcome> {
-        submit(&self.raft, request, self.write_timeout).await
+        let attempt = async {
+            loop {
+                match self.submit_once(request.clone()).await {
+                    Err(Error::NotLeader(_) | Error::QuorumUnavailable) => {
+                        tokio::time::sleep(DRIVE_INTERVAL).await;
+                    }
+                    other => return other,
+                }
+            }
+        };
+        tokio::time::timeout(self.write_timeout, attempt)
+            .await
+            .unwrap_or(Err(Error::QuorumUnavailable))
+    }
+
+    async fn submit_once(&self, request: SignedRequest) -> Result<Outcome> {
+        match self
+            .raft
+            .client_write(ControlEntry::Request(request.clone()))
+            .await
+        {
+            Ok(response) => Ok(response.data),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+                match (forward.leader_id, &self.forwarder) {
+                    (Some(leader), Some(forwarder)) if leader != self.device => {
+                        forwarder.forward(leader, request).await
+                    }
+                    (leader, _) => Err(Error::NotLeader(leader)),
+                }
+            }
+            Err(error) => Err(Error::Raft(error.to_string())),
+        }
     }
 
     /// Stops the node. Its database keeps everything needed to restart.
@@ -149,41 +211,12 @@ impl ControlNode {
     }
 }
 
-async fn submit(
-    raft: &Raft<ControlConfig>,
-    request: SignedRequest,
-    timeout: Duration,
-) -> Result<Outcome> {
-    match tokio::time::timeout(timeout, raft.client_write(request)).await {
-        Err(_) => Err(Error::QuorumUnavailable),
-        Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward)))) => {
-            Err(Error::NotLeader(forward.leader_id))
-        }
-        Ok(Err(error)) => Err(Error::Raft(error.to_string())),
-        Ok(Ok(response)) => Ok(response.data),
-    }
-}
-
-/// The stable ID of the completion for `request_id`, so a completion
-/// retried by a new leader is recognized as the same request.
-fn completion_id(request_id: &[u8; 16]) -> [u8; 16] {
-    let digest = Sha256::new()
-        .chain_update(b"osm-complete-change-v1\0")
-        .chain_update(request_id)
-        .finalize();
-    let mut id = [0; 16];
-    id.copy_from_slice(&digest[..16]);
-    id
-}
-
 async fn drive(
     raft: Raft<ControlConfig>,
     state: Arc<Mutex<ControlState>>,
-    signer: Arc<dyn RequestSigner>,
     timeout: Duration,
     mut stopped: watch::Receiver<bool>,
 ) {
-    let device = signer.device();
     loop {
         tokio::select! {
             _ = stopped.changed() => return,
@@ -192,36 +225,30 @@ async fn drive(
         let leading = {
             let metrics = raft.metrics();
             let metrics = metrics.borrow();
-            metrics.running_state.is_ok() && metrics.current_leader == Some(device)
+            metrics.running_state.is_ok() && metrics.current_leader == Some(metrics.id)
         };
         if !leading {
             continue;
         }
-        let pending = state.lock().ok().and_then(|state| state.pending.clone());
-        if let Some(pending) = pending {
+        let applied = state.lock().ok().map(|state| state.clone());
+        if let Some(applied) = applied {
             // Every step is idempotent; a failed or timed-out step is simply
             // retried on a later tick, possibly by another leader.
-            let _ = tokio::time::timeout(
-                timeout,
-                advance(&raft, &state, signer.as_ref(), &pending, timeout),
-            )
-            .await;
+            let _ = tokio::time::timeout(timeout, advance(&raft, &applied)).await;
         }
     }
 }
 
-async fn advance(
-    raft: &Raft<ControlConfig>,
-    state: &Mutex<ControlState>,
-    signer: &dyn RequestSigner,
-    pending: &PendingChange,
-    timeout: Duration,
-) -> Result<()> {
+async fn advance(raft: &Raft<ControlConfig>, state: &ControlState) -> Result<()> {
+    let Some(pending) = &state.pending else {
+        return remove_stale_learners(raft, state, None).await;
+    };
     // A new voter first catches up as a learner. Catch-up is checked
     // explicitly on every attempt rather than trusted to a blocking call: a
     // learner entry can commit while its device is unreachable, and a
     // configuration that includes it would still reach a majority without it.
-    if let MembershipChange::Enroll { device, node } = &pending.change {
+    if let (MembershipChange::Enroll { device, node }, false) = (&pending.change, pending.cancelled)
+    {
         let known = raft
             .metrics()
             .borrow()
@@ -248,25 +275,55 @@ async fn advance(
             return Ok(());
         }
     }
-    let committed = state
-        .lock()
-        .map(|state| state.is_uniform() && state.voters() == pending.target_voters)
-        .unwrap_or(false);
-    if !committed {
+    if !(state.is_uniform() && state.voters() == pending.target_voters) {
         // Commits the joint configuration and then the uniform one; from a
-        // joint configuration left by a crash, it finishes the change.
+        // joint configuration left by a crash, it finishes the change. A
+        // device dropped from the target is removed outright, not kept as a
+        // learner.
         raft.change_membership(pending.target_voters.clone(), false)
             .await
             .map_err(|error| Error::Raft(error.to_string()))?;
         return Ok(());
     }
-    let completion = SignedRequest::sign(
-        completion_id(&pending.request_id),
-        signer.device(),
-        ControlRequest::CompleteChange {
-            request_id: pending.request_id,
-        },
-        signer,
-    );
-    submit(raft, completion, timeout).await.map(|_| ())
+    remove_stale_learners(raft, state, Some(pending)).await?;
+    raft.client_write(ControlEntry::Complete {
+        request_id: pending.request_id,
+    })
+    .await
+    .map_err(|error| Error::Raft(error.to_string()))?;
+    Ok(())
+}
+
+/// Removes learners that no pending enrollment is waiting for, such as the
+/// device of a cancelled enrollment. Only from a committed, uniform
+/// configuration, which is the only one a new change may start from.
+async fn remove_stale_learners(
+    raft: &Raft<ControlConfig>,
+    state: &ControlState,
+    pending: Option<&PendingChange>,
+) -> Result<()> {
+    let effective = raft.metrics().borrow().membership_config.clone();
+    if effective.log_id() != state.membership.log_id() || !state.is_uniform() {
+        return Ok(());
+    }
+    let enrolling = pending
+        .filter(|pending| !pending.cancelled)
+        .and_then(|pending| match &pending.change {
+            MembershipChange::Enroll { device, .. } => Some(*device),
+            MembershipChange::Remove { .. } => None,
+        });
+    let voters = state.voters();
+    let stale: BTreeSet<DeviceId> = effective
+        .membership()
+        .nodes()
+        .map(|(device, _)| *device)
+        .filter(|device| !voters.contains(device) && Some(*device) != enrolling)
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    raft.change_membership(ChangeMembers::RemoveNodes(stale), false)
+        .await
+        .map_err(|error| Error::Raft(error.to_string()))?;
+    Ok(())
 }

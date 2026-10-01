@@ -1,18 +1,30 @@
 //! The control-plane state machine. Applying a log entry depends only on the
 //! entry and the state before it, so every node reaches the same state.
+//!
+//! Besides membership, the state carries the vault's key epochs: the current
+//! epoch, a check committing every member to the same key for each epoch,
+//! and each device's epoch keys sealed to its recipient key. A removal
+//! carries the next epoch's key for every remaining voter, and that epoch
+//! becomes current only in the entry that completes the removal.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use ed25519_dalek::VerifyingKey;
 use openraft::{EntryPayload, LogId, StoredMembership};
+use osm_vault_sync::{EpochKeyEnvelope, HpkePublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ControlConfig, ControlRequest, DeviceId, DeviceNode, MembershipChange, Outcome, Rejection,
-    SignedRequest,
+    ControlConfig, ControlEntry, ControlRequest, DeviceId, DeviceNode, MembershipChange, Outcome,
+    Rejection, Rotation, SignedRequest,
 };
 
 /// How many applied request IDs are remembered for deduplication.
 const REMEMBERED_REQUESTS: usize = 4096;
+/// Bounds that keep a single request, and the state, reasonably sized.
+const MAX_EPOCH: u64 = 1 << 32;
+const MAX_EPOCHS: usize = 1024;
+const MAX_AUTHORS: usize = 10_000;
 
 /// A membership change accepted by the cluster and not yet completed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,10 +34,27 @@ pub struct PendingChange {
     pub change: MembershipChange,
     /// The voter set once the change has taken effect.
     pub target_voters: BTreeSet<DeviceId>,
+    /// An enrollment that was cancelled: the change now leads back to the
+    /// voters without the device.
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+impl PendingChange {
+    /// The device being enrolled or removed.
+    pub fn subject(&self) -> DeviceId {
+        match &self.change {
+            MembershipChange::Enroll { device, .. } | MembershipChange::Remove { device, .. } => {
+                *device
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlState {
+    /// The vault this control plane belongs to; requests are signed for it.
+    pub vault_id: [u8; 32],
     pub last_applied: Option<LogId<DeviceId>>,
     /// The last membership entry applied, i.e. the committed membership.
     pub membership: StoredMembership<DeviceId, DeviceNode>,
@@ -33,12 +62,33 @@ pub struct ControlState {
     /// Recently accepted request IDs, oldest first. Only accepted requests
     /// are remembered: they are the ones with effects that must not repeat.
     /// A rejected request had no effect, so resubmitting it is evaluated
-    /// again; a leader's derived completion ID can never be stuck behind a
-    /// completion that arrived too early.
+    /// again.
     pub applied_requests: VecDeque<([u8; 16], Outcome)>,
+    /// The epoch new revisions are written under; 0 before genesis.
+    pub epoch: u64,
+    /// The key check of every epoch from 1 to `epoch`.
+    pub epoch_checks: BTreeMap<u64, [u8; 32]>,
+    /// Every device whose revisions the vault accepts or has accepted, with
+    /// its signing key: the genesis authors and every enrolled device.
+    pub authors: BTreeMap<DeviceId, [u8; 32]>,
+    /// Removed devices, each with the device that removed it. Their stored
+    /// revisions stay valid; they never rejoin.
+    pub removed: BTreeMap<DeviceId, DeviceId>,
+    /// The epochs whose keys each voter has been given.
+    pub keys_held: BTreeMap<DeviceId, BTreeSet<u64>>,
+    /// Epoch keys sealed to each device, by epoch. The founding device
+    /// holds its keys without envelopes.
+    pub envelopes: BTreeMap<DeviceId, BTreeMap<u64, Vec<u8>>>,
 }
 
 impl ControlState {
+    pub fn new(vault_id: [u8; 32]) -> Self {
+        Self {
+            vault_id,
+            ..Self::default()
+        }
+    }
+
     pub fn voters(&self) -> BTreeSet<DeviceId> {
         self.membership.voter_ids().collect()
     }
@@ -59,6 +109,29 @@ impl ControlState {
             .map(|(_, outcome)| outcome)
     }
 
+    /// Epochs up to the current one whose keys `device`, a voter, has not
+    /// been given yet. Empty for a device that is not a voter.
+    pub fn missing_epochs(&self, device: DeviceId) -> Vec<u64> {
+        if !self.voters().contains(&device) {
+            return Vec::new();
+        }
+        let held = self.keys_held.get(&device);
+        (1..=self.epoch)
+            .filter(|epoch| !held.is_some_and(|held| held.contains(epoch)))
+            .collect()
+    }
+
+    /// Whether `device` is a voter that a pending change does not concern,
+    /// so it is a full member.
+    pub fn is_settled_member(&self, device: DeviceId) -> bool {
+        self.is_uniform()
+            && self.voters().contains(&device)
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.subject() != device)
+    }
+
     pub(crate) fn apply(
         &mut self,
         log_id: LogId<DeviceId>,
@@ -71,7 +144,10 @@ impl ControlState {
                 self.membership = StoredMembership::new(Some(log_id), membership.clone());
                 Outcome::Recorded
             }
-            EntryPayload::Normal(request) => self.apply_request(request),
+            EntryPayload::Normal(ControlEntry::Request(request)) => self.apply_request(request),
+            EntryPayload::Normal(ControlEntry::Complete { request_id }) => {
+                self.complete(request_id)
+            }
         }
     }
 
@@ -99,56 +175,257 @@ impl ControlState {
         let Some(requester) = self.node(signed.requester) else {
             return Outcome::Rejected(Rejection::Unauthorized);
         };
-        if !signed.verify(&requester.public_key) {
+        if !signed.verify(&self.vault_id, &requester.public_key) {
             return Outcome::Rejected(Rejection::BadSignature);
         }
-        match &signed.request {
-            ControlRequest::ProposeChange(change) => {
-                if self.pending.is_some() {
-                    return Outcome::Rejected(Rejection::ChangeInProgress);
-                }
-                let mut target = self.voters();
-                match change {
-                    MembershipChange::Enroll { device, .. } => {
-                        if !target.insert(*device) {
-                            return Outcome::Rejected(Rejection::InvalidChange(
-                                "device is already a voter".into(),
-                            ));
-                        }
-                    }
-                    MembershipChange::Remove { device } => {
-                        if !target.remove(device) {
-                            return Outcome::Rejected(Rejection::InvalidChange(
-                                "device is not a voter".into(),
-                            ));
-                        }
-                        if target.is_empty() {
-                            return Outcome::Rejected(Rejection::InvalidChange(
-                                "the last voter cannot be removed".into(),
-                            ));
-                        }
-                    }
-                }
-                self.pending = Some(PendingChange {
-                    request_id: signed.request_id,
-                    requester: signed.requester,
-                    change: change.clone(),
-                    target_voters: target,
-                });
-                Outcome::Accepted
-            }
-            ControlRequest::CompleteChange { request_id } => {
-                let effective = self.pending.as_ref().is_some_and(|pending| {
-                    pending.request_id == *request_id
-                        && self.is_uniform()
-                        && self.voters() == pending.target_voters
-                });
-                if !effective {
-                    return Outcome::Rejected(Rejection::NotPending);
-                }
-                self.pending = None;
-                Outcome::Accepted
-            }
+        let result = match &signed.request {
+            ControlRequest::Genesis {
+                epoch,
+                checks,
+                authors,
+            } => self.genesis(signed.requester, *epoch, checks, authors),
+            _ if self.epoch == 0 => Err(Rejection::NotInitialized),
+            ControlRequest::ProposeChange(change) => self.propose(signed, change),
+            ControlRequest::CancelEnrollment { request_id } => self.cancel(request_id),
+            ControlRequest::GrantKeys { device, envelopes } => self.grant(*device, envelopes),
+        };
+        match result {
+            Ok(()) => Outcome::Accepted,
+            Err(rejection) => Outcome::Rejected(rejection),
         }
     }
+
+    fn genesis(
+        &mut self,
+        founder: DeviceId,
+        epoch: u64,
+        checks: &[[u8; 32]],
+        authors: &[(DeviceId, [u8; 32])],
+    ) -> Result<(), Rejection> {
+        if self.epoch != 0 {
+            return Err(invalid("the control plane is already founded"));
+        }
+        if epoch == 0 || epoch as usize > MAX_EPOCHS || checks.len() as u64 != epoch {
+            return Err(invalid("genesis needs a check for every epoch"));
+        }
+        if authors.len() > MAX_AUTHORS {
+            return Err(invalid("too many authors"));
+        }
+        let mut author_keys = BTreeMap::new();
+        for (device, public_key) in authors {
+            if VerifyingKey::from_bytes(public_key).is_err()
+                || author_keys.insert(*device, *public_key).is_some()
+            {
+                return Err(invalid("invalid author list"));
+            }
+        }
+        // Every voter is an author, with the key membership records.
+        for voter in self.voters() {
+            let key = self.node(voter).map(|node| node.public_key);
+            match author_keys.get(&voter) {
+                Some(listed) if Some(*listed) != key => {
+                    return Err(invalid("an author's key differs from its voter key"))
+                }
+                Some(_) => {}
+                None => {
+                    author_keys.insert(voter, key.unwrap_or_default());
+                }
+            }
+        }
+        self.epoch = epoch;
+        self.epoch_checks = (1..=epoch).zip(checks.iter().copied()).collect();
+        self.authors = author_keys;
+        self.keys_held.insert(founder, (1..=epoch).collect());
+        Ok(())
+    }
+
+    fn propose(
+        &mut self,
+        signed: &SignedRequest,
+        change: &MembershipChange,
+    ) -> Result<(), Rejection> {
+        if self.pending.is_some() {
+            return Err(Rejection::ChangeInProgress);
+        }
+        let mut target = self.voters();
+        match change {
+            MembershipChange::Enroll { device, node } => {
+                if self.removed.contains_key(device) {
+                    return Err(invalid("a removed device cannot rejoin"));
+                }
+                if !target.insert(*device) {
+                    return Err(invalid("device is already a voter"));
+                }
+                if self
+                    .authors
+                    .get(device)
+                    .is_some_and(|key| *key != node.public_key)
+                {
+                    return Err(invalid("device is an author with a different key"));
+                }
+                if VerifyingKey::from_bytes(&node.public_key).is_err()
+                    || HpkePublicKey::from_bytes(node.recipient_key).is_err()
+                {
+                    return Err(invalid("invalid device keys"));
+                }
+            }
+            MembershipChange::Remove { device, rotation } => {
+                if *device == signed.requester {
+                    return Err(invalid("a device cannot remove itself"));
+                }
+                if !target.remove(device) {
+                    return Err(invalid("device is not a voter"));
+                }
+                self.check_rotation(rotation, &target)?;
+            }
+        }
+        self.pending = Some(PendingChange {
+            request_id: signed.request_id,
+            requester: signed.requester,
+            change: change.clone(),
+            target_voters: target,
+            cancelled: false,
+        });
+        Ok(())
+    }
+
+    /// The rotation introduces the next epoch with exactly one valid
+    /// envelope for each remaining voter.
+    fn check_rotation(
+        &self,
+        rotation: &Rotation,
+        remaining: &BTreeSet<DeviceId>,
+    ) -> Result<(), Rejection> {
+        if rotation.epoch != self.epoch + 1 || rotation.epoch > MAX_EPOCH {
+            return Err(invalid("a removal must introduce the next epoch"));
+        }
+        let recipients: BTreeSet<DeviceId> = rotation
+            .envelopes
+            .iter()
+            .map(|(device, _)| *device)
+            .collect();
+        if recipients.len() != rotation.envelopes.len() || &recipients != remaining {
+            return Err(invalid(
+                "the new key must be sealed to each remaining voter",
+            ));
+        }
+        for (device, envelope) in &rotation.envelopes {
+            self.check_envelope(*device, rotation.epoch, envelope)?;
+        }
+        Ok(())
+    }
+
+    /// The envelope is for this vault and `epoch`, and is sealed to
+    /// `device`'s keys as membership records them.
+    fn check_envelope(
+        &self,
+        device: DeviceId,
+        epoch: u64,
+        envelope: &[u8],
+    ) -> Result<(), Rejection> {
+        let node = self
+            .node(device)
+            .ok_or_else(|| invalid("envelope for an unknown device"))?;
+        let envelope =
+            EpochKeyEnvelope::from_bytes(envelope).map_err(|_| invalid("malformed envelope"))?;
+        if envelope.vault_id().0 != self.vault_id
+            || envelope.epoch() != epoch
+            || envelope.recipient().0 != node.public_key
+            || envelope.recipient_key().as_bytes() != node.recipient_key
+        {
+            return Err(invalid("envelope is not sealed to that device and epoch"));
+        }
+        Ok(())
+    }
+
+    fn cancel(&mut self, request_id: &[u8; 16]) -> Result<(), Rejection> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Err(Rejection::NotPending);
+        };
+        let MembershipChange::Enroll { device, .. } = &pending.change else {
+            return Err(Rejection::NotPending);
+        };
+        if pending.request_id != *request_id || pending.cancelled {
+            return Err(Rejection::NotPending);
+        }
+        // The device never received keys: grants wait until its enrollment
+        // completes. The leader now steers back to the voters without it.
+        pending.target_voters.remove(device);
+        pending.cancelled = true;
+        Ok(())
+    }
+
+    fn grant(&mut self, device: DeviceId, envelopes: &[Vec<u8>]) -> Result<(), Rejection> {
+        if !self.is_settled_member(device) {
+            return Err(invalid(
+                "keys go only to a voter whose enrollment is complete",
+            ));
+        }
+        if envelopes.is_empty() || envelopes.len() > MAX_EPOCHS {
+            return Err(invalid("invalid number of envelopes"));
+        }
+        let missing: BTreeSet<u64> = self.missing_epochs(device).into_iter().collect();
+        let mut granted = BTreeMap::new();
+        for envelope in envelopes {
+            let epoch = EpochKeyEnvelope::from_bytes(envelope)
+                .map_err(|_| invalid("malformed envelope"))?
+                .epoch();
+            if !missing.contains(&epoch) || granted.contains_key(&epoch) {
+                return Err(invalid("the device already holds that epoch's key"));
+            }
+            self.check_envelope(device, epoch, envelope)?;
+            granted.insert(epoch, envelope.clone());
+        }
+        for (epoch, envelope) in granted {
+            self.record_key(device, epoch, envelope);
+        }
+        Ok(())
+    }
+
+    fn record_key(&mut self, device: DeviceId, epoch: u64, envelope: Vec<u8>) {
+        self.keys_held.entry(device).or_default().insert(epoch);
+        self.envelopes
+            .entry(device)
+            .or_default()
+            .insert(epoch, envelope);
+    }
+
+    /// Applies the leader's record that the pending change took effect.
+    /// Not deduplicated by ID: once accepted, the change is no longer
+    /// pending, so a repeat is simply `NotPending`.
+    fn complete(&mut self, request_id: &[u8; 16]) -> Outcome {
+        let effective = self.pending.as_ref().is_some_and(|pending| {
+            pending.request_id == *request_id
+                && self.is_uniform()
+                && self.voters() == pending.target_voters
+        });
+        if !effective {
+            return Outcome::Rejected(Rejection::NotPending);
+        }
+        let Some(pending) = self.pending.take() else {
+            return Outcome::Rejected(Rejection::NotPending);
+        };
+        match pending.change {
+            MembershipChange::Enroll { device, node } => {
+                if !pending.cancelled {
+                    self.authors.insert(device, node.public_key);
+                }
+            }
+            MembershipChange::Remove { device, rotation } => {
+                self.epoch = rotation.epoch;
+                self.epoch_checks.insert(rotation.epoch, rotation.check);
+                for (recipient, envelope) in rotation.envelopes {
+                    self.record_key(recipient, rotation.epoch, envelope);
+                }
+                self.keys_held.remove(&device);
+                self.envelopes.remove(&device);
+                self.removed.insert(device, pending.requester);
+            }
+        }
+        Outcome::Accepted
+    }
+}
+
+fn invalid(reason: &str) -> Rejection {
+    Rejection::InvalidChange(reason.into())
 }

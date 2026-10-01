@@ -11,11 +11,11 @@ use crate::{
     SyncSession,
 };
 
-const NOW: u64 = 1_800_000_000;
+pub(crate) const NOW: u64 = 1_800_000_000;
 /// The sans-IO tests never open a TLS connection, so any pin will do.
-const JOINER_PIN: [u8; 32] = [7; 32];
+pub(crate) const JOINER_PIN: [u8; 32] = [7; 32];
 
-fn address() -> Vec<String> {
+pub(crate) fn address() -> Vec<String> {
     vec!["127.0.0.1:1".to_owned()]
 }
 
@@ -34,7 +34,7 @@ fn inviter(dir: &Path) -> Device {
     }
 }
 
-fn login(title: &str, password: &str) -> Item {
+pub(crate) fn login(title: &str, password: &str) -> Item {
     let mut item = Item::new(title);
     item.username = "owner@example.test".into();
     item.password = password.into();
@@ -42,7 +42,7 @@ fn login(title: &str, password: &str) -> Item {
 }
 
 /// Sends a pairing message through the real frame encoding.
-fn over_wire<T: serde::Serialize + serde::de::DeserializeOwned>(message: &T) -> T {
+pub(crate) fn over_wire<T: serde::Serialize + serde::de::DeserializeOwned>(message: &T) -> T {
     let frame = encode_frame(message).unwrap();
     let mut decoder = FrameDecoder::default();
     decoder.push(&frame).unwrap();
@@ -164,7 +164,7 @@ fn run_sync(
     ))
 }
 
-fn sync(a: &mut Vault, b: &mut Vault) -> (SyncReport, SyncReport) {
+pub(crate) fn sync(a: &mut Vault, b: &mut Vault) -> (SyncReport, SyncReport) {
     let (complete, report_a, report_b) = run_sync(a, b, |_, _| Fault::Deliver).unwrap();
     assert!(complete);
     (report_a, report_b)
@@ -497,18 +497,18 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
         Err(Error::Sync(osm_vault_sync::Error::InvitationReplay))
     ));
 
-    // One paired device is the limit until committed membership exists.
-    assert!(matches!(
-        invite(
-            &a.vault,
-            &mut a.invitations,
-            &mut a.peers,
-            address(),
-            NOW,
-            300
-        ),
-        Err(Error::PeerLimit)
-    ));
+    // Interim pairing allows one paired device; enrollment through the
+    // control plane has no such limit, so inviting still works.
+    assert!(matches!(a.peers.ensure_capacity(), Err(Error::PeerLimit)));
+    assert!(invite(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        address(),
+        NOW,
+        300
+    )
+    .is_ok());
 }
 
 #[test]

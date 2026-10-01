@@ -14,12 +14,17 @@ The repository is deliberately split at the security boundary:
   integration work, not hidden behind this crate.
 - `crates/vault-peer` owns owner-confirmed pairing and the revision sync
   protocol as sans-IO steps over bounded frames, carried over TLS 1.3 with
-  both device certificates pinned. The `osm-peer` binary is a development
-  CLI for pairing and syncing two vaults from separate processes.
+  both device certificates pinned, and couples each vault to the control
+  plane (enrollment, removal with key rotation, reconciliation). The
+  `osm-peer` binary is a development CLI for pairing and syncing two vaults
+  from separate processes.
 - `crates/vault-membership` is the membership control plane on OpenRaft:
   signed enrollment and removal requests decided by a Raft majority, with
-  SQLite-backed log and state. It runs in-process in tests; wiring it to
-  devices and to key rotation is the remaining Phase 4 work.
+  SQLite-backed log and state. It also decides key epochs: a removal
+  carries the next epoch key sealed to every remaining device, active only
+  once the removal completes. It runs in-process in tests; carrying its
+  RPCs over pinned TLS and running it in the desktop app is the remaining
+  Phase 4 work.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
   route from the interface to the Rust core.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and
@@ -28,13 +33,14 @@ The repository is deliberately split at the security boundary:
   desktop session adapter is installed.
 
 The prototype is intentionally offline-first. Local vault use does not depend
-on a peer or a network. Two devices can pair (owner-confirmed, one peer until
-committed membership exists) and sync over pinned TLS; a locked device stores
-what it receives and verifies it at the next unlock. The desktop app pairs from
-its Devices panel and syncs automatically on the local network; there is no
-discovery beyond the address in the invitation. Membership changes and key
-rotation remain blocked at the OpenRaft integration boundary until a committed
-majority adapter exists.
+on a peer or a network. Two devices can pair and sync over pinned TLS; a
+locked device stores what it receives and verifies it at the next unlock. The
+desktop app pairs from its Devices panel (still the interim, owner-confirmed
+path with one peer) and syncs automatically on the local network; there is no
+discovery beyond the address in the invitation. In the libraries, pairing
+instead proposes the new device to the control plane, so any number of
+devices can join, and removing a device rotates the vault key; the desktop
+app adopts this once the control plane runs over the network.
 
 ## Development
 

@@ -6,14 +6,22 @@
 //! [`verify_rpc_sender`] does. [`Router`] is an in-process transport for
 //! tests: it knows each connection's true sender, models partitions, and
 //! applies the same check the TLS transport will.
+//!
+//! Only the leader appends to the log, so a request submitted on a follower
+//! is passed to the leader by a [`Forwarder`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use openraft::{
-    error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable},
+    error::{
+        ClientWriteError, InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError,
+        Unreachable,
+    },
     network::RPCOption,
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
@@ -22,7 +30,17 @@ use openraft::{
     Raft, RaftNetwork, RaftNetworkFactory, Vote,
 };
 
-use crate::{ControlConfig, DeviceId, DeviceNode};
+use crate::{ControlConfig, ControlEntry, DeviceId, DeviceNode, Error, Outcome, SignedRequest};
+
+/// Passes a signed request to the current leader and returns its verdict.
+/// The request is self-authenticating, so the leader needs nothing else.
+pub trait Forwarder: Send + Sync + 'static {
+    fn forward(
+        &self,
+        leader: DeviceId,
+        request: SignedRequest,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<Outcome>> + Send + '_>>;
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -100,6 +118,14 @@ impl Router {
             router: self.clone(),
             from: device,
         }
+    }
+
+    /// Forwards `device`'s requests to the leader, subject to partitions.
+    pub fn forwarder(&self, device: DeviceId) -> Arc<dyn Forwarder> {
+        Arc::new(RouterForwarder {
+            router: self.clone(),
+            from: device,
+        })
     }
 
     fn target(&self, from: DeviceId, to: DeviceId) -> Result<Raft<ControlConfig>, Unreachable> {
@@ -205,5 +231,32 @@ impl RaftNetwork<ControlConfig> for Connection {
         _option: RPCOption,
     ) -> Rpc<VoteResponse<DeviceId>> {
         self.router.vote(self.from, self.to, rpc).await
+    }
+}
+
+struct RouterForwarder {
+    router: Router,
+    from: DeviceId,
+}
+
+impl Forwarder for RouterForwarder {
+    fn forward(
+        &self,
+        leader: DeviceId,
+        request: SignedRequest,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<Outcome>> + Send + '_>> {
+        Box::pin(async move {
+            let raft = self
+                .router
+                .target(self.from, leader)
+                .map_err(|_| Error::QuorumUnavailable)?;
+            match raft.client_write(ControlEntry::Request(request)).await {
+                Ok(response) => Ok(response.data),
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+                    Err(Error::NotLeader(forward.leader_id))
+                }
+                Err(error) => Err(Error::Raft(error.to_string())),
+            }
+        })
     }
 }

@@ -3,18 +3,34 @@
 //! 1. The inviter issues an [`Invitation`] and shows it out of band (for
 //!    example as a QR code). It carries a one-use token and the inviter's
 //!    device key, which the joiner pins.
-//! 2. The joiner creates its own device identity and a [`JoinRequest`] signed
-//!    with it, bound to a transcript of both identities and the token.
+//! 2. The joiner creates its own device identity, including the HPKE
+//!    recipient key it keeps for life, and a [`JoinRequest`] signed with it,
+//!    bound to a transcript of both identities and the token.
 //! 3. The inviter reviews the request. Both devices display the same short
 //!    code derived from the transcript, and the owner compares them.
-//! 4. After the owner confirms, the inviter consumes the token, authorizes
-//!    the joiner as a revision author, and returns a signed [`JoinGrant`]
-//!    carrying the vault key sealed to the joiner with HPKE.
-//! 5. After the owner confirms on the joiner too, it verifies the grant and
-//!    creates its own copy of the vault. Revisions then arrive by sync.
+//! 4. After the owner confirms, the inviter consumes the token and proposes
+//!    enrolling the joiner to the vault's control plane
+//!    ([`approve_enrollment`]). Once a quorum has committed the proposal, it
+//!    sends a signed [`EnrollmentGrant`] naming it.
+//! 5. After the owner confirms on the joiner too, the joiner's control-plane
+//!    node catches up as a learner and becomes a voter; a member then grants
+//!    it every epoch key, sealed to its recipient key in committed state.
+//!    The joiner creates its own copy of the vault from that state
+//!    ([`Joiner::finish_enrollment`]). Revisions then arrive by sync.
+//!
+//! Until the desktop app runs the control plane, it still uses the interim
+//! path: [`approve_join`] authorizes the joiner directly and returns a
+//! [`JoinGrant`] carrying the epoch keys, and [`Joiner::finish`] completes
+//! it, with at most one paired device. It must not be used on a vault whose
+//! control plane has been founded.
 
 use base64ct::{Base64UrlUnpadded, Encoding};
-use osm_vault_core::{verify_pairing_signature, EnrollmentMaterial, PendingDevice, Vault};
+use osm_vault_core::{
+    epoch_key_check, verify_pairing_signature, EnrollmentMaterial, PendingDevice, Vault,
+};
+use osm_vault_membership::{
+    device_id_from_bytes, device_id_to_bytes, ControlState, DeviceNode, SignedRequest,
+};
 use osm_vault_sync::{
     open_epoch_key, seal_epoch_key, DeviceId, EpochKeyEnvelope, HpkeKeyPair, HpkePublicKey,
     InvitationStore, InvitationToken, VaultId,
@@ -23,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{Error, Peer, PeerStore, Result};
+use crate::{control, Error, Peer, PeerStore, Result};
 
 const PAIRING_VERSION: u8 = 1;
 const INVITATION_PREFIX: &str = "OSM-PAIR1-";
@@ -234,6 +250,45 @@ impl JoinGrant {
     }
 }
 
+/// Sent by the inviter once the joiner's enrollment proposal is committed.
+/// The keys themselves reach the joiner through committed control state
+/// after it has become a voter, so nothing here is secret.
+#[derive(Serialize, Deserialize)]
+pub struct EnrollmentGrant {
+    version: u8,
+    vault_id: [u8; 32],
+    /// The committed proposal that enrolls the joiner.
+    request_id: [u8; 16],
+    /// Lets the joiner verify the recovery key before enabling recovery.
+    recovery_check: Option<[u8; 32]>,
+    /// Inviter's pairing signature over the transcript and every field.
+    signature: Vec<u8>,
+}
+
+impl EnrollmentGrant {
+    fn signed_message(&self, transcript: &[u8; 32]) -> Vec<u8> {
+        let mut message = b"enrollment-grant\0".to_vec();
+        message.extend_from_slice(transcript);
+        message.push(self.version);
+        message.extend_from_slice(&self.vault_id);
+        message.extend_from_slice(&self.request_id);
+        match &self.recovery_check {
+            Some(check) => {
+                message.push(1);
+                message.extend_from_slice(check);
+            }
+            None => message.push(0),
+        }
+        message
+    }
+
+    /// The enrollment proposal, for cancelling it if the joiner never
+    /// appears.
+    pub fn request_id(&self) -> [u8; 16] {
+        self.request_id
+    }
+}
+
 /// A verified join request awaiting the owner's decision on the inviter.
 pub struct JoinReview {
     request: JoinRequest,
@@ -248,6 +303,15 @@ impl JoinReview {
 
     pub fn joiner_device_id(&self) -> [u8; 16] {
         self.request.joiner_device_id
+    }
+
+    /// The joiner as committed membership will record it.
+    pub fn joiner_node(&self) -> DeviceNode {
+        DeviceNode {
+            public_key: self.request.joiner_public_key,
+            transport_pin: self.request.joiner_transport_pin,
+            recipient_key: self.request.joiner_hpke_key,
+        }
     }
 }
 
@@ -267,7 +331,6 @@ pub fn invite(
     if !valid_addresses(&addresses) {
         return Err(Error::InvalidAddress);
     }
-    peers.ensure_capacity()?;
     let transport_pin = peers.transport_identity()?.pin();
     let (device_id, public_key) = own_identity(vault)?;
     let expires_at = now.checked_add(ttl_secs).ok_or(Error::InvalidInvitation)?;
@@ -330,8 +393,43 @@ pub fn review_join(
     })
 }
 
-/// Completes pairing on the inviter. Call only after the owner confirmed
-/// that both devices show the same short code.
+/// Approves a joiner on the inviter by proposing its enrollment. Call only
+/// after the owner confirmed that both devices show the same short code.
+///
+/// The token is consumed so it cannot be replayed. Submit the returned
+/// request to the control plane; once it is accepted, send the grant. If it
+/// is refused, tell the joiner pairing failed; the owner starts over with a
+/// new invitation.
+pub fn approve_enrollment(
+    vault: &Vault,
+    invitations: &mut InvitationStore,
+    review: JoinReview,
+    now: u64,
+) -> Result<(SignedRequest, EnrollmentGrant)> {
+    let request =
+        control::enrollment_request(vault, review.request.joiner_device_id, review.joiner_node())?;
+    let mut grant = EnrollmentGrant {
+        version: PAIRING_VERSION,
+        vault_id: vault.vault_id(),
+        request_id: request.request_id,
+        recovery_check: vault.recovery_check(),
+        signature: Vec::new(),
+    };
+    grant.signature = vault
+        .sign_pairing(&grant.signed_message(&review.transcript))?
+        .to_vec();
+    invitations.approve(
+        &InvitationToken::from_bytes(review.request.token),
+        DeviceId(review.request.joiner_public_key),
+        now,
+    )?;
+    Ok((request, grant))
+}
+
+/// Completes interim pairing on the inviter: the owner's confirmation
+/// authorizes the joiner directly, with at most one paired device. Call
+/// only after the owner confirmed that both devices show the same short
+/// code, and never on a vault with a control plane.
 ///
 /// The grant is built before any side effect, then the token is consumed so
 /// it cannot be replayed, and only then is the joiner authorized.
@@ -404,7 +502,10 @@ pub fn approve_join(
 pub struct Joiner {
     invitation: Invitation,
     device: PendingDevice,
+    /// The device's long-lived recipient key, derived from the secret its
+    /// vault will keep.
     hpke: HpkeKeyPair,
+    transport_pin: [u8; 32],
     transcript: [u8; 32],
 }
 
@@ -420,7 +521,7 @@ impl Joiner {
             return Err(Error::InvitationExpired);
         }
         let device = PendingDevice::generate();
-        let hpke = HpkeKeyPair::generate()?;
+        let hpke = HpkeKeyPair::from_secret(&device.recipient_secret());
         let body = &invitation.body;
         let mut request = JoinRequest {
             version: PAIRING_VERSION,
@@ -448,10 +549,112 @@ impl Joiner {
                 invitation,
                 device,
                 hpke,
+                transport_pin,
                 transcript,
             },
             request,
         ))
+    }
+
+    /// This device's ID in the control plane. Start its control-plane node
+    /// with it (and [`Joiner::vault_id`]) before the owner confirms, so the
+    /// leader can bring it up to date as a learner.
+    pub fn control_device(&self) -> osm_vault_membership::DeviceId {
+        device_id_from_bytes(self.device.device_id())
+    }
+
+    pub fn vault_id(&self) -> [u8; 32] {
+        self.invitation.body.vault_id
+    }
+
+    /// Whether committed control state lists this device as an enrolled
+    /// voter holding every epoch key, so [`Joiner::finish_enrollment`] can
+    /// proceed.
+    pub fn enrolled(&self, state: &ControlState) -> bool {
+        let me = self.control_device();
+        state.epoch > 0
+            && state.is_settled_member(me)
+            && state.missing_epochs(me).is_empty()
+            && state
+                .envelopes
+                .get(&me)
+                .is_some_and(|sealed| (1..=state.epoch).all(|epoch| sealed.contains_key(&epoch)))
+    }
+
+    /// Verifies the grant and creates this device's vault at `path` from
+    /// committed control state: its epoch keys come from the envelopes
+    /// sealed to it, each checked against the committed key check, and its
+    /// authors and removed devices from the state. Call with
+    /// `owner_confirmed` only after the owner compared the short codes.
+    /// Fails with `EnrollmentPending` until [`Joiner::enrolled`] holds.
+    pub fn finish_enrollment(
+        self,
+        grant: &EnrollmentGrant,
+        owner_confirmed: bool,
+        state: &ControlState,
+        path: impl AsRef<std::path::Path>,
+        password: &str,
+    ) -> Result<Vault> {
+        if !owner_confirmed {
+            return Err(Error::NotConfirmed);
+        }
+        let body = &self.invitation.body;
+        if grant.version != PAIRING_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        if grant.vault_id != body.vault_id || state.vault_id != body.vault_id {
+            return Err(Error::VaultMismatch);
+        }
+        // The inviter's key came from the invitation, not from the channel.
+        verify_pairing_signature(
+            &body.inviter_public_key,
+            &grant.signed_message(&self.transcript),
+            &grant.signature,
+        )
+        .map_err(|_| Error::InvalidSignature)?;
+        if !self.enrolled(state) {
+            return Err(Error::EnrollmentPending);
+        }
+        let me = self.control_device();
+        let public_key = self.device.public_key();
+        let recorded = state.node(me).ok_or(Error::EnrollmentPending)?;
+        if recorded.public_key != public_key
+            || recorded.recipient_key != self.hpke.public().as_bytes()
+            || recorded.transport_pin != self.transport_pin
+            || state.authors.get(&me) != Some(&public_key)
+        {
+            return Err(Error::ProtocolViolation);
+        }
+        let sealed = state.envelopes.get(&me).ok_or(Error::EnrollmentPending)?;
+        let epoch_keys = (1..=state.epoch)
+            .map(|epoch| {
+                let envelope = sealed.get(&epoch).ok_or(Error::EnrollmentPending)?;
+                let key = control::open(&body.vault_id, epoch, public_key, &self.hpke, envelope)?;
+                if state.epoch_checks.get(&epoch)
+                    != Some(&epoch_key_check(&body.vault_id, epoch, &key))
+                {
+                    return Err(Error::EpochKeyMismatch);
+                }
+                Ok((epoch, key))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let material = EnrollmentMaterial {
+            vault_id: body.vault_id,
+            current_epoch: state.epoch,
+            epoch_keys,
+            recovery_check: grant.recovery_check,
+            devices: state
+                .authors
+                .iter()
+                .map(|(device, key)| (device_id_to_bytes(*device), *key))
+                .collect(),
+            revoked: state
+                .removed
+                .keys()
+                .map(|device| device_id_to_bytes(*device))
+                .collect(),
+        };
+        Ok(Vault::join(path, password, self.device, material)?)
     }
 
     /// The short code to compare with the inviter's screen.
@@ -463,8 +666,9 @@ impl Joiner {
         self.device.device_id()
     }
 
-    /// Verifies the grant and creates this device's vault at `path`. Call
-    /// with `owner_confirmed` only after the owner compared the short codes.
+    /// Verifies an interim grant and creates this device's vault at `path`.
+    /// Call with `owner_confirmed` only after the owner compared the short
+    /// codes.
     pub fn finish(
         self,
         grant: &JoinGrant,
@@ -530,6 +734,7 @@ impl Joiner {
                 .iter()
                 .map(|device| (device.device_id, device.public_key))
                 .collect(),
+            revoked: Vec::new(),
         };
         let peer = Peer {
             device_id: inviter.device_id,

@@ -53,7 +53,14 @@ impl HpkeKeyPair {
     pub fn generate() -> Result<Self> {
         let mut ikm = Zeroizing::new([0u8; KEY_LEN]);
         getrandom::fill(ikm.as_mut()).map_err(|_| Error::Randomness)?;
-        let (private, public) = Kem::derive_keypair(ikm.as_ref());
+        Ok(Self::from_secret(&ikm))
+    }
+
+    /// Derives the key pair from a stored 32-byte secret with the KEM's
+    /// `DeriveKeyPair`, so a device can keep one long-lived recipient key
+    /// without storing the X25519 key itself.
+    pub fn from_secret(secret: &[u8; KEY_LEN]) -> Self {
+        let (private, public) = Kem::derive_keypair(secret);
         let private_bytes: [u8; KEY_LEN] = private
             .to_bytes()
             .as_slice()
@@ -64,10 +71,10 @@ impl HpkeKeyPair {
             .as_slice()
             .try_into()
             .expect("X25519 public key size");
-        Ok(Self {
+        Self {
             private: HpkePrivateKey(private_bytes),
             public: HpkePublicKey(public_bytes),
-        })
+        }
     }
 
     pub fn public(&self) -> HpkePublicKey {
@@ -233,6 +240,31 @@ fn put<const N: usize>(output: &mut [u8], offset: &mut usize, value: &[u8; N]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_pair_derived_from_a_secret_is_stable() {
+        let first = HpkeKeyPair::from_secret(&[5; 32]);
+        let again = HpkeKeyPair::from_secret(&[5; 32]);
+        assert_eq!(first.public(), again.public());
+        assert_ne!(first.public(), HpkeKeyPair::from_secret(&[6; 32]).public());
+        let envelope = seal_epoch_key(
+            VaultId([1; 32]),
+            1,
+            DeviceId([2; 32]),
+            first.public(),
+            &[3; 32],
+        )
+        .unwrap();
+        let opened = open_epoch_key(
+            &envelope,
+            VaultId([1; 32]),
+            1,
+            DeviceId([2; 32]),
+            again.private(),
+        )
+        .unwrap();
+        assert_eq!(*opened, [3; 32]);
+    }
 
     #[test]
     fn round_trip_is_bound_to_vault_epoch_and_recipient() {

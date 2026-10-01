@@ -9,6 +9,15 @@ pub enum Error {
     Vault(#[from] osm_vault_core::Error),
     #[error("sync primitive: {0}")]
     Sync(#[from] osm_vault_sync::Error),
+    /// Boxed: OpenRaft's storage errors are large.
+    #[error("membership: {0}")]
+    Membership(Box<osm_vault_membership::Error>),
+    #[error("the vault's devices refused the request: {0:?}")]
+    Rejected(osm_vault_membership::Rejection),
+    #[error("this device is not yet an enrolled member holding the vault's keys")]
+    EnrollmentPending,
+    #[error("an epoch key does not match the key committed for that epoch")]
+    EpochKeyMismatch,
     #[error("peer store: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("invalid invitation code")]
@@ -49,4 +58,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("transport: {0}")]
     Transport(&'static str),
+}
+
+impl From<osm_vault_membership::Error> for Error {
+    fn from(error: osm_vault_membership::Error) -> Self {
+        Self::Membership(Box::new(error))
+    }
 }

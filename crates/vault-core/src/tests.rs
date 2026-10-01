@@ -894,7 +894,7 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
     assert_eq!(current.revision, second);
     assert!(!current.conflict);
     migrated.update(current.item, &current.revision).unwrap();
-    // The chained 2 -> 3 -> 4 -> 5 -> 6 migration created the quarantine.
+    // The chained 2 -> 3 -> 4 -> 5 -> 7 migration created the quarantine.
     assert!(migrated.quarantined().unwrap().is_empty());
     drop(migrated);
     let version: u32 = Connection::open(&path)
@@ -903,7 +903,7 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -1212,7 +1212,7 @@ fn a_format_4_vault_gains_the_ingress_queue_when_opened_locked() {
     );
     // Re-rooting waits for a password unlock.
     vault.unlock("password").unwrap();
-    assert_eq!(version(&path), 6);
+    assert_eq!(version(&path), 7);
     assert_eq!(vault.get(&item.id).unwrap().item.title, "Before upgrade");
 }
 
@@ -1438,4 +1438,294 @@ fn a_shared_key_vault_is_re_rooted_at_its_next_password_unlock() {
     assert_eq!(reopened.list().unwrap().len(), 2);
     reopened.lock();
     reopened.unlock("password").unwrap();
+}
+
+/// A device joined from `from`'s current enrollment material.
+fn join(dir: &std::path::Path, name: &str, from: &Vault) -> Vault {
+    Vault::join(
+        dir.join(name),
+        "password",
+        crate::PendingDevice::generate(),
+        from.enrollment_material().unwrap(),
+    )
+    .unwrap()
+}
+
+/// Applies every revision `from` has accepted, parents first. Returns how
+/// many were quarantined.
+fn deliver(to: &mut Vault, from: &Vault) -> usize {
+    let mut held = 0;
+    for revision in from.encrypted_revisions().unwrap() {
+        match to.apply_encrypted_revision(revision) {
+            Ok(_) => {}
+            Err(Error::Quarantined) => held += 1,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    held
+}
+
+fn authorize(vault: &mut Vault, other: &Vault) {
+    vault
+        .authorize_device(
+            other.device_id().unwrap(),
+            other.device_public_key().unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_removed_devices_later_revisions_are_held_unless_a_member_builds_on_them() {
+    let dir = tempdir().unwrap();
+    let (mut a, _) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let item = login("Shared");
+    let base = a.put(item.clone()).unwrap().revision;
+    let mut r = join(dir.path(), "r.db", &a);
+    authorize(&mut a, &r);
+    let mut b = join(dir.path(), "b.db", &a);
+    authorize(&mut a, &b);
+    authorize(&mut r, &b);
+    deliver(&mut r, &a);
+    deliver(&mut b, &a);
+
+    // Before removal R's edit is accepted everywhere.
+    let r1 = edit(&mut r, &item, &base, "r1");
+    a.apply_encrypted_revision(r1.clone()).unwrap();
+    b.apply_encrypted_revision(r1.clone()).unwrap();
+
+    // A learns of the removal first. B accepts R's next edit before it does.
+    let r_id = r.device_id().unwrap();
+    assert!(a.revoke_device(r_id).unwrap());
+    assert!(!a.revoke_device(r_id).unwrap());
+    let r2 = edit(&mut r, &item, &r1.revision_id(), "r2");
+    assert!(matches!(
+        a.apply_encrypted_revision(r2.clone()),
+        Err(Error::Quarantined)
+    ));
+    b.apply_encrypted_revision(r2.clone()).unwrap();
+    b.revoke_device(r_id).unwrap();
+    // A still reads what R wrote before removal.
+    assert_eq!(a.get(&item.id).unwrap().item.password, "r1");
+
+    // B builds on r2, which vouches for it: A accepts both, as-is.
+    let b1 = edit(&mut b, &item, &r2.revision_id(), "b1");
+    a.apply_encrypted_revision(b1.clone()).unwrap();
+    assert_eq!(head_set(&a, &item.id), vec![b1.revision_id()]);
+    assert!(a.quarantined().unwrap().is_empty());
+    assert!(a.encrypted_revisions().unwrap().contains(&r2));
+
+    // Nobody builds on R's later edit, so it stays held, also after a
+    // restart.
+    let r3 = edit(&mut r, &item, &r2.revision_id(), "r3");
+    drop(a);
+    let mut a = Vault::open(dir.path().join("a.db")).unwrap();
+    a.unlock("password").unwrap();
+    assert_eq!(a.revoked_devices().unwrap(), vec![r_id]);
+    assert!(matches!(
+        a.apply_encrypted_revision(r3),
+        Err(Error::Quarantined)
+    ));
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+    assert_eq!(a.get(&item.id).unwrap().item.password, "b1");
+
+    assert!(matches!(
+        a.revoke_device(a.device_id().unwrap()),
+        Err(Error::InvalidDevice(_))
+    ));
+    assert!(matches!(
+        a.revoke_device([9; 16]),
+        Err(Error::InvalidDevice(_))
+    ));
+}
+
+#[test]
+fn endorsing_a_removed_devices_heads_keeps_them_for_devices_that_join_later() {
+    let dir = tempdir().unwrap();
+    let (mut a, _) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let item = login("Shared");
+    let base = a.put(item.clone()).unwrap().revision;
+    let mut r = join(dir.path(), "r.db", &a);
+    authorize(&mut a, &r);
+    deliver(&mut r, &a);
+    let r1 = edit(&mut r, &item, &base, "r1");
+    a.apply_encrypted_revision(r1.clone()).unwrap();
+    let deleted = a.put(login("Deleted by R")).unwrap();
+    deliver(&mut r, &a);
+    let tombstone = r.delete(&deleted.item_id, &deleted.revision).unwrap();
+    a.apply_encrypted_revision(wire(&r, &tombstone.revision))
+        .unwrap();
+
+    a.revoke_device(r.device_id().unwrap()).unwrap();
+    let endorsed = a.endorse_heads_of(r.device_id().unwrap()).unwrap();
+    assert_eq!(endorsed.len(), 2);
+    assert_eq!(endorsed[0].parents, vec![r1.revision_id()]);
+    // Endorsed heads are no longer R's, so a second call does nothing.
+    assert!(a
+        .endorse_heads_of(r.device_id().unwrap())
+        .unwrap()
+        .is_empty());
+    assert_eq!(a.get(&item.id).unwrap().item.password, "r1");
+    assert!(matches!(a.get(&deleted.item_id), Err(Error::NotFound)));
+
+    // A device joining now treats R as removed, yet ends up with A's view:
+    // each held revision of R's is released by A's endorsement.
+    let mut joined = join(dir.path(), "j.db", &a);
+    assert_eq!(
+        joined.revoked_devices().unwrap(),
+        vec![r.device_id().unwrap()]
+    );
+    assert_eq!(deliver(&mut joined, &a), 2);
+    assert!(joined.quarantined().unwrap().is_empty());
+    for id in [&item.id, &deleted.item_id] {
+        assert_eq!(head_set(&joined, id), head_set(&a, id));
+    }
+    assert_eq!(joined.get(&item.id).unwrap().item.password, "r1");
+}
+
+#[test]
+fn held_revisions_apply_once_their_author_is_authorized() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base, _) = untrusted_copy(dir.path());
+    let foreign = edit(&mut b, &item, &base, "from B");
+    assert!(matches!(
+        a.apply_encrypted_revision(foreign.clone()),
+        Err(Error::Quarantined)
+    ));
+    assert_eq!(a.retry_quarantined().unwrap(), 0);
+    authorize(&mut a, &b);
+    assert_eq!(a.retry_quarantined().unwrap(), 1);
+    assert!(a.quarantined().unwrap().is_empty());
+    assert_eq!(head_set(&a, &item.id), vec![foreign.revision_id()]);
+}
+
+#[test]
+fn a_write_fence_stops_writes_until_the_committed_epoch_is_active() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    let item = login("Fenced");
+    let first = vault.put(item.clone()).unwrap();
+    vault.lock();
+    drop(vault);
+
+    // Committed membership moved on while this device was locked.
+    let mut vault = Vault::open(&path).unwrap();
+    vault.raise_write_fence(2).unwrap();
+    vault.unlock("password").unwrap();
+    assert_eq!(vault.write_fence(), 2);
+    assert!(matches!(
+        vault.put(login("Blocked")),
+        Err(Error::EpochPending)
+    ));
+    assert!(matches!(
+        vault.update(item.clone(), &first.revision),
+        Err(Error::EpochPending)
+    ));
+    // Reading is unaffected.
+    assert_eq!(vault.list().unwrap().len(), 1);
+
+    let (epoch, _) = vault.generate_epoch_key().unwrap();
+    vault.activate_epoch(epoch).unwrap();
+    vault.put(login("Allowed")).unwrap();
+    // The fence never moves back.
+    vault.raise_write_fence(1).unwrap();
+    assert_eq!(vault.write_fence(), 2);
+    assert!(matches!(vault.raise_write_fence(0), Err(Error::Crypto)));
+}
+
+#[test]
+fn a_format_6_vault_gains_membership_fields_when_opened_locked() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v6.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    let item = login("Before upgrade");
+    vault.put(item.clone()).unwrap();
+    drop(vault);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE revoked_devices;
+             ALTER TABLE vault_meta DROP COLUMN recipient_nonce;
+             ALTER TABLE vault_meta DROP COLUMN recipient_wrapped_secret;
+             ALTER TABLE vault_meta DROP COLUMN write_fence;
+             UPDATE vault_meta SET format_version=6;",
+        )
+        .unwrap();
+    drop(connection);
+    let version = |path: &std::path::Path| -> u32 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+
+    // Without the key: the fence works at once.
+    let mut vault = Vault::open(&path).unwrap();
+    assert_eq!(version(&path), 7);
+    vault.raise_write_fence(1).unwrap();
+    // The recipient secret needs the root key, so it appears at unlock and
+    // stays the same afterwards.
+    vault.unlock("password").unwrap();
+    let secret = vault.recipient_secret().unwrap();
+    assert_eq!(vault.get(&item.id).unwrap().item.title, "Before upgrade");
+    vault.lock();
+    assert!(matches!(vault.recipient_secret(), Err(Error::Locked)));
+    vault.unlock("password").unwrap();
+    assert_eq!(*vault.recipient_secret().unwrap(), *secret);
+    drop(vault);
+    let mut reopened = Vault::open(&path).unwrap();
+    reopened.unlock("password").unwrap();
+    assert_eq!(*reopened.recipient_secret().unwrap(), *secret);
+}
+
+#[test]
+fn joining_keeps_the_pending_recipient_secret_and_backups_keep_revocations() {
+    let dir = tempdir().unwrap();
+    let (mut a, recovery) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let item = login("Shared");
+    let base = a.put(item.clone()).unwrap().revision;
+    let pending = crate::PendingDevice::generate();
+    let secret = pending.recipient_secret();
+    let mut r = Vault::join(
+        dir.path().join("r.db"),
+        "password",
+        pending,
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(*r.recipient_secret().unwrap(), *secret);
+    assert_ne!(*a.recipient_secret().unwrap(), *secret);
+    authorize(&mut a, &r);
+    deliver(&mut r, &a);
+    let r1 = edit(&mut r, &item, &base, "r1");
+    a.apply_encrypted_revision(r1.clone()).unwrap();
+    a.revoke_device(r.device_id().unwrap()).unwrap();
+
+    let backup = dir.path().join("a.osmbak");
+    a.export_backup(&backup).unwrap();
+    let mut restored = Vault::restore_backup(
+        &backup,
+        dir.path().join("restored.db"),
+        &recovery,
+        "password",
+    )
+    .unwrap();
+    // R's accepted edit is restored as accepted; its later ones are held.
+    assert_eq!(
+        restored.revoked_devices().unwrap(),
+        vec![r.device_id().unwrap()]
+    );
+    assert_eq!(restored.get(&item.id).unwrap().item.password, "r1");
+    let r2 = edit(&mut r, &item, &r1.revision_id(), "r2");
+    assert!(matches!(
+        restored.apply_encrypted_revision(r2),
+        Err(Error::Quarantined)
+    ));
+    // A restored vault is a new device with its own recipient secret.
+    assert_ne!(
+        *restored.recipient_secret().unwrap(),
+        *a.recipient_secret().unwrap()
+    );
 }

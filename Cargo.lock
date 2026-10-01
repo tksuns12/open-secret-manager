@@ -1349,6 +1349,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "openraft",
+ "osm-vault-sync",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1363,7 +1364,10 @@ name = "osm-vault-peer"
 version = "0.1.0"
 dependencies = [
  "base64ct",
+ "getrandom 0.3.4",
+ "openraft",
  "osm-vault-core",
+ "osm-vault-membership",
  "osm-vault-sync",
  "postcard",
  "rcgen",

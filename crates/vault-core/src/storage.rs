@@ -13,9 +13,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{
-        decrypt, derive_password_key, device_authorization, device_key_aad, encrypt, epoch_key_aad,
-        key_wrap_aad, keys_equal, legacy_record_aad, legacy_revision_id, random_array, record_aad,
-        recovery_check, revision_id, revision_signature_message, verify_device_authorization,
+        decrypt, derive_password_key, device_authorization, device_key_aad, device_revocation,
+        encrypt, epoch_key_aad, key_wrap_aad, keys_equal, legacy_record_aad, legacy_revision_id,
+        random_array, recipient_key_aad, record_aad, recovery_check, revision_id,
+        revision_signature_message, verify_device_authorization, verify_device_revocation,
         verify_recovery_check, KdfConfig, SecretKey, DEVICE_ID_LEN, KEY_LEN, NONCE_LEN,
         PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
@@ -23,11 +24,14 @@ use crate::{
     RevisionInfo, StageOutcome, VaultItem,
 };
 
-/// Storage layout: multi-head revisions plus a quarantine for revisions
-/// from unauthorized devices.
-/// Storage layout: a per-device root key wraps the device key, the
-/// authorized-author MACs, and the vault's epoch keys.
-const VAULT_FORMAT_VERSION: u32 = 6;
+/// Storage layout: a per-device root key wraps the device key, the HPKE
+/// recipient secret, the authorized-author and revocation MACs, and the
+/// vault's epoch keys; a write fence holds writes until a committed epoch is
+/// active.
+const VAULT_FORMAT_VERSION: u32 = 7;
+/// Per-device root keys without revocations, a recipient secret, or a write
+/// fence; gains them when opened, without the key.
+const ROOT_KEY_FORMAT_VERSION: u32 = 6;
 /// One shared vault key for everything; re-rooted at the next password
 /// unlock.
 const SHARED_KEY_FORMAT_VERSION: u32 = 5;
@@ -86,8 +90,38 @@ CREATE TABLE vault_meta (
     device_id BLOB NOT NULL CHECK(length(device_id) = 16),
     device_public_key BLOB NOT NULL CHECK(length(device_public_key) = 32),
     device_key_nonce BLOB NOT NULL CHECK(length(device_key_nonce) = 24),
-    device_wrapped_signing_key BLOB NOT NULL CHECK(length(device_wrapped_signing_key) = 48)
+    device_wrapped_signing_key BLOB NOT NULL CHECK(length(device_wrapped_signing_key) = 48),
+    recipient_nonce BLOB CHECK(recipient_nonce IS NULL OR length(recipient_nonce) = 24),
+    recipient_wrapped_secret BLOB
+        CHECK(recipient_wrapped_secret IS NULL OR length(recipient_wrapped_secret) = 48),
+    write_fence INTEGER NOT NULL DEFAULT 1 CHECK(write_fence >= 1)
 ) STRICT;
+"#;
+
+/// Format 7 columns, added to a format 6 `vault_meta` in place. The
+/// recipient secret needs the root key, so it is filled at the next unlock.
+const FORMAT_7_COLUMNS: &str = r#"
+ALTER TABLE vault_meta ADD COLUMN recipient_nonce BLOB
+    CHECK(recipient_nonce IS NULL OR length(recipient_nonce) = 24);
+ALTER TABLE vault_meta ADD COLUMN recipient_wrapped_secret BLOB
+    CHECK(recipient_wrapped_secret IS NULL OR length(recipient_wrapped_secret) = 48);
+ALTER TABLE vault_meta ADD COLUMN write_fence INTEGER NOT NULL DEFAULT 1 CHECK(write_fence >= 1);
+"#;
+
+/// Authorized devices that committed membership has removed. Their stored
+/// revisions stay readable; a revision of theirs not yet accepted is held
+/// for review unless an authorized device has built on it. Each row carries
+/// a MAC keyed by a subkey of the root key; rows are never changed or
+/// removed.
+const REVOCATIONS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS revoked_devices (
+    device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16) REFERENCES devices(device_id),
+    revocation BLOB NOT NULL CHECK(length(revocation) = 32)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS revoked_devices_no_update BEFORE UPDATE ON revoked_devices
+BEGIN SELECT RAISE(ABORT, 'revocations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS revoked_devices_no_delete BEFORE DELETE ON revoked_devices
+BEGIN SELECT RAISE(ABORT, 'revocations are immutable'); END;
 "#;
 
 const DEVICES_TRIGGER: &str = r#"
@@ -287,6 +321,13 @@ struct Header {
     current_epoch: u64,
     /// `None` only for a format 1 vault that has not been unlocked yet.
     device: Option<DeviceHeader>,
+    /// This device's HPKE recipient secret, wrapped by the root key. `None`
+    /// until a vault from before format 7 is unlocked.
+    recipient: Option<KeyWrapper>,
+    /// The earliest epoch new revisions may use. Raised, never lowered,
+    /// when committed membership activates a later epoch; it works while
+    /// locked, so writes stop until this device has that epoch's key.
+    write_fence: u64,
 }
 
 #[derive(Clone)]
@@ -321,6 +362,11 @@ pub struct Vault {
     signing_key: Option<SigningKey>,
     /// Authorized revision authors, loaded and authenticated at unlock.
     devices: BTreeMap<[u8; DEVICE_ID_LEN], VerifyingKey>,
+    /// Authors removed by committed membership, loaded and authenticated at
+    /// unlock.
+    revoked: BTreeSet<[u8; DEVICE_ID_LEN]>,
+    /// Secret behind this device's HPKE recipient key, while unlocked.
+    recipient_secret: Option<SecretKey>,
 }
 
 /// Seals revisions for one author. Borrowing the keys separately from the
@@ -407,6 +453,12 @@ impl Vault {
         let password_salt = random_array::<SALT_LEN>();
         let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &root_key)?;
         let (device, _) = generate_device(&root_key, &vault_id)?;
+        let recipient = wrap_recipient_secret(
+            &root_key,
+            &vault_id,
+            &device.device_id,
+            &random_array::<KEY_LEN>(),
+        )?;
         let header = Header {
             format_version: VAULT_FORMAT_VERSION,
             vault_id,
@@ -419,6 +471,8 @@ impl Vault {
             legacy_recovery: None,
             current_epoch: FIRST_EPOCH,
             device: Some(device),
+            recipient: Some(recipient),
+            write_fence: FIRST_EPOCH,
         };
         insert_header(&connection, &header)?;
         insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
@@ -438,6 +492,8 @@ impl Vault {
             epoch_keys: BTreeMap::new(),
             signing_key: None,
             devices: BTreeMap::new(),
+            revoked: BTreeSet::new(),
+            recipient_secret: None,
         }
     }
 
@@ -450,6 +506,11 @@ impl Vault {
         // receive as soon as it is opened.
         if vault.header.format_version == QUARANTINE_FORMAT_VERSION {
             vault.migrate_add_ingress()?;
+        }
+        // Likewise the write fence, so a locked device can stop writes as
+        // soon as it learns of a new epoch.
+        if vault.header.format_version == ROOT_KEY_FORMAT_VERSION {
+            vault.migrate_add_membership()?;
         }
         Ok(vault)
     }
@@ -525,6 +586,8 @@ impl Vault {
         self.epoch_keys.clear();
         self.signing_key = None;
         self.devices.clear();
+        self.revoked.clear();
+        self.recipient_secret = None;
     }
 
     /// Completes an unlock: migrates an older vault, then loads the device
@@ -553,6 +616,9 @@ impl Vault {
             let password_key = password_key.ok_or(Error::UpgradeRequiresPassword)?;
             root_key = self.migrate_root_key(&master_key, password_key)?;
         }
+        if self.header.format_version == ROOT_KEY_FORMAT_VERSION {
+            self.migrate_add_membership()?;
+        }
         let device = self.header.device.as_ref().ok_or(Error::Crypto)?;
         let seed = decrypt(
             &root_key,
@@ -574,11 +640,46 @@ impl Vault {
         if !epoch_keys.contains_key(&self.header.current_epoch) {
             return Err(Error::Crypto);
         }
+        let revoked = load_revocations(&self.connection, &root_key, &self.header.vault_id)?;
+        let recipient_secret = self.recipient_secret_or_create(&root_key)?;
         self.root_key = Some(root_key);
         self.epoch_keys = epoch_keys;
         self.signing_key = Some(signing_key);
         self.devices = devices;
+        self.revoked = revoked;
+        self.recipient_secret = Some(recipient_secret);
         Ok(())
+    }
+
+    /// Unwraps this device's recipient secret, creating it for a vault from
+    /// before format 7.
+    fn recipient_secret_or_create(&mut self, root_key: &SecretKey) -> Result<SecretKey> {
+        let vault_id = self.header.vault_id;
+        let device_id = self.header.device.as_ref().ok_or(Error::Crypto)?.device_id;
+        if let Some(wrapper) = &self.header.recipient {
+            let secret = decrypt(
+                root_key,
+                &wrapper.nonce,
+                &recipient_key_aad(&vault_id, &device_id),
+                &wrapper.wrapped_key,
+            )
+            .map_err(|_| Error::Crypto)?;
+            return to_key(&secret);
+        }
+        let secret = Zeroizing::new(random_array::<KEY_LEN>());
+        let wrapper = wrap_recipient_secret(root_key, &vault_id, &device_id, &secret)?;
+        // Only one connection may create it; another may have done so since
+        // this one read the header.
+        let changed = self.connection.execute(
+            "UPDATE vault_meta SET recipient_nonce=?, recipient_wrapped_secret=? \
+             WHERE singleton=1 AND recipient_nonce IS NULL",
+            params![wrapper.nonce.as_slice(), wrapper.wrapped_key],
+        )?;
+        self.header = read_header(&self.connection)?;
+        if changed == 0 {
+            return self.recipient_secret_or_create(root_key);
+        }
+        Ok(secret)
     }
 
     /// Rewrites a format 1 vault as the current format in one transaction. Every
@@ -755,9 +856,38 @@ impl Vault {
         Ok(())
     }
 
+    /// Adds the format 7 columns and the revocation table to a format 6
+    /// vault. Purely additive and keyless.
+    fn migrate_add_membership(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = transaction.query_row(
+            "SELECT format_version FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == ROOT_KEY_FORMAT_VERSION {
+            transaction.execute_batch(FORMAT_7_COLUMNS)?;
+            transaction.execute_batch(REVOCATIONS_SCHEMA)?;
+            transaction.execute(
+                "UPDATE vault_meta SET format_version=? WHERE singleton=1",
+                [VAULT_FORMAT_VERSION],
+            )?;
+        }
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(())
+    }
+
     fn signer(&self) -> Result<RevisionSigner<'_>> {
         self.key()?;
         let epoch = self.header.current_epoch;
+        // Committed membership has moved on: writing under this epoch could
+        // reach a removed device.
+        if epoch < self.header.write_fence {
+            return Err(Error::EpochPending);
+        }
         Ok(RevisionSigner {
             key: self.epoch_keys.get(&epoch).ok_or(Error::MissingEpochKey)?,
             epoch,
@@ -1114,6 +1244,7 @@ impl Vault {
                 .collect(),
             revisions: self.encrypted_revisions()?,
             quarantine: quarantined_revisions(&self.connection)?,
+            revoked: self.revoked.iter().copied().collect(),
         };
         let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
         if plaintext.len() as u64 > MAX_BACKUP_BYTES {
@@ -1237,6 +1368,12 @@ impl Vault {
         let password_salt = random_array::<SALT_LEN>();
         let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &root_key)?;
         let (device, _) = generate_device(&root_key, &vault_id)?;
+        let recipient = wrap_recipient_secret(
+            &root_key,
+            &vault_id,
+            &device.device_id,
+            &random_array::<KEY_LEN>(),
+        )?;
         let header = Header {
             format_version: VAULT_FORMAT_VERSION,
             vault_id,
@@ -1249,6 +1386,8 @@ impl Vault {
             legacy_recovery: None,
             current_epoch: payload.current_epoch,
             device: Some(device),
+            recipient: Some(recipient),
+            write_fence: FIRST_EPOCH,
         };
         insert_header(&connection, &header)?;
         insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
@@ -1272,6 +1411,11 @@ impl Vault {
                 Err(error) => return Err(error),
             }
         }
+        // Revoked last, so the removed devices' accepted revisions above
+        // were restored as accepted.
+        for device_id in payload.revoked {
+            vault.revoke_device(device_id)?;
+        }
         Ok(vault)
     }
 
@@ -1281,20 +1425,91 @@ impl Vault {
     /// `MissingParent` means nothing was written and the caller should retry
     /// once the parent has been applied.
     ///
-    /// A revision whose author is not an authorized device is held in the
-    /// quarantine and `Quarantined` is returned: it is not merged. Only a
-    /// well-formed revision that decrypts with the vault key is held.
+    /// A revision whose author is not an authorized device, or was removed
+    /// by committed membership, is held in the quarantine and `Quarantined`
+    /// is returned: it is not merged. Only a well-formed revision that
+    /// decrypts with the vault key is held. A held revision by a known
+    /// author is released as-is once an authorized revision names it as a
+    /// parent: that device has vouched for it by building on it.
     pub fn apply_encrypted_revision(
         &mut self,
         revision: EncryptedRevision,
     ) -> Result<RevisionInfo> {
         self.key()?;
         revision.validate_shape(&self.header.vault_id)?;
-        if !self.devices.contains_key(&revision.author_device_id) {
+        if !self.is_active_author(&revision.author_device_id) {
             self.quarantine(revision)?;
             return Err(Error::Quarantined);
         }
         self.commit_revision(revision, None, None)
+    }
+
+    fn is_active_author(&self, device_id: &[u8; DEVICE_ID_LEN]) -> bool {
+        self.devices.contains_key(device_id) && !self.revoked.contains(device_id)
+    }
+
+    /// Applies held revisions whose authors are now authorized and not
+    /// revoked, as-is. Call after authorizing devices. A held revision still
+    /// missing a parent, or that fails verification, stays held. Returns
+    /// how many were applied.
+    pub fn retry_quarantined(&mut self) -> Result<usize> {
+        self.key()?;
+        let mut applied = 0;
+        loop {
+            let mut progressed = false;
+            for held in quarantined_revisions(&self.connection)? {
+                if !self.is_active_author(&held.author_device_id) {
+                    continue;
+                }
+                match self.commit_revision(held, None, None) {
+                    Ok(_) => {
+                        applied += 1;
+                        progressed = true;
+                    }
+                    Err(error) if error_keeps_hold(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if !progressed {
+                return Ok(applied);
+            }
+        }
+    }
+
+    /// Writes, as this device, a revision with the same content as each
+    /// head authored by `device_id` and that head as its only parent.
+    ///
+    /// After a device is removed, its revisions not yet accepted elsewhere
+    /// are held for review; building on its current heads keeps its last
+    /// accepted state visible on every device, because a held revision that
+    /// an authorized revision names as a parent is released. Only the device
+    /// that removed it should call this, so the heads are not endorsed twice.
+    /// Endorsed heads stop being heads, so calling it again does nothing.
+    pub fn endorse_heads_of(
+        &mut self,
+        device_id: [u8; DEVICE_ID_LEN],
+    ) -> Result<Vec<RevisionInfo>> {
+        self.key()?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {REVISION_COLUMNS} FROM heads h JOIN revisions r ON r.revision=h.revision \
+             WHERE r.author_device_id=? ORDER BY r.rowid"
+        ))?;
+        let heads = statement
+            .query_map([device_id.as_slice()], row_to_revision)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut endorsed = Vec::new();
+        for head in heads {
+            let plaintext = self.open_revision(&head)?;
+            let revision = self.signer()?.seal(
+                &head.item_id,
+                vec![head.revision_id()],
+                head.tombstone,
+                &plaintext,
+            )?;
+            endorsed.push(self.commit_revision(revision, None, None)?);
+        }
+        Ok(endorsed)
     }
 
     fn quarantine(&mut self, revision: EncryptedRevision) -> Result<()> {
@@ -1390,16 +1605,8 @@ impl Vault {
         release: Option<&str>,
     ) -> Result<RevisionInfo> {
         self.key()?;
-        revision.validate_shape(&self.header.vault_id)?;
-        if !revision.tombstone {
-            let item = self.open_item(&revision)?;
-            item.validate()?;
-            if item.id != revision.item_id {
-                return Err(Error::Crypto);
-            }
-        } else {
-            self.open_revision(&revision)?;
-        }
+        self.verify_revision(&revision)?;
+        let vouched = self.vouched_ancestors(&revision)?;
 
         let id = revision.revision_id();
         let info = RevisionInfo {
@@ -1418,15 +1625,22 @@ impl Vault {
             transaction.commit()?;
             return Ok(info);
         }
-        for parent in &revision.parents {
-            match revision_by_id(&transaction, parent)? {
-                None => return Err(Error::MissingParent),
-                Some(stored) if stored.item_id != revision.item_id => {
-                    return Err(Error::InvalidParent)
-                }
-                Some(_) => {}
+        // Held revisions this one builds on are accepted with it, parents
+        // first, in the same transaction.
+        for held in &vouched {
+            let held_id = held.revision_id();
+            if revision_by_id(&transaction, &held_id)?.is_some() {
+                continue;
             }
+            if quarantined_by_id(&transaction, &held_id)?.is_none() {
+                return Err(Error::MissingParent);
+            }
+            check_parents(&transaction, held)?;
+            insert_revision(&transaction, "revisions", held, &held_id)?;
+            transaction.execute("DELETE FROM quarantine WHERE revision=?", [&held_id])?;
+            replace_heads(&transaction, held, &held_id)?;
         }
+        check_parents(&transaction, &revision)?;
         if let Some(kind) = local {
             kind.check(
                 &head_ids(&transaction, &revision.item_id)?,
@@ -1442,18 +1656,74 @@ impl Vault {
         }
         // A staged copy is consumed by the same transaction that accepts it.
         transaction.execute("DELETE FROM ingress WHERE revision=?", [&id])?;
-        // Parents always arrive before children, so a new revision is never
-        // an ancestor of a stored one. Removing only the named parents keeps
-        // every concurrent head.
-        for parent in &revision.parents {
-            transaction.execute("DELETE FROM heads WHERE revision=?", [parent])?;
-        }
-        transaction.execute(
-            "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,?)",
-            params![id, revision.item_id, revision.tombstone],
-        )?;
+        replace_heads(&transaction, &revision, &id)?;
         transaction.commit()?;
         Ok(info)
+    }
+
+    /// Verifies the author's signature and decrypts; for an edit, also that
+    /// the content is a valid item with the revision's item ID.
+    fn verify_revision(&self, revision: &EncryptedRevision) -> Result<()> {
+        revision.validate_shape(&self.header.vault_id)?;
+        if revision.tombstone {
+            self.open_revision(revision)?;
+            return Ok(());
+        }
+        let item = self.open_item(revision)?;
+        item.validate()?;
+        if item.id != revision.item_id {
+            return Err(Error::Crypto);
+        }
+        Ok(())
+    }
+
+    /// Held revisions that `revision` builds on, directly or through other
+    /// held revisions, ordered parents first. Only revisions by a known
+    /// author (authorized, possibly since revoked) that verify are included:
+    /// a held revision from an unknown device cannot be checked, so a child
+    /// of one keeps waiting. An authorized device that names a held revision
+    /// as a parent has accepted it, which vouches for it.
+    fn vouched_ancestors(&self, revision: &EncryptedRevision) -> Result<Vec<EncryptedRevision>> {
+        let mut ordered = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut held_by_id = BTreeMap::new();
+        // (revision ID, whether its parents have been visited)
+        let mut stack: Vec<(String, bool)> = revision
+            .parents
+            .iter()
+            .rev()
+            .map(|parent| (parent.clone(), false))
+            .collect();
+        while let Some((id, visited)) = stack.pop() {
+            if visited {
+                ordered.extend(held_by_id.remove(&id));
+                continue;
+            }
+            if seen.len() as i64 > MAX_QUARANTINE || !seen.insert(id.clone()) {
+                continue;
+            }
+            if revision_by_id(&self.connection, &id)?.is_some() {
+                continue;
+            }
+            let Some(held) = quarantined_by_id(&self.connection, &id)? else {
+                continue;
+            };
+            if held.item_id != revision.item_id
+                || !self.devices.contains_key(&held.author_device_id)
+                || self.verify_revision(&held).is_err()
+            {
+                continue;
+            }
+            stack.push((id.clone(), true));
+            stack.extend(
+                held.parents
+                    .iter()
+                    .rev()
+                    .map(|parent| (parent.clone(), false)),
+            );
+            held_by_id.insert(id, held);
+        }
+        Ok(ordered)
     }
 
     /// Seals an arbitrary revision as this device, bypassing head checks, so
@@ -1515,6 +1785,39 @@ impl LocalWrite {
     }
 }
 
+/// Every parent must be stored and belong to the same item.
+fn check_parents(connection: &Connection, revision: &EncryptedRevision) -> Result<()> {
+    for parent in &revision.parents {
+        match revision_by_id(connection, parent)? {
+            None => return Err(Error::MissingParent),
+            Some(stored) if stored.item_id != revision.item_id => return Err(Error::InvalidParent),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// A new revision supersedes exactly the parents it names. Parents always
+/// arrive before children, so a new revision is never an ancestor of a
+/// stored one, and removing only the named parents keeps every concurrent
+/// head.
+fn replace_heads(connection: &Connection, revision: &EncryptedRevision, id: &str) -> Result<()> {
+    for parent in &revision.parents {
+        connection.execute("DELETE FROM heads WHERE revision=?", [parent])?;
+    }
+    connection.execute(
+        "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,?)",
+        params![id, revision.item_id, revision.tombstone],
+    )?;
+    Ok(())
+}
+
+/// Errors after which a held revision stays held: it cannot be applied yet,
+/// or it does not verify, which is for the owner to review.
+fn error_keeps_hold(error: &Error) -> bool {
+    is_rejection(error) || matches!(error, Error::MissingParent | Error::MissingEpochKey)
+}
+
 fn is_revision_id(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1526,6 +1829,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(VAULT_META_TABLE)?;
     connection.execute_batch(DEVICES_SCHEMA)?;
     connection.execute_batch(DEVICES_TRIGGER)?;
+    connection.execute_batch(REVOCATIONS_SCHEMA)?;
     connection.execute_batch(EPOCH_KEYS_SCHEMA)?;
     connection.execute_batch(RECORD_SCHEMA)?;
     connection.execute_batch(QUARANTINE_SCHEMA)?;
@@ -1618,6 +1922,9 @@ struct BackupPayload {
     /// Held revisions, so pending owner review survives a restore.
     #[serde(default)]
     quarantine: Vec<EncryptedRevision>,
+    /// Authors removed by committed membership.
+    #[serde(default)]
+    revoked: Vec<[u8; DEVICE_ID_LEN]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1691,6 +1998,7 @@ fn read_header(connection: &Connection) -> Result<Header> {
             | MULTI_HEAD_FORMAT_VERSION
             | QUARANTINE_FORMAT_VERSION
             | SHARED_KEY_FORMAT_VERSION
+            | ROOT_KEY_FORMAT_VERSION
             | VAULT_FORMAT_VERSION
     ) {
         return Err(Error::UnsupportedVersion(version));
@@ -1700,17 +2008,22 @@ fn read_header(connection: &Connection) -> Result<Header> {
     } else {
         "NULL,NULL,NULL,NULL"
     };
-    // Columns added by format 6 do not exist in older files.
-    let root_columns = if version == VAULT_FORMAT_VERSION {
+    // Columns added by formats 6 and 7 do not exist in older files.
+    let root_columns = if version >= ROOT_KEY_FORMAT_VERSION {
         "recovery_check,legacy_recovery_nonce,legacy_recovery_wrapped_key,current_epoch"
     } else {
         "NULL,NULL,NULL,1"
+    };
+    let membership_columns = if version == VAULT_FORMAT_VERSION {
+        "recipient_nonce,recipient_wrapped_secret,write_fence"
+    } else {
+        "NULL,NULL,1"
     };
     let row = connection.query_row(
         &format!(
             "SELECT vault_id,kdf_memory_kib,kdf_iterations,kdf_parallelism,password_salt,\
              password_nonce,password_wrapped_key,recovery_nonce,recovery_wrapped_key,{device_columns},\
-             {root_columns} FROM vault_meta WHERE singleton=1"
+             {root_columns},{membership_columns} FROM vault_meta WHERE singleton=1"
         ),
         [],
         |row| Ok((
@@ -1728,9 +2041,13 @@ fn read_header(connection: &Connection) -> Result<Header> {
                 row.get::<_, Option<Vec<u8>>>(13)?, row.get::<_, Option<Vec<u8>>>(14)?,
                 row.get::<_, Option<Vec<u8>>>(15)?, row.get::<_, i64>(16)?,
             ),
+            (
+                row.get::<_, Option<Vec<u8>>>(17)?, row.get::<_, Option<Vec<u8>>>(18)?,
+                row.get::<_, i64>(19)?,
+            ),
         )),
     )?;
-    let (base, device_row, root_row) = row;
+    let (base, device_row, root_row, membership_row) = row;
     let device = match device_row {
         (Some(device_id), Some(public_key), Some(key_nonce), Some(wrapped_signing_key)) => {
             Some(DeviceHeader {
@@ -1745,11 +2062,15 @@ fn read_header(connection: &Connection) -> Result<Header> {
     };
     let recovery = key_wrapper(base.7, base.8)?;
     // Older formats always had a recovery wrapper.
-    if version != VAULT_FORMAT_VERSION && recovery.is_none() {
+    if version < ROOT_KEY_FORMAT_VERSION && recovery.is_none() {
         return Err(Error::Crypto);
     }
     let current_epoch = u64::try_from(root_row.3).map_err(|_| Error::Crypto)?;
     if current_epoch == 0 || current_epoch > MAX_EPOCH {
+        return Err(Error::Crypto);
+    }
+    let write_fence = u64::try_from(membership_row.2).map_err(|_| Error::Crypto)?;
+    if write_fence == 0 || write_fence > MAX_EPOCH {
         return Err(Error::Crypto);
     }
     Ok(Header {
@@ -1768,6 +2089,8 @@ fn read_header(connection: &Connection) -> Result<Header> {
         legacy_recovery: key_wrapper(root_row.1, root_row.2)?,
         current_epoch,
         device,
+        recipient: key_wrapper(membership_row.0, membership_row.1)?,
+        write_fence,
     })
 }
 
@@ -1790,8 +2113,9 @@ fn insert_header(connection: &Connection, header: &Header) -> Result<()> {
         "INSERT INTO vault_meta(singleton,format_version,vault_id,kdf_memory_kib,kdf_iterations,\
          kdf_parallelism,password_salt,password_nonce,password_wrapped_key,recovery_nonce,\
          recovery_wrapped_key,recovery_check,legacy_recovery_nonce,legacy_recovery_wrapped_key,\
-         current_epoch,device_id,device_public_key,device_key_nonce,device_wrapped_signing_key) \
-         VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         current_epoch,device_id,device_public_key,device_key_nonce,device_wrapped_signing_key,\
+         recipient_nonce,recipient_wrapped_secret,write_fence) \
+         VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             header.format_version,
             header.vault_id.as_slice(),
@@ -1823,6 +2147,15 @@ fn insert_header(connection: &Connection, header: &Header) -> Result<()> {
             device.public_key.as_slice(),
             device.key_nonce.as_slice(),
             device.wrapped_signing_key,
+            header
+                .recipient
+                .as_ref()
+                .map(|wrapper| wrapper.nonce.to_vec()),
+            header
+                .recipient
+                .as_ref()
+                .map(|wrapper| wrapper.wrapped_key.clone()),
+            i64::try_from(header.write_fence).map_err(|_| Error::Crypto)?,
         ],
     )?;
     Ok(())
@@ -1861,6 +2194,24 @@ fn wrap_with(
             &nonce,
             &key_wrap_aad(vault_id, method),
             root_key.as_ref(),
+        )?,
+    })
+}
+
+fn wrap_recipient_secret(
+    root_key: &SecretKey,
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    secret: &[u8; KEY_LEN],
+) -> Result<KeyWrapper> {
+    let nonce = random_array::<NONCE_LEN>();
+    Ok(KeyWrapper {
+        nonce,
+        wrapped_key: encrypt(
+            root_key,
+            &nonce,
+            &recipient_key_aad(vault_id, device_id),
+            secret,
         )?,
     })
 }
@@ -2014,6 +2365,42 @@ fn load_devices(
     Ok(devices)
 }
 
+/// Loads the revoked devices, failing closed if any row was not written by
+/// a holder of the root key.
+fn load_revocations(
+    connection: &Connection,
+    root_key: &SecretKey,
+    vault_id: &[u8; 32],
+) -> Result<BTreeSet<[u8; DEVICE_ID_LEN]>> {
+    let mut statement = connection.prepare("SELECT device_id,revocation FROM revoked_devices")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut revoked = BTreeSet::new();
+    for (device_id, revocation) in rows {
+        let device_id = array::<DEVICE_ID_LEN>(&device_id)?;
+        verify_device_revocation(root_key, vault_id, &device_id, &revocation)?;
+        revoked.insert(device_id);
+    }
+    Ok(revoked)
+}
+
+fn insert_revocation(
+    connection: &Connection,
+    root_key: &SecretKey,
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+) -> Result<()> {
+    let revocation = device_revocation(root_key, vault_id, device_id)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO revoked_devices(device_id,revocation) VALUES(?,?)",
+        params![device_id.as_slice(), revocation.as_slice()],
+    )?;
+    Ok(())
+}
+
 /// A format 1 row, read only while migrating.
 struct LegacyRevision {
     revision: String,
@@ -2152,6 +2539,10 @@ fn to_key(value: &[u8]) -> Result<SecretKey> {
 /// revision signature made with the same device key.
 pub const PAIRING_SIGNATURE_DOMAIN: &[u8] = b"osm-pairing-signature-v1\0";
 
+/// Prepended to every membership control signature; see
+/// [`Vault::sign_control`].
+pub const CONTROL_SIGNATURE_DOMAIN: &[u8] = b"osm-control-signature-v1\0";
+
 fn pairing_signature(key: &SigningKey, message: &[u8]) -> [u8; SIGNATURE_LEN] {
     let mut signed = PAIRING_SIGNATURE_DOMAIN.to_vec();
     signed.extend_from_slice(message);
@@ -2178,6 +2569,9 @@ pub fn verify_pairing_signature(
 pub struct PendingDevice {
     device_id: [u8; DEVICE_ID_LEN],
     seed: Zeroizing<[u8; 32]>,
+    /// Secret behind the device's HPKE recipient key; `Vault::join` wraps
+    /// it under the new root key.
+    recipient: SecretKey,
 }
 
 impl PendingDevice {
@@ -2185,11 +2579,18 @@ impl PendingDevice {
         Self {
             device_id: random_array(),
             seed: Zeroizing::new(random_array()),
+            recipient: Zeroizing::new(random_array()),
         }
     }
 
     pub fn device_id(&self) -> [u8; DEVICE_ID_LEN] {
         self.device_id
+    }
+
+    /// The secret the device's HPKE recipient key pair is derived from.
+    /// Epoch keys are sealed to that key; keep the secret in memory only.
+    pub fn recipient_secret(&self) -> SecretKey {
+        self.recipient.clone()
     }
 
     pub fn public_key(&self) -> [u8; PUBLIC_KEY_LEN] {
@@ -2226,6 +2627,8 @@ pub struct EnrollmentMaterial {
     pub recovery_check: Option<[u8; 32]>,
     /// Authorized authors as (device ID, public key), including this device.
     pub devices: Vec<([u8; DEVICE_ID_LEN], [u8; PUBLIC_KEY_LEN])>,
+    /// Authors among `devices` that committed membership has removed.
+    pub revoked: Vec<[u8; DEVICE_ID_LEN]>,
 }
 
 impl std::fmt::Debug for EnrollmentMaterial {
@@ -2303,7 +2706,78 @@ impl Vault {
             epoch_keys: self.epoch_keys()?,
             recovery_check: self.header.recovery_check,
             devices: self.authorized_devices()?,
+            revoked: self.revoked_devices()?,
         })
+    }
+
+    /// Signs a membership control request with this device's key;
+    /// `CONTROL_SIGNATURE_DOMAIN` is prepended, so the signature can never
+    /// pass as a revision or pairing signature.
+    pub fn sign_control(&self, message: &[u8]) -> Result<[u8; SIGNATURE_LEN]> {
+        let key = self.signing_key.as_ref().ok_or(Error::Locked)?;
+        let mut signed = CONTROL_SIGNATURE_DOMAIN.to_vec();
+        signed.extend_from_slice(message);
+        Ok(key.sign(&signed).to_bytes())
+    }
+
+    /// The secret this device's HPKE recipient key pair is derived from.
+    /// Epoch keys for this device are sealed to that key.
+    pub fn recipient_secret(&self) -> Result<SecretKey> {
+        self.recipient_secret.clone().ok_or(Error::Locked)
+    }
+
+    /// Authors removed by committed membership.
+    pub fn revoked_devices(&self) -> Result<Vec<[u8; DEVICE_ID_LEN]>> {
+        self.key()?;
+        Ok(self.revoked.iter().copied().collect())
+    }
+
+    /// Records that committed membership removed `device_id`. Its stored
+    /// revisions stay readable. A revision of its that this device has not
+    /// accepted yet is held for review, unless an authorized device's
+    /// revision names it as a parent. Returns whether this is new.
+    pub fn revoke_device(&mut self, device_id: [u8; DEVICE_ID_LEN]) -> Result<bool> {
+        let root_key = self.key()?.clone();
+        if Some(device_id) == self.device_id() {
+            return Err(Error::InvalidDevice("a device cannot revoke itself"));
+        }
+        if !self.devices.contains_key(&device_id) {
+            return Err(Error::InvalidDevice(
+                "only an authorized author can be revoked",
+            ));
+        }
+        if self.revoked.contains(&device_id) {
+            return Ok(false);
+        }
+        insert_revocation(
+            &self.connection,
+            &root_key,
+            &self.header.vault_id,
+            &device_id,
+        )?;
+        self.revoked.insert(device_id);
+        Ok(true)
+    }
+
+    /// The earliest epoch new revisions may use.
+    pub fn write_fence(&self) -> u64 {
+        self.header.write_fence
+    }
+
+    /// Stops writes under any epoch before `epoch` until it is activated.
+    /// Call when committed membership activates `epoch`. Works while
+    /// locked; the fence is never lowered.
+    pub fn raise_write_fence(&mut self, epoch: u64) -> Result<()> {
+        if epoch == 0 || epoch > MAX_EPOCH {
+            return Err(Error::Crypto);
+        }
+        let epoch_value = i64::try_from(epoch).map_err(|_| Error::Crypto)?;
+        self.connection.execute(
+            "UPDATE vault_meta SET write_fence=? WHERE singleton=1 AND write_fence<?",
+            params![epoch_value, epoch_value],
+        )?;
+        self.header.write_fence = self.header.write_fence.max(epoch);
+        Ok(())
     }
 
     /// Creates this device's copy of a vault from enrollment material, under
@@ -2358,6 +2832,8 @@ impl Vault {
             &device_key_aad(&vault_id, &device.device_id, &public_key),
             device.seed.as_ref(),
         )?;
+        let recipient =
+            wrap_recipient_secret(&root_key, &vault_id, &device.device_id, &device.recipient)?;
         let header = Header {
             format_version: VAULT_FORMAT_VERSION,
             vault_id,
@@ -2375,6 +2851,8 @@ impl Vault {
                 key_nonce,
                 wrapped_signing_key,
             }),
+            recipient: Some(recipient),
+            write_fence: material.current_epoch,
         };
         insert_header(&connection, &header)?;
         insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
@@ -2399,6 +2877,14 @@ impl Vault {
         }
         for (epoch, key) in &material.epoch_keys {
             store_epoch_key(&connection, &root_key, &vault_id, *epoch, key)?;
+        }
+        for device_id in &material.revoked {
+            if *device_id == device.device_id
+                || !material.devices.iter().any(|(id, _)| id == device_id)
+            {
+                return Err(Error::Crypto);
+            }
+            insert_revocation(&connection, &root_key, &vault_id, device_id)?;
         }
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
@@ -2444,7 +2930,10 @@ impl Vault {
     }
 
     /// Creates and stores the key for the next epoch without activating it.
-    /// Rotation seals it to the retained members before activation.
+    /// Only for a vault without a control plane: committed rotation instead
+    /// seals a fresh key into the removal proposal, and each member installs
+    /// it from committed state, so a key stored here for that epoch would
+    /// conflict with it.
     pub fn generate_epoch_key(&mut self) -> Result<(u64, SecretKey)> {
         self.key()?;
         let epoch = self.epoch_keys.keys().next_back().copied().unwrap_or(0) + 1;
@@ -2581,6 +3070,7 @@ impl Vault {
             )?;
         }
         transaction.execute_batch(DEVICES_TRIGGER)?;
+        transaction.execute_batch(REVOCATIONS_SCHEMA)?;
         transaction.execute_batch(EPOCH_KEYS_SCHEMA)?;
         store_epoch_key(&transaction, &root_key, &vault_id, FIRST_EPOCH, shared_key)?;
         transaction.execute_batch(SET_ASIDE_RECORD_TABLES)?;
@@ -2627,6 +3117,8 @@ impl Vault {
             legacy_recovery: None,
             current_epoch: FIRST_EPOCH,
             device: Some(device),
+            recipient: None,
+            write_fence: FIRST_EPOCH,
         };
         insert_header(&connection, &header)?;
         let record = header.device_record()?;

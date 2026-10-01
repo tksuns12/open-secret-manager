@@ -26,8 +26,11 @@ use openraft::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
+use tokio::sync::watch;
 
-use crate::{ControlConfig, ControlRequest, ControlState, DeviceId, DeviceNode, Outcome};
+use crate::{
+    ControlConfig, ControlEntry, ControlRequest, ControlState, DeviceId, DeviceNode, Outcome,
+};
 
 type Result<T> = std::result::Result<T, StorageError<DeviceId>>;
 
@@ -143,8 +146,18 @@ fn from_json<T: DeserializeOwned>(text: &str) -> Result<T> {
     serde_json::from_str(text).map_err(read_error)
 }
 
-/// Opens (or creates) a node's control-plane database.
-pub fn open(path: impl AsRef<Path>, crash: CrashPlan) -> Result<(LogStore, StateMachineStore)> {
+fn wrong_vault() -> StorageError<DeviceId> {
+    read_error(std::io::Error::other(
+        "the control-plane database belongs to another vault",
+    ))
+}
+
+/// Opens (or creates) a node's control-plane database for `vault_id`.
+pub fn open(
+    path: impl AsRef<Path>,
+    vault_id: [u8; 32],
+    crash: CrashPlan,
+) -> Result<(LogStore, StateMachineStore)> {
     let connection = Connection::open(path).map_err(read_error)?;
     connection.execute_batch(SCHEMA).map_err(write_error)?;
     let state = match connection
@@ -156,9 +169,13 @@ pub fn open(path: impl AsRef<Path>, crash: CrashPlan) -> Result<(LogStore, State
         .optional()
         .map_err(read_error)?
     {
-        Some(text) => from_json(&text)?,
-        None => ControlState::default(),
+        Some(text) => from_json::<ControlState>(&text)?,
+        None => ControlState::new(vault_id),
     };
+    if state.vault_id != vault_id {
+        return Err(wrong_vault());
+    }
+    let (applied, _) = watch::channel(state.last_applied);
     let db = Arc::new(Mutex::new(connection));
     Ok((
         LogStore {
@@ -168,6 +185,7 @@ pub fn open(path: impl AsRef<Path>, crash: CrashPlan) -> Result<(LogStore, State
         StateMachineStore {
             db,
             state: Arc::new(Mutex::new(state)),
+            applied: Arc::new(applied),
             crash,
         },
     ))
@@ -371,6 +389,8 @@ impl RaftLogStorage<ControlConfig> for LogStore {
 pub struct StateMachineStore {
     db: Arc<Mutex<Connection>>,
     state: Arc<Mutex<ControlState>>,
+    /// The last applied log ID, published after the state is on disk.
+    applied: Arc<watch::Sender<Option<LogId<DeviceId>>>>,
     crash: CrashPlan,
 }
 
@@ -378,6 +398,18 @@ impl StateMachineStore {
     /// A shared view of the applied state, for reading outside Raft.
     pub fn state_handle(&self) -> Arc<Mutex<ControlState>> {
         self.state.clone()
+    }
+
+    /// Changes whenever newly applied state has been persisted.
+    pub fn applied_handle(&self) -> watch::Receiver<Option<LogId<DeviceId>>> {
+        self.applied.subscribe()
+    }
+
+    fn vault_id(&self) -> Result<[u8; 32]> {
+        self.state
+            .lock()
+            .map(|state| state.vault_id)
+            .map_err(|_| read_error(std::io::Error::other("state lock poisoned")))
     }
 
     fn persist(&self, state: &ControlState) -> Result<()> {
@@ -467,7 +499,7 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
                 {
                     crash |= self.crash.trigger(point);
                 }
-                if let EntryPayload::Normal(request) = &entry.payload {
+                if let EntryPayload::Normal(ControlEntry::Request(request)) = &entry.payload {
                     if matches!(request.request, ControlRequest::ProposeChange(_)) {
                         crash |= self.crash.trigger(CrashPoint::ApplyProposal);
                     }
@@ -480,6 +512,7 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
         if crash {
             return Err(crashed());
         }
+        self.applied.send_replace(snapshot.last_applied);
         Ok(outcomes)
     }
 
@@ -506,6 +539,9 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
     ) -> Result<()> {
         let data = snapshot.into_inner();
         let mut installed: ControlState = serde_json::from_slice(&data).map_err(read_error)?;
+        if installed.vault_id != self.vault_id()? {
+            return Err(wrong_vault());
+        }
         installed.last_applied = meta.last_log_id;
         installed.membership = meta.last_membership.clone();
         {
@@ -518,10 +554,12 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
             .map_err(write_error)?;
         }
         self.persist(&installed)?;
+        let applied = installed.last_applied;
         *self
             .state
             .lock()
             .map_err(|_| write_error(std::io::Error::other("state lock poisoned")))? = installed;
+        self.applied.send_replace(applied);
         Ok(())
     }
 

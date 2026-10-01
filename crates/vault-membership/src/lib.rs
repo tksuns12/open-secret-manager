@@ -7,6 +7,12 @@
 //! OpenRaft's joint-consensus membership change. Log, vote, and state are
 //! persisted in SQLite before anything is acknowledged.
 //!
+//! The state also decides key epochs. A removal carries the next epoch key
+//! sealed to every remaining voter, and that epoch becomes current only when
+//! the removal completes; an enrolled device receives epoch keys only after
+//! it has become a voter. Keys travel as HPKE envelopes, so the log holds no
+//! key in the clear.
+//!
 //! Raft tolerates crashed and partitioned devices, not malicious ones: a
 //! compromised voter is outside its safety model.
 
@@ -20,19 +26,20 @@ mod types;
 use std::io::Cursor;
 
 pub use error::{Error, Result};
-pub use network::{verify_rpc_sender, NetworkFactory, Router, SenderMismatch};
+pub use network::{verify_rpc_sender, Forwarder, NetworkFactory, Router, SenderMismatch};
 pub use node::{default_config, ControlNode, NodeOptions};
 pub use state::{ControlState, PendingChange};
 pub use store::{CrashPlan, CrashPoint};
 pub use types::{
-    device_id_from_bytes, ControlRequest, DeviceId, DeviceNode, KeySigner, MembershipChange,
-    Outcome, Rejection, RequestSigner, SignedRequest,
+    device_id_from_bytes, device_id_to_bytes, ControlEntry, ControlRequest, DeviceId, DeviceNode,
+    KeySigner, MembershipChange, Outcome, Rejection, RequestSigner, Rotation, SignedRequest,
+    SIGNATURE_DOMAIN,
 };
 
 openraft::declare_raft_types!(
     /// OpenRaft types for the control plane. Node IDs are device IDs.
     pub ControlConfig:
-        D = SignedRequest,
+        D = ControlEntry,
         R = Outcome,
         NodeId = DeviceId,
         Node = DeviceNode,
