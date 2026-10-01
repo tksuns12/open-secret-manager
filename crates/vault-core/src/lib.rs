@@ -11,8 +11,8 @@ pub use crypto::RecoveryKey;
 pub use error::{Error, Result};
 pub use import::preview_import;
 pub use model::{
-    ImportFormat, ImportPreview, ImportWarning, Item, ItemKind, ItemSummary, ItemVersion,
-    PasswordPolicy, QuarantinedRevision, RevisionInfo, VaultItem,
+    ImportFormat, ImportPreview, ImportWarning, IngressReport, Item, ItemKind, ItemSummary,
+    ItemVersion, PasswordPolicy, QuarantinedRevision, RevisionInfo, StageOutcome, VaultItem,
 };
 pub use storage::{
     verify_pairing_signature, EncryptedRevision, EnrollmentMaterial, PendingDevice, Vault,

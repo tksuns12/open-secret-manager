@@ -7,12 +7,19 @@
 //! ```text
 //! osm-peer create <vault>
 //! osm-peer add <vault> <title>
-//! osm-peer list <vault>                              ITEM <title>
-//! osm-peer invite <vault> <peers.db> <listen-addr>   LISTEN, INVITE, SAS, PAIRED
-//! osm-peer join <code> <vault> <peers.db>            SAS, JOINED
-//! osm-peer serve <vault> <peers.db> <listen-addr>    LISTEN, SYNCED
-//! osm-peer sync <vault> <peers.db> <address>         SYNCED
+//! osm-peer list <vault>                                ITEM <title>
+//! osm-peer invite <vault> <peers.db> <listen-addr>     LISTEN, INVITE, SAS, PAIRED
+//! osm-peer join <code> <vault> <peers.db>              SAS, JOINED
+//! osm-peer serve <vault> <peers.db> <listen-addr>      LISTEN, SYNCED
+//! osm-peer sync <vault> <peers.db> <address>           SYNCED
+//! osm-peer serve-locked <vault> <peers.db> <listen>    LISTEN, SYNCED
+//! osm-peer sync-locked <vault> <peers.db> <address>    SYNCED
 //! ```
+//!
+//! The `-locked` forms open the vault without its password: received
+//! revisions are staged unverified and processed at the next unlock. Every
+//! command that unlocks processes staged revisions first and prints
+//! `PROCESSED` when there were any.
 //!
 //! `invite` and `join` print the short code and wait for `y` on stdin: the
 //! owner must compare the codes on both devices before either confirms.
@@ -112,16 +119,24 @@ async fn run(args: &[String]) -> CliResult {
             println!("JOINED");
             Ok(())
         }
-        ["serve", vault, peers, listen] => {
-            let mut vault = unlock(vault)?;
+        ["serve" | "serve-locked", vault, peers, listen] => {
+            let mut vault = if args[0] == "serve" {
+                unlock(vault)?
+            } else {
+                Vault::open(vault)?
+            };
             let mut peers = PeerStore::open(peers)?;
             let listener = TcpListener::bind(listen).await?;
             println!("LISTEN {}", listener.local_addr()?);
             report(&serve_sync(&listener, &mut vault, &mut peers).await?);
             Ok(())
         }
-        ["sync", vault, peers, address] => {
-            let mut vault = unlock(vault)?;
+        ["sync" | "sync-locked", vault, peers, address] => {
+            let mut vault = if args[0] == "sync" {
+                unlock(vault)?
+            } else {
+                Vault::open(vault)?
+            };
             let mut peers = PeerStore::open(peers)?;
             report(&connect_sync(address, &mut vault, &mut peers).await?);
             Ok(())
@@ -137,6 +152,13 @@ fn password() -> Result<String, Box<dyn std::error::Error>> {
 fn unlock(path: &str) -> Result<Vault, Box<dyn std::error::Error>> {
     let mut vault = Vault::open(path)?;
     vault.unlock(&password()?)?;
+    if !vault.staged_revision_ids()?.is_empty() {
+        let processed = vault.process_staged()?;
+        println!(
+            "PROCESSED applied={} quarantined={} rejected={} pending={}",
+            processed.applied, processed.quarantined, processed.rejected, processed.pending
+        );
+    }
     Ok(vault)
 }
 
@@ -159,7 +181,7 @@ async fn confirmed() -> bool {
 
 fn report(report: &SyncReport) {
     println!(
-        "SYNCED sent={} applied={} quarantined={} deferred={}",
-        report.sent, report.applied, report.quarantined, report.deferred
+        "SYNCED sent={} received={} applied={} quarantined={} pending={}",
+        report.sent, report.received, report.applied, report.quarantined, report.pending
     );
 }

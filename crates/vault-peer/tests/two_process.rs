@@ -42,7 +42,18 @@ struct Running {
 
 impl Running {
     fn start(args: &[&str]) -> Self {
-        let mut child = osm_peer()
+        Self::spawn(osm_peer(), args)
+    }
+
+    /// Starts a process that has no way to learn the vault password.
+    fn start_without_password(args: &[&str]) -> Self {
+        let mut command = osm_peer();
+        command.env_remove("OSM_PASSWORD");
+        Self::spawn(command, args)
+    }
+
+    fn spawn(mut command: Command, args: &[&str]) -> Self {
+        let mut child = command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -135,7 +146,7 @@ fn two_processes_pair_and_sync_over_tls() {
     let synced = run(&["sync", &b, &b_peers, &address]);
     assert!(synced
         .iter()
-        .any(|line| line.starts_with("SYNCED sent=0 applied=2")));
+        .any(|line| line.starts_with("SYNCED sent=0 received=2 applied=2")));
     server.succeed();
     assert_eq!(items(&b), ["Bank", "Mail"]);
 
@@ -146,10 +157,26 @@ fn two_processes_pair_and_sync_over_tls() {
     let synced = run(&["sync", &a, &a_peers, &address]);
     assert!(synced
         .iter()
-        .any(|line| line.starts_with("SYNCED sent=0 applied=1")));
+        .any(|line| line.starts_with("SYNCED sent=0 received=1 applied=1")));
     server.succeed();
     assert_eq!(items(&a), ["Bank", "Mail", "Wifi"]);
     assert_eq!(items(&b), items(&a));
+
+    // B receives while locked: its process never has the password, so it
+    // can only stage ciphertext.
+    run(&["add", &a, "Locker"]);
+    let server = Running::start_without_password(&["serve-locked", &b, &b_peers, "127.0.0.1:0"]);
+    let address = server.expect("LISTEN");
+    run(&["sync", &a, &a_peers, &address]);
+    let received = server.expect("SYNCED");
+    assert!(received.contains("received=1 applied=0"), "{received}");
+    assert!(received.ends_with("pending=1"), "{received}");
+    server.succeed();
+
+    // The next unlock verifies and applies it.
+    let listed = run(&["list", &b]);
+    assert!(listed.contains(&"PROCESSED applied=1 quarantined=0 rejected=0 pending=0".to_owned()));
+    assert_eq!(items(&b), ["Bank", "Locker", "Mail", "Wifi"]);
 }
 
 #[test]

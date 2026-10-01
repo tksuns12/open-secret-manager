@@ -18,13 +18,15 @@ use crate::{
         revision_signature_message, verify_device_authorization, KdfConfig, SecretKey,
         DEVICE_ID_LEN, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    Error, Item, ItemSummary, ItemVersion, QuarantinedRevision, RecoveryKey, Result, RevisionInfo,
-    VaultItem,
+    Error, IngressReport, Item, ItemSummary, ItemVersion, QuarantinedRevision, RecoveryKey, Result,
+    RevisionInfo, StageOutcome, VaultItem,
 };
 
 /// Storage layout: multi-head revisions plus a quarantine for revisions
 /// from unauthorized devices.
-const VAULT_FORMAT_VERSION: u32 = 4;
+const VAULT_FORMAT_VERSION: u32 = 5;
+/// Quarantine but no ingress queue; migrated without the key on open.
+const QUARANTINE_FORMAT_VERSION: u32 = 4;
 /// Multi-head layout without a quarantine table; migrated on first unlock.
 const MULTI_HEAD_FORMAT_VERSION: u32 = 3;
 /// Signed revisions with one head per item; migrated by SQL on first unlock.
@@ -39,6 +41,9 @@ const BACKUP_FORMAT_VERSION: u32 = 3;
 const MAX_PARENTS: usize = 16;
 /// Upper bound on held revisions awaiting owner review.
 const MAX_QUARANTINE: i64 = 10_000;
+/// Bounds on received revisions awaiting processing.
+const MAX_INGRESS: i64 = 100_000;
+const MAX_INGRESS_BYTES: i64 = 512 * 1024 * 1024;
 const KEY_EPOCH: u64 = 1;
 const MAX_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 16 * 1024 * 1024;
@@ -119,6 +124,28 @@ CREATE TABLE quarantine (
 ) STRICT;
 CREATE TRIGGER quarantine_no_update BEFORE UPDATE ON quarantine
 BEGIN SELECT RAISE(ABORT, 'quarantined revisions are immutable'); END;
+"#;
+
+/// Received revisions not yet processed, with their exact signed bytes:
+/// staged while locked, or waiting for a parent. Nothing here has been
+/// verified; processing moves each row into `revisions` or `quarantine` in
+/// the same transaction that deletes it.
+const INGRESS_SCHEMA: &str = r#"
+CREATE TABLE ingress (
+    revision TEXT PRIMARY KEY CHECK(length(revision) = 64),
+    format_version INTEGER NOT NULL CHECK(format_version = 2),
+    vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
+    item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
+    parents TEXT NOT NULL CHECK(length(parents) % 64 = 0 AND length(parents) <= 1024),
+    key_epoch INTEGER NOT NULL CHECK(key_epoch = 1),
+    author_device_id BLOB NOT NULL CHECK(length(author_device_id) = 16),
+    nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+    ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 16 AND 16777232),
+    tombstone INTEGER NOT NULL CHECK(tombstone IN (0, 1)),
+    signature BLOB NOT NULL CHECK(length(signature) = 64)
+) STRICT;
+CREATE TRIGGER ingress_no_update BEFORE UPDATE ON ingress
+BEGIN SELECT RAISE(ABORT, 'staged revisions are immutable'); END;
 "#;
 
 const REVISION_COLUMNS: &str = "r.format_version,r.vault_id,r.item_id,r.parents,r.key_epoch,\
@@ -366,7 +393,13 @@ impl Vault {
         let path = path.as_ref();
         let connection = open_connection(path)?;
         let header = read_header(&connection)?;
-        Ok(Self::from_parts(path, connection, header))
+        let mut vault = Self::from_parts(path, connection, header);
+        // Adding the ingress queue needs no key, so a locked vault can
+        // receive as soon as it is opened.
+        if vault.header.format_version == QUARANTINE_FORMAT_VERSION {
+            vault.migrate_add_ingress()?;
+        }
+        Ok(vault)
     }
 
     pub fn vault_id(&self) -> [u8; 32] {
@@ -435,6 +468,9 @@ impl Vault {
         }
         if self.header.format_version == MULTI_HEAD_FORMAT_VERSION {
             self.migrate_add_quarantine()?;
+        }
+        if self.header.format_version == QUARANTINE_FORMAT_VERSION {
+            self.migrate_add_ingress()?;
         }
         let device = self.header.device.as_ref().ok_or(Error::Crypto)?;
         let seed = decrypt(
@@ -599,6 +635,29 @@ impl Vault {
         )?;
         if version == MULTI_HEAD_FORMAT_VERSION {
             transaction.execute_batch(QUARANTINE_SCHEMA)?;
+            transaction.execute(
+                "UPDATE vault_meta SET format_version=? WHERE singleton=1",
+                [QUARANTINE_FORMAT_VERSION],
+            )?;
+        }
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(())
+    }
+
+    /// Adds the ingress queue to a format 4 vault. Purely additive and
+    /// keyless.
+    fn migrate_add_ingress(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = transaction.query_row(
+            "SELECT format_version FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == QUARANTINE_FORMAT_VERSION {
+            transaction.execute_batch(INGRESS_SCHEMA)?;
             transaction.execute(
                 "UPDATE vault_meta SET format_version=? WHERE singleton=1",
                 [VAULT_FORMAT_VERSION],
@@ -1162,6 +1221,7 @@ impl Vault {
             }
             insert_revision(&transaction, "quarantine", &revision, &id)?;
         }
+        transaction.execute("DELETE FROM ingress WHERE revision=?", [&id])?;
         transaction.commit()?;
         Ok(())
     }
@@ -1257,6 +1317,8 @@ impl Vault {
             if stored != revision {
                 return Err(Error::Crypto);
             }
+            transaction.execute("DELETE FROM ingress WHERE revision=?", [&id])?;
+            transaction.commit()?;
             return Ok(info);
         }
         for parent in &revision.parents {
@@ -1281,6 +1343,8 @@ impl Vault {
         for held in release.into_iter().chain([id.as_str()]) {
             transaction.execute("DELETE FROM quarantine WHERE revision=?", [held])?;
         }
+        // A staged copy is consumed by the same transaction that accepts it.
+        transaction.execute("DELETE FROM ingress WHERE revision=?", [&id])?;
         // Parents always arrive before children, so a new revision is never
         // an ancestor of a stored one. Removing only the named parents keeps
         // every concurrent head.
@@ -1365,6 +1429,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(META_SCHEMA)?;
     connection.execute_batch(RECORD_SCHEMA)?;
     connection.execute_batch(QUARANTINE_SCHEMA)?;
+    connection.execute_batch(INGRESS_SCHEMA)?;
     Ok(())
 }
 
@@ -1509,6 +1574,7 @@ fn read_header(connection: &Connection) -> Result<Header> {
         LEGACY_FORMAT_VERSION
             | SINGLE_HEAD_FORMAT_VERSION
             | MULTI_HEAD_FORMAT_VERSION
+            | QUARANTINE_FORMAT_VERSION
             | VAULT_FORMAT_VERSION
     ) {
         return Err(Error::UnsupportedVersion(version));
@@ -2038,9 +2104,8 @@ impl Vault {
     }
 
     /// IDs of every accepted revision in insertion order, so parents always
-    /// precede children.
+    /// precede children. Works while locked: IDs are public metadata.
     pub fn revision_ids(&self) -> Result<Vec<String>> {
-        self.key()?;
         let mut statement = self
             .connection
             .prepare("SELECT revision FROM revisions ORDER BY rowid")?;
@@ -2051,9 +2116,9 @@ impl Vault {
     }
 
     /// The accepted revisions among `ids`, parents first. Unknown IDs are
-    /// skipped.
+    /// skipped. Works while locked: revisions are already encrypted and
+    /// signed, so a locked device can still send them.
     pub fn revisions_by_id(&self, ids: &[String]) -> Result<Vec<EncryptedRevision>> {
-        self.key()?;
         let mut statement = self.connection.prepare(&format!(
             "SELECT r.rowid,{REVISION_COLUMNS} FROM revisions r WHERE r.revision=?"
         ))?;
@@ -2072,4 +2137,128 @@ impl Vault {
         found.dedup_by_key(|(rowid, _)| *rowid);
         Ok(found.into_iter().map(|(_, revision)| revision).collect())
     }
+}
+
+impl Vault {
+    /// Durably stores a received revision for later processing. Works while
+    /// locked: only the envelope's shape is checked, and nothing is
+    /// decrypted or verified until [`Vault::process_staged`].
+    pub fn stage_revision(&mut self, revision: EncryptedRevision) -> Result<StageOutcome> {
+        // Older layouts gain the ingress queue on unlock.
+        if self.header.format_version != VAULT_FORMAT_VERSION {
+            return Err(Error::Locked);
+        }
+        revision.validate_shape(&self.header.vault_id)?;
+        let id = revision.revision_id();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let known: i64 = transaction.query_row(
+            "SELECT (SELECT COUNT(*) FROM revisions WHERE revision=?1)
+                  + (SELECT COUNT(*) FROM ingress WHERE revision=?1)
+                  + (SELECT COUNT(*) FROM quarantine WHERE revision=?1)",
+            [&id],
+            |row| row.get(0),
+        )?;
+        if known > 0 {
+            return Ok(StageOutcome::Duplicate);
+        }
+        let (count, bytes): (i64, i64) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(ciphertext)), 0) FROM ingress",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if count >= MAX_INGRESS || bytes + revision.ciphertext.len() as i64 > MAX_INGRESS_BYTES {
+            return Err(Error::IngressFull);
+        }
+        insert_revision(&transaction, "ingress", &revision, &id)?;
+        transaction.commit()?;
+        Ok(StageOutcome::Staged)
+    }
+
+    /// IDs of staged revisions in arrival order. Works while locked.
+    pub fn staged_revision_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT revision FROM ingress ORDER BY rowid")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Parents named by staged revisions that are neither accepted nor
+    /// staged, so a sync peer can be asked for them. Works while locked.
+    pub fn staged_missing_parents(&self) -> Result<Vec<String>> {
+        let known: BTreeSet<String> = self
+            .revision_ids()?
+            .into_iter()
+            .chain(self.staged_revision_ids()?)
+            .collect();
+        let missing: BTreeSet<String> = staged_revisions(&self.connection)?
+            .into_iter()
+            .flat_map(|revision| revision.parents)
+            .filter(|parent| !known.contains(parent))
+            .collect();
+        Ok(missing.into_iter().collect())
+    }
+
+    /// Verifies and applies staged revisions in arrival order, repeating
+    /// while any progress is made. Each accepted or quarantined revision
+    /// leaves the queue in the same transaction that stores it. A revision
+    /// that fails verification is discarded; one still missing a parent
+    /// stays staged. Storage failures stop processing and leave the queue
+    /// and the vault as they were for that revision.
+    pub fn process_staged(&mut self) -> Result<IngressReport> {
+        self.key()?;
+        let mut report = IngressReport::default();
+        loop {
+            let mut progressed = false;
+            for revision in staged_revisions(&self.connection)? {
+                let id = revision.revision_id();
+                match self.apply_encrypted_revision(revision) {
+                    Ok(_) => report.applied += 1,
+                    Err(Error::Quarantined) => report.quarantined += 1,
+                    Err(Error::MissingParent) => continue,
+                    Err(error) if is_rejection(&error) => {
+                        self.connection
+                            .execute("DELETE FROM ingress WHERE revision=?", [&id])?;
+                        report.rejected += 1;
+                        report.first_rejection.get_or_insert(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        report.pending = self.staged_revision_ids()?.len();
+        Ok(report)
+    }
+}
+
+/// Errors that prove a revision itself is invalid, as opposed to a storage
+/// or state failure that must not discard it.
+fn is_rejection(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Crypto
+            | Error::InvalidSignature
+            | Error::InvalidParent
+            | Error::InvalidItem(_)
+            | Error::UnsupportedVersion(_)
+            | Error::Serialization(_)
+    )
+}
+
+fn staged_revisions(connection: &Connection) -> Result<Vec<EncryptedRevision>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {REVISION_COLUMNS} FROM ingress r ORDER BY r.rowid"
+    ))?;
+    let staged = statement
+        .query_map([], row_to_revision)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(staged)
 }

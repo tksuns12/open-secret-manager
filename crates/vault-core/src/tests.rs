@@ -847,6 +847,7 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
     connection
         .execute_batch(
             "DROP TRIGGER quarantine_no_update; DROP TABLE quarantine;
+             DROP TRIGGER ingress_no_update; DROP TABLE ingress;
              DROP TRIGGER revisions_no_update; DROP TRIGGER revisions_no_delete;
              DROP INDEX revisions_item_id; DROP INDEX heads_item_id;
              ALTER TABLE heads RENAME TO multi_heads;
@@ -885,7 +886,7 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
     assert_eq!(current.revision, second.revision);
     assert!(!current.conflict);
     migrated.update(current.item, &current.revision).unwrap();
-    // The chained 2 -> 3 -> 4 migration created the quarantine.
+    // The chained 2 -> 3 -> 4 -> 5 migration created the quarantine.
     assert!(migrated.quarantined().unwrap().is_empty());
     drop(migrated);
     let version: u32 = Connection::open(&path)
@@ -894,7 +895,7 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
@@ -1047,4 +1048,148 @@ fn held_revisions_survive_backup_and_restore() {
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].revision, foreign_id);
     assert_eq!(head_set(&restored, &item.id), [base]);
+}
+
+#[test]
+fn locked_vault_stages_revisions_and_applies_them_on_unlock() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let incoming = edit(&mut b, &item, &base, "sent while A was locked");
+    let incoming_id = incoming.revision_id();
+    drop(a);
+
+    // Opened without a password: no key is available.
+    let mut locked = Vault::open(dir.path().join("a.db")).unwrap();
+    assert!(!locked.is_unlocked());
+    assert_eq!(
+        locked.stage_revision(incoming.clone()).unwrap(),
+        crate::StageOutcome::Staged
+    );
+    assert_eq!(
+        locked.stage_revision(incoming.clone()).unwrap(),
+        crate::StageOutcome::Duplicate
+    );
+    assert_eq!(
+        locked.staged_revision_ids().unwrap(),
+        std::slice::from_ref(&incoming_id)
+    );
+    assert!(matches!(locked.get(&item.id), Err(Error::Locked)));
+    assert!(matches!(locked.process_staged(), Err(Error::Locked)));
+    // Staged, not accepted: the head set is unchanged.
+    assert!(!locked.revision_ids().unwrap().contains(&incoming_id));
+    drop(locked);
+
+    // The staged revision survives a restart and is applied on unlock.
+    a = Vault::open(dir.path().join("a.db")).unwrap();
+    assert_eq!(a.staged_revision_ids().unwrap().len(), 1);
+    a.unlock("password").unwrap();
+    let report = a.process_staged().unwrap();
+    assert_eq!((report.applied, report.pending, report.rejected), (1, 0, 0));
+    assert_eq!(
+        a.get(&item.id).unwrap().item.password,
+        "sent while A was locked"
+    );
+    assert!(a.staged_revision_ids().unwrap().is_empty());
+    // Once accepted it is a duplicate, not staged again.
+    assert_eq!(
+        a.stage_revision(incoming).unwrap(),
+        crate::StageOutcome::Duplicate
+    );
+}
+
+#[test]
+fn a_staged_child_waits_for_its_parent_across_restarts() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let first = edit(&mut b, &item, &base, "first");
+    let second = edit(&mut b, &item, &first.revision_id(), "second");
+
+    a.stage_revision(second.clone()).unwrap();
+    assert_eq!(a.staged_missing_parents().unwrap(), [first.revision_id()]);
+    let report = a.process_staged().unwrap();
+    assert_eq!((report.applied, report.pending), (0, 1));
+    drop(a);
+
+    let mut a = Vault::open(dir.path().join("a.db")).unwrap();
+    a.stage_revision(first).unwrap();
+    assert!(a.staged_missing_parents().unwrap().is_empty());
+    a.unlock("password").unwrap();
+    // Arrival order was child first; processing repeats until both apply.
+    let report = a.process_staged().unwrap();
+    assert_eq!((report.applied, report.pending), (2, 0));
+    assert_eq!(a.get(&item.id).unwrap().item.password, "second");
+}
+
+#[test]
+fn staged_forgeries_are_discarded_and_valid_revisions_kept() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let valid = edit(&mut b, &item, &base, "valid");
+    let other = login("Other");
+    let mut forged = b.seal_for_test(&other, Vec::new(), false).unwrap();
+    forged.signature[0] ^= 1;
+
+    // Staging checks shape only, so a bad signature is not noticed yet...
+    a.lock();
+    a.stage_revision(forged.clone()).unwrap();
+    a.stage_revision(valid).unwrap();
+    // ...but a malformed envelope is refused outright.
+    let mut malformed = forged.clone();
+    malformed.signature.pop();
+    assert!(matches!(a.stage_revision(malformed), Err(Error::Crypto)));
+    assert_eq!(a.staged_revision_ids().unwrap().len(), 2);
+
+    a.unlock("password").unwrap();
+    let report = a.process_staged().unwrap();
+    assert_eq!((report.applied, report.rejected, report.pending), (1, 1, 0));
+    assert!(matches!(
+        report.first_rejection,
+        Some(Error::InvalidSignature)
+    ));
+    assert!(a.staged_revision_ids().unwrap().is_empty());
+    assert!(matches!(a.get(&other.id), Err(Error::NotFound)));
+    assert_eq!(a.get(&item.id).unwrap().item.password, "valid");
+}
+
+#[test]
+fn staged_revisions_from_unknown_devices_go_to_quarantine() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base, _) = untrusted_copy(dir.path());
+    let foreign = edit(&mut b, &item, &base, "from unknown device");
+    a.lock();
+    a.stage_revision(foreign).unwrap();
+    a.unlock("password").unwrap();
+    let report = a.process_staged().unwrap();
+    assert_eq!(
+        (report.quarantined, report.applied, report.pending),
+        (1, 0, 0)
+    );
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+    assert!(a.staged_revision_ids().unwrap().is_empty());
+}
+
+#[test]
+fn a_format_4_vault_gains_the_ingress_queue_when_opened_locked() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let incoming = edit(&mut b, &item, &base, "after upgrade");
+    drop(a);
+    let connection = Connection::open(dir.path().join("a.db")).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER ingress_no_update; DROP TABLE ingress;
+             UPDATE vault_meta SET format_version=4;",
+        )
+        .unwrap();
+    drop(connection);
+
+    a = Vault::open(dir.path().join("a.db")).unwrap();
+    a.stage_revision(incoming).unwrap();
+    let version: u32 = Connection::open(dir.path().join("a.db"))
+        .unwrap()
+        .query_row("SELECT format_version FROM vault_meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 5);
 }

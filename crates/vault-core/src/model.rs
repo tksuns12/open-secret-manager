@@ -136,6 +136,28 @@ impl fmt::Debug for VaultItem {
     }
 }
 
+/// Result of storing a received revision for later processing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// Stored durably; it will be verified when processed.
+    Staged,
+    /// Already stored, staged, or quarantined.
+    Duplicate,
+}
+
+/// Result of processing staged revisions after unlock.
+#[derive(Debug, Default)]
+pub struct IngressReport {
+    pub applied: usize,
+    pub quarantined: usize,
+    /// Failed verification and were discarded.
+    pub rejected: usize,
+    /// Still waiting for a parent.
+    pub pending: usize,
+    /// Why the first rejected revision failed.
+    pub first_rejection: Option<crate::Error>,
+}
+
 /// A revision held because its author is not an authorized device. It was
 /// encrypted with the vault key but is not part of the item's history until
 /// the owner accepts it.

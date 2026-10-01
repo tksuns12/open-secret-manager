@@ -32,6 +32,8 @@ pub enum Error {
     Quarantined,
     #[error("quarantine is full; review or discard held revisions")]
     QuarantineFull,
+    #[error("too many received revisions are waiting; unlock to process them")]
+    IngressFull,
     #[error("invalid item: {0}")]
     InvalidItem(String),
     #[error("invalid import: {0}")]

@@ -319,7 +319,7 @@ fn a_missing_parent_is_requested_and_the_child_applied() {
     .unwrap();
     assert!(complete);
     assert_eq!(report_b.applied, 2);
-    assert_eq!(report_b.deferred, 0);
+    assert_eq!(report_b.pending, 0);
     assert_eq!(b.vault.get(&item.id).unwrap().item.password, "v2");
 }
 
@@ -364,9 +364,10 @@ fn revisions_from_a_device_unknown_to_the_receiver_are_quarantined() {
     assert_eq!(b.vault.get(&item.id).unwrap().item.password, "original");
     assert_eq!(b.vault.quarantined().unwrap()[0].revision, from_d);
 
-    // It is offered again by the next session and held only once.
+    // It is offered again by the next session, recognized as already held,
+    // and held only once.
     let (_, report_b) = sync(&mut a.vault, &mut b.vault);
-    assert_eq!(report_b.quarantined, 1);
+    assert_eq!((report_b.duplicates, report_b.quarantined), (1, 0));
     assert_eq!(b.vault.quarantined().unwrap().len(), 1);
 }
 
@@ -551,4 +552,70 @@ fn oversized_and_malformed_frames_are_rejected() {
         decode_body::<SyncMessage>(&body),
         Err(Error::MalformedFrame)
     ));
+}
+
+#[test]
+fn a_locked_receiver_stages_everything_and_applies_it_after_unlock() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    let item = login("Mail", "sent while B is locked");
+    a.vault.put(item.clone()).unwrap();
+    let mut b = pair(dir.path(), &mut a);
+
+    b.vault.lock();
+    let (to_b, report_b) = sync(&mut a.vault, &mut b.vault);
+    assert_eq!(to_b.sent, 1);
+    assert_eq!(
+        (report_b.received, report_b.applied, report_b.pending),
+        (1, 0, 1)
+    );
+    // Nothing was decrypted: B still cannot read, and has only staged it.
+    assert!(matches!(
+        b.vault.get(&item.id),
+        Err(osm_vault_core::Error::Locked)
+    ));
+    assert!(b.vault.revision_ids().unwrap().is_empty());
+
+    // A second locked session does not resend what B already staged.
+    let (to_b, report_b) = sync(&mut a.vault, &mut b.vault);
+    assert_eq!((to_b.sent, report_b.received), (0, 0));
+
+    b.vault.unlock("joiner password").unwrap();
+    let processed = b.vault.process_staged().unwrap();
+    assert_eq!((processed.applied, processed.pending), (1, 0));
+    assert_eq!(
+        b.vault.get(&item.id).unwrap().item.password,
+        "sent while B is locked"
+    );
+    assert_eq!(ids(&a.vault), ids(&b.vault));
+}
+
+#[test]
+fn a_locked_device_can_still_send() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    a.vault.put(login("From a locked sender", "p")).unwrap();
+    let mut b = pair(dir.path(), &mut a);
+    a.vault.lock();
+    let (from_a, report_b) = sync(&mut a.vault, &mut b.vault);
+    assert_eq!((from_a.sent, report_b.applied), (1, 1));
+    assert_eq!(b.vault.list().unwrap().len(), 1);
+}
+
+#[test]
+fn staged_revisions_are_processed_when_the_next_session_starts_unlocked() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    a.vault.put(login("Later", "p")).unwrap();
+    let mut b = pair(dir.path(), &mut a);
+    b.vault.lock();
+    sync(&mut a.vault, &mut b.vault);
+    b.vault.unlock("joiner password").unwrap();
+    // No explicit processing: starting a session while unlocked does it.
+    let (_, report_b) = sync(&mut a.vault, &mut b.vault);
+    assert_eq!(
+        (report_b.applied, report_b.received, report_b.pending),
+        (1, 0, 0)
+    );
+    assert_eq!(b.vault.list().unwrap().len(), 1);
 }

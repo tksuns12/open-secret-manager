@@ -1,20 +1,25 @@
 //! One synchronization exchange between two copies of a vault.
 //!
 //! Both sides open with `Hello` and an `Inventory` of every revision ID they
-//! hold. Each answers the other's inventory with the revisions it lacks,
-//! parents first, in bounded `Revisions` batches followed by `Done`. A
-//! revision whose parent did not arrive is deferred; after `Done` the
-//! receiver asks for missing parents with `Need`, for a bounded number of
-//! rounds. When a side needs nothing more it sends `Finished`; the session
-//! is complete once both have.
+//! hold, accepted or staged. Each answers the other's inventory with the
+//! revisions it lacks, parents first, in bounded `Revisions` batches followed
+//! by `Done`.
 //!
-//! The exchange is stateless across sessions: an interrupted session is
-//! resumed by starting a new one, since inventories recompute what is
-//! missing.
+//! Every received revision is first staged durably in the vault's ingress
+//! queue, which works while the vault is locked and checks only the
+//! envelope's shape. If the vault is unlocked, staged revisions are then
+//! verified and applied, each moving out of the queue in the same
+//! transaction. A revision whose parent is missing stays staged; after
+//! `Done` the receiver asks for missing parents with `Need`, for a bounded
+//! number of rounds. When a side needs nothing more it sends `Finished`; the
+//! session is complete once both have.
+//!
+//! An interrupted session is resumed by starting a new one: inventories
+//! recompute what is missing, and staged revisions are never re-sent.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
-use osm_vault_core::{EncryptedRevision, Vault};
+use osm_vault_core::{EncryptedRevision, StageOutcome, Vault};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -63,21 +68,22 @@ impl std::fmt::Debug for SyncMessage {
 pub struct SyncReport {
     /// Revisions sent to the peer.
     pub sent: usize,
-    /// Revisions received and merged.
-    pub applied: usize,
-    /// Revisions received that were already stored.
+    /// New revisions received and stored durably (staged).
+    pub received: usize,
+    /// Revisions received that were already accepted, staged, or held.
     pub duplicates: usize,
-    /// Revisions from unauthorized devices, held for owner review.
+    /// Staged revisions verified and merged. Only while unlocked.
+    pub applied: usize,
+    /// Staged revisions from unauthorized devices, held for owner review.
     pub quarantined: usize,
-    /// Revisions still waiting for a parent when the session ended; they are
-    /// not stored and will be offered again by the next session.
-    pub deferred: usize,
+    /// Revisions still staged when the session ended: everything received
+    /// while locked, or revisions waiting for a parent.
+    pub pending: usize,
 }
 
 pub struct SyncSession {
     vault_id: [u8; 32],
     hello_received: bool,
-    deferred: Vec<EncryptedRevision>,
     need_rounds: u32,
     sent_finished: bool,
     peer_finished: bool,
@@ -85,24 +91,27 @@ pub struct SyncSession {
 }
 
 impl SyncSession {
-    /// Starts a session and returns the opening messages.
-    pub fn start(vault: &Vault) -> Result<(Self, Vec<SyncMessage>)> {
-        let session = Self {
+    /// Starts a session and returns the opening messages. If the vault is
+    /// unlocked, anything staged earlier is processed first.
+    pub fn start(vault: &mut Vault) -> Result<(Self, Vec<SyncMessage>)> {
+        let mut session = Self {
             vault_id: vault.vault_id(),
             hello_received: false,
-            deferred: Vec::new(),
             need_rounds: 0,
             sent_finished: false,
             peer_finished: false,
             report: SyncReport::default(),
         };
+        session.process(vault)?;
+        let mut inventory = vault.revision_ids()?;
+        inventory.extend(vault.staged_revision_ids()?);
         let opening = vec![
             SyncMessage::Hello {
                 version: PROTOCOL_VERSION,
                 vault_id: session.vault_id,
             },
             SyncMessage::Inventory {
-                revisions: vault.revision_ids()?,
+                revisions: inventory,
             },
         ];
         Ok((session, opening))
@@ -156,9 +165,9 @@ impl SyncSession {
                     return Err(Error::ProtocolViolation);
                 }
                 for revision in revisions {
-                    self.receive(vault, revision)?;
+                    self.stage(vault, revision)?;
                 }
-                self.retry_deferred(vault)?;
+                self.process(vault)?;
                 Ok(Vec::new())
             }
             SyncMessage::Done => self.after_done(vault),
@@ -198,65 +207,54 @@ impl SyncSession {
         Ok(messages)
     }
 
-    fn receive(&mut self, vault: &mut Vault, revision: EncryptedRevision) -> Result<()> {
-        let id = revision.revision_id();
-        if !vault.revisions_by_id(std::slice::from_ref(&id))?.is_empty() {
-            self.report.duplicates += 1;
-            return Ok(());
-        }
-        match vault.apply_encrypted_revision(revision.clone()) {
-            Ok(_) => self.report.applied += 1,
-            Err(osm_vault_core::Error::Quarantined) => self.report.quarantined += 1,
-            Err(osm_vault_core::Error::MissingParent) => self.deferred.push(revision),
-            // A forged, malformed, or cross-item revision ends the session;
-            // the core has not stored it.
+    /// Stores a received revision durably before anything else happens to
+    /// it. A malformed envelope ends the session.
+    fn stage(&mut self, vault: &mut Vault, revision: EncryptedRevision) -> Result<()> {
+        match vault.stage_revision(revision) {
+            Ok(StageOutcome::Staged) => self.report.received += 1,
+            Ok(StageOutcome::Duplicate) => self.report.duplicates += 1,
+            Err(
+                error @ (osm_vault_core::Error::IngressFull
+                | osm_vault_core::Error::Database(_)
+                | osm_vault_core::Error::Io(_)
+                | osm_vault_core::Error::Locked),
+            ) => return Err(Error::Vault(error)),
             Err(error) => return Err(Error::InvalidRevision(error)),
         }
         Ok(())
     }
 
-    /// Applies deferred revisions whose parents have since arrived, until no
-    /// further progress is possible.
-    fn retry_deferred(&mut self, vault: &mut Vault) -> Result<()> {
-        loop {
-            let pending = std::mem::take(&mut self.deferred);
-            let before = pending.len();
-            for revision in pending {
-                self.receive(vault, revision)?;
-            }
-            if self.deferred.is_empty() || self.deferred.len() == before {
-                return Ok(());
-            }
+    /// Verifies and applies staged revisions when the vault is unlocked. A
+    /// revision that fails verification was sent by a misbehaving peer: it
+    /// is discarded and the session ends.
+    fn process(&mut self, vault: &mut Vault) -> Result<()> {
+        if !vault.is_unlocked() {
+            return Ok(());
         }
+        let processed = vault.process_staged()?;
+        self.report.applied += processed.applied;
+        self.report.quarantined += processed.quarantined;
+        if processed.rejected > 0 {
+            return Err(Error::InvalidRevision(
+                processed
+                    .first_rejection
+                    .unwrap_or(osm_vault_core::Error::Crypto),
+            ));
+        }
+        Ok(())
     }
 
     fn after_done(&mut self, vault: &mut Vault) -> Result<Vec<SyncMessage>> {
-        self.retry_deferred(vault)?;
-        if !self.deferred.is_empty() && self.need_rounds < MAX_NEED_ROUNDS {
+        self.process(vault)?;
+        let missing = vault.staged_missing_parents()?;
+        if !missing.is_empty() && self.need_rounds < MAX_NEED_ROUNDS {
             self.need_rounds += 1;
-            let stored: HashSet<String> = vault.revision_ids()?.into_iter().collect();
-            let deferred: HashSet<String> = self
-                .deferred
-                .iter()
-                .map(EncryptedRevision::revision_id)
-                .collect();
-            let missing: BTreeSet<String> = self
-                .deferred
-                .iter()
-                .flat_map(|revision| revision.parents.iter())
-                .filter(|parent| !stored.contains(*parent) && !deferred.contains(*parent))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                return Ok(vec![SyncMessage::Need {
-                    revisions: missing.into_iter().collect(),
-                }]);
-            }
+            return Ok(vec![SyncMessage::Need { revisions: missing }]);
         }
         if self.sent_finished {
             return Ok(Vec::new());
         }
-        self.report.deferred = self.deferred.len();
+        self.report.pending = vault.staged_revision_ids()?.len();
         self.sent_finished = true;
         Ok(vec![SyncMessage::Finished])
     }
