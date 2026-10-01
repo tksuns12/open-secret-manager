@@ -9,14 +9,15 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{
-        decrypt, derive_password_key, device_authorization, device_key_aad, encrypt, key_wrap_aad,
-        legacy_record_aad, legacy_revision_id, random_array, record_aad, revision_id,
-        revision_signature_message, verify_device_authorization, KdfConfig, SecretKey,
-        DEVICE_ID_LEN, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
+        decrypt, derive_password_key, device_authorization, device_key_aad, encrypt, epoch_key_aad,
+        key_wrap_aad, keys_equal, legacy_record_aad, legacy_revision_id, random_array, record_aad,
+        recovery_check, revision_id, revision_signature_message, verify_device_authorization,
+        verify_recovery_check, KdfConfig, SecretKey, DEVICE_ID_LEN, KEY_LEN, NONCE_LEN,
+        PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
     Error, IngressReport, Item, ItemSummary, ItemVersion, QuarantinedRevision, RecoveryKey, Result,
     RevisionInfo, StageOutcome, VaultItem,
@@ -24,7 +25,12 @@ use crate::{
 
 /// Storage layout: multi-head revisions plus a quarantine for revisions
 /// from unauthorized devices.
-const VAULT_FORMAT_VERSION: u32 = 5;
+/// Storage layout: a per-device root key wraps the device key, the
+/// authorized-author MACs, and the vault's epoch keys.
+const VAULT_FORMAT_VERSION: u32 = 6;
+/// One shared vault key for everything; re-rooted at the next password
+/// unlock.
+const SHARED_KEY_FORMAT_VERSION: u32 = 5;
 /// Quarantine but no ingress queue; migrated without the key on open.
 const QUARANTINE_FORMAT_VERSION: u32 = 4;
 /// Multi-head layout without a quarantine table; migrated on first unlock.
@@ -36,7 +42,7 @@ const LEGACY_FORMAT_VERSION: u32 = 1;
 /// Signed revision envelope. Unchanged by the multi-head layout because a
 /// single parent encodes identically.
 const RECORD_FORMAT_VERSION: u32 = 2;
-const BACKUP_FORMAT_VERSION: u32 = 3;
+const BACKUP_FORMAT_VERSION: u32 = 4;
 /// Upper bound on heads one revision may supersede.
 const MAX_PARENTS: usize = 16;
 /// Upper bound on held revisions awaiting owner review.
@@ -44,11 +50,21 @@ const MAX_QUARANTINE: i64 = 10_000;
 /// Bounds on received revisions awaiting processing.
 const MAX_INGRESS: i64 = 100_000;
 const MAX_INGRESS_BYTES: i64 = 512 * 1024 * 1024;
-const KEY_EPOCH: u64 = 1;
+/// The epoch every vault starts in, and the only epoch older formats used.
+const FIRST_EPOCH: u64 = 1;
+/// Bounds on epochs, so a malformed revision or grant cannot name absurd
+/// values.
+const MAX_EPOCH: u64 = 1 << 32;
+pub(crate) const MAX_EPOCHS: usize = 1024;
 const MAX_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 16 * 1024 * 1024;
 
-const META_SCHEMA: &str = r#"
+/// `password_*` and `recovery_*` wrap this device's root key (format 6) or
+/// the shared vault key (older formats). Recovery is optional per device;
+/// `recovery_check` verifies a typed recovery key before it is enabled, and
+/// `legacy_recovery_*` keeps a re-rooted vault's old recovery wrapper only
+/// for that check.
+const VAULT_META_TABLE: &str = r#"
 CREATE TABLE vault_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     format_version INTEGER NOT NULL,
@@ -59,20 +75,46 @@ CREATE TABLE vault_meta (
     password_salt BLOB NOT NULL CHECK(length(password_salt) = 16),
     password_nonce BLOB NOT NULL CHECK(length(password_nonce) = 24),
     password_wrapped_key BLOB NOT NULL CHECK(length(password_wrapped_key) = 48),
-    recovery_nonce BLOB NOT NULL CHECK(length(recovery_nonce) = 24),
-    recovery_wrapped_key BLOB NOT NULL CHECK(length(recovery_wrapped_key) = 48),
+    recovery_nonce BLOB CHECK(recovery_nonce IS NULL OR length(recovery_nonce) = 24),
+    recovery_wrapped_key BLOB CHECK(recovery_wrapped_key IS NULL OR length(recovery_wrapped_key) = 48),
+    recovery_check BLOB CHECK(recovery_check IS NULL OR length(recovery_check) = 32),
+    legacy_recovery_nonce BLOB
+        CHECK(legacy_recovery_nonce IS NULL OR length(legacy_recovery_nonce) = 24),
+    legacy_recovery_wrapped_key BLOB
+        CHECK(legacy_recovery_wrapped_key IS NULL OR length(legacy_recovery_wrapped_key) = 48),
+    current_epoch INTEGER NOT NULL DEFAULT 1 CHECK(current_epoch >= 1),
     device_id BLOB NOT NULL CHECK(length(device_id) = 16),
     device_public_key BLOB NOT NULL CHECK(length(device_public_key) = 32),
     device_key_nonce BLOB NOT NULL CHECK(length(device_key_nonce) = 24),
     device_wrapped_signing_key BLOB NOT NULL CHECK(length(device_wrapped_signing_key) = 48)
 ) STRICT;
+"#;
+
+const DEVICES_TRIGGER: &str = r#"
+CREATE TRIGGER devices_no_update BEFORE UPDATE ON devices
+BEGIN SELECT RAISE(ABORT, 'device authorizations are immutable'); END;
+"#;
+
+const DEVICES_SCHEMA: &str = r#"
 CREATE TABLE devices (
     device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
     public_key BLOB NOT NULL UNIQUE CHECK(length(public_key) = 32),
     authorization BLOB NOT NULL CHECK(length(authorization) = 32)
 ) STRICT;
-CREATE TRIGGER devices_no_update BEFORE UPDATE ON devices
-BEGIN SELECT RAISE(ABORT, 'device authorizations are immutable'); END;
+"#;
+
+/// Each epoch key wrapped by this device's root key. Rows are never changed
+/// or removed: older epochs stay readable.
+const EPOCH_KEYS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS epoch_keys (
+    epoch INTEGER PRIMARY KEY CHECK(epoch >= 1),
+    nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+    wrapped_key BLOB NOT NULL CHECK(length(wrapped_key) = 48)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS epoch_keys_no_update BEFORE UPDATE ON epoch_keys
+BEGIN SELECT RAISE(ABORT, 'epoch keys are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS epoch_keys_no_delete BEFORE DELETE ON epoch_keys
+BEGIN SELECT RAISE(ABORT, 'epoch keys are immutable'); END;
 "#;
 
 /// `parents` holds the sorted parent IDs concatenated (64 characters each).
@@ -85,7 +127,7 @@ CREATE TABLE revisions (
     vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
     item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
     parents TEXT NOT NULL CHECK(length(parents) % 64 = 0 AND length(parents) <= 1024),
-    key_epoch INTEGER NOT NULL CHECK(key_epoch = 1),
+    key_epoch INTEGER NOT NULL CHECK(key_epoch >= 1),
     author_device_id BLOB NOT NULL CHECK(length(author_device_id) = 16) REFERENCES devices(device_id),
     nonce BLOB NOT NULL CHECK(length(nonce) = 24),
     ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 16 AND 16777232),
@@ -115,7 +157,7 @@ CREATE TABLE quarantine (
     vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
     item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
     parents TEXT NOT NULL CHECK(length(parents) % 64 = 0 AND length(parents) <= 1024),
-    key_epoch INTEGER NOT NULL CHECK(key_epoch = 1),
+    key_epoch INTEGER NOT NULL CHECK(key_epoch >= 1),
     author_device_id BLOB NOT NULL CHECK(length(author_device_id) = 16),
     nonce BLOB NOT NULL CHECK(length(nonce) = 24),
     ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 16 AND 16777232),
@@ -137,7 +179,7 @@ CREATE TABLE ingress (
     vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
     item_id TEXT NOT NULL CHECK(length(item_id) BETWEEN 1 AND 128),
     parents TEXT NOT NULL CHECK(length(parents) % 64 = 0 AND length(parents) <= 1024),
-    key_epoch INTEGER NOT NULL CHECK(key_epoch = 1),
+    key_epoch INTEGER NOT NULL CHECK(key_epoch >= 1),
     author_device_id BLOB NOT NULL CHECK(length(author_device_id) = 16),
     nonce BLOB NOT NULL CHECK(length(nonce) = 24),
     ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 16 AND 16777232),
@@ -221,8 +263,8 @@ impl EncryptedRevision {
         {
             return Err(Error::Crypto);
         }
-        if self.key_epoch != KEY_EPOCH {
-            return Err(Error::UnsupportedVersion(self.key_epoch as u32));
+        if self.key_epoch == 0 || self.key_epoch > MAX_EPOCH {
+            return Err(Error::Crypto);
         }
         Ok(())
     }
@@ -236,10 +278,21 @@ struct Header {
     password_salt: [u8; SALT_LEN],
     password_nonce: [u8; NONCE_LEN],
     password_wrapped_key: Vec<u8>,
-    recovery_nonce: [u8; NONCE_LEN],
-    recovery_wrapped_key: Vec<u8>,
+    /// `None` until recovery is enabled on this device.
+    recovery: Option<KeyWrapper>,
+    recovery_check: Option<[u8; 32]>,
+    /// A re-rooted vault's old recovery wrapper, kept only to check a
+    /// recovery key typed to re-enable recovery.
+    legacy_recovery: Option<KeyWrapper>,
+    current_epoch: u64,
     /// `None` only for a format 1 vault that has not been unlocked yet.
     device: Option<DeviceHeader>,
+}
+
+#[derive(Clone)]
+struct KeyWrapper {
+    nonce: [u8; NONCE_LEN],
+    wrapped_key: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -261,7 +314,10 @@ pub struct Vault {
     path: PathBuf,
     connection: Connection,
     header: Header,
-    master_key: Option<SecretKey>,
+    /// This device's root key while unlocked. It never leaves the device.
+    root_key: Option<SecretKey>,
+    /// Every epoch key this device holds, while unlocked.
+    epoch_keys: BTreeMap<u64, SecretKey>,
     signing_key: Option<SigningKey>,
     /// Authorized revision authors, loaded and authenticated at unlock.
     devices: BTreeMap<[u8; DEVICE_ID_LEN], VerifyingKey>,
@@ -270,7 +326,9 @@ pub struct Vault {
 /// Seals revisions for one author. Borrowing the keys separately from the
 /// connection lets callers seal while holding a write transaction.
 struct RevisionSigner<'a> {
+    /// The key of `epoch`, which revisions are sealed under.
     key: &'a SecretKey,
+    epoch: u64,
     signing_key: &'a SigningKey,
     vault_id: [u8; 32],
     author: [u8; DEVICE_ID_LEN],
@@ -289,7 +347,7 @@ impl RevisionSigner<'_> {
             &self.vault_id,
             item_id,
             &parents,
-            KEY_EPOCH,
+            self.epoch,
             &self.author,
             tombstone,
         );
@@ -302,7 +360,7 @@ impl RevisionSigner<'_> {
             vault_id: self.vault_id,
             item_id: item_id.to_owned(),
             parents,
-            key_epoch: KEY_EPOCH,
+            key_epoch: self.epoch,
             author_device_id: self.author,
             nonce,
             ciphertext,
@@ -317,7 +375,7 @@ impl std::fmt::Debug for Vault {
         f.debug_struct("Vault")
             .field("path", &self.path)
             .field("vault_id", &"[REDACTED]")
-            .field("unlocked", &self.master_key.is_some())
+            .field("unlocked", &self.root_key.is_some())
             .finish()
     }
 }
@@ -339,42 +397,35 @@ impl Vault {
         let connection = open_connection(path)?;
         create_schema(&connection)?;
         let vault_id = random_array::<32>();
-        let master_key = Zeroizing::new(random_array::<KEY_LEN>());
-        let password_salt = random_array::<SALT_LEN>();
-        let password_nonce = random_array::<NONCE_LEN>();
-        let recovery_nonce = random_array::<NONCE_LEN>();
-        let kdf = KdfConfig::default();
-        let password_key = derive_password_key(password, &password_salt, kdf)?;
+        // The root key stays on this device; the epoch key is what other
+        // devices receive. They are separate so a device that is later
+        // removed never learns a key that wraps future epochs.
+        let root_key = Zeroizing::new(random_array::<KEY_LEN>());
+        let epoch_key = Zeroizing::new(random_array::<KEY_LEN>());
         let recovery = RecoveryKey::generate();
-        let password_wrapped_key = encrypt(
-            &password_key,
-            &password_nonce,
-            &key_wrap_aad(&vault_id, b"password"),
-            master_key.as_ref(),
-        )?;
-        let recovery_wrapped_key = encrypt(
-            recovery.expose(),
-            &recovery_nonce,
-            &key_wrap_aad(&vault_id, b"recovery"),
-            master_key.as_ref(),
-        )?;
-        let (device, _) = generate_device(&master_key, &vault_id)?;
+        let kdf = KdfConfig::default();
+        let password_salt = random_array::<SALT_LEN>();
+        let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &root_key)?;
+        let (device, _) = generate_device(&root_key, &vault_id)?;
         let header = Header {
             format_version: VAULT_FORMAT_VERSION,
             vault_id,
             kdf,
             password_salt,
-            password_nonce,
-            password_wrapped_key,
-            recovery_nonce,
-            recovery_wrapped_key,
+            password_nonce: password.nonce,
+            password_wrapped_key: password.wrapped_key,
+            recovery: Some(wrap_with_recovery(&recovery, &vault_id, &root_key)?),
+            recovery_check: Some(recovery_check(recovery.expose(), &vault_id)?),
+            legacy_recovery: None,
+            current_epoch: FIRST_EPOCH,
             device: Some(device),
         };
         insert_header(&connection, &header)?;
-        insert_device_authorization(&connection, &master_key, &header, &header.device_record()?)?;
+        insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
+        store_epoch_key(&connection, &root_key, &vault_id, FIRST_EPOCH, &epoch_key)?;
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
-        vault.activate(master_key)?;
+        vault.activate(root_key, None)?;
         Ok((vault, recovery))
     }
 
@@ -383,7 +434,8 @@ impl Vault {
             path: path.to_path_buf(),
             connection,
             header,
-            master_key: None,
+            root_key: None,
+            epoch_keys: BTreeMap::new(),
             signing_key: None,
             devices: BTreeMap::new(),
         }
@@ -409,7 +461,19 @@ impl Vault {
         &self.path
     }
     pub fn is_unlocked(&self) -> bool {
-        self.master_key.is_some()
+        self.root_key.is_some()
+    }
+    /// The epoch new revisions are written under.
+    pub fn current_epoch(&self) -> u64 {
+        self.header.current_epoch
+    }
+    pub fn recovery_enabled(&self) -> bool {
+        self.header.recovery.is_some()
+    }
+    /// Lets another device verify the vault's recovery key; see
+    /// [`Vault::enable_recovery`]. Public: it reveals nothing about the key.
+    pub fn recovery_check(&self) -> Option<[u8; 32]> {
+        self.header.recovery_check
     }
     /// This device's revision-signing identity. `None` until a format 1
     /// vault has been unlocked and migrated.
@@ -426,40 +490,53 @@ impl Vault {
         }
         let wrapping_key =
             derive_password_key(password, &self.header.password_salt, self.header.kdf)?;
-        let master = decrypt(
+        let unwrapped = decrypt(
             &wrapping_key,
             &self.header.password_nonce,
             &key_wrap_aad(&self.header.vault_id, b"password"),
             &self.header.password_wrapped_key,
         )
         .map_err(|_| Error::InvalidCredentials)?;
-        self.activate(to_key(&master)?)
+        self.activate(to_key(&unwrapped)?, Some(&wrapping_key))
     }
 
     pub fn unlock_with_recovery(&mut self, recovery: &RecoveryKey) -> Result<()> {
         if self.is_unlocked() {
             return Err(Error::AlreadyUnlocked);
         }
-        let master = decrypt(
+        let wrapper = self
+            .header
+            .recovery
+            .as_ref()
+            .ok_or(Error::RecoveryNotEnabled)?;
+        let unwrapped = decrypt(
             recovery.expose(),
-            &self.header.recovery_nonce,
+            &wrapper.nonce,
             &key_wrap_aad(&self.header.vault_id, b"recovery"),
-            &self.header.recovery_wrapped_key,
+            &wrapper.wrapped_key,
         )
         .map_err(|_| Error::InvalidCredentials)?;
-        self.activate(to_key(&master)?)
+        // An older vault can only be re-rooted with the password.
+        self.activate(to_key(&unwrapped)?, None)
     }
 
     pub fn lock(&mut self) {
-        self.master_key = None;
+        self.root_key = None;
+        self.epoch_keys.clear();
         self.signing_key = None;
         self.devices.clear();
     }
 
     /// Completes an unlock: migrates an older vault, then loads the device
-    /// signing key and the authenticated author set. The vault stays locked
-    /// if any step fails.
-    fn activate(&mut self, master_key: SecretKey) -> Result<()> {
+    /// signing key, the authenticated author set, and the epoch keys. The
+    /// vault stays locked if any step fails.
+    ///
+    /// `unlocked` is what the password or recovery wrapper held: the root key
+    /// in format 6, the shared vault key in older formats. Re-rooting an
+    /// older vault needs `password_key` to rewrap the new root.
+    fn activate(&mut self, unlocked: SecretKey, password_key: Option<&SecretKey>) -> Result<()> {
+        let mut root_key = unlocked;
+        let master_key = root_key.clone();
         if self.header.format_version == LEGACY_FORMAT_VERSION {
             self.migrate_legacy(&master_key)?;
         }
@@ -472,9 +549,13 @@ impl Vault {
         if self.header.format_version == QUARANTINE_FORMAT_VERSION {
             self.migrate_add_ingress()?;
         }
+        if self.header.format_version == SHARED_KEY_FORMAT_VERSION {
+            let password_key = password_key.ok_or(Error::UpgradeRequiresPassword)?;
+            root_key = self.migrate_root_key(&master_key, password_key)?;
+        }
         let device = self.header.device.as_ref().ok_or(Error::Crypto)?;
         let seed = decrypt(
-            &master_key,
+            &root_key,
             &device.key_nonce,
             &device_key_aad(&self.header.vault_id, &device.device_id, &device.public_key),
             &device.wrapped_signing_key,
@@ -485,11 +566,16 @@ impl Vault {
         if signing_key.verifying_key().to_bytes() != device.public_key {
             return Err(Error::Crypto);
         }
-        let devices = load_devices(&self.connection, &master_key, &self.header.vault_id)?;
+        let devices = load_devices(&self.connection, &root_key, &self.header.vault_id)?;
         if devices.get(&device.device_id).map(VerifyingKey::to_bytes) != Some(device.public_key) {
             return Err(Error::Crypto);
         }
-        self.master_key = Some(master_key);
+        let epoch_keys = load_epoch_keys(&self.connection, &root_key, &self.header.vault_id)?;
+        if !epoch_keys.contains_key(&self.header.current_epoch) {
+            return Err(Error::Crypto);
+        }
+        self.root_key = Some(root_key);
+        self.epoch_keys = epoch_keys;
         self.signing_key = Some(signing_key);
         self.devices = devices;
         Ok(())
@@ -527,7 +613,7 @@ impl Vault {
             };
             let (device, signing_key) = generate_device(master_key, &vault_id)?;
             let mut header = self.header.clone();
-            header.format_version = VAULT_FORMAT_VERSION;
+            header.format_version = SHARED_KEY_FORMAT_VERSION;
             header.device = Some(device);
 
             transaction
@@ -539,6 +625,7 @@ impl Vault {
 
             let signer = RevisionSigner {
                 key: master_key,
+                epoch: FIRST_EPOCH,
                 signing_key: &signing_key,
                 vault_id,
                 author: record.device_id,
@@ -660,7 +747,7 @@ impl Vault {
             transaction.execute_batch(INGRESS_SCHEMA)?;
             transaction.execute(
                 "UPDATE vault_meta SET format_version=? WHERE singleton=1",
-                [VAULT_FORMAT_VERSION],
+                [SHARED_KEY_FORMAT_VERSION],
             )?;
         }
         transaction.commit()?;
@@ -669,8 +756,11 @@ impl Vault {
     }
 
     fn signer(&self) -> Result<RevisionSigner<'_>> {
+        self.key()?;
+        let epoch = self.header.current_epoch;
         Ok(RevisionSigner {
-            key: self.key()?,
+            key: self.epoch_keys.get(&epoch).ok_or(Error::MissingEpochKey)?,
+            epoch,
             signing_key: self.signing_key.as_ref().ok_or(Error::Locked)?,
             vault_id: self.header.vault_id,
             author: self.header.device.as_ref().ok_or(Error::Locked)?.device_id,
@@ -700,13 +790,13 @@ impl Vault {
     /// AEAD decryption only. This proves the revision was produced by a
     /// holder of the vault key, not which device authored it.
     fn decrypt_unverified(&self, revision: &EncryptedRevision) -> Result<Zeroizing<Vec<u8>>> {
-        decrypt(
-            self.key()?,
-            &revision.nonce,
-            &revision.aad(),
-            &revision.ciphertext,
-        )
-        .map_err(|_| Error::Crypto)
+        self.key()?;
+        let key = self
+            .epoch_keys
+            .get(&revision.key_epoch)
+            .ok_or(Error::MissingEpochKey)?;
+        decrypt(key, &revision.nonce, &revision.aad(), &revision.ciphertext)
+            .map_err(|_| Error::Crypto)
     }
 
     fn open_item(&self, revision: &EncryptedRevision) -> Result<Item> {
@@ -740,7 +830,7 @@ impl Vault {
     }
 
     pub fn change_password(&mut self, current_password: &str, new_password: &str) -> Result<()> {
-        let master = self.key()?.clone();
+        let root_key = self.key()?.clone();
         let current_key = derive_password_key(
             current_password,
             &self.header.password_salt,
@@ -761,7 +851,7 @@ impl Vault {
             &wrapping_key,
             &nonce,
             &key_wrap_aad(&self.header.vault_id, b"password"),
-            master.as_ref(),
+            root_key.as_ref(),
         )?;
         self.connection.execute(
             "UPDATE vault_meta SET password_salt=?, password_nonce=?, password_wrapped_key=? WHERE singleton=1",
@@ -995,9 +1085,25 @@ impl Vault {
         revisions
     }
 
+    /// Writes an encrypted backup that the recovery key opens. Requires
+    /// recovery to be enabled on this device.
     pub fn export_backup(&self, path: impl AsRef<Path>) -> Result<()> {
         let key = self.key()?;
+        let recovery = self
+            .header
+            .recovery
+            .as_ref()
+            .ok_or(Error::RecoveryNotEnabled)?;
         let payload = BackupPayload {
+            current_epoch: self.header.current_epoch,
+            epoch_keys: self
+                .epoch_keys
+                .iter()
+                .map(|(epoch, key)| EpochKeyRecord {
+                    epoch: *epoch,
+                    key: **key,
+                })
+                .collect(),
             devices: self
                 .devices
                 .iter()
@@ -1014,8 +1120,8 @@ impl Vault {
             return Err(Error::InvalidBackup("backup is too large".into()));
         }
         let nonce = random_array::<NONCE_LEN>();
-        let recovery_nonce = encode(&self.header.recovery_nonce);
-        let recovery_wrapped_key = encode(&self.header.recovery_wrapped_key);
+        let recovery_nonce = encode(&recovery.nonce);
+        let recovery_wrapped_key = encode(&recovery.wrapped_key);
         let aad = backup_aad(
             &self.header.vault_id,
             &recovery_nonce,
@@ -1066,14 +1172,14 @@ impl Vault {
                 "invalid recovery wrapping length".into(),
             ));
         }
-        let master_plaintext = decrypt(
+        let source_root = decrypt(
             recovery.expose(),
             &recovery_nonce,
             &key_wrap_aad(&vault_id, b"recovery"),
             &recovery_wrapped_key,
         )
         .map_err(|_| Error::InvalidCredentials)?;
-        let master_key = to_key(&master_plaintext)?;
+        let source_root = to_key(&source_root)?;
         let nonce = decode_array::<NONCE_LEN>(&envelope.nonce)?;
         let ciphertext = decode(&envelope.ciphertext)?;
         let aad = backup_aad(
@@ -1081,13 +1187,14 @@ impl Vault {
             &envelope.recovery_nonce,
             &envelope.recovery_wrapped_key,
         );
-        let plaintext = decrypt(&master_key, &nonce, &aad, &ciphertext)
+        let plaintext = decrypt(&source_root, &nonce, &aad, &ciphertext)
             .map_err(|_| Error::InvalidBackup("authentication failed".into()))?;
         let payload: BackupPayload = serde_json::from_slice(&plaintext)
             .map_err(|_| Error::InvalidBackup("invalid payload".into()))?;
         if payload.revisions.len() > 1_000_000
             || payload.devices.len() > 10_000
             || payload.quarantine.len() as i64 > MAX_QUARANTINE
+            || payload.epoch_keys.len() > MAX_EPOCHS
         {
             return Err(Error::InvalidBackup("too many revisions".into()));
         }
@@ -1105,15 +1212,8 @@ impl Vault {
             .create_new(true)
             .open(vault_path)?;
         drop(placeholder);
-        let result = Self::initialize_restored(
-            vault_path,
-            new_password,
-            vault_id,
-            master_key,
-            recovery_nonce,
-            recovery_wrapped_key,
-            payload,
-        );
+        let result =
+            Self::initialize_restored(vault_path, new_password, vault_id, recovery, payload);
         if result.is_err() {
             let _ = std::fs::remove_file(vault_path);
         }
@@ -1124,46 +1224,43 @@ impl Vault {
         path: &Path,
         password: &str,
         vault_id: [u8; 32],
-        master_key: SecretKey,
-        recovery_nonce: [u8; NONCE_LEN],
-        recovery_wrapped_key: Vec<u8>,
+        recovery: &RecoveryKey,
         payload: BackupPayload,
     ) -> Result<Self> {
         let connection = open_connection(path)?;
         create_schema(&connection)?;
+        // A restored vault is a new device: a fresh root key and signing
+        // identity, never the source's. The source authors stay authorized
+        // so their revisions in the backup still verify.
+        let root_key = Zeroizing::new(random_array::<KEY_LEN>());
         let kdf = KdfConfig::default();
         let password_salt = random_array::<SALT_LEN>();
-        let password_nonce = random_array::<NONCE_LEN>();
-        let wrapping_key = derive_password_key(password, &password_salt, kdf)?;
-        let password_wrapped_key = encrypt(
-            &wrapping_key,
-            &password_nonce,
-            &key_wrap_aad(&vault_id, b"password"),
-            master_key.as_ref(),
-        )?;
-        // A restored vault is a new writer: it gets a fresh signing identity
-        // and never reuses the source device's key. The source authors stay
-        // authorized so their revisions in the backup still verify.
-        let (device, _) = generate_device(&master_key, &vault_id)?;
+        let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &root_key)?;
+        let (device, _) = generate_device(&root_key, &vault_id)?;
         let header = Header {
             format_version: VAULT_FORMAT_VERSION,
             vault_id,
             kdf,
             password_salt,
-            password_nonce,
-            password_wrapped_key,
-            recovery_nonce,
-            recovery_wrapped_key,
+            password_nonce: password.nonce,
+            password_wrapped_key: password.wrapped_key,
+            recovery: Some(wrap_with_recovery(recovery, &vault_id, &root_key)?),
+            recovery_check: Some(recovery_check(recovery.expose(), &vault_id)?),
+            legacy_recovery: None,
+            current_epoch: payload.current_epoch,
             device: Some(device),
         };
         insert_header(&connection, &header)?;
-        insert_device_authorization(&connection, &master_key, &header, &header.device_record()?)?;
+        insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
         for record in &payload.devices {
-            insert_device_authorization(&connection, &master_key, &header, record)?;
+            insert_device_authorization(&connection, &root_key, &header, record)?;
+        }
+        for record in &payload.epoch_keys {
+            store_epoch_key(&connection, &root_key, &vault_id, record.epoch, &record.key)?;
         }
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
-        vault.activate(master_key)?;
+        vault.activate(root_key, None)?;
         // Revisions are exported in insertion order, so parents precede
         // children and the head set is rebuilt exactly.
         for revision in payload.revisions {
@@ -1426,7 +1523,10 @@ fn is_revision_id(value: &str) -> bool {
 }
 
 fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(META_SCHEMA)?;
+    connection.execute_batch(VAULT_META_TABLE)?;
+    connection.execute_batch(DEVICES_SCHEMA)?;
+    connection.execute_batch(DEVICES_TRIGGER)?;
+    connection.execute_batch(EPOCH_KEYS_SCHEMA)?;
     connection.execute_batch(RECORD_SCHEMA)?;
     connection.execute_batch(QUARANTINE_SCHEMA)?;
     connection.execute_batch(INGRESS_SCHEMA)?;
@@ -1491,13 +1591,28 @@ fn item_heads(connection: &Connection, item_id: &str) -> Result<Vec<EncryptedRev
 }
 
 impl Vault {
+    /// This device's root key; also the check that the vault is unlocked.
     fn key(&self) -> Result<&SecretKey> {
-        self.master_key.as_ref().ok_or(Error::Locked)
+        self.root_key.as_ref().ok_or(Error::Locked)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct EpochKeyRecord {
+    epoch: u64,
+    key: [u8; KEY_LEN],
+}
+
+impl Drop for EpochKeyRecord {
+    fn drop(&mut self) {
+        self.key.zeroize();
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct BackupPayload {
+    current_epoch: u64,
+    epoch_keys: Vec<EpochKeyRecord>,
     devices: Vec<DeviceRecord>,
     revisions: Vec<EncryptedRevision>,
     /// Held revisions, so pending owner review survives a restore.
@@ -1575,6 +1690,7 @@ fn read_header(connection: &Connection) -> Result<Header> {
             | SINGLE_HEAD_FORMAT_VERSION
             | MULTI_HEAD_FORMAT_VERSION
             | QUARANTINE_FORMAT_VERSION
+            | SHARED_KEY_FORMAT_VERSION
             | VAULT_FORMAT_VERSION
     ) {
         return Err(Error::UnsupportedVersion(version));
@@ -1584,23 +1700,38 @@ fn read_header(connection: &Connection) -> Result<Header> {
     } else {
         "NULL,NULL,NULL,NULL"
     };
+    // Columns added by format 6 do not exist in older files.
+    let root_columns = if version == VAULT_FORMAT_VERSION {
+        "recovery_check,legacy_recovery_nonce,legacy_recovery_wrapped_key,current_epoch"
+    } else {
+        "NULL,NULL,NULL,1"
+    };
     let row = connection.query_row(
         &format!(
             "SELECT vault_id,kdf_memory_kib,kdf_iterations,kdf_parallelism,password_salt,\
-             password_nonce,password_wrapped_key,recovery_nonce,recovery_wrapped_key,{device_columns} \
-             FROM vault_meta WHERE singleton=1"
+             password_nonce,password_wrapped_key,recovery_nonce,recovery_wrapped_key,{device_columns},\
+             {root_columns} FROM vault_meta WHERE singleton=1"
         ),
         [],
         |row| Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, u32>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?,
-            row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?,
-            row.get::<_, Vec<u8>>(7)?, row.get::<_, Vec<u8>>(8)?,
-            row.get::<_, Option<Vec<u8>>>(9)?, row.get::<_, Option<Vec<u8>>>(10)?,
-            row.get::<_, Option<Vec<u8>>>(11)?, row.get::<_, Option<Vec<u8>>>(12)?,
+            (
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, u32>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?,
+                row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?, row.get::<_, Option<Vec<u8>>>(8)?,
+            ),
+            (
+                row.get::<_, Option<Vec<u8>>>(9)?, row.get::<_, Option<Vec<u8>>>(10)?,
+                row.get::<_, Option<Vec<u8>>>(11)?, row.get::<_, Option<Vec<u8>>>(12)?,
+            ),
+            (
+                row.get::<_, Option<Vec<u8>>>(13)?, row.get::<_, Option<Vec<u8>>>(14)?,
+                row.get::<_, Option<Vec<u8>>>(15)?, row.get::<_, i64>(16)?,
+            ),
         )),
     )?;
-    let device = match (row.9, row.10, row.11, row.12) {
+    let (base, device_row, root_row) = row;
+    let device = match device_row {
         (Some(device_id), Some(public_key), Some(key_nonce), Some(wrapped_signing_key)) => {
             Some(DeviceHeader {
                 device_id: array(&device_id)?,
@@ -1612,21 +1743,45 @@ fn read_header(connection: &Connection) -> Result<Header> {
         (None, None, None, None) if version == LEGACY_FORMAT_VERSION => None,
         _ => return Err(Error::Crypto),
     };
+    let recovery = key_wrapper(base.7, base.8)?;
+    // Older formats always had a recovery wrapper.
+    if version != VAULT_FORMAT_VERSION && recovery.is_none() {
+        return Err(Error::Crypto);
+    }
+    let current_epoch = u64::try_from(root_row.3).map_err(|_| Error::Crypto)?;
+    if current_epoch == 0 || current_epoch > MAX_EPOCH {
+        return Err(Error::Crypto);
+    }
     Ok(Header {
         format_version: version,
-        vault_id: array(&row.0)?,
+        vault_id: array(&base.0)?,
         kdf: KdfConfig {
-            memory_kib: row.1,
-            iterations: row.2,
-            parallelism: row.3,
+            memory_kib: base.1,
+            iterations: base.2,
+            parallelism: base.3,
         },
-        password_salt: array(&row.4)?,
-        password_nonce: array(&row.5)?,
-        password_wrapped_key: row.6,
-        recovery_nonce: array(&row.7)?,
-        recovery_wrapped_key: row.8,
+        password_salt: array(&base.4)?,
+        password_nonce: array(&base.5)?,
+        password_wrapped_key: base.6,
+        recovery,
+        recovery_check: root_row.0.map(|check| array(&check)).transpose()?,
+        legacy_recovery: key_wrapper(root_row.1, root_row.2)?,
+        current_epoch,
         device,
     })
+}
+
+fn key_wrapper(nonce: Option<Vec<u8>>, wrapped_key: Option<Vec<u8>>) -> Result<Option<KeyWrapper>> {
+    match (nonce, wrapped_key) {
+        (Some(nonce), Some(wrapped_key)) if wrapped_key.len() == KEY_LEN + 16 => {
+            Ok(Some(KeyWrapper {
+                nonce: array(&nonce)?,
+                wrapped_key,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(Error::Crypto),
+    }
 }
 
 fn insert_header(connection: &Connection, header: &Header) -> Result<()> {
@@ -1634,8 +1789,9 @@ fn insert_header(connection: &Connection, header: &Header) -> Result<()> {
     connection.execute(
         "INSERT INTO vault_meta(singleton,format_version,vault_id,kdf_memory_kib,kdf_iterations,\
          kdf_parallelism,password_salt,password_nonce,password_wrapped_key,recovery_nonce,\
-         recovery_wrapped_key,device_id,device_public_key,device_key_nonce,device_wrapped_signing_key) \
-         VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         recovery_wrapped_key,recovery_check,legacy_recovery_nonce,legacy_recovery_wrapped_key,\
+         current_epoch,device_id,device_public_key,device_key_nonce,device_wrapped_signing_key) \
+         VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             header.format_version,
             header.vault_id.as_slice(),
@@ -1645,8 +1801,24 @@ fn insert_header(connection: &Connection, header: &Header) -> Result<()> {
             header.password_salt.as_slice(),
             header.password_nonce.as_slice(),
             header.password_wrapped_key,
-            header.recovery_nonce.as_slice(),
-            header.recovery_wrapped_key,
+            header
+                .recovery
+                .as_ref()
+                .map(|wrapper| wrapper.nonce.to_vec()),
+            header
+                .recovery
+                .as_ref()
+                .map(|wrapper| wrapper.wrapped_key.clone()),
+            header.recovery_check.map(|check| check.to_vec()),
+            header
+                .legacy_recovery
+                .as_ref()
+                .map(|wrapper| wrapper.nonce.to_vec()),
+            header
+                .legacy_recovery
+                .as_ref()
+                .map(|wrapper| wrapper.wrapped_key.clone()),
+            i64::try_from(header.current_epoch).map_err(|_| Error::Crypto)?,
             device.device_id.as_slice(),
             device.public_key.as_slice(),
             device.key_nonce.as_slice(),
@@ -1654,6 +1826,96 @@ fn insert_header(connection: &Connection, header: &Header) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn wrap_with_password(
+    password: &str,
+    salt: &[u8; SALT_LEN],
+    kdf: KdfConfig,
+    vault_id: &[u8; 32],
+    root_key: &SecretKey,
+) -> Result<KeyWrapper> {
+    let wrapping_key = derive_password_key(password, salt, kdf)?;
+    wrap_with(&wrapping_key, vault_id, b"password", root_key)
+}
+
+fn wrap_with_recovery(
+    recovery: &RecoveryKey,
+    vault_id: &[u8; 32],
+    root_key: &SecretKey,
+) -> Result<KeyWrapper> {
+    wrap_with(recovery.expose(), vault_id, b"recovery", root_key)
+}
+
+fn wrap_with(
+    wrapping_key: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    method: &[u8],
+    root_key: &SecretKey,
+) -> Result<KeyWrapper> {
+    let nonce = random_array::<NONCE_LEN>();
+    Ok(KeyWrapper {
+        nonce,
+        wrapped_key: encrypt(
+            wrapping_key,
+            &nonce,
+            &key_wrap_aad(vault_id, method),
+            root_key.as_ref(),
+        )?,
+    })
+}
+
+fn store_epoch_key(
+    connection: &Connection,
+    root_key: &SecretKey,
+    vault_id: &[u8; 32],
+    epoch: u64,
+    key: &[u8; KEY_LEN],
+) -> Result<()> {
+    if epoch == 0 || epoch > MAX_EPOCH {
+        return Err(Error::Crypto);
+    }
+    let nonce = random_array::<NONCE_LEN>();
+    let wrapped = encrypt(root_key, &nonce, &epoch_key_aad(vault_id, epoch), key)?;
+    connection.execute(
+        "INSERT INTO epoch_keys(epoch,nonce,wrapped_key) VALUES(?,?,?)",
+        params![
+            i64::try_from(epoch).map_err(|_| Error::Crypto)?,
+            nonce.as_slice(),
+            wrapped
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_epoch_keys(
+    connection: &Connection,
+    root_key: &SecretKey,
+    vault_id: &[u8; 32],
+) -> Result<BTreeMap<u64, SecretKey>> {
+    let mut statement = connection.prepare("SELECT epoch,nonce,wrapped_key FROM epoch_keys")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut keys = BTreeMap::new();
+    for (epoch, nonce, wrapped) in rows {
+        let epoch = u64::try_from(epoch).map_err(|_| Error::Crypto)?;
+        let key = decrypt(
+            root_key,
+            &array(&nonce)?,
+            &epoch_key_aad(vault_id, epoch),
+            &wrapped,
+        )
+        .map_err(|_| Error::Crypto)?;
+        keys.insert(epoch, to_key(&key)?);
+    }
+    Ok(keys)
 }
 
 impl Header {
@@ -1667,7 +1929,7 @@ impl Header {
 }
 
 /// Creates a random device identity whose signing key is wrapped by the
-/// vault master key.
+/// device's root key (the shared vault key in older formats).
 fn generate_device(
     master_key: &SecretKey,
     vault_id: &[u8; 32],
@@ -1796,7 +2058,7 @@ fn legacy_revisions(connection: &Connection, vault_id: &[u8; 32]) -> Result<Vec<
         .map(|(revision, version, row_vault_id, mut legacy)| {
             if version != LEGACY_FORMAT_VERSION
                 || row_vault_id.as_slice() != vault_id.as_slice()
-                || legacy.key_epoch != KEY_EPOCH
+                || legacy.key_epoch != FIRST_EPOCH
             {
                 return Err(Error::Crypto);
             }
@@ -1952,13 +2214,16 @@ impl std::fmt::Debug for PendingDevice {
 }
 
 /// What a newly paired device needs to open this vault besides its own
-/// password. `master_key` must leave this process only sealed to the joiner.
+/// password. It carries epoch keys, never the root key, so the joiner wraps
+/// them under a root key of its own.
 pub struct EnrollmentMaterial {
     pub vault_id: [u8; 32],
-    pub key_epoch: u64,
-    pub master_key: SecretKey,
-    pub recovery_nonce: [u8; NONCE_LEN],
-    pub recovery_wrapped_key: Vec<u8>,
+    pub current_epoch: u64,
+    /// Every epoch key this device holds. Each must leave this process only
+    /// sealed to the joiner.
+    pub epoch_keys: Vec<(u64, SecretKey)>,
+    /// Lets the joiner verify the recovery key before enabling recovery.
+    pub recovery_check: Option<[u8; 32]>,
     /// Authorized authors as (device ID, public key), including this device.
     pub devices: Vec<([u8; DEVICE_ID_LEN], [u8; PUBLIC_KEY_LEN])>,
 }
@@ -1966,12 +2231,50 @@ pub struct EnrollmentMaterial {
 impl std::fmt::Debug for EnrollmentMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnrollmentMaterial")
-            .field("key_epoch", &self.key_epoch)
-            .field("master_key", &"[REDACTED]")
+            .field("current_epoch", &self.current_epoch)
+            .field("epoch_keys", &self.epoch_keys.len())
             .field("devices", &self.devices.len())
             .finish_non_exhaustive()
     }
 }
+
+/// Record tables accept any epoch from format 6 on. Re-rooting renames the
+/// format 5 tables so they can be recreated and every row copied unchanged.
+const SET_ASIDE_RECORD_TABLES: &str = r#"
+DROP TRIGGER revisions_no_update;
+DROP TRIGGER revisions_no_delete;
+DROP INDEX revisions_item_id;
+DROP INDEX heads_item_id;
+ALTER TABLE heads RENAME TO heads_old;
+ALTER TABLE revisions RENAME TO revisions_old;
+DROP TRIGGER quarantine_no_update;
+ALTER TABLE quarantine RENAME TO quarantine_old;
+DROP TRIGGER ingress_no_update;
+ALTER TABLE ingress RENAME TO ingress_old;
+"#;
+
+const COPY_RECORD_TABLES: &str = r#"
+INSERT INTO revisions(revision,format_version,vault_id,item_id,parents,key_epoch,
+    author_device_id,nonce,ciphertext,tombstone,signature)
+SELECT revision,format_version,vault_id,item_id,parents,key_epoch,
+    author_device_id,nonce,ciphertext,tombstone,signature
+FROM revisions_old ORDER BY rowid;
+INSERT INTO heads(revision,item_id,tombstone) SELECT revision,item_id,tombstone FROM heads_old;
+INSERT INTO quarantine(revision,format_version,vault_id,item_id,parents,key_epoch,
+    author_device_id,nonce,ciphertext,tombstone,signature)
+SELECT revision,format_version,vault_id,item_id,parents,key_epoch,
+    author_device_id,nonce,ciphertext,tombstone,signature
+FROM quarantine_old ORDER BY rowid;
+INSERT INTO ingress(revision,format_version,vault_id,item_id,parents,key_epoch,
+    author_device_id,nonce,ciphertext,tombstone,signature)
+SELECT revision,format_version,vault_id,item_id,parents,key_epoch,
+    author_device_id,nonce,ciphertext,tombstone,signature
+FROM ingress_old ORDER BY rowid;
+DROP TABLE heads_old;
+DROP TABLE revisions_old;
+DROP TABLE quarantine_old;
+DROP TABLE ingress_old;
+"#;
 
 impl Vault {
     /// Signs a pairing message with this device's key;
@@ -1992,30 +2295,36 @@ impl Vault {
     }
 
     /// Exports what a paired device needs to open this vault. Call only for
-    /// an owner-confirmed pairing, and seal `master_key` to the joiner.
+    /// an owner-confirmed enrollment, and seal every epoch key to the joiner.
     pub fn enrollment_material(&self) -> Result<EnrollmentMaterial> {
         Ok(EnrollmentMaterial {
             vault_id: self.header.vault_id,
-            key_epoch: KEY_EPOCH,
-            master_key: self.key()?.clone(),
-            recovery_nonce: self.header.recovery_nonce,
-            recovery_wrapped_key: self.header.recovery_wrapped_key.clone(),
+            current_epoch: self.header.current_epoch,
+            epoch_keys: self.epoch_keys()?,
+            recovery_check: self.header.recovery_check,
             devices: self.authorized_devices()?,
         })
     }
 
-    /// Creates this device's copy of a vault from pairing material. The
-    /// device keeps its own identity and password; revisions arrive by sync.
+    /// Creates this device's copy of a vault from enrollment material, under
+    /// a new root key of its own. Recovery starts disabled; see
+    /// [`Vault::enable_recovery`]. Revisions arrive by sync.
     pub fn join(
         path: impl AsRef<Path>,
         password: &str,
         device: PendingDevice,
         material: EnrollmentMaterial,
     ) -> Result<Self> {
-        if material.key_epoch != KEY_EPOCH {
-            return Err(Error::UnsupportedVersion(material.key_epoch as u32));
-        }
-        if material.recovery_wrapped_key.len() != KEY_LEN + 16 {
+        let epochs: BTreeSet<u64> = material
+            .epoch_keys
+            .iter()
+            .map(|(epoch, _)| *epoch)
+            .collect();
+        if epochs.len() != material.epoch_keys.len()
+            || epochs.len() > MAX_EPOCHS
+            || !epochs.contains(&material.current_epoch)
+            || epochs.iter().any(|epoch| *epoch == 0 || *epoch > MAX_EPOCH)
+        {
             return Err(Error::Crypto);
         }
         let path = path.as_ref();
@@ -2037,20 +2346,14 @@ impl Vault {
         let connection = open_connection(path)?;
         create_schema(&connection)?;
         let vault_id = material.vault_id;
+        let root_key = Zeroizing::new(random_array::<KEY_LEN>());
         let kdf = KdfConfig::default();
         let password_salt = random_array::<SALT_LEN>();
-        let password_nonce = random_array::<NONCE_LEN>();
-        let wrapping_key = derive_password_key(password, &password_salt, kdf)?;
-        let password_wrapped_key = encrypt(
-            &wrapping_key,
-            &password_nonce,
-            &key_wrap_aad(&vault_id, b"password"),
-            material.master_key.as_ref(),
-        )?;
+        let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &root_key)?;
         let public_key = device.public_key();
         let key_nonce = random_array::<NONCE_LEN>();
         let wrapped_signing_key = encrypt(
-            &material.master_key,
+            &root_key,
             &key_nonce,
             &device_key_aad(&vault_id, &device.device_id, &public_key),
             device.seed.as_ref(),
@@ -2060,10 +2363,12 @@ impl Vault {
             vault_id,
             kdf,
             password_salt,
-            password_nonce,
-            password_wrapped_key,
-            recovery_nonce: material.recovery_nonce,
-            recovery_wrapped_key: material.recovery_wrapped_key.clone(),
+            password_nonce: password.nonce,
+            password_wrapped_key: password.wrapped_key,
+            recovery: None,
+            recovery_check: material.recovery_check,
+            legacy_recovery: None,
+            current_epoch: material.current_epoch,
             device: Some(DeviceHeader {
                 device_id: device.device_id,
                 public_key,
@@ -2072,12 +2377,7 @@ impl Vault {
             }),
         };
         insert_header(&connection, &header)?;
-        insert_device_authorization(
-            &connection,
-            &material.master_key,
-            &header,
-            &header.device_record()?,
-        )?;
+        insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
         for (device_id, key) in &material.devices {
             if *device_id == device.device_id {
                 // The inviter may already list this device; it must be the
@@ -2089,7 +2389,7 @@ impl Vault {
             }
             insert_device_authorization(
                 &connection,
-                &material.master_key,
+                &root_key,
                 &header,
                 &DeviceRecord {
                     device_id: *device_id,
@@ -2097,10 +2397,267 @@ impl Vault {
                 },
             )?;
         }
+        for (epoch, key) in &material.epoch_keys {
+            store_epoch_key(&connection, &root_key, &vault_id, *epoch, key)?;
+        }
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
-        vault.activate(material.master_key.clone())?;
+        vault.activate(root_key, None)?;
         Ok(vault)
+    }
+
+    /// Every epoch key this device holds. Each must leave this process only
+    /// sealed to a recipient device.
+    pub fn epoch_keys(&self) -> Result<Vec<(u64, SecretKey)>> {
+        self.key()?;
+        Ok(self
+            .epoch_keys
+            .iter()
+            .map(|(epoch, key)| (*epoch, key.clone()))
+            .collect())
+    }
+
+    /// Stores the key for `epoch`, received from another member. Installing
+    /// the same key again is a no-op; a different key for a known epoch is
+    /// refused. Staged revisions under that epoch become processable.
+    pub fn install_epoch_key(&mut self, epoch: u64, key: &[u8; KEY_LEN]) -> Result<()> {
+        let root_key = self.key()?.clone();
+        if let Some(existing) = self.epoch_keys.get(&epoch) {
+            return if keys_equal(existing, key) {
+                Ok(())
+            } else {
+                Err(Error::Crypto)
+            };
+        }
+        if self.epoch_keys.len() >= MAX_EPOCHS {
+            return Err(Error::Crypto);
+        }
+        store_epoch_key(
+            &self.connection,
+            &root_key,
+            &self.header.vault_id,
+            epoch,
+            key,
+        )?;
+        self.epoch_keys.insert(epoch, Zeroizing::new(*key));
+        Ok(())
+    }
+
+    /// Creates and stores the key for the next epoch without activating it.
+    /// Rotation seals it to the retained members before activation.
+    pub fn generate_epoch_key(&mut self) -> Result<(u64, SecretKey)> {
+        self.key()?;
+        let epoch = self.epoch_keys.keys().next_back().copied().unwrap_or(0) + 1;
+        let key = Zeroizing::new(random_array::<KEY_LEN>());
+        self.install_epoch_key(epoch, &key)?;
+        Ok((epoch, key))
+    }
+
+    /// Makes `epoch` the one new revisions are written under. Call only when
+    /// committed membership has activated it; older epochs stay readable.
+    pub fn activate_epoch(&mut self, epoch: u64) -> Result<()> {
+        self.key()?;
+        if epoch <= self.header.current_epoch {
+            return Err(Error::Conflict {
+                expected: format!("an epoch after {}", self.header.current_epoch),
+                actual: epoch.to_string(),
+            });
+        }
+        if !self.epoch_keys.contains_key(&epoch) {
+            return Err(Error::MissingEpochKey);
+        }
+        self.connection.execute(
+            "UPDATE vault_meta SET current_epoch=? WHERE singleton=1",
+            [i64::try_from(epoch).map_err(|_| Error::Crypto)?],
+        )?;
+        self.header.current_epoch = epoch;
+        Ok(())
+    }
+
+    /// Turns on recovery for this device after checking that `recovery` is
+    /// this vault's recovery key: against the vault's recovery check, or for
+    /// a re-rooted vault against its old recovery wrapper.
+    pub fn enable_recovery(&mut self, recovery: &RecoveryKey) -> Result<()> {
+        let root_key = self.key()?.clone();
+        let vault_id = self.header.vault_id;
+        match (&self.header.recovery_check, &self.header.legacy_recovery) {
+            (Some(check), _) => verify_recovery_check(recovery.expose(), &vault_id, check)?,
+            (None, Some(legacy)) => {
+                let old_key = decrypt(
+                    recovery.expose(),
+                    &legacy.nonce,
+                    &key_wrap_aad(&vault_id, b"recovery"),
+                    &legacy.wrapped_key,
+                )
+                .map_err(|_| Error::InvalidRecoveryKey)?;
+                let first = self.epoch_keys.get(&FIRST_EPOCH).ok_or(Error::Crypto)?;
+                if !keys_equal(&array(&old_key)?, first) {
+                    return Err(Error::InvalidRecoveryKey);
+                }
+            }
+            // Nothing to check a typed key against; enable recovery on a
+            // device that has it first, then pair from there.
+            (None, None) => return Err(Error::InvalidRecoveryKey),
+        }
+        let wrapper = wrap_with_recovery(recovery, &vault_id, &root_key)?;
+        let check = recovery_check(recovery.expose(), &vault_id)?;
+        self.connection.execute(
+            "UPDATE vault_meta SET recovery_nonce=?, recovery_wrapped_key=?, recovery_check=?, \
+             legacy_recovery_nonce=NULL, legacy_recovery_wrapped_key=NULL WHERE singleton=1",
+            params![
+                wrapper.nonce.as_slice(),
+                wrapper.wrapped_key,
+                check.as_slice()
+            ],
+        )?;
+        self.header.recovery = Some(wrapper);
+        self.header.recovery_check = Some(check);
+        self.header.legacy_recovery = None;
+        Ok(())
+    }
+
+    /// Re-roots a format 5 vault in one transaction. The shared vault key
+    /// becomes epoch 1; a new random root key takes over wrapping the device
+    /// key, the authorized-author MACs, and the epoch keys; and the password
+    /// wrapper is rewritten for it. Recovery stays off until the recovery
+    /// key is entered again; the old recovery wrapper is kept only to check
+    /// it. Every revision row is copied unchanged.
+    fn migrate_root_key(
+        &mut self,
+        shared_key: &SecretKey,
+        password_key: &SecretKey,
+    ) -> Result<SecretKey> {
+        let vault_id = self.header.vault_id;
+        let root_key = Zeroizing::new(random_array::<KEY_LEN>());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = transaction.query_row(
+            "SELECT format_version FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != SHARED_KEY_FORMAT_VERSION {
+            // Another process re-rooted the vault after this one read its
+            // header, so the key just unwrapped is not the root. Unlocking
+            // again reads the new header.
+            drop(transaction);
+            self.header = read_header(&self.connection)?;
+            return Err(Error::Locked);
+        }
+        let device = self.header.device.clone().ok_or(Error::Crypto)?;
+        let device_aad = device_key_aad(&vault_id, &device.device_id, &device.public_key);
+        let seed = decrypt(
+            shared_key,
+            &device.key_nonce,
+            &device_aad,
+            &device.wrapped_signing_key,
+        )
+        .map_err(|_| Error::Crypto)?;
+        let key_nonce = random_array::<NONCE_LEN>();
+        let wrapped_signing_key = encrypt(&root_key, &key_nonce, &device_aad, &seed)?;
+        let password = wrap_with(password_key, &vault_id, b"password", &root_key)?;
+        let mut header = self.header.clone();
+        header.format_version = VAULT_FORMAT_VERSION;
+        header.password_nonce = password.nonce;
+        header.password_wrapped_key = password.wrapped_key;
+        header.legacy_recovery = header.recovery.take();
+        header.recovery_check = None;
+        header.current_epoch = FIRST_EPOCH;
+        header.device = Some(DeviceHeader {
+            key_nonce,
+            wrapped_signing_key,
+            ..device
+        });
+
+        let devices = load_devices(&transaction, shared_key, &vault_id)?;
+        transaction.execute_batch("DROP TRIGGER devices_no_update;")?;
+        for (device_id, key) in &devices {
+            let authorization =
+                device_authorization(&root_key, &vault_id, device_id, &key.to_bytes())?;
+            transaction.execute(
+                "UPDATE devices SET authorization=? WHERE device_id=?",
+                params![authorization.as_slice(), device_id.as_slice()],
+            )?;
+        }
+        transaction.execute_batch(DEVICES_TRIGGER)?;
+        transaction.execute_batch(EPOCH_KEYS_SCHEMA)?;
+        store_epoch_key(&transaction, &root_key, &vault_id, FIRST_EPOCH, shared_key)?;
+        transaction.execute_batch(SET_ASIDE_RECORD_TABLES)?;
+        transaction.execute_batch(RECORD_SCHEMA)?;
+        transaction.execute_batch(QUARANTINE_SCHEMA)?;
+        transaction.execute_batch(INGRESS_SCHEMA)?;
+        transaction.execute_batch(COPY_RECORD_TABLES)?;
+        transaction.execute_batch("DROP TABLE vault_meta;")?;
+        transaction.execute_batch(VAULT_META_TABLE)?;
+        insert_header(&transaction, &header)?;
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(root_key)
+    }
+
+    /// Writes a vault in the format 5 layout, where one shared key wraps
+    /// everything and encrypts records as epoch 1, with `items` as its
+    /// revisions (an item repeated is an edit). For testing re-rooting.
+    #[cfg(test)]
+    pub(crate) fn create_format5(
+        path: &Path,
+        password: &str,
+        items: &[Item],
+    ) -> Result<RecoveryKey> {
+        drop(OpenOptions::new().write(true).create_new(true).open(path)?);
+        let connection = open_connection(path)?;
+        create_schema(&connection)?;
+        let vault_id = random_array::<32>();
+        let shared_key = Zeroizing::new(random_array::<KEY_LEN>());
+        let recovery = RecoveryKey::generate();
+        let kdf = KdfConfig::default();
+        let password_salt = random_array::<SALT_LEN>();
+        let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &shared_key)?;
+        let (device, signing_key) = generate_device(&shared_key, &vault_id)?;
+        let header = Header {
+            format_version: SHARED_KEY_FORMAT_VERSION,
+            vault_id,
+            kdf,
+            password_salt,
+            password_nonce: password.nonce,
+            password_wrapped_key: password.wrapped_key,
+            recovery: Some(wrap_with_recovery(&recovery, &vault_id, &shared_key)?),
+            recovery_check: None,
+            legacy_recovery: None,
+            current_epoch: FIRST_EPOCH,
+            device: Some(device),
+        };
+        insert_header(&connection, &header)?;
+        let record = header.device_record()?;
+        insert_device_authorization(&connection, &shared_key, &header, &record)?;
+        let signer = RevisionSigner {
+            key: &shared_key,
+            epoch: FIRST_EPOCH,
+            signing_key: &signing_key,
+            vault_id,
+            author: record.device_id,
+        };
+        for item in items {
+            let parents = head_ids(&connection, &item.id)?;
+            let revision =
+                signer.seal(&item.id, parents.clone(), false, &serde_json::to_vec(item)?)?;
+            let id = revision.revision_id();
+            insert_revision(&connection, "revisions", &revision, &id)?;
+            for parent in &parents {
+                connection.execute("DELETE FROM heads WHERE revision=?", [parent])?;
+            }
+            connection.execute(
+                "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,0)",
+                params![id, item.id],
+            )?;
+        }
+        Ok(recovery)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_key_for_tests(&self) -> SecretKey {
+        self.root_key.clone().expect("unlocked")
     }
 
     /// IDs of every accepted revision in insertion order, so parents always
@@ -2144,8 +2701,10 @@ impl Vault {
     /// locked: only the envelope's shape is checked, and nothing is
     /// decrypted or verified until [`Vault::process_staged`].
     pub fn stage_revision(&mut self, revision: EncryptedRevision) -> Result<StageOutcome> {
-        // Older layouts gain the ingress queue on unlock.
-        if self.header.format_version != VAULT_FORMAT_VERSION {
+        // The ingress queue exists from format 5 on (a format 4 vault gains
+        // it when opened); older layouts gain it on unlock. Staging needs no
+        // key, so a format 5 vault receives before it is re-rooted.
+        if self.header.format_version < SHARED_KEY_FORMAT_VERSION {
             return Err(Error::Locked);
         }
         revision.validate_shape(&self.header.vault_id)?;
@@ -2219,7 +2778,9 @@ impl Vault {
                 match self.apply_encrypted_revision(revision) {
                     Ok(_) => report.applied += 1,
                     Err(Error::Quarantined) => report.quarantined += 1,
-                    Err(Error::MissingParent) => continue,
+                    // Wait for the parent, or for this device to receive
+                    // the epoch's key.
+                    Err(Error::MissingParent | Error::MissingEpochKey) => continue,
                     Err(error) if is_rejection(&error) => {
                         self.connection
                             .execute("DELETE FROM ingress WHERE revision=?", [&id])?;

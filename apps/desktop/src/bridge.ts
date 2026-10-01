@@ -119,6 +119,11 @@ export const bridge: DesktopBridge = {
     if (invoke) return (await invoke("sync_status")) as SyncStatus;
     return { state: "unpaired", pending: 0 };
   },
+  async recoveryStatus() {
+    const invoke = native();
+    return invoke ? Boolean(await invoke("recovery_status")) : true;
+  },
+  enableRecovery: (recoveryKey) => nativeOnly("enable_recovery", { recoveryKey }),
   syncNow: () => nativeOnly("sync_now"),
   startInvite: () => nativeOnly("start_invite"),
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),

@@ -30,6 +30,12 @@ pub enum Error {
     InvalidSignature,
     #[error("revision from an unauthorized device was quarantined for owner review")]
     Quarantined,
+    #[error("recovery is not enabled on this device; enter the recovery key to enable it")]
+    RecoveryNotEnabled,
+    #[error("unlock with the password once to upgrade this vault")]
+    UpgradeRequiresPassword,
+    #[error("this device does not have the key for that epoch yet")]
+    MissingEpochKey,
     #[error("quarantine is full; review or discard held revisions")]
     QuarantineFull,
     #[error("too many received revisions are waiting; unlock to process them")]

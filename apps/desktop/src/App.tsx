@@ -35,6 +35,7 @@ function App() {
   const [devicesOpen, setDevicesOpen] = useState(false);
   const [invite, setInvite] = useState<InviteState | null>(null);
   const [joining, setJoining] = useState(false);
+  const [recoveryOn, setRecoveryOn] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [generatorOpen, setGeneratorOpen] = useState(false);
   const [editor, setEditor] = useState<EditorState | null>(null);
@@ -78,6 +79,9 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [locked]);
+  useEffect(() => {
+    if (devicesOpen) void bridge.recoveryStatus().then(setRecoveryOn).catch(() => {});
+  }, [devicesOpen]);
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(null), 3200);
@@ -175,6 +179,16 @@ function App() {
     setInvite(null);
   }
 
+  async function enableRecovery(recoveryKey: string) {
+    try {
+      await bridge.enableRecovery(recoveryKey);
+      setRecoveryOn(true);
+      setNotice("Recovery is on for this device");
+    } catch (error) {
+      setNotice(commandMessage(error, "Recovery could not be turned on"));
+    }
+  }
+
   async function syncNow() {
     try {
       await bridge.syncNow();
@@ -257,7 +271,7 @@ function App() {
       {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
       {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
-      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Pairing and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div><DevicesPanel sync={sync} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Pairing and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {notice && <div className="toast"><ShieldCheck size={15} />{notice}</div>}
     </main>
   );
@@ -298,6 +312,16 @@ function DevicesPanel({ sync, invite, locked, onInvite, onAnswer, onCancelInvite
   return <div className="device-panel">
     <p className="review-hint">Pair one other device. Each keeps a full encrypted copy and they sync directly, with no server. You will compare a six-digit code on both screens.</p>
     <button className="generate-button" onClick={onInvite} disabled={locked}>{locked ? "Unlock to invite a device" : "Invite a device"}</button>
+  </div>;
+}
+
+/** A device that joined from another one has its own root key, so the
+ * recovery key must be entered once before it can unlock this device. */
+function RecoveryPrompt({ onEnable }: { onEnable: (recoveryKey: string) => void }) {
+  const [recoveryKey, setRecoveryKey] = useState("");
+  return <div className="device-panel recovery-prompt">
+    <p className="review-hint">Recovery is off on this device. Enter the vault's recovery key once so a forgotten password can be recovered here too. It is checked before it is accepted.</p>
+    <div className="unlock-form"><input aria-label="Recovery key" type="password" placeholder="OSM-RK1-…" value={recoveryKey} onChange={(event) => setRecoveryKey(event.target.value)} /><button disabled={!recoveryKey.trim()} onClick={() => { onEnable(recoveryKey); setRecoveryKey(""); }}>Turn on</button></div>
   </div>;
 }
 
@@ -365,6 +389,8 @@ function commandMessage(error: unknown, fallback: string): string {
   if (code === "invitation_expired") return "The invitation has expired · create a new one";
   if (code === "invalid_invitation") return "That is not a valid invitation";
   if (code === "peer_limit") return "This vault already has a paired device";
+  if (code === "invalid_recovery_key") return "That is not this vault's recovery key";
+  if (code === "upgrade_requires_password") return "Unlock with your password once to upgrade this vault";
   if (code === "peer_address") return (error as { message?: string }).message ?? fallback;
   if (code === "network" || code === "timeout") return `${fallback} · ${(error as { message?: string }).message ?? "network error"}`;
   if (code === "invalid_item") return (error as { message?: string }).message ?? fallback;

@@ -3,6 +3,8 @@ use std::fs;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
+use base64ct::Encoding;
+
 use crate::{
     crypto::{
         derive_password_key, encrypt, key_wrap_aad, legacy_record_aad, legacy_revision_id,
@@ -833,20 +835,26 @@ fn invalid_ancestry_is_rejected_and_missing_parents_can_be_retried() {
 fn single_head_vault_migrates_without_changing_signed_revisions() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("v2.db");
-    let (mut vault, _) = Vault::create(&path, "password").unwrap();
     let item = login("Before migration");
-    let first = vault.put(item.clone()).unwrap();
     let mut changed = item.clone();
     changed.password = "changed".into();
-    let second = vault.update(changed, &first.revision).unwrap();
-    let before = vault.encrypted_revisions().unwrap();
-    drop(vault);
+    Vault::create_format5(&path, "password", &[item.clone(), changed]).unwrap();
+    // Revision IDs and ciphertext are readable without unlocking.
+    let before = {
+        let vault = Vault::open(&path).unwrap();
+        vault
+            .revisions_by_id(&vault.revision_ids().unwrap())
+            .unwrap()
+    };
+    let second = before[1].revision_id();
 
     // Rebuild the format 2 layout: single parent column, one head per item.
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
-            "DROP TRIGGER quarantine_no_update; DROP TABLE quarantine;
+            "DROP TRIGGER epoch_keys_no_update; DROP TRIGGER epoch_keys_no_delete;
+             DROP TABLE epoch_keys;
+             DROP TRIGGER quarantine_no_update; DROP TABLE quarantine;
              DROP TRIGGER ingress_no_update; DROP TABLE ingress;
              DROP TRIGGER revisions_no_update; DROP TRIGGER revisions_no_delete;
              DROP INDEX revisions_item_id; DROP INDEX heads_item_id;
@@ -883,10 +891,10 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
     // Signed bytes, and therefore revision IDs, are unchanged.
     assert_eq!(migrated.encrypted_revisions().unwrap(), before);
     let current = migrated.get(&item.id).unwrap();
-    assert_eq!(current.revision, second.revision);
+    assert_eq!(current.revision, second);
     assert!(!current.conflict);
     migrated.update(current.item, &current.revision).unwrap();
-    // The chained 2 -> 3 -> 4 -> 5 migration created the quarantine.
+    // The chained 2 -> 3 -> 4 -> 5 -> 6 migration created the quarantine.
     assert!(migrated.quarantined().unwrap().is_empty());
     drop(migrated);
     let version: u32 = Connection::open(&path)
@@ -895,7 +903,7 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -1171,10 +1179,10 @@ fn staged_revisions_from_unknown_devices_go_to_quarantine() {
 #[test]
 fn a_format_4_vault_gains_the_ingress_queue_when_opened_locked() {
     let dir = tempdir().unwrap();
-    let (mut a, mut b, item, base) = two_copies(dir.path());
-    let incoming = edit(&mut b, &item, &base, "after upgrade");
-    drop(a);
-    let connection = Connection::open(dir.path().join("a.db")).unwrap();
+    let path = dir.path().join("v4.db");
+    let item = login("Before upgrade");
+    Vault::create_format5(&path, "password", std::slice::from_ref(&item)).unwrap();
+    let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
             "DROP TRIGGER ingress_no_update; DROP TABLE ingress;
@@ -1182,14 +1190,252 @@ fn a_format_4_vault_gains_the_ingress_queue_when_opened_locked() {
         )
         .unwrap();
     drop(connection);
+    let version = |path: &std::path::Path| -> u32 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
 
-    a = Vault::open(dir.path().join("a.db")).unwrap();
-    a.stage_revision(incoming).unwrap();
-    let version: u32 = Connection::open(dir.path().join("a.db"))
+    // Opening without a key adds the queue, so staging works while locked.
+    let mut vault = Vault::open(&path).unwrap();
+    assert_eq!(version(&path), 5);
+    let stored = vault
+        .revisions_by_id(&vault.revision_ids().unwrap())
         .unwrap()
-        .query_row("SELECT format_version FROM vault_meta", [], |row| {
-            row.get(0)
-        })
+        .remove(0);
+    assert_eq!(
+        vault.stage_revision(stored).unwrap(),
+        crate::StageOutcome::Duplicate
+    );
+    // Re-rooting waits for a password unlock.
+    vault.unlock("password").unwrap();
+    assert_eq!(version(&path), 6);
+    assert_eq!(vault.get(&item.id).unwrap().item.title, "Before upgrade");
+}
+
+#[test]
+fn epochs_rotate_without_losing_history() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    let item = login("Rotated");
+    let first = vault.put(item.clone()).unwrap();
+    assert_eq!(vault.current_epoch(), 1);
+
+    // A generated key is held but not used until activated.
+    let (epoch, _) = vault.generate_epoch_key().unwrap();
+    assert_eq!(epoch, 2);
+    let mut changed = item.clone();
+    changed.password = "still epoch 1".into();
+    let second = vault.update(changed.clone(), &first.revision).unwrap();
+    assert_eq!(wire(&vault, &second.revision).key_epoch, 1);
+
+    vault.activate_epoch(2).unwrap();
+    changed.password = "epoch 2".into();
+    let third = vault.update(changed, &second.revision).unwrap();
+    assert_eq!(wire(&vault, &third.revision).key_epoch, 2);
+    assert!(matches!(
+        vault.activate_epoch(1),
+        Err(Error::Conflict { .. })
+    ));
+    assert!(matches!(
+        vault.activate_epoch(3),
+        Err(Error::MissingEpochKey)
+    ));
+
+    // Both epochs persist and stay readable.
+    vault.lock();
+    drop(vault);
+    let mut vault = Vault::open(&path).unwrap();
+    vault.unlock("password").unwrap();
+    assert_eq!(vault.current_epoch(), 2);
+    assert_eq!(vault.get(&item.id).unwrap().item.password, "epoch 2");
+    assert_eq!(vault.encrypted_revisions().unwrap().len(), 3);
+}
+
+#[test]
+fn revisions_under_an_epoch_this_device_lacks_wait_for_its_key() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_copies(dir.path());
+    let (epoch, key) = a.generate_epoch_key().unwrap();
+    a.activate_epoch(epoch).unwrap();
+    let newer = edit(&mut a, &item, &base, "written under epoch 2");
+
+    b.stage_revision(newer).unwrap();
+    let report = b.process_staged().unwrap();
+    assert_eq!((report.applied, report.pending, report.rejected), (0, 1, 0));
+
+    // A different key for a known epoch is refused; the real one unblocks it.
+    b.install_epoch_key(epoch, &key).unwrap();
+    assert!(matches!(
+        b.install_epoch_key(epoch, &[7; 32]),
+        Err(Error::Crypto)
+    ));
+    let report = b.process_staged().unwrap();
+    assert_eq!((report.applied, report.pending), (1, 0));
+    assert_eq!(
+        b.get(&item.id).unwrap().item.password,
+        "written under epoch 2"
+    );
+}
+
+/// Every key a joined device holds: its own root and its epoch keys.
+fn keys_held(vault: &Vault) -> Vec<[u8; 32]> {
+    let mut keys = vec![*vault.root_key_for_tests()];
+    keys.extend(vault.epoch_keys().unwrap().into_iter().map(|(_, key)| *key));
+    keys
+}
+
+#[test]
+fn a_removed_device_cannot_read_later_epochs_from_a_leaked_file_or_backup() {
+    let dir = tempdir().unwrap();
+    let (mut a, recovery) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    a.put(login("Before removal")).unwrap();
+    let joined = Vault::join(
+        dir.path().join("b.db"),
+        "joined password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    // The joined device got the epoch keys, not A's root key.
+    assert!(!keys_held(&joined).contains(&*a.root_key_for_tests()));
+
+    // A rotates without the joined device, then writes and backs up.
+    let (epoch, _) = a.generate_epoch_key().unwrap();
+    a.activate_epoch(epoch).unwrap();
+    a.put(login("After removal")).unwrap();
+    let backup = dir.path().join("after.osmbak");
+    a.export_backup(&backup).unwrap();
+    drop(a);
+
+    // A's file wraps the new epoch key under A's root: nothing the joined
+    // device holds opens it.
+    let connection = Connection::open(dir.path().join("a.db")).unwrap();
+    let (vault_id, nonce, wrapped): (Vec<u8>, Vec<u8>, Vec<u8>) = connection
+        .query_row(
+            "SELECT (SELECT vault_id FROM vault_meta), nonce, wrapped_key FROM epoch_keys WHERE epoch=2",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .unwrap();
-    assert_eq!(version, 5);
+    let aad = crate::crypto::epoch_key_aad(&vault_id.try_into().unwrap(), 2);
+    for key in keys_held(&joined) {
+        assert!(
+            crate::crypto::decrypt(&key, &nonce.clone().try_into().unwrap(), &aad, &wrapped)
+                .is_err()
+        );
+    }
+    // Neither do they open the newer backup; only the recovery key does.
+    let envelope: serde_json::Value = serde_json::from_slice(&fs::read(&backup).unwrap()).unwrap();
+    let wrapped_root =
+        base64ct::Base64UrlUnpadded::decode_vec(envelope["recovery_wrapped_key"].as_str().unwrap())
+            .unwrap();
+    let root_nonce: [u8; 24] =
+        base64ct::Base64UrlUnpadded::decode_vec(envelope["recovery_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let wrap_aad = key_wrap_aad(&joined.vault_id(), b"recovery");
+    for key in keys_held(&joined) {
+        assert!(crate::crypto::decrypt(&key, &root_nonce, &wrap_aad, &wrapped_root).is_err());
+    }
+    let restored = Vault::restore_backup(
+        &backup,
+        dir.path().join("restored.db"),
+        &recovery,
+        "restored password",
+    )
+    .unwrap();
+    assert_eq!(restored.list().unwrap().len(), 2);
+    assert_eq!(restored.current_epoch(), 2);
+}
+
+#[test]
+fn a_joined_device_enables_recovery_only_with_the_right_key() {
+    let dir = tempdir().unwrap();
+    let (a, recovery) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let path = dir.path().join("b.db");
+    let mut joined = Vault::join(
+        &path,
+        "joined password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    assert!(!joined.recovery_enabled());
+    assert!(matches!(
+        joined.export_backup(dir.path().join("b.osmbak")),
+        Err(Error::RecoveryNotEnabled)
+    ));
+    joined.lock();
+    assert!(matches!(
+        joined.unlock_with_recovery(&recovery),
+        Err(Error::RecoveryNotEnabled)
+    ));
+
+    joined.unlock("joined password").unwrap();
+    let (_, other_vaults_key) = Vault::create(dir.path().join("other.db"), "x").unwrap();
+    assert!(matches!(
+        joined.enable_recovery(&other_vaults_key),
+        Err(Error::InvalidRecoveryKey)
+    ));
+    joined.enable_recovery(&recovery).unwrap();
+    drop(joined);
+    let mut reopened = Vault::open(&path).unwrap();
+    reopened.unlock_with_recovery(&recovery).unwrap();
+    reopened.export_backup(dir.path().join("b.osmbak")).unwrap();
+}
+
+#[test]
+fn a_shared_key_vault_is_re_rooted_at_its_next_password_unlock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v5.db");
+    let item = login("Kept through re-rooting");
+    let recovery = Vault::create_format5(&path, "password", std::slice::from_ref(&item)).unwrap();
+    let before = {
+        let vault = Vault::open(&path).unwrap();
+        vault
+            .revisions_by_id(&vault.revision_ids().unwrap())
+            .unwrap()
+    };
+
+    // Re-rooting needs the password, so recovery cannot do it.
+    let mut vault = Vault::open(&path).unwrap();
+    assert!(matches!(
+        vault.unlock_with_recovery(&recovery),
+        Err(Error::UpgradeRequiresPassword)
+    ));
+    assert!(!vault.is_unlocked());
+
+    vault.unlock("password").unwrap();
+    assert_eq!(
+        vault.get(&item.id).unwrap().item.title,
+        "Kept through re-rooting"
+    );
+    assert_eq!(vault.encrypted_revisions().unwrap(), before);
+    // The old shared key is now epoch 1, distinct from the new root.
+    let epochs = vault.epoch_keys().unwrap();
+    assert_eq!(epochs.len(), 1);
+    assert_ne!(*epochs[0].1, *vault.root_key_for_tests());
+    // Recovery is re-enabled by entering the key, checked against the old
+    // wrapper.
+    assert!(!vault.recovery_enabled());
+    let (_, wrong) = Vault::create(dir.path().join("other.db"), "x").unwrap();
+    assert!(matches!(
+        vault.enable_recovery(&wrong),
+        Err(Error::InvalidRecoveryKey)
+    ));
+    vault.enable_recovery(&recovery).unwrap();
+    vault.put(login("After re-rooting")).unwrap();
+    drop(vault);
+
+    let mut reopened = Vault::open(&path).unwrap();
+    reopened.unlock_with_recovery(&recovery).unwrap();
+    assert_eq!(reopened.list().unwrap().len(), 2);
+    reopened.lock();
+    reopened.unlock("password").unwrap();
 }

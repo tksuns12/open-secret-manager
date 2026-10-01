@@ -642,3 +642,29 @@ fn staged_revisions_are_processed_when_the_next_session_starts_unlocked() {
     );
     assert_eq!(b.vault.list().unwrap().len(), 1);
 }
+
+#[test]
+fn pairing_sends_every_epoch_key_but_never_the_root() {
+    let dir = tempdir().unwrap();
+    let (vault, recovery) = Vault::create(dir.path().join("a.db"), "inviter password").unwrap();
+    let mut a = Device {
+        vault,
+        invitations: InvitationStore::open_in_memory(InvitationPolicy::default()).unwrap(),
+        peers: PeerStore::open_in_memory().unwrap(),
+    };
+    a.vault.put(login("Written in epoch 1", "p")).unwrap();
+    let (epoch, _) = a.vault.generate_epoch_key().unwrap();
+    a.vault.activate_epoch(epoch).unwrap();
+    a.vault.put(login("Written in epoch 2", "p")).unwrap();
+
+    let mut b = pair(dir.path(), &mut a);
+    assert_eq!(b.vault.current_epoch(), 2);
+    assert_eq!(b.vault.epoch_keys().unwrap().len(), 2);
+    sync(&mut a.vault, &mut b.vault);
+    assert_eq!(b.vault.list().unwrap().len(), 2);
+
+    // The joiner has its own root, so recovery starts off; the vault's
+    // recovery key, checked against the grant's recovery check, turns it on.
+    assert!(!b.vault.recovery_enabled());
+    b.vault.enable_recovery(&recovery).unwrap();
+}

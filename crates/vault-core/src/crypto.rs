@@ -185,6 +185,49 @@ fn device_authorization_mac(
 /// `parents` are sorted, unique 64-character revision IDs joined into one
 /// length-prefixed field. Zero or one parent therefore encodes exactly as the
 /// original single-parent layout, so existing signatures and IDs stay valid.
+/// Wraps one epoch key under a device's root key.
+pub(crate) fn epoch_key_aad(vault_id: &[u8; 32], epoch: u64) -> Vec<u8> {
+    let mut aad = b"osm-epoch-key-v1\0".to_vec();
+    aad.extend_from_slice(vault_id);
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad
+}
+
+/// A public value that lets a device check a typed recovery key without
+/// storing it. The recovery key has 256 bits of entropy, so the check
+/// reveals nothing useful about it.
+pub(crate) fn recovery_check(recovery: &[u8; KEY_LEN], vault_id: &[u8; 32]) -> Result<[u8; 32]> {
+    Ok(recovery_check_mac(recovery, vault_id)?
+        .finalize()
+        .into_bytes()
+        .into())
+}
+
+pub(crate) fn verify_recovery_check(
+    recovery: &[u8; KEY_LEN],
+    vault_id: &[u8; 32],
+    expected: &[u8; 32],
+) -> Result<()> {
+    recovery_check_mac(recovery, vault_id)?
+        .verify_slice(expected)
+        .map_err(|_| Error::InvalidRecoveryKey)
+}
+
+fn recovery_check_mac(recovery: &[u8; KEY_LEN], vault_id: &[u8; 32]) -> Result<Hmac<Sha256>> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(recovery).map_err(|_| Error::Crypto)?;
+    mac.update(b"osm-recovery-check-v1\0");
+    mac.update(vault_id);
+    Ok(mac)
+}
+
+/// Compares two keys without an early exit.
+pub(crate) fn keys_equal(left: &[u8; KEY_LEN], right: &[u8; KEY_LEN]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
 pub(crate) fn record_aad(
     vault_id: &[u8; 32],
     item_id: &str,

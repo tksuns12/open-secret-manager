@@ -29,7 +29,7 @@ const PAIRING_VERSION: u8 = 1;
 const INVITATION_PREFIX: &str = "OSM-PAIR1-";
 const MAX_INVITATION_CODE_LEN: usize = 512;
 const MAX_GRANT_DEVICES: usize = 64;
-const RECOVERY_WRAPPED_KEY_LEN: usize = 48;
+const MAX_GRANT_EPOCHS: usize = 1024;
 const MAX_ADDRESSES: usize = 4;
 const MAX_ADDRESS_LEN: usize = 128;
 
@@ -179,10 +179,13 @@ pub struct DeviceEntry {
 pub struct JoinGrant {
     version: u8,
     vault_id: [u8; 32],
-    key_epoch: u64,
-    envelope: Vec<u8>,
-    recovery_nonce: [u8; 24],
-    recovery_wrapped_key: Vec<u8>,
+    /// The epoch the joiner writes under.
+    current_epoch: u64,
+    /// One HPKE envelope per epoch key, sealed to the joiner. Each names its
+    /// epoch. The inviter's root key is never sent.
+    envelopes: Vec<Vec<u8>>,
+    /// Lets the joiner verify the recovery key before enabling recovery.
+    recovery_check: Option<[u8; 32]>,
     devices: Vec<DeviceEntry>,
     /// Port the inviter accepts sync connections on, if it listens. The
     /// joiner pairs it with the inviter's address from the invitation; the
@@ -198,10 +201,18 @@ impl JoinGrant {
         message.extend_from_slice(transcript);
         message.push(self.version);
         message.extend_from_slice(&self.vault_id);
-        message.extend_from_slice(&self.key_epoch.to_be_bytes());
-        push_field(&mut message, &self.envelope);
-        message.extend_from_slice(&self.recovery_nonce);
-        push_field(&mut message, &self.recovery_wrapped_key);
+        message.extend_from_slice(&self.current_epoch.to_be_bytes());
+        message.extend_from_slice(&(self.envelopes.len() as u64).to_be_bytes());
+        for envelope in &self.envelopes {
+            push_field(&mut message, envelope);
+        }
+        match &self.recovery_check {
+            Some(check) => {
+                message.push(1);
+                message.extend_from_slice(check);
+            }
+            None => message.push(0),
+        }
         message.extend_from_slice(&(self.devices.len() as u64).to_be_bytes());
         for device in &self.devices {
             message.extend_from_slice(&device.device_id);
@@ -336,20 +347,28 @@ pub fn approve_join(
     peers.ensure_capacity()?;
     let request = &review.request;
     let material = vault.enrollment_material()?;
-    let envelope = seal_epoch_key(
-        VaultId(material.vault_id),
-        material.key_epoch,
-        DeviceId(request.joiner_public_key),
-        HpkePublicKey::from_bytes(request.joiner_hpke_key)?,
-        &material.master_key,
-    )?;
+    let recipient_key = HpkePublicKey::from_bytes(request.joiner_hpke_key)?;
+    let envelopes = material
+        .epoch_keys
+        .iter()
+        .map(|(epoch, key)| {
+            Ok(seal_epoch_key(
+                VaultId(material.vault_id),
+                *epoch,
+                DeviceId(request.joiner_public_key),
+                recipient_key,
+                key,
+            )?
+            .to_bytes()
+            .to_vec())
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut grant = JoinGrant {
         version: PAIRING_VERSION,
         vault_id: material.vault_id,
-        key_epoch: material.key_epoch,
-        envelope: envelope.to_bytes().to_vec(),
-        recovery_nonce: material.recovery_nonce,
-        recovery_wrapped_key: material.recovery_wrapped_key.clone(),
+        current_epoch: material.current_epoch,
+        envelopes,
+        recovery_check: material.recovery_check,
         devices: material
             .devices
             .iter()
@@ -478,25 +497,34 @@ impl Joiner {
         };
         if grant.devices.len() > MAX_GRANT_DEVICES
             || !grant.devices.contains(&inviter)
-            || grant.recovery_wrapped_key.len() != RECOVERY_WRAPPED_KEY_LEN
+            || grant.envelopes.is_empty()
+            || grant.envelopes.len() > MAX_GRANT_EPOCHS
         {
             return Err(Error::ProtocolViolation);
         }
-        let envelope = EpochKeyEnvelope::from_bytes(&grant.envelope)?;
-        let master_key = open_epoch_key(
-            &envelope,
-            VaultId(grant.vault_id),
-            grant.key_epoch,
-            DeviceId(self.device.public_key()),
-            self.hpke.private(),
-        )?;
+        // Each envelope is bound to this vault, its epoch, and this device;
+        // `Vault::join` rejects duplicate epochs or a missing current one.
+        let epoch_keys = grant
+            .envelopes
+            .iter()
+            .map(|bytes| {
+                let envelope = EpochKeyEnvelope::from_bytes(bytes)?;
+                let key = open_epoch_key(
+                    &envelope,
+                    VaultId(grant.vault_id),
+                    envelope.epoch(),
+                    DeviceId(self.device.public_key()),
+                    self.hpke.private(),
+                )?;
+                Ok((envelope.epoch(), key))
+            })
+            .collect::<Result<Vec<_>>>()?;
         peers.ensure_capacity()?;
         let material = EnrollmentMaterial {
             vault_id: grant.vault_id,
-            key_epoch: grant.key_epoch,
-            master_key,
-            recovery_nonce: grant.recovery_nonce,
-            recovery_wrapped_key: grant.recovery_wrapped_key.clone(),
+            current_epoch: grant.current_epoch,
+            epoch_keys,
+            recovery_check: grant.recovery_check,
             devices: grant
                 .devices
                 .iter()

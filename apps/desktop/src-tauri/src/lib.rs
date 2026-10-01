@@ -35,6 +35,9 @@ impl From<osm_vault_core::Error> for CommandError {
             osm_vault_core::Error::Conflict { .. } => "conflict",
             osm_vault_core::Error::InvalidItem(_) => "invalid_item",
             osm_vault_core::Error::Unresolved => "unresolved",
+            osm_vault_core::Error::InvalidRecoveryKey => "invalid_recovery_key",
+            osm_vault_core::Error::RecoveryNotEnabled => "recovery_not_enabled",
+            osm_vault_core::Error::UpgradeRequiresPassword => "upgrade_requires_password",
             _ => "vault_error",
         };
         Self {
@@ -384,6 +387,34 @@ async fn unlock_vault(
     Ok(())
 }
 
+/// Whether this device can be unlocked with the recovery key. A device that
+/// joined from another one starts without it.
+#[tauri::command]
+async fn recovery_status(state: tauri::State<'_, AppState>) -> Result<bool, CommandError> {
+    Ok(state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(Vault::recovery_enabled))
+}
+
+/// Turns on recovery for this device after checking the typed key against
+/// the vault's recovery check.
+#[tauri::command]
+async fn enable_recovery(
+    recovery_key: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let recovery = osm_vault_core::RecoveryKey::parse(recovery_key.trim())?;
+    let mut vault = state.vault.lock().await;
+    let vault = vault.as_mut().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    vault.enable_recovery(&recovery).map_err(Into::into)
+}
+
 pub fn run() {
     let path = default_vault_path();
     let network = network::Network::open(&path).expect("could not open the peer store");
@@ -410,6 +441,8 @@ pub fn run() {
             update_entry,
             list_versions,
             resolve_entry,
+            recovery_status,
+            enable_recovery,
             network::sync_status,
             network::sync_now,
             network::start_invite,
