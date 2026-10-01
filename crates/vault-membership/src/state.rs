@@ -102,6 +102,28 @@ impl ControlState {
         self.membership.membership().get_node(&device)
     }
 
+    /// Whether `device` is a voter whose enrollment the vault's devices
+    /// signed for: an author under the key membership records for it.
+    ///
+    /// Authority and epoch keys follow this, never voting rights alone. A
+    /// Raft membership entry carries no signature, so a device that held
+    /// only a voter's transport identity could add voters; without a signed
+    /// enrollment they can neither make requests nor be given keys.
+    pub fn is_enrolled(&self, device: DeviceId) -> bool {
+        self.voters().contains(&device)
+            && self
+                .node(device)
+                .is_some_and(|node| self.authors.get(&device) == Some(&node.public_key))
+    }
+
+    /// The enrolled voters; see [`Self::is_enrolled`].
+    pub fn members(&self) -> BTreeSet<DeviceId> {
+        self.voters()
+            .into_iter()
+            .filter(|device| self.is_enrolled(*device))
+            .collect()
+    }
+
     pub fn outcome_of(&self, request_id: &[u8; 16]) -> Option<&Outcome> {
         self.applied_requests
             .iter()
@@ -121,11 +143,11 @@ impl ControlState {
             .collect()
     }
 
-    /// Whether `device` is a voter that a pending change does not concern,
-    /// so it is a full member.
+    /// Whether `device` is an enrolled voter that a pending change does not
+    /// concern, so it is a full member.
     pub fn is_settled_member(&self, device: DeviceId) -> bool {
         self.is_uniform()
-            && self.voters().contains(&device)
+            && self.is_enrolled(device)
             && self
                 .pending
                 .as_ref()
@@ -168,13 +190,19 @@ impl ControlState {
 
     fn decide(&mut self, signed: &SignedRequest) -> Outcome {
         // Only a current voter may ask for anything, and only with its own
-        // key as recorded in the committed membership.
+        // key as recorded in the committed membership. Once the control
+        // plane is founded it must also be enrolled: genesis and every
+        // enrollment since were signed, so authority traces back to the
+        // founder rather than to whatever the Raft membership contains.
         if !self.voters().contains(&signed.requester) {
             return Outcome::Rejected(Rejection::Unauthorized);
         }
         let Some(requester) = self.node(signed.requester) else {
             return Outcome::Rejected(Rejection::Unauthorized);
         };
+        if self.epoch != 0 && !self.is_enrolled(signed.requester) {
+            return Outcome::Rejected(Rejection::Unauthorized);
+        }
         if !signed.verify(&self.vault_id, &requester.public_key) {
             return Outcome::Rejected(Rejection::BadSignature);
         }
@@ -268,6 +296,20 @@ impl ControlState {
                 {
                     return Err(invalid("invalid device keys"));
                 }
+                // A transport certificate identifies one device: peers map
+                // a connection's certificate back to a device ID.
+                if self
+                    .membership
+                    .membership()
+                    .nodes()
+                    .any(|(known, recorded)| {
+                        known != device && recorded.transport_pin == node.transport_pin
+                    })
+                {
+                    return Err(invalid(
+                        "the transport certificate belongs to another device",
+                    ));
+                }
             }
             MembershipChange::Remove { device, rotation } => {
                 if *device == signed.requester {
@@ -276,7 +318,13 @@ impl ControlState {
                 if !target.remove(device) {
                     return Err(invalid("device is not a voter"));
                 }
-                self.check_rotation(rotation, &target)?;
+                // The new key goes to the enrolled devices that remain.
+                let remaining = target
+                    .iter()
+                    .copied()
+                    .filter(|voter| self.is_enrolled(*voter))
+                    .collect();
+                self.check_rotation(rotation, &remaining)?;
             }
         }
         self.pending = Some(PendingChange {
@@ -290,7 +338,7 @@ impl ControlState {
     }
 
     /// The rotation introduces the next epoch with exactly one valid
-    /// envelope for each remaining voter.
+    /// envelope for each remaining member.
     fn check_rotation(
         &self,
         rotation: &Rotation,
@@ -306,7 +354,7 @@ impl ControlState {
             .collect();
         if recipients.len() != rotation.envelopes.len() || &recipients != remaining {
             return Err(invalid(
-                "the new key must be sealed to each remaining voter",
+                "the new key must be sealed to each remaining member",
             ));
         }
         for (device, envelope) in &rotation.envelopes {

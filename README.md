@@ -14,17 +14,18 @@ The repository is deliberately split at the security boundary:
   integration work, not hidden behind this crate.
 - `crates/vault-peer` owns owner-confirmed pairing and the revision sync
   protocol as sans-IO steps over bounded frames, carried over TLS 1.3 with
-  both device certificates pinned, and couples each vault to the control
-  plane (enrollment, removal with key rotation, reconciliation). The
-  `osm-peer` binary is a development CLI for pairing and syncing two vaults
+  both device certificates pinned, couples each vault to the control
+  plane (enrollment, removal with key rotation, reconciliation), and carries
+  the control plane's own messages between devices over the same pinned
+  TLS. The `osm-peer` binary is a development CLI for pairing and syncing two vaults
   from separate processes.
 - `crates/vault-membership` is the membership control plane on OpenRaft:
   signed enrollment and removal requests decided by a Raft majority, with
   SQLite-backed log and state. It also decides key epochs: a removal
   carries the next epoch key sealed to every remaining device, active only
-  once the removal completes. It runs in-process in tests; carrying its
-  RPCs over pinned TLS and running it in the desktop app is the remaining
-  Phase 4 work.
+  once the removal completes. Tests run it in-process and over TLS between
+  listeners in one process; running it between processes and in the desktop
+  app is the remaining Phase 4 work.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
   route from the interface to the Rust core.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and
@@ -40,7 +41,7 @@ path with one peer) and syncs automatically on the local network; there is no
 discovery beyond the address in the invitation. In the libraries, pairing
 instead proposes the new device to the control plane, so any number of
 devices can join, and removing a device rotates the vault key; the desktop
-app adopts this once the control plane runs over the network.
+app adopts this in the remaining Phase 4 work.
 
 ## Development
 

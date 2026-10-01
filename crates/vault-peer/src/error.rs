@@ -42,8 +42,12 @@ pub enum Error {
     ProtocolViolation,
     #[error("peer sent a revision that failed validation: {0}")]
     InvalidRevision(osm_vault_core::Error),
+    #[error("the vault's devices did not accept this device")]
+    EnrollmentRefused,
     #[error("invalid peer address")]
     InvalidAddress,
+    #[error("no address is known for that device")]
+    AddressUnknown,
     #[error("no paired device")]
     NotPaired,
     #[error("the peer's TLS certificate does not match its pin")]

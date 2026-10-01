@@ -16,7 +16,7 @@ use crate::{
     approve_enrollment,
     control::{self, Reconciled},
     invite, review_join,
-    tests::{address, login, over_wire, sync, JOINER_PIN, NOW},
+    tests::{address, login, over_wire, sync, NOW},
     EnrollmentGrant, Error, Invitation, Joiner, PeerStore,
 };
 
@@ -65,7 +65,7 @@ impl Member {
 }
 
 /// Polls until `condition` holds.
-async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+pub(crate) async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     for _ in 0..400 {
         if condition() {
             return;
@@ -94,11 +94,10 @@ impl Net {
             self.dir.path().join(format!("{name}.raft")),
             device,
             vault_id,
-            self.router.network(device),
+            self.router.dialer(device),
             NodeOptions {
                 config: fast_config(),
                 write_timeout: Duration::from_secs(3),
-                forwarder: Some(self.router.forwarder(device)),
                 ..NodeOptions::default()
             },
         )
@@ -143,8 +142,10 @@ impl Net {
         )
         .unwrap();
         let code = invitation.encode().unwrap();
+        // A certificate identifies one device, so each joiner has its own.
+        let pin = [name.as_bytes()[0]; 32];
         let (joiner, request) =
-            Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW + 1).unwrap();
+            Joiner::start(Invitation::decode(&code).unwrap(), pin, NOW + 1).unwrap();
         let node = if online {
             Some(
                 self.node(name, joiner.control_device(), joiner.vault_id())
@@ -162,8 +163,15 @@ impl Net {
         )
         .unwrap();
         assert_eq!(review.sas(), joiner.sas());
-        let (proposal, grant) =
-            approve_enrollment(&inviter.vault, &mut inviter.invitations, review, NOW + 3).unwrap();
+        let (proposal, grant) = approve_enrollment(
+            &inviter.vault,
+            &mut inviter.invitations,
+            review,
+            Vec::new(),
+            None,
+            NOW + 3,
+        )
+        .unwrap();
         control::submit(&inviter.node, proposal).await.unwrap();
         (joiner, over_wire(&grant), node)
     }

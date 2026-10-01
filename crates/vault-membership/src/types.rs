@@ -24,15 +24,15 @@ pub struct DeviceNode {
     pub recipient_key: [u8; 32],
 }
 
-/// The next epoch key, introduced by a removal and sealed to every device
-/// that remains.
+/// The next epoch key, introduced by a removal and sealed to every enrolled
+/// device that remains.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rotation {
     /// Exactly one after the current epoch.
     pub epoch: u64,
     /// The new key's check (see `osm_vault_core::epoch_key_check`).
     pub check: [u8; 32],
-    /// One epoch-key envelope per remaining voter.
+    /// One epoch-key envelope per remaining member.
     pub envelopes: Vec<(DeviceId, Vec<u8>)>,
 }
 

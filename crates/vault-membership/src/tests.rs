@@ -6,17 +6,16 @@ use std::{
 
 use ed25519_dalek::SigningKey;
 use openraft::{
-    error::RPCError,
-    raft::{AppendEntriesRequest, VoteRequest},
-    Config, ServerState, Vote,
+    raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest},
+    Config, ServerState, SnapshotMeta, Vote,
 };
 use osm_vault_sync::{open_epoch_key, seal_epoch_key, HpkeKeyPair, VaultId};
 use tempfile::TempDir;
 
 use crate::{
-    verify_rpc_sender, ControlNode, ControlRequest, CrashPlan, CrashPoint, DeviceId, DeviceNode,
-    Error, KeySigner, MembershipChange, NodeOptions, Outcome, Rejection, RequestSigner, Rotation,
-    Router, SignedRequest,
+    verify_rpc_sender, ControlNode, ControlReply, ControlRequest, ControlRpc, CrashPlan,
+    CrashPoint, DeviceId, DeviceNode, Dialer, Error, KeySigner, Link, MembershipChange,
+    NodeOptions, Outcome, Rejection, RequestSigner, Rotation, Router, SignedRequest,
 };
 
 const VAULT: [u8; 32] = [42; 32];
@@ -89,11 +88,10 @@ impl Cluster {
             self.dir.path().join(format!("{device}.sqlite3")),
             device,
             VAULT,
-            self.router.network(device),
+            self.router.dialer(device),
             NodeOptions {
                 config: fast_config(),
                 write_timeout: Duration::from_secs(3),
-                forwarder: Some(self.router.forwarder(device)),
                 crash,
             },
         )
@@ -139,6 +137,18 @@ impl Cluster {
             self.running[&voters[0]].submit(genesis).await.unwrap(),
             Outcome::Accepted
         );
+        // Requests are built from a device's own applied state, so every
+        // voter must have applied genesis before a test goes on.
+        for _ in 0..200 {
+            if voters
+                .iter()
+                .all(|device| self.running[device].state().epoch == 1)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("genesis did not reach every voter");
     }
 
     /// The running device that is leader, once one is elected.
@@ -783,7 +793,9 @@ async fn rpcs_cannot_claim_another_devices_identity() {
     cluster.start_all(CrashPlan::default()).await;
     cluster.bootstrap(&[1, 2, 3]).await;
 
-    // Device 2's connection carries a request claiming to be from leader 1.
+    // Device 2's connection carries requests claiming to be from device 1.
+    let mut link = cluster.router.dialer(2).link(3, &cluster.node_info(3));
+    let ttl = Duration::from_secs(1);
     let forged_append = AppendEntriesRequest {
         vote: Vote::new_committed(99, 1),
         prev_log_id: None,
@@ -791,16 +803,35 @@ async fn rpcs_cannot_claim_another_devices_identity() {
         leader_commit: None,
     };
     assert!(matches!(
-        cluster.router.append_entries(2, 3, forged_append).await,
-        Err(RPCError::Network(_))
+        link.call(ControlRpc::AppendEntries(forged_append), ttl)
+            .await,
+        Ok(ControlReply::Refused)
     ));
     let forged_vote = VoteRequest {
         vote: Vote::new(99, 1),
         last_log_id: None,
     };
     assert!(matches!(
-        cluster.router.vote(2, 3, forged_vote).await,
-        Err(RPCError::Network(_))
+        link.call(ControlRpc::Vote(forged_vote), ttl).await,
+        Ok(ControlReply::Refused)
+    ));
+    let forged_snapshot = InstallSnapshotRequest {
+        vote: Vote::new_committed(99, 1),
+        meta: SnapshotMeta::default(),
+        offset: 0,
+        data: Vec::new(),
+        done: true,
+    };
+    assert!(matches!(
+        link.call(ControlRpc::InstallSnapshot(forged_snapshot), ttl)
+            .await,
+        Ok(ControlReply::Refused)
+    ));
+    // A device passes on only requests it signed itself.
+    let borrowed = cluster.remove(1, 9, 3);
+    assert!(matches!(
+        link.call(ControlRpc::Submit(borrowed), ttl).await,
+        Ok(ControlReply::Refused)
     ));
     assert!(verify_rpc_sender(&Vote::new(1, 2), 2).is_ok());
     assert!(verify_rpc_sender(&Vote::new(1, 2), 3).is_err());
@@ -856,7 +887,7 @@ async fn the_control_plane_resumes_after_every_device_restarts() {
         cluster.dir.path().join("1.sqlite3"),
         1,
         [7; 32],
-        cluster.router.network(1),
+        cluster.router.dialer(1),
         NodeOptions::default(),
     )
     .await;
@@ -887,4 +918,221 @@ async fn an_unreachable_device_never_becomes_a_voter_before_catching_up() {
     }
     cluster.start(4, CrashPlan::default()).await;
     cluster.settle(&[1, 2, 3, 4], &[1, 2, 3, 4]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voter_without_a_signed_enrollment_has_no_authority() {
+    let mut cluster = Cluster::new(4);
+    cluster.start_all(CrashPlan::default()).await;
+    cluster.bootstrap(&[1, 2, 3]).await;
+    let leader = cluster.leader().await;
+
+    // What a device holding only a voter's transport identity could do if
+    // it led: a membership entry carries no signature.
+    let raft = cluster.running[&leader].raft();
+    raft.add_learner(4, cluster.node_info(4), true)
+        .await
+        .unwrap();
+    raft.change_membership(BTreeSet::from([1, 2, 3, 4]), false)
+        .await
+        .unwrap();
+    cluster.settle(&[1, 2, 3, 4], &[1, 2, 3, 4]).await;
+    let node = &cluster.running[&leader];
+    let state = node.state();
+    assert_eq!(state.members(), BTreeSet::from([1, 2, 3]));
+    assert!(!state.is_settled_member(4));
+    assert!(!node.directory().members().contains_key(&4));
+
+    // It can ask for nothing, and no member's request gives it keys.
+    let request = cluster.request(
+        4,
+        1,
+        ControlRequest::CancelEnrollment {
+            request_id: [0; 16],
+        },
+    );
+    assert_eq!(
+        node.submit(request).await.unwrap(),
+        Outcome::Rejected(Rejection::Unauthorized)
+    );
+    assert!(invalid(
+        &node.submit(cluster.grant(1, 2, 4, &[1])).await.unwrap()
+    ));
+    let removal = |id, remaining: &[DeviceId]| {
+        cluster.request(
+            1,
+            id,
+            ControlRequest::ProposeChange(MembershipChange::Remove {
+                device: 3,
+                rotation: cluster.rotation(2, remaining),
+            }),
+        )
+    };
+    assert!(invalid(&node.submit(removal(3, &[1, 2, 4])).await.unwrap()));
+    assert_eq!(
+        node.submit(removal(4, &[1, 2])).await.unwrap(),
+        Outcome::Accepted
+    );
+    cluster.settle(&[1, 2, 4], &[1, 2, 4]).await;
+    let state = cluster.running[&1].state();
+    assert_eq!(state.epoch, 2);
+    assert_eq!(
+        state.envelopes.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    // A member can remove it like any voter.
+    let leader = cluster.leader().await;
+    let eviction = cluster.request(
+        1,
+        5,
+        ControlRequest::ProposeChange(MembershipChange::Remove {
+            device: 4,
+            rotation: cluster.rotation(3, &[1, 2]),
+        }),
+    );
+    assert_eq!(
+        cluster.running[&leader].submit(eviction).await.unwrap(),
+        Outcome::Accepted
+    );
+    cluster.settle(&[1, 2], &[1, 2]).await;
+    assert_eq!(cluster.running[&1].state().removed.get(&4), Some(&1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_are_accepted_from_recorded_and_introduced_devices_only() {
+    let mut cluster = Cluster::new(5);
+    for device in [1, 2, 3] {
+        cluster.start(device, CrashPlan::default()).await;
+    }
+    cluster.bootstrap(&[1, 2, 3]).await;
+    let leader = cluster.leader().await;
+    let node = &cluster.running[&leader];
+    let directory = node.directory();
+    // `node_info` pins device N to a certificate hash of N repeated.
+    let pin = |device: DeviceId| [device as u8; 32];
+    for device in [1, 2, 3] {
+        assert_eq!(cluster.node_info(device).transport_pin, pin(device));
+        assert_eq!(directory.device_for_pin(&pin(device)), Some(device));
+        assert!(directory.is_member(device));
+    }
+    assert_eq!(directory.device_for_pin(&pin(4)), None);
+
+    // A certificate identifies one device.
+    let mut duplicate = cluster.node_info(4);
+    duplicate.transport_pin = pin(2);
+    let reused = cluster.request(
+        1,
+        1,
+        ControlRequest::ProposeChange(MembershipChange::Enroll {
+            device: 4,
+            node: duplicate,
+        }),
+    );
+    assert!(invalid(&node.submit(reused).await.unwrap()));
+
+    // A device is accepted from the moment its enrollment is proposed, so
+    // it can announce itself, but it is not a member until it completes.
+    assert_eq!(
+        node.submit(cluster.enroll(1, 2, 4)).await.unwrap(),
+        Outcome::Accepted
+    );
+    assert_eq!(directory.device_for_pin(&pin(4)), Some(4));
+    assert!(!directory.is_member(4));
+    assert!(!directory.members().contains_key(&4));
+    cluster.start(4, CrashPlan::default()).await;
+    cluster.settle(&[1, 2, 3, 4], &[1, 2, 3, 4]).await;
+    assert!(directory.is_member(4));
+
+    // An introduction is honoured until the log says otherwise.
+    directory.introduce([(5, pin(5)), (2, [0xEE; 32])]);
+    assert_eq!(directory.device_for_pin(&pin(5)), Some(5));
+    assert_eq!(directory.device_for_pin(&pin(2)), Some(2));
+    assert_eq!(directory.device_for_pin(&[0xEE; 32]), None);
+    // Two introduced devices claiming one certificate: neither is accepted
+    // by it. A certificate the log records stays with its device.
+    directory.introduce([(6, pin(5)), (7, pin(1))]);
+    assert_eq!(directory.device_for_pin(&pin(5)), None);
+    assert_eq!(directory.device_for_pin(&pin(1)), Some(1));
+
+    // A removed device is refused, whatever a member said about it.
+    let leader = cluster.leader().await;
+    let removed = if leader == 4 { 3 } else { 4 };
+    let removal = cluster.remove(leader, 3, removed);
+    assert_eq!(
+        cluster.running[&leader].submit(removal).await.unwrap(),
+        Outcome::Accepted
+    );
+    let remaining: Vec<DeviceId> = [1, 2, 3, 4]
+        .into_iter()
+        .filter(|device| *device != removed)
+        .collect();
+    cluster.settle(&remaining, &remaining).await;
+    let directory = cluster.running[&leader].directory();
+    directory.introduce([(removed, pin(removed))]);
+    assert_eq!(directory.device_for_pin(&pin(removed)), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_far_behind_catches_up_from_a_snapshot() {
+    let mut cluster = Cluster::new(4);
+    for device in [1, 2, 3] {
+        cluster.start(device, CrashPlan::default()).await;
+    }
+    cluster.bootstrap(&[1, 2, 3]).await;
+    let leader = cluster.leader().await;
+    let removed = if leader == 3 { 2 } else { 3 };
+    let removal = cluster.remove(leader, 1, removed);
+    assert_eq!(
+        cluster.running[&leader].submit(removal).await.unwrap(),
+        Outcome::Accepted
+    );
+    let remaining: Vec<DeviceId> = [1, 2, 3]
+        .into_iter()
+        .filter(|device| *device != removed)
+        .collect();
+    cluster.settle(&remaining, &remaining).await;
+
+    // The leader keeps a snapshot and drops the log it covers.
+    let leader = cluster.leader_among(&remaining).await;
+    let raft = cluster.running[&leader].raft();
+    raft.trigger().snapshot().await.unwrap();
+    let mut metrics = raft.metrics();
+    let snapshot = loop {
+        if let Some(snapshot) = metrics.borrow().snapshot {
+            break snapshot;
+        }
+        metrics.changed().await.unwrap();
+    };
+    raft.trigger().purge_log(snapshot.index).await.unwrap();
+    loop {
+        if metrics.borrow().purged == Some(snapshot) {
+            break;
+        }
+        metrics.changed().await.unwrap();
+    }
+
+    // A new device cannot be sent those entries; it installs the snapshot
+    // and ends up with the same state.
+    let enrollment = cluster.enroll(leader, 2, 4);
+    assert_eq!(
+        cluster.running[&leader].submit(enrollment).await.unwrap(),
+        Outcome::Accepted
+    );
+    cluster.start(4, CrashPlan::default()).await;
+    let mut voters = remaining.clone();
+    voters.push(4);
+    cluster.settle(&voters, &voters).await;
+    let joined = &cluster.running[&4];
+    assert!(joined.raft().metrics().borrow().snapshot >= Some(snapshot));
+    let state = joined.state();
+    assert_eq!(state.epoch, 2);
+    assert_eq!(state.removed, cluster.running[&leader].state().removed);
+    assert_eq!(state.vault_id, VAULT);
+
+    // It restarts from the installed snapshot.
+    cluster.crash(4).await;
+    cluster.start(4, CrashPlan::default()).await;
+    assert_eq!(cluster.running[&4].state().epoch, 2);
+    cluster.settle(&voters, &voters).await;
 }

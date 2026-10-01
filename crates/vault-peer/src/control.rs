@@ -108,7 +108,7 @@ pub fn enrollment_request(
 }
 
 /// Proposes removing `device`, with a new epoch key sealed to every other
-/// voter in `state`. The key is not kept here: this device, like every
+/// enrolled member in `state`. The key is not kept here: this device, like every
 /// remaining one, recovers it from its own envelope once the removal
 /// completes, so nothing can activate it early.
 pub fn removal_request(
@@ -121,10 +121,10 @@ pub fn removal_request(
     let epoch = state.epoch + 1;
     let key = random_key()?;
     let envelopes = state
-        .voters()
+        .members()
         .into_iter()
-        .filter(|voter| *voter != removed)
-        .map(|voter| Ok((voter, seal(state, voter, epoch, &key)?)))
+        .filter(|member| *member != removed)
+        .map(|member| Ok((member, seal(state, member, epoch, &key)?)))
         .collect::<Result<Vec<_>>>()?;
     sign(
         vault,

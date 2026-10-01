@@ -7,14 +7,15 @@ use std::{
 
 use openraft::{
     error::{ClientWriteError, RaftError},
-    ChangeMembers, Config, LogId, Raft, RaftNetworkFactory,
+    ChangeMembers, Config, LogId, Raft,
 };
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
+    network::{self, Forward, RpcNetwork},
     store::{self, CrashPlan},
-    ControlConfig, ControlEntry, ControlState, DeviceId, DeviceNode, Error, Forwarder,
-    MembershipChange, Outcome, PendingChange, Result, SignedRequest,
+    ControlConfig, ControlEntry, ControlReply, ControlRpc, ControlState, DeviceId, DeviceNode,
+    Dialer, Directory, Error, MembershipChange, Outcome, PendingChange, Result, SignedRequest,
 };
 
 /// How often the leader checks for a pending change to advance, and how
@@ -40,9 +41,6 @@ pub struct NodeOptions {
     pub config: Arc<Config>,
     /// How long a write may wait for a quorum before `QuorumUnavailable`.
     pub write_timeout: Duration,
-    /// Passes requests submitted on a follower to the leader. Without one,
-    /// a follower returns `NotLeader`.
-    pub forwarder: Option<Arc<dyn Forwarder>>,
     /// Test-only failure injection.
     pub crash: CrashPlan,
 }
@@ -52,7 +50,6 @@ impl Default for NodeOptions {
         Self {
             config: default_config(),
             write_timeout: Duration::from_secs(10),
-            forwarder: None,
             crash: CrashPlan::default(),
         }
     }
@@ -85,27 +82,33 @@ pub struct ControlNode {
     state: Arc<Mutex<ControlState>>,
     applied: watch::Receiver<Option<LogId<DeviceId>>>,
     write_timeout: Duration,
-    forwarder: Option<Arc<dyn Forwarder>>,
+    forwarder: Arc<dyn Forward>,
+    directory: Directory,
     stop: watch::Sender<bool>,
-    driver: JoinHandle<()>,
+    driver: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ControlNode {
     /// Opens the node's database at `path` and starts Raft as `device` in
-    /// the control plane of `vault_id`. A node that ran before resumes from
-    /// its persisted log, vote, and state; a database for another vault is
-    /// refused.
+    /// the control plane of `vault_id`, reaching the other devices through
+    /// `dialer`. A node that ran before resumes from its persisted log,
+    /// vote, and state; a database for another vault is refused.
     pub async fn start(
         path: impl AsRef<Path>,
         device: DeviceId,
         vault_id: [u8; 32],
-        network: impl RaftNetworkFactory<ControlConfig>,
+        dialer: impl Dialer,
         options: NodeOptions,
     ) -> Result<Self> {
         let (log, state_machine) = store::open(path, vault_id, options.crash)?;
         let state = state_machine.state_handle();
         let applied = state_machine.applied_handle();
+        let dialer = Arc::new(dialer);
+        let network = RpcNetwork {
+            dialer: dialer.clone(),
+        };
         let raft = Raft::new(device, options.config, network, log, state_machine).await?;
+        let directory = Directory::new(state.clone(), raft.metrics());
         let (stop, stopped) = watch::channel(false);
         let driver = tokio::spawn(drive(
             raft.clone(),
@@ -119,9 +122,10 @@ impl ControlNode {
             state,
             applied,
             write_timeout: options.write_timeout,
-            forwarder: options.forwarder,
+            forwarder: dialer,
+            directory,
             stop,
-            driver,
+            driver: Mutex::new(Some(driver)),
         })
     }
 
@@ -151,6 +155,18 @@ impl ControlNode {
         self.raft.metrics().borrow().current_leader
     }
 
+    /// Which devices this node accepts control connections from.
+    pub fn directory(&self) -> Directory {
+        self.directory.clone()
+    }
+
+    /// Handles an RPC that arrived over a connection the transport
+    /// authenticated as `authenticated`, a device in [`Self::directory`].
+    /// An RPC claiming another sender is refused before it reaches Raft.
+    pub async fn handle(&self, authenticated: DeviceId, rpc: ControlRpc) -> ControlReply {
+        network::serve(&self.raft, authenticated, rpc, self.write_timeout).await
+    }
+
     /// Forms a new cluster with `members` as its voters. Only for a vault's
     /// first device(s); every later change goes through a proposal.
     pub async fn initialize(&self, members: BTreeMap<DeviceId, DeviceNode>) -> Result<()> {
@@ -161,8 +177,8 @@ impl ControlNode {
     }
 
     /// Commits a signed request and returns the state machine's verdict.
-    /// On a follower the request goes to the leader through the forwarder;
-    /// while no leader is known it is retried.
+    /// On a follower the request is passed to the leader; while no leader
+    /// is known or reachable it is retried.
     ///
     /// Fails with `QuorumUnavailable` if no quorum commits it in time. In
     /// that case the outcome is unknown until a quorum returns; resubmitting
@@ -192,9 +208,11 @@ impl ControlNode {
         {
             Ok(response) => Ok(response.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
-                match (forward.leader_id, &self.forwarder) {
-                    (Some(leader), Some(forwarder)) if leader != self.device => {
-                        forwarder.forward(leader, request).await
+                match (forward.leader_id, forward.leader_node) {
+                    (Some(leader), Some(node)) if leader != self.device => {
+                        self.forwarder
+                            .forward(leader, node, request, self.write_timeout)
+                            .await
                     }
                     (leader, _) => Err(Error::NotLeader(leader)),
                 }
@@ -204,9 +222,12 @@ impl ControlNode {
     }
 
     /// Stops the node. Its database keeps everything needed to restart.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(&self) {
         let _ = self.stop.send(true);
-        let _ = self.driver.await;
+        let driver = self.driver.lock().ok().and_then(|mut driver| driver.take());
+        if let Some(driver) = driver {
+            let _ = driver.await;
+        }
         let _ = self.raft.shutdown().await;
     }
 }

@@ -44,6 +44,8 @@ Immutable signed revisions reveal tampering, but a completely rolled-back local 
 
 Raft assumes crash faults, not Byzantine participants. A malicious enrolled voter is outside its consensus safety model. Signatures authenticate an author; they do not make an authorized compromised device honest. OpenRaft is the consensus implementation, not a substitute for application authorization.
 
+A device takes part in Raft under its transport identity, whose key is stored unencrypted so that a locked device can receive. Whoever copies that key and the control-plane database from a device, locked or not, can act as that voter: vote, lead, and write unsigned membership entries. That can stall or corrupt the control plane for the other devices, and the remedy is then recovery into a new trust domain. It must not yield keys or authority, so both follow signed enrollment rather than Raft membership: only a voter whose enrollment a member signed can make a request or be given an epoch key, and a removal seals the next key to enrolled voters only.
+
 Availability depends on device reachability. A single device can use its local vault offline. Membership changes need a majority of the configured voters; a two-voter vault needs both voters. Losing quorum must not enable an unauthenticated emergency removal. An explicit recovery fork creates a new trust domain.
 
 ## Local encryption and lock lifecycle
@@ -69,6 +71,8 @@ Receipt may happen out of order. Deduplicate by a cryptographic revision identit
 An invitation contains a fresh high-entropy one-use secret, short expiry, inviter identity, and an authenticated pin or transcript binding. Verify the device identities through the transferred invitation or an explicit short-authentication-string comparison. Displaying a QR code is not by itself proof of endpoint authenticity. Never log invitations.
 
 TLS must validate proof of possession and the expected peer pin in both directions. Disable broad “accept any certificate” paths. Address discovery is untrusted and cannot replace the identity check. Retry cannot downgrade authentication. Network parsers need size/time limits and rejection before expensive cryptography where possible.
+
+Control-plane connections accept the certificates of the devices a node's own log names and refuse removed devices. A node whose log is behind, or a device still being enrolled, also accepts a certificate that a member vouched for: in the signed enrollment grant, or in the member list a device it already counts as a member sends when a connection opens. This adds no principal that could not already act: a device trusted to send Raft messages can already feed a lagging node a log of its choosing. It does mean a lagging node trusts whatever its last known members trust, including a member that has since been removed, until it catches up. A Raft message is attributed to the device whose certificate the connection presented, never to the sender it names.
 
 When locked, the receiver may store bounded encrypted envelopes and public signed control messages. It cannot decrypt, approve invitations, sign membership changes, or unwrap a new epoch. Verify everything possible with committed public membership, and defer remaining checks. Unlock processes the quarantine transactionally. A disk-full or malformed-message failure must leave existing vault state intact.
 

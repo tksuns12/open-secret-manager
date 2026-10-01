@@ -11,11 +11,13 @@
 //! 4. After the owner confirms, the inviter consumes the token and proposes
 //!    enrolling the joiner to the vault's control plane
 //!    ([`approve_enrollment`]). Once a quorum has committed the proposal, it
-//!    sends a signed [`EnrollmentGrant`] naming it.
-//! 5. After the owner confirms on the joiner too, the joiner's control-plane
-//!    node catches up as a learner and becomes a voter; a member then grants
-//!    it every epoch key, sealed to its recipient key in committed state.
-//!    The joiner creates its own copy of the vault from that state
+//!    sends a signed [`EnrollmentGrant`] naming it and the vault's members.
+//! 5. The joiner has no log yet, so it accepts control connections from the
+//!    members the grant names ([`Joiner::members`]) and tells them where it
+//!    listens. Its control-plane node catches up as a learner and becomes a
+//!    voter; a member then grants it every epoch key, sealed to its
+//!    recipient key in committed state. After the owner confirms on the
+//!    joiner too, it creates its own copy of the vault from that state
 //!    ([`Joiner::finish_enrollment`]). Revisions then arrive by sync.
 //!
 //! Until the desktop app runs the control plane, it still uses the interim
@@ -39,7 +41,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{control, Error, Peer, PeerStore, Result};
+use crate::{
+    control,
+    members::{valid_contacts, MemberContact},
+    Error, Peer, PeerStore, Result,
+};
 
 const PAIRING_VERSION: u8 = 1;
 const INVITATION_PREFIX: &str = "OSM-PAIR1-";
@@ -261,6 +267,13 @@ pub struct EnrollmentGrant {
     request_id: [u8; 16],
     /// Lets the joiner verify the recovery key before enabling recovery.
     recovery_check: Option<[u8; 32]>,
+    /// The vault's members, the inviter among them. The joiner has no log
+    /// to tell it whose control connections to accept, and the leader that
+    /// brings it up to date need not be the inviter.
+    members: Vec<MemberContact>,
+    /// Port the inviter accepts member connections on, if it listens. The
+    /// joiner pairs it with the inviter's address from the invitation.
+    inviter_port: Option<u16>,
     /// Inviter's pairing signature over the transcript and every field.
     signature: Vec<u8>,
 }
@@ -276,6 +289,25 @@ impl EnrollmentGrant {
             Some(check) => {
                 message.push(1);
                 message.extend_from_slice(check);
+            }
+            None => message.push(0),
+        }
+        message.extend_from_slice(&(self.members.len() as u64).to_be_bytes());
+        for member in &self.members {
+            message.extend_from_slice(&member.device_id);
+            message.extend_from_slice(&member.transport_pin);
+            match &member.address {
+                Some(address) => {
+                    message.push(1);
+                    push_field(&mut message, address.as_bytes());
+                }
+                None => message.push(0),
+            }
+        }
+        match self.inviter_port {
+            Some(port) => {
+                message.push(1);
+                message.extend_from_slice(&port.to_be_bytes());
             }
             None => message.push(0),
         }
@@ -400,12 +432,21 @@ pub fn review_join(
 /// request to the control plane; once it is accepted, send the grant. If it
 /// is refused, tell the joiner pairing failed; the owner starts over with a
 /// new invitation.
+///
+/// `members` are the vault's members from this device's committed state,
+/// this device included (`MemberEndpoint::roster`), and `listen_port` is
+/// where this device accepts member connections, if it listens.
 pub fn approve_enrollment(
     vault: &Vault,
     invitations: &mut InvitationStore,
     review: JoinReview,
+    members: Vec<MemberContact>,
+    listen_port: Option<u16>,
     now: u64,
 ) -> Result<(SignedRequest, EnrollmentGrant)> {
+    if !valid_contacts(&members) {
+        return Err(Error::InvalidAddress);
+    }
     let request =
         control::enrollment_request(vault, review.request.joiner_device_id, review.joiner_node())?;
     let mut grant = EnrollmentGrant {
@@ -413,6 +454,8 @@ pub fn approve_enrollment(
         vault_id: vault.vault_id(),
         request_id: request.request_id,
         recovery_check: vault.recovery_check(),
+        members,
+        inviter_port: listen_port.filter(|port| *port != 0),
         signature: Vec::new(),
     };
     grant.signature = vault
@@ -581,6 +624,52 @@ impl Joiner {
                 .is_some_and(|sealed| (1..=state.epoch).all(|epoch| sealed.contains_key(&epoch)))
     }
 
+    /// Checks that the grant is the invitation's inviter answering this
+    /// pairing.
+    fn verify_grant(&self, grant: &EnrollmentGrant) -> Result<()> {
+        let body = &self.invitation.body;
+        if grant.version != PAIRING_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        if grant.vault_id != body.vault_id {
+            return Err(Error::VaultMismatch);
+        }
+        // The inviter's key came from the invitation, not from the channel.
+        verify_pairing_signature(
+            &body.inviter_public_key,
+            &grant.signed_message(&self.transcript),
+            &grant.signature,
+        )
+        .map_err(|_| Error::InvalidSignature)
+    }
+
+    /// Verifies the grant and returns the vault's members as the inviter
+    /// named them. Until this device has the log, these are the devices it
+    /// accepts control connections from, so that whichever of them leads
+    /// can bring it up to date; introduce them to its control-plane node.
+    /// The inviter's own entry must carry the certificate from the
+    /// invitation, and its address is the invitation's host with the port
+    /// the grant names.
+    pub fn members(&self, grant: &EnrollmentGrant) -> Result<Vec<MemberContact>> {
+        self.verify_grant(grant)?;
+        let body = &self.invitation.body;
+        if !valid_contacts(&grant.members) {
+            return Err(Error::ProtocolViolation);
+        }
+        let mut members = grant.members.clone();
+        let inviter = members
+            .iter_mut()
+            .find(|member| member.device_id == body.inviter_device_id)
+            .ok_or(Error::ProtocolViolation)?;
+        if inviter.transport_pin != body.inviter_transport_pin {
+            return Err(Error::ProtocolViolation);
+        }
+        inviter.address = grant
+            .inviter_port
+            .and_then(|port| sync_address(body.addresses.first(), Some(port)));
+        Ok(members)
+    }
+
     /// Verifies the grant and creates this device's vault at `path` from
     /// committed control state: its epoch keys come from the envelopes
     /// sealed to it, each checked against the committed key check, and its
@@ -598,20 +687,11 @@ impl Joiner {
         if !owner_confirmed {
             return Err(Error::NotConfirmed);
         }
+        self.verify_grant(grant)?;
         let body = &self.invitation.body;
-        if grant.version != PAIRING_VERSION {
-            return Err(Error::UnsupportedVersion);
-        }
-        if grant.vault_id != body.vault_id || state.vault_id != body.vault_id {
+        if state.vault_id != body.vault_id {
             return Err(Error::VaultMismatch);
         }
-        // The inviter's key came from the invitation, not from the channel.
-        verify_pairing_signature(
-            &body.inviter_public_key,
-            &grant.signed_message(&self.transcript),
-            &grant.signature,
-        )
-        .map_err(|_| Error::InvalidSignature)?;
         if !self.enrolled(state) {
             return Err(Error::EnrollmentPending);
         }

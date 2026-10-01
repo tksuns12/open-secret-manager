@@ -41,20 +41,23 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use osm_vault_membership::SignedRequest;
+
 use crate::{
-    approve_join,
+    approve_enrollment, approve_join,
+    members::MemberContact,
     pairing::JoinReview,
     peers::{pin_of, TransportIdentity},
     review_join,
     wire::{decode_body, encode_frame, MAX_FRAME_BYTES},
-    Error, Invitation, JoinGrant, JoinRequest, Joiner, Peer, PeerStore, Result, SyncReport,
-    SyncSession, MAX_INVITATION_TTL_SECS,
+    EnrollmentGrant, Error, Invitation, JoinGrant, JoinRequest, Joiner, Peer, PeerStore, Result,
+    SyncReport, SyncSession, MAX_INVITATION_TTL_SECS,
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest wait for one frame from a peer during sync.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 /// The joiner waits this long for the owner to confirm on the inviter.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(MAX_INVITATION_TTL_SECS);
 const OUTGOING_FRAMES: usize = 16;
@@ -63,6 +66,11 @@ const OUTGOING_FRAMES: usize = 16;
 enum PairingReply {
     Grant(JoinGrant),
     Declined,
+    /// The enrollment was proposed and the vault's devices accepted it.
+    Enrollment(EnrollmentGrant),
+    /// The owner confirmed, but the vault's devices did not accept the
+    /// enrollment.
+    Refused,
 }
 
 /// Accepts pairing connections. Waiting on it never touches the vault, so an
@@ -176,8 +184,60 @@ impl PendingJoin {
         })
     }
 
+    /// Approves the joiner after the owner confirmed, by proposing its
+    /// enrollment (see [`approve_enrollment`]). Submit the returned request
+    /// to the control plane, then call [`ApprovedEnrollment::send`] if it
+    /// was accepted or [`ApprovedEnrollment::refuse`] if not.
+    pub fn approve_enrollment(
+        self,
+        vault: &Vault,
+        invitations: &mut InvitationStore,
+        members: Vec<MemberContact>,
+        listen_port: Option<u16>,
+        now: u64,
+    ) -> Result<(SignedRequest, ApprovedEnrollment)> {
+        let (request, grant) =
+            approve_enrollment(vault, invitations, self.review, members, listen_port, now)?;
+        Ok((
+            request,
+            ApprovedEnrollment {
+                stream: self.stream,
+                grant,
+            },
+        ))
+    }
+
     pub async fn decline(mut self) -> Result<()> {
         write_frame(&mut self.stream, &PairingReply::Declined).await?;
+        let _ = self.stream.shutdown().await;
+        Ok(())
+    }
+}
+
+/// An enrollment the owner approved, whose proposal is on its way through
+/// the control plane. The joiner is still waiting.
+pub struct ApprovedEnrollment {
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    grant: EnrollmentGrant,
+}
+
+impl ApprovedEnrollment {
+    /// The enrollment proposal, for cancelling it if the joiner never
+    /// catches up.
+    pub fn request_id(&self) -> [u8; 16] {
+        self.grant.request_id()
+    }
+
+    /// Sends the grant. Call once the proposal was accepted.
+    pub async fn send(mut self) -> Result<()> {
+        write_frame(&mut self.stream, &PairingReply::Enrollment(self.grant)).await?;
+        let _ = self.stream.shutdown().await;
+        Ok(())
+    }
+
+    /// Tells the joiner that the vault's devices did not accept it.
+    pub async fn refuse(mut self) -> Result<()> {
+        write_frame(&mut self.stream, &PairingReply::Refused).await?;
         let _ = self.stream.shutdown().await;
         Ok(())
     }
@@ -252,6 +312,29 @@ impl PairingConnection {
         match reply {
             PairingReply::Grant(grant) => Ok((self.joiner, grant)),
             PairingReply::Declined => Err(Error::NotConfirmed),
+            PairingReply::Refused => Err(Error::EnrollmentRefused),
+            PairingReply::Enrollment(_) => Err(Error::ProtocolViolation),
+        }
+    }
+
+    /// This device's pending identity. Start its control-plane node under
+    /// [`Joiner::control_device`] before waiting for the inviter.
+    pub fn joiner(&self) -> &Joiner {
+        &self.joiner
+    }
+
+    /// Waits for the inviter to report that the vault's devices accepted
+    /// this device's enrollment. Introduce [`Joiner::members`] to this
+    /// device's control-plane node next; the vault is created with
+    /// [`Joiner::finish_enrollment`] once the enrollment completes.
+    pub async fn receive_enrollment(mut self) -> Result<(Joiner, EnrollmentGrant)> {
+        let reply: PairingReply =
+            with_timeout(PAIRING_TIMEOUT, read_frame(&mut self.stream)).await??;
+        match reply {
+            PairingReply::Enrollment(grant) => Ok((self.joiner, grant)),
+            PairingReply::Declined => Err(Error::NotConfirmed),
+            PairingReply::Refused => Err(Error::EnrollmentRefused),
+            PairingReply::Grant(_) => Err(Error::ProtocolViolation),
         }
     }
 }
@@ -441,7 +524,7 @@ async fn write_frames<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &impl Serialize,
 ) -> Result<()> {
@@ -451,11 +534,40 @@ async fn write_frame<W: AsyncWrite + Unpin>(
         .map_err(io_error)
 }
 
+/// Writes a frame whose body is JSON: control-plane RPCs use the encoding
+/// the Raft log is stored in.
+pub(crate) async fn write_json_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &impl Serialize,
+) -> Result<()> {
+    let body = serde_json::to_vec(message).map_err(|_| Error::MalformedFrame)?;
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(Error::FrameTooLarge);
+    }
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    with_timeout(FRAME_TIMEOUT, writer.write_all(&frame))
+        .await?
+        .map_err(io_error)
+}
+
+/// Reads one JSON frame. The declared length is checked before the body is
+/// allocated.
+pub(crate) async fn read_json_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    reader: &mut R,
+) -> Result<T> {
+    serde_json::from_slice(&read_body(reader).await?).map_err(|_| Error::MalformedFrame)
+}
+
 /// Reads one frame. The declared length is checked before the body is
 /// allocated.
 pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T> {
+    decode_body(&read_body(reader).await?)
+}
+
+async fn read_body<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut prefix = [0u8; 4];
     reader.read_exact(&mut prefix).await.map_err(io_error)?;
     let length = u32::from_be_bytes(prefix) as usize;
@@ -464,7 +576,7 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).await.map_err(io_error)?;
-    decode_body(&body)
+    Ok(body)
 }
 
 async fn connect_first(addresses: &[String]) -> Result<TcpStream> {
@@ -479,7 +591,7 @@ async fn connect_first(addresses: &[String]) -> Result<TcpStream> {
     Err(last)
 }
 
-async fn with_timeout<T>(limit: Duration, future: impl Future<Output = T>) -> Result<T> {
+pub(crate) async fn with_timeout<T>(limit: Duration, future: impl Future<Output = T>) -> Result<T> {
     tokio::time::timeout(limit, future)
         .await
         .map_err(|_| Error::Timeout)
@@ -493,7 +605,7 @@ fn io_error(error: std::io::Error) -> Error {
 }
 
 /// Distinguishes a certificate that failed its pin from other TLS failures.
-fn handshake_error(error: std::io::Error) -> Error {
+pub(crate) fn handshake_error(error: std::io::Error) -> Error {
     match error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
@@ -505,7 +617,7 @@ fn handshake_error(error: std::io::Error) -> Error {
 }
 
 /// Peers never check names; this is only required by the TLS API.
-fn server_name() -> ServerName<'static> {
+pub(crate) fn server_name() -> ServerName<'static> {
     ServerName::try_from("osm-peer").expect("static server name is valid")
 }
 
@@ -522,24 +634,34 @@ fn certificate(
     )
 }
 
-enum ClientPolicy {
+/// Decides at each handshake whether a client certificate is accepted.
+pub(crate) trait PinPolicy: Send + Sync + std::fmt::Debug {
+    fn accepts(&self, pin: &[u8; 32]) -> bool;
+}
+
+#[derive(Debug)]
+pub(crate) enum ClientPolicy {
     /// Pairing: any certificate, checked afterwards against the request.
     AnyForPairing,
     /// Sync: only the paired devices' certificates.
     Pinned(Vec<[u8; 32]>),
+    /// Control plane: whichever certificates the policy accepts when the
+    /// handshake happens, so membership changes apply to new connections
+    /// at once.
+    Members(Arc<dyn PinPolicy>),
 }
 
-fn server_config(identity: &TransportIdentity, clients: ClientPolicy) -> Result<Arc<ServerConfig>> {
+pub(crate) fn server_config(
+    identity: &TransportIdentity,
+    clients: ClientPolicy,
+) -> Result<Arc<ServerConfig>> {
     let provider = provider();
     let (chain, key) = certificate(identity);
     let mut config = ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| Error::Transport("TLS 1.3 is unavailable"))?
         .with_client_cert_verifier(Arc::new(PinnedClients {
-            pins: match clients {
-                ClientPolicy::AnyForPairing => None,
-                ClientPolicy::Pinned(pins) => Some(pins),
-            },
+            policy: clients,
             provider,
         }))
         .with_single_cert(chain, key)
@@ -549,7 +671,10 @@ fn server_config(identity: &TransportIdentity, clients: ClientPolicy) -> Result<
     Ok(Arc::new(config))
 }
 
-fn client_config(identity: &TransportIdentity, server_pin: [u8; 32]) -> Result<Arc<ClientConfig>> {
+pub(crate) fn client_config(
+    identity: &TransportIdentity,
+    server_pin: [u8; 32],
+) -> Result<Arc<ClientConfig>> {
     let provider = provider();
     let (chain, key) = certificate(identity);
     let mut config = ClientConfig::builder_with_provider(provider.clone())
@@ -632,10 +757,10 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
-/// Requires a client certificate; with `pins`, only one of those hashes.
+/// Requires a client certificate that the policy accepts.
 #[derive(Debug)]
 struct PinnedClients {
-    pins: Option<Vec<[u8; 32]>>,
+    policy: ClientPolicy,
     provider: Arc<CryptoProvider>,
 }
 
@@ -650,14 +775,16 @@ impl ClientCertVerifier for PinnedClients {
         intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> std::result::Result<ClientCertVerified, rustls::Error> {
-        match &self.pins {
-            Some(pins) => check_pin(end_entity, intermediates, pins)?,
-            None if intermediates.is_empty() => {}
-            None => {
-                return Err(rustls::Error::InvalidCertificate(
-                    CertificateError::ApplicationVerificationFailure,
-                ))
-            }
+        let accepted = intermediates.is_empty()
+            && match &self.policy {
+                ClientPolicy::AnyForPairing => true,
+                ClientPolicy::Pinned(pins) => pins.contains(&pin_of(end_entity)),
+                ClientPolicy::Members(policy) => policy.accepts(&pin_of(end_entity)),
+            };
+        if !accepted {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
         }
         Ok(ClientCertVerified::assertion())
     }

@@ -26,7 +26,10 @@ mod types;
 use std::io::Cursor;
 
 pub use error::{Error, Result};
-pub use network::{verify_rpc_sender, Forwarder, NetworkFactory, Router, SenderMismatch};
+pub use network::{
+    verify_rpc_sender, ControlReply, ControlRpc, Dialer, Directory, Link, LinkError, Router,
+    RouterDialer, RouterLink, SenderMismatch, SubmitRefusal,
+};
 pub use node::{default_config, ControlNode, NodeOptions};
 pub use state::{ControlState, PendingChange};
 pub use store::{CrashPlan, CrashPoint};
