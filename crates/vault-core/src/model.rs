@@ -158,6 +158,20 @@ pub struct IngressReport {
     pub first_rejection: Option<crate::Error>,
 }
 
+/// What a fork into a new trust domain carried over and what it left in the
+/// source vault.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForkReport {
+    /// Items carried over.
+    pub items: usize,
+    /// Items carried with more than one version, still to be resolved.
+    pub conflicts: usize,
+    /// Revisions held for the owner's review, not carried.
+    pub held_left_behind: usize,
+    /// Received revisions not yet verified, not carried.
+    pub staged_left_behind: usize,
+}
+
 /// A revision held because its author is not an authorized device. It was
 /// encrypted with the vault key but is not part of the item's history until
 /// the owner accepts it.

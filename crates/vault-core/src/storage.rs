@@ -20,8 +20,8 @@ use crate::{
         verify_recovery_check, KdfConfig, SecretKey, DEVICE_ID_LEN, KEY_LEN, NONCE_LEN,
         PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    Error, IngressReport, Item, ItemSummary, ItemVersion, QuarantinedRevision, RecoveryKey, Result,
-    RevisionInfo, StageOutcome, VaultItem,
+    Error, ForkReport, IngressReport, Item, ItemSummary, ItemVersion, QuarantinedRevision,
+    RecoveryKey, Result, RevisionInfo, StageOutcome, VaultItem,
 };
 
 /// Storage layout: a per-device root key wraps the device key, the HPKE
@@ -1117,6 +1117,98 @@ impl Vault {
         }
         transaction.commit()?;
         Ok(revisions)
+    }
+
+    /// Starts a new trust domain from what this vault shows now, for when
+    /// too many of its devices are lost for the rest to remove them.
+    ///
+    /// The new vault at `path` shares nothing with this one: it has a new
+    /// vault ID, device identity, root key, first epoch key, and recovery
+    /// key, and its only author is the new identity. Every live version of
+    /// every item is written again as that author, without parents: an item
+    /// with several versions stays a conflict for the owner to resolve.
+    /// Earlier history, deletions, held revisions, and unverified received
+    /// revisions are not carried, and an unresolved choice between an edit
+    /// and a deletion keeps the edit. This vault is left as it is. No device
+    /// of the old domain can read or write the new vault; each joins it
+    /// again by pairing.
+    pub fn fork(
+        &self,
+        path: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<(Self, RecoveryKey, ForkReport)> {
+        self.key()?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT item_id FROM heads WHERE tombstone=0 ORDER BY item_id")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut report = ForkReport::default();
+        let mut versions = Vec::new();
+        for id in &ids {
+            let live: Vec<EncryptedRevision> = item_heads(&self.connection, id)?
+                .into_iter()
+                .filter(|revision| !revision.tombstone)
+                .collect();
+            report.items += 1;
+            if live.len() > 1 {
+                report.conflicts += 1;
+            }
+            for revision in &live {
+                versions.push(self.open_item(revision)?);
+            }
+        }
+        let count = |table: &str| -> Result<usize> {
+            let rows: i64 =
+                self.connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            Ok(rows as usize)
+        };
+        report.held_left_behind = count("quarantine")?;
+        report.staged_left_behind = count("ingress")?;
+
+        let path = path.as_ref();
+        let (mut fork, recovery) = Self::create(path, password)?;
+        if let Err(error) = fork.seed(versions) {
+            drop(fork);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+        Ok((fork, recovery, report))
+    }
+
+    /// Writes each item version as a revision of its own, without parents,
+    /// in one transaction. Several versions of one item become concurrent
+    /// heads.
+    fn seed(&mut self, versions: Vec<Item>) -> Result<()> {
+        let sealed = {
+            let signer = self.signer()?;
+            versions
+                .iter()
+                .map(|item| {
+                    item.validate()?;
+                    let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
+                    signer.seal(&item.id, Vec::new(), false, &plaintext)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for revision in sealed {
+            let revision_id = revision.revision_id();
+            insert_revision(&transaction, "revisions", &revision, &revision_id)?;
+            transaction.execute(
+                "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,0)",
+                params![revision_id, revision.item_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Edits an item with one head. Fails with `Unresolved` while the item

@@ -89,6 +89,19 @@ export type DevicesInfo = {
   quorum: number;
 };
 
+/** What starting over as a new vault produced. */
+export type Recovered = {
+  /** The new vault's recovery key, shown once. */
+  recoveryKey: string;
+  items: number;
+  /** Items carried with more than one version, still to be resolved. */
+  conflicts: number;
+  /** Revisions that were held for review and stay in the old vault. */
+  heldLeftBehind: number;
+  /** Folder the old vault and its files were moved to. */
+  archive: string;
+};
+
 export type DesktopBridge = {
   status: () => Promise<"missing" | "locked" | "unlocked">;
   listEntries: () => Promise<VaultEntry[]>;
@@ -111,6 +124,8 @@ export type DesktopBridge = {
   foundControlPlane: () => Promise<void>;
   removeDevice: (device: string) => Promise<void>;
   cancelEnrollment: () => Promise<void>;
+  /** Starts over from this device as a new vault; `password` is the vault password. */
+  recoverVault: (password: string) => Promise<Recovered>;
   startInvite: () => Promise<{ code: string; expiresAt: number }>;
   confirmInvite: (accept: boolean) => Promise<void>;
   cancelInvite: () => Promise<void>;

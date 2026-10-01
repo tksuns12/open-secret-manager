@@ -104,7 +104,7 @@ pub struct Network {
     directory: PathBuf,
     peers: Mutex<PeerStore>,
     invitations: Mutex<InvitationStore>,
-    addresses: AddressBook,
+    addresses: StdMutex<AddressBook>,
     status: StdMutex<SyncStatus>,
     control: Mutex<Option<Arc<Control>>>,
     /// The inviter's pending decision, while a joiner waits.
@@ -145,7 +145,7 @@ impl Network {
             directory,
             peers: Mutex::new(peers),
             invitations: Mutex::new(invitations),
-            addresses,
+            addresses: StdMutex::new(addresses),
             status: StdMutex::new(SyncStatus {
                 state: "local",
                 ..SyncStatus::default()
@@ -176,6 +176,57 @@ impl Network {
             file.push(suffix);
             let _ = std::fs::remove_file(file);
         }
+    }
+}
+
+/// The vault a recovery has finished writing, waiting to take the old
+/// vault's place, and the same file while it is still being written.
+const RECOVERED: &str = "recovered.sqlite3";
+const RECOVERED_PARTIAL: &str = "recovered.sqlite3.partial";
+/// The files that belong to one vault on this device.
+const VAULT_FILES: [&str; 3] = ["control.sqlite3", "peers.sqlite3", "invitations.sqlite3"];
+
+/// Moves the old vault and everything that belonged to it into a new
+/// archive folder beside it, the vault file last, and puts the recovered
+/// vault in its place. Each step is a rename, and the steps can be repeated.
+fn replace_with_recovered(vault_path: &Path) -> std::io::Result<PathBuf> {
+    let directory = vault_path.parent().unwrap_or(Path::new("."));
+    let mut archive = directory.join(format!("archive-{}", now()));
+    let mut attempt = 1;
+    while archive.exists() {
+        archive = directory.join(format!("archive-{}-{attempt}", now()));
+        attempt += 1;
+    }
+    std::fs::create_dir(&archive)?;
+    let vault_name = vault_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for name in VAULT_FILES
+        .iter()
+        .copied()
+        .chain(std::iter::once(vault_name.as_str()))
+    {
+        for suffix in ["-wal", "-shm", "-journal", ""] {
+            let file = format!("{name}{suffix}");
+            let from = directory.join(&file);
+            if from.exists() {
+                std::fs::rename(from, archive.join(&file))?;
+            }
+        }
+    }
+    std::fs::rename(directory.join(RECOVERED), vault_path)?;
+    Ok(archive)
+}
+
+/// At launch, before the vault is opened: finishes a recovery that was
+/// interrupted after the new vault was complete, and discards one that was
+/// interrupted before.
+pub fn finish_interrupted_recovery(vault_path: &Path) {
+    let directory = vault_path.parent().unwrap_or(Path::new("."));
+    let _ = std::fs::remove_file(directory.join(RECOVERED_PARTIAL));
+    if directory.join(RECOVERED).exists() {
+        let _ = replace_with_recovered(vault_path);
     }
 }
 
@@ -224,7 +275,12 @@ async fn start_control<R: Runtime>(
     }
     let endpoint = {
         let mut peers = net.peers.lock().await;
-        MemberEndpoint::new(vault_id, &mut peers, net.addresses.clone()).map_err(network_error)?
+        let addresses = net
+            .addresses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        MemberEndpoint::new(vault_id, &mut peers, addresses).map_err(network_error)?
     };
     let node = start_node(net.control_path(), device, &endpoint, node_options())
         .await
@@ -875,6 +931,140 @@ pub async fn cancel_enrollment<R: Runtime>(app: AppHandle<R>) -> Result<(), Comm
         .map_err(network_error)?;
     let _ = app.emit("devices-changed", ());
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recovered {
+    /// The new vault's recovery key, to show the owner once.
+    pub(crate) recovery_key: String,
+    pub(crate) items: usize,
+    /// Items carried with more than one version, still to be resolved.
+    pub(crate) conflicts: usize,
+    /// Revisions that were held for review and stay in the old vault.
+    pub(crate) held_left_behind: usize,
+    /// Where the old vault and its files were moved.
+    pub(crate) archive: String,
+}
+
+/// Starts over from this device when too many of the vault's devices are
+/// lost for the rest to remove them: a new vault, with a new identity and
+/// new keys, holding what this one shows now. The old vault and its files
+/// are moved aside untouched, and this device becomes the first member of
+/// the new vault. The other devices are not part of it until they join
+/// again.
+///
+/// This is not a way around the other devices' agreement: nothing in the
+/// old vault's membership changes, and the new vault is a different vault.
+#[tauri::command]
+pub async fn recover_vault<R: Runtime>(
+    password: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
+) -> Result<Recovered, CommandError> {
+    let net = &state.network;
+    if net.join.lock().await.is_some() {
+        return Err(CommandError {
+            code: "joining",
+            message: "finish or cancel joining first".into(),
+        });
+    }
+    if net.control().await.is_none() {
+        return Err(CommandError {
+            code: "unmanaged",
+            message: "this vault has no other devices to start over from".into(),
+        });
+    }
+    // The password is asked again: it confirms the owner's intent and
+    // becomes the new vault's password.
+    {
+        let mut vault = state.vault.lock().await;
+        let vault = vault.as_mut().ok_or(CommandError {
+            code: "vault_missing",
+            message: "vault has not been configured".into(),
+        })?;
+        if vault.is_unlocked() {
+            osm_vault_core::Vault::open(&state.path)?.unlock(&password)?;
+        } else {
+            vault.unlock(&password)?;
+        }
+    }
+    if let Some(invite) = net.invite.lock().await.take() {
+        invite.task.abort();
+    }
+    // Take in whatever committed state and received revisions this device
+    // already has, then stop taking part in the old vault.
+    if let Some(control) = net.control().await {
+        if !net.removed.load(Ordering::SeqCst) {
+            maintain(&app, &control).await;
+        }
+    }
+    if let Some(control) = net.control.lock().await.take() {
+        control.stop().await;
+    }
+
+    let directory = net.directory.clone();
+    let (partial, complete) = (directory.join(RECOVERED_PARTIAL), directory.join(RECOVERED));
+    let (recovery_key, report) = {
+        let vault = state.vault.lock().await;
+        let vault = vault
+            .as_ref()
+            .filter(|vault| vault.is_unlocked())
+            .ok_or_else(locked)?;
+        let _ = std::fs::remove_file(&partial);
+        let (fork, recovery, report) = vault.fork(&partial, &password)?;
+        drop(fork);
+        // From here on the recovery is finished at the next launch even if
+        // the app stops.
+        std::fs::rename(&partial, &complete).map_err(storage_error)?;
+        (recovery.to_string(), report)
+    };
+
+    let archive = {
+        let mut vault = state.vault.lock().await;
+        let mut invitations = net.invitations.lock().await;
+        let mut peers = net.peers.lock().await;
+        // Close every file of the old vault before moving it.
+        *vault = None;
+        *peers = PeerStore::open_in_memory().map_err(network_error)?;
+        *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
+            .map_err(|error| network_error(error.into()))?;
+        let archive = replace_with_recovered(&state.path).map_err(storage_error)?;
+        // The new vault has its own transport identity and address book.
+        let peers_path = directory.join("peers.sqlite3");
+        *peers = PeerStore::open(&peers_path).map_err(network_error)?;
+        *net.addresses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            AddressBook::open(&peers_path).map_err(network_error)?;
+        *invitations = InvitationStore::open(
+            directory.join("invitations.sqlite3"),
+            InvitationPolicy::default(),
+        )
+        .map_err(|error| network_error(error.into()))?;
+        let mut recovered = osm_vault_core::Vault::open(&state.path)?;
+        recovered.unlock(&password)?;
+        *vault = Some(recovered);
+        archive
+    };
+    net.removed.store(false, Ordering::SeqCst);
+    update_status(&app, |status| {
+        *status = SyncStatus {
+            state: "local",
+            ..SyncStatus::default()
+        }
+    });
+    // The new vault's control plane starts with this device alone.
+    found(&app).await?;
+    let _ = app.emit("vault-changed", ());
+    let _ = app.emit("devices-changed", ());
+    Ok(Recovered {
+        recovery_key,
+        items: report.items,
+        conflicts: report.conflicts,
+        held_left_behind: report.held_left_behind,
+        archive: archive.to_string_lossy().into_owned(),
+    })
 }
 
 #[derive(Serialize)]

@@ -127,6 +127,7 @@ export const bridge: DesktopBridge = {
   foundControlPlane: () => nativeOnly("found_control_plane"),
   removeDevice: (device) => nativeOnly("remove_device", { device }),
   cancelEnrollment: () => nativeOnly("cancel_enrollment"),
+  recoverVault: (password) => nativeOnly("recover_vault", { password }),
   async recoveryStatus() {
     const invoke = native();
     return invoke ? Boolean(await invoke("recovery_status")) : true;

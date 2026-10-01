@@ -235,6 +235,16 @@ function App() {
     }
   }
 
+  async function recovered(recoveryKey: string, summary: string) {
+    setDevices(await bridge.devices());
+    setEntries(await bridge.listEntries());
+    setLocked(false);
+    setVaultStatus("unlocked");
+    setDevicesOpen(false);
+    setRecoveryKey(recoveryKey);
+    setNotice(summary);
+  }
+
   async function rejoined() {
     setDevices(await bridge.devices());
     setEntries(await bridge.listEntries());
@@ -315,7 +325,7 @@ function App() {
       {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
       {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
-      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {notice && <div className="toast"><ShieldCheck size={15} />{notice}</div>}
     </main>
   );
@@ -348,14 +358,17 @@ type DevicesPanelProps = {
   onRemove: (device: string) => void;
   onCancelEnrollment: () => void;
   onRejoined: () => void;
+  onRecovered: (recoveryKey: string, summary: string) => void;
   onNotice: (text: string) => void;
   onCopy: (text: string) => void;
 };
 
-function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onNotice, onCopy }: DevicesPanelProps) {
+function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onNotice, onCopy }: DevicesPanelProps) {
   const [removing, setRemoving] = useState<string | null>(null);
   const [rejoining, setRejoining] = useState(false);
+  const [recovering, setRecovering] = useState(false);
 
+  if (recovering) return <RecoverPanel onCancel={() => setRecovering(false)} onRecovered={onRecovered} onNotice={onNotice} />;
   if (devices.setup === "removed") {
     return <div className="device-panel">
       <div className="conflict-banner"><CircleAlert size={16} /><div><strong>This device was removed from the vault</strong><span>Your other devices moved to a new key that this device never received. It gets no further changes, and nothing it writes is accepted by them. What it already held stays readable here.</span></div></div>
@@ -410,6 +423,38 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
       {others.length > 0 && <button className="secondary" onClick={onSync} disabled={sync.state === "syncing"}>Sync now</button>}
       <button className="generate-button" onClick={onInvite} disabled={locked || Boolean(pending)}>{locked ? "Unlock to invite a device" : "Invite a device"}</button>
     </div>
+    {others.length > 0 && <button className="link-button" onClick={() => setRecovering(true)}>Lost devices and cannot remove them? Start over as a new vault…</button>}
+  </div>;
+}
+
+/** The last resort when too many devices are lost for the rest to remove
+ * them: this device starts a new vault from what it holds. */
+function RecoverPanel({ onCancel, onRecovered, onNotice }: { onCancel: () => void; onRecovered: (recoveryKey: string, summary: string) => void; onNotice: (text: string) => void }) {
+  const [password, setPassword] = useState("");
+  const [working, setWorking] = useState(false);
+
+  async function recover() {
+    setWorking(true);
+    try {
+      const result = await bridge.recoverVault(password);
+      setPassword("");
+      const carried = `${result.items} ${result.items === 1 ? "item" : "items"} carried over`;
+      const conflicts = result.conflicts > 0 ? ` · ${result.conflicts} still need your decision` : "";
+      const held = result.heldLeftBehind > 0 ? ` · ${result.heldLeftBehind} held for review stayed in the old vault` : "";
+      onRecovered(result.recoveryKey, `New vault started · ${carried}${conflicts}${held}`);
+    } catch (error) {
+      setWorking(false);
+      onNotice(commandMessage(error, "The new vault could not be started"));
+    }
+  }
+
+  return <div className="device-panel">
+    <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Start over as a new vault</strong><span>Use this only when you cannot reach enough of your devices to remove the lost ones. If they can be reached, remove the lost device instead.</span></div></div>
+    <p className="review-hint">This device makes a new vault from what it holds now: the current version of every item, without earlier history. The new vault has new keys and a new recovery key, which you will be shown once.</p>
+    <p className="review-hint">Your other devices are not part of the new vault and can no longer sync with this one. On each device you still have, join again with an invitation from here. A lost device keeps what it already had, so change any passwords it could have seen.</p>
+    <p className="review-hint">The old vault is not deleted. It is moved, untouched, to an archive folder next to the new one.</p>
+    <div className="unlock-form"><input aria-label="Vault password" type="password" placeholder="Vault password, to confirm" value={password} disabled={working} onChange={(event) => setPassword(event.target.value)} /></div>
+    <div className="form-actions"><button className="secondary" disabled={working} onClick={onCancel}>Cancel</button><button className="generate-button" disabled={working || !password} onClick={() => void recover()}>{working ? "Starting the new vault…" : "Start over as a new vault"}</button></div>
   </div>;
 }
 
@@ -498,6 +543,7 @@ function commandMessage(error: unknown, fallback: string): string {
   if (code === "invitation_expired") return "The invitation has expired · create a new one";
   if (code === "invalid_invitation") return "That is not a valid invitation";
   if (code === "quorum_unavailable") return "Not enough of your devices are reachable · most of them must be online to add or remove one · nothing was changed";
+  if (code === "invalid_credentials") return "That password was rejected · nothing was changed";
   if (code === "removed") return "This device was removed from the vault";
   if (code === "change_in_progress") return "Another device is still being added or removed · finish or cancel that first";
   if (code === "enrollment_refused") return "Your other devices did not accept this device";

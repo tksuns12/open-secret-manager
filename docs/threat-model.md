@@ -48,6 +48,8 @@ A device takes part in Raft under its transport identity, whose key is stored un
 
 Availability depends on device reachability. A single device can use its local vault offline. Membership changes need a majority of the configured voters; a two-voter vault needs both voters. Losing quorum must not enable an unauthenticated emergency removal. An explicit recovery fork creates a new trust domain.
 
+The recovery fork is not a removal. It does not take anything back from a lost device, which keeps every key and record it already had, so the owner must change the passwords it could have seen. It protects what is written afterwards: the new vault has a new identity and new keys that no device of the old vault holds. It needs only one unlocked device and its password, so anyone who can unlock a device can start a new vault from it, but that vault is separate and the old one and its other devices are unaffected. The old vault's files stay on the device in an archive folder, still encrypted under the same password; deleting them is the owner's decision. Earlier revision history and revisions held for review are not carried into the new vault.
+
 ## Local encryption and lock lifecycle
 
 Use a randomly generated 256-bit vault/epoch key to encrypt records with XChaCha20-Poly1305. Bind record identity, vault identity, format version, key epoch, and revision metadata as authenticated additional data. Generate each 24-byte nonce from the operating system random source. Passwords wrap keys; they are not record-encryption keys.

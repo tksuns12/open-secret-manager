@@ -425,6 +425,7 @@ async fn enable_recovery(
 
 pub fn run() {
     let path = default_vault_path();
+    network::finish_interrupted_recovery(&path);
     let network = network::Network::open(&path).expect("could not open the peer store");
     tauri::Builder::default()
         .manage(AppState {
@@ -457,6 +458,7 @@ pub fn run() {
             network::found_control_plane,
             network::remove_device,
             network::cancel_enrollment,
+            network::recover_vault,
             network::start_invite,
             network::confirm_invite,
             network::cancel_invite,

@@ -1729,3 +1729,112 @@ fn joining_keeps_the_pending_recipient_secret_and_backups_keep_revocations() {
         *a.recipient_secret().unwrap()
     );
 }
+
+#[test]
+fn a_fork_starts_a_new_trust_domain_from_the_current_versions() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base, old_recovery) = untrusted_copy(dir.path());
+
+    // The source has history, a deletion, a held revision, and a conflict.
+    let kept = login("Kept");
+    let first = a.put(kept.clone()).unwrap().revision;
+    edit(&mut a, &kept, &first, "second version");
+    let gone = login("Gone");
+    let created = a.put(gone.clone()).unwrap().revision;
+    a.delete(&gone.id, &created).unwrap();
+    let unknown = b.put(login("From an unknown device")).unwrap().revision;
+    assert!(matches!(
+        a.apply_encrypted_revision(wire(&b, &unknown)),
+        Err(Error::Quarantined)
+    ));
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+    a.authorize_device(b.device_id().unwrap(), b.device_public_key().unwrap())
+        .unwrap();
+    edit(&mut a, &item, &base, "from A");
+    let from_b = edit(&mut b, &item, &base, "from B");
+    a.apply_encrypted_revision(from_b).unwrap();
+    assert!(a.get(&item.id).unwrap().conflict);
+    let before = a.encrypted_revisions().unwrap();
+
+    let path = dir.path().join("fork.db");
+    let (mut fork, recovery, report) = a.fork(&path, "new password").unwrap();
+    assert_eq!(
+        report,
+        crate::ForkReport {
+            items: 2,
+            conflicts: 1,
+            held_left_behind: 1,
+            staged_left_behind: 0,
+        }
+    );
+
+    // Nothing of the old domain's identity or keys is reused.
+    assert_ne!(fork.vault_id(), a.vault_id());
+    assert_ne!(fork.device_id(), a.device_id());
+    assert_ne!(fork.device_public_key(), a.device_public_key());
+    assert_eq!(fork.current_epoch(), 1);
+    assert_eq!(fork.epoch_keys().unwrap().len(), 1);
+    assert!(keys_held(&a)
+        .iter()
+        .all(|key| !keys_held(&fork).contains(key)));
+    assert_eq!(
+        fork.authorized_devices().unwrap(),
+        vec![(fork.device_id().unwrap(), fork.device_public_key().unwrap())]
+    );
+
+    // The current versions are there; history, the deletion, and the held
+    // revision are not. The conflict is still a conflict.
+    assert_eq!(fork.list().unwrap().len(), 2);
+    assert_eq!(fork.get(&kept.id).unwrap().item.password, "second version");
+    assert!(matches!(fork.get(&gone.id), Err(Error::NotFound)));
+    assert!(fork.quarantined().unwrap().is_empty());
+    assert!(fork.get(&item.id).unwrap().conflict);
+    let mut versions: Vec<String> = fork
+        .versions(&item.id)
+        .unwrap()
+        .into_iter()
+        .map(|version| version.item.unwrap().password.clone())
+        .collect();
+    versions.sort();
+    assert_eq!(versions, ["from A", "from B"]);
+    let revisions = fork.encrypted_revisions().unwrap();
+    assert_eq!(revisions.len(), 3);
+    for revision in &revisions {
+        assert!(revision.parents.is_empty());
+        assert_eq!(revision.vault_id, fork.vault_id());
+        assert_eq!(Some(revision.author_device_id), fork.device_id());
+    }
+    // The owner resolves it in the new vault as in any other.
+    let heads = head_set(&fork, &item.id);
+    let keep = fork.versions(&item.id).unwrap().remove(0).item;
+    fork.resolve(&item.id, keep, &heads).unwrap();
+    assert!(!fork.get(&item.id).unwrap().conflict);
+
+    // The two domains accept nothing from each other, verified or staged.
+    assert!(a.apply_encrypted_revision(revisions[0].clone()).is_err());
+    assert!(a.stage_revision(revisions[0].clone()).is_err());
+    assert!(fork.apply_encrypted_revision(before[0].clone()).is_err());
+    assert!(fork.stage_revision(before[0].clone()).is_err());
+
+    // The source is untouched, and an existing file is never overwritten.
+    assert_eq!(a.encrypted_revisions().unwrap(), before);
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+    assert!(a.fork(&path, "new password").is_err());
+
+    // The new vault has its own password and its own recovery key.
+    drop(fork);
+    let mut reopened = Vault::open(&path).unwrap();
+    assert!(reopened.unlock("password").is_err());
+    assert!(reopened.unlock_with_recovery(&old_recovery).is_err());
+    reopened.unlock_with_recovery(&recovery).unwrap();
+    reopened.lock();
+    reopened.unlock("new password").unwrap();
+    assert_eq!(reopened.list().unwrap().len(), 2);
+
+    // A locked vault cannot be forked.
+    a.lock();
+    assert!(matches!(
+        a.fork(dir.path().join("other.db"), "p"),
+        Err(Error::Locked)
+    ));
+}

@@ -431,3 +431,169 @@ fn an_existing_vault_is_set_up_at_unlock_and_resumes_while_locked() {
         network::shutdown(&handle).await;
     });
 }
+
+async fn vault_id(app: &AppHandle<MockRuntime>) -> [u8; 32] {
+    let state = app.state::<AppState>();
+    let vault = state.vault.lock().await;
+    vault.as_ref().unwrap().vault_id()
+}
+
+#[test]
+fn a_vault_that_lost_a_device_starts_over_as_a_new_vault() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let apps: Vec<_> = dirs.iter().map(|dir| shell(dir.path())).collect();
+    let codes = record(&apps[0], "pairing-code");
+    let finished = record(&apps[0], "pairing-finished");
+    let handles: Vec<_> = apps.iter().map(|app| app.handle().clone()).collect();
+    let (a, b, c) = (handles[0].clone(), handles[1].clone(), handles[2].clone());
+    let a_dir = dirs[0].path().to_owned();
+
+    tauri::async_runtime::block_on(async move {
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "From A").await;
+        pair(&a, &codes, &finished, 0, &b, Some("joiner password")).await;
+        eventually(&b, &["From A"]).await;
+        put(&b, "From B").await;
+        network::schedule_sync(&b);
+        eventually(&a, &["From A", "From B"]).await;
+        until_devices(&a, "two members", |info| {
+            info.members.len() == 2 && info.pending.is_none()
+        })
+        .await;
+        let old_vault = vault_id(&a).await;
+        let old_device = devices(&a).await.this_device.unwrap();
+        let b_id = devices(&b).await.this_device.unwrap();
+
+        // B is lost. Two devices need both for any change, so A cannot
+        // remove it.
+        network::shutdown(&b).await;
+        let refused = network::remove_device(b_id.clone(), a.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "quorum_unavailable");
+
+        // Starting over asks for the password; a wrong one changes nothing.
+        let wrong = network::recover_vault("not the password".into(), a.state(), a.clone())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(wrong.code, "invalid_credentials");
+        assert_eq!(vault_id(&a).await, old_vault);
+        assert_eq!(devices(&a).await.members.len(), 2);
+
+        let recovered = network::recover_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        assert_eq!((recovered.items, recovered.conflicts), (2, 0));
+        assert!(recovered.recovery_key.starts_with("OSM-RK1-"));
+
+        // A new vault: new identity, this device its only member, the same
+        // contents, unlocked under the same password.
+        assert_ne!(vault_id(&a).await, old_vault);
+        let info = devices(&a).await;
+        assert_eq!(
+            (info.setup, info.members.len(), info.epoch),
+            ("ready", 1, 1)
+        );
+        assert_ne!(info.this_device.clone().unwrap(), old_device);
+        assert_eq!(titles(&a).await, ["From A", "From B"]);
+        {
+            let state = a.state::<AppState>();
+            let mut vault = state.vault.lock().await;
+            let vault = vault.as_mut().unwrap();
+            assert_eq!(vault.encrypted_revisions().unwrap().len(), 2);
+            vault.lock();
+            vault.unlock(PASSWORD).unwrap();
+        }
+
+        // The old vault and its files were moved aside, not destroyed.
+        let archive = std::path::PathBuf::from(&recovered.archive);
+        assert_eq!(archive.parent(), Some(a_dir.as_path()));
+        for file in ["vault.sqlite3", "control.sqlite3", "peers.sqlite3"] {
+            assert!(archive.join(file).exists(), "{file} was not archived");
+        }
+        let mut archived = Vault::open(archive.join("vault.sqlite3")).unwrap();
+        assert_eq!(archived.vault_id(), old_vault);
+        archived.unlock(PASSWORD).unwrap();
+        assert_eq!(archived.list().unwrap().len(), 2);
+        assert!(!a_dir.join("recovered.sqlite3").exists());
+
+        // The lost device turns up again. It is not part of the new vault:
+        // it reaches no one, and A takes nothing from it.
+        network::start(&b);
+        until_devices(&b, "B's control plane resumes", |info| {
+            info.setup == "ready"
+        })
+        .await;
+        put(&b, "Written on the lost device").await;
+        assert!(network::sync_now(b.clone()).await.is_err());
+        assert_eq!(titles(&a).await, ["From A", "From B"]);
+        assert_eq!(devices(&a).await.members.len(), 1);
+
+        // Devices join the new vault by pairing, as with any vault.
+        pair(&a, &codes, &finished, 1, &c, Some("third password")).await;
+        eventually(&c, &["From A", "From B"]).await;
+        assert_eq!(vault_id(&c).await, vault_id(&a).await);
+        for app in [&a, &c] {
+            until_devices(app, "two members of the new vault", |info| {
+                info.members.len() == 2 && info.pending.is_none()
+            })
+            .await;
+        }
+        for app in [&a, &b, &c] {
+            network::shutdown(app).await;
+        }
+    });
+}
+
+#[test]
+fn an_interrupted_recovery_is_finished_or_discarded_at_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.sqlite3");
+    let (mut vault, _) = Vault::create(&path, PASSWORD).unwrap();
+    vault.put(Item::new("Kept")).unwrap();
+    let old_vault = vault.vault_id();
+    std::fs::write(dir.path().join("control.sqlite3"), b"old control").unwrap();
+
+    // Stopped while the new vault was still being written: it is discarded
+    // and the vault is as it was.
+    let partial = dir.path().join("recovered.sqlite3.partial");
+    drop(vault.fork(&partial, PASSWORD).unwrap());
+    network::finish_interrupted_recovery(&path);
+    assert!(!partial.exists());
+    assert_eq!(Vault::open(&path).unwrap().vault_id(), old_vault);
+    assert!(dir.path().join("control.sqlite3").exists());
+
+    // Stopped after the new vault was complete: the swap is finished.
+    let (fork, _, _) = vault
+        .fork(dir.path().join("recovered.sqlite3"), PASSWORD)
+        .unwrap();
+    let new_vault = fork.vault_id();
+    drop((fork, vault));
+    network::finish_interrupted_recovery(&path);
+    let mut current = Vault::open(&path).unwrap();
+    assert_eq!(current.vault_id(), new_vault);
+    current.unlock(PASSWORD).unwrap();
+    assert_eq!(current.list().unwrap().len(), 1);
+    assert!(!dir.path().join("recovered.sqlite3").exists());
+    assert!(!dir.path().join("control.sqlite3").exists());
+    let archive = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("archive-"))
+        .unwrap()
+        .path();
+    assert_eq!(
+        Vault::open(archive.join("vault.sqlite3"))
+            .unwrap()
+            .vault_id(),
+        old_vault
+    );
+    assert!(archive.join("control.sqlite3").exists());
+
+    // Nothing to do on an ordinary launch.
+    network::finish_interrupted_recovery(&path);
+    assert_eq!(Vault::open(&path).unwrap().vault_id(), new_vault);
+}

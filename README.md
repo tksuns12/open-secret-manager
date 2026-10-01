@@ -42,8 +42,10 @@ syncs with every member automatically on the local network; a locked device
 still takes part and stores what it receives until the next unlock. There is
 no discovery beyond the address in the invitation. With two devices both must
 be reachable for any change, so a lost device cannot be removed from a
-two-device vault; recovering such a vault into a new one is the remaining
-Phase 4 work.
+two-device vault. For that case, and any other in which too many devices are
+lost, one device can start over as a new vault with new keys from what it
+holds; the others join it again. Three or more devices tolerate one being
+lost.
 
 ## Development
 
