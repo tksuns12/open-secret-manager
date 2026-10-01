@@ -13,7 +13,7 @@ use tokio_rustls::TlsConnector;
 use crate::{
     accept_pairing, connect_sync, invite, serve_sync, start_pairing,
     transport::{client_config_for_tests, server_name_for_tests},
-    Error, Peer, PeerStore,
+    Error, PairingListener, Peer, PeerStore,
 };
 
 const NOW: u64 = 1_800_000_000;
@@ -33,6 +33,12 @@ fn device(path: &Path) -> Device {
     }
 }
 
+async fn pairing_listener(peers: &mut PeerStore) -> (PairingListener, String) {
+    let listener = PairingListener::bind("127.0.0.1:0", peers).await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    (listener, address)
+}
+
 async fn listener() -> (TcpListener, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -42,7 +48,7 @@ async fn listener() -> (TcpListener, String) {
 /// Pairs `a` with a new device over TLS on localhost, confirming on both
 /// sides only if the short codes match.
 async fn pair_over_tls(dir: &Path, a: &mut Device) -> Device {
-    let (pairing_listener, address) = listener().await;
+    let (pairing_listener, address) = pairing_listener(&mut a.peers).await;
     let invitation = invite(
         &a.vault,
         &mut a.invitations,
@@ -206,7 +212,7 @@ async fn an_oversized_frame_over_tls_ends_the_session() {
 async fn the_pairing_listener_ignores_junk_and_the_owner_can_decline() {
     let dir = tempdir().unwrap();
     let mut a = device(&dir.path().join("a.db"));
-    let (pairing_listener, address) = listener().await;
+    let (pairing_listener, address) = pairing_listener(&mut a.peers).await;
     let invitation = invite(
         &a.vault,
         &mut a.invitations,
@@ -246,7 +252,7 @@ async fn a_joiner_refuses_an_inviter_whose_certificate_does_not_match() {
     let dir = tempdir().unwrap();
     let mut a = device(&dir.path().join("a.db"));
     let mut impostor = device(&dir.path().join("c.db"));
-    let (impostor_listener, address) = listener().await;
+    let (impostor_listener, address) = pairing_listener(&mut impostor.peers).await;
     // A's invitation, but its address leads to another device.
     let invitation = invite(
         &a.vault,
@@ -274,4 +280,33 @@ async fn a_joiner_refuses_an_inviter_whose_certificate_does_not_match() {
     );
     assert!(matches!(joined, Err(Error::PinMismatch)));
     assert!(b_peers.peers().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn each_side_learns_where_the_other_listens() {
+    let dir = tempdir().unwrap();
+    let mut a = device(&dir.path().join("a.db"));
+    let mut b = pair_over_tls(dir.path(), &mut a).await;
+    // A's invitation told B where A was listening for pairing, but A has
+    // never learned an address for B.
+    assert_eq!(a.peers.peers().unwrap()[0].address, None);
+
+    let (sync_listener, address) = listener().await;
+    let endpoint = crate::SyncEndpoint::load(&mut b.peers).unwrap();
+    let (served, outcome) = tokio::join!(
+        serve_sync(&sync_listener, &mut a.vault, &mut a.peers),
+        async {
+            let connection = endpoint.connect(&address).await?;
+            // B says it listens on 4242.
+            connection.run(&mut b.vault, Some(4242)).await
+        }
+    );
+    served.unwrap();
+    // A records B's address as the connection's source IP and B's port...
+    assert_eq!(
+        a.peers.peers().unwrap()[0].address.as_deref(),
+        Some("127.0.0.1:4242")
+    );
+    // ...and B learns the port A serves sync on.
+    assert_eq!(outcome.unwrap().peer_address, Some(address));
 }

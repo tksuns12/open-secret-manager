@@ -1,14 +1,23 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, sync::Mutex};
+mod network;
+#[cfg(test)]
+mod network_tests;
+
+use std::path::PathBuf;
 
 use osm_vault_core::{Item, ItemKind, ItemSummary, PasswordPolicy, Vault, VaultItem};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Lock order, where both are needed: `vault`, then the network's peer
+/// store. Network waits (handshakes, the owner reading a pairing code) never
+/// hold either.
 struct AppState {
     vault: Mutex<Option<Vault>>,
     path: PathBuf,
+    network: network::Network,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,25 +45,19 @@ impl From<osm_vault_core::Error> for CommandError {
 }
 
 #[tauri::command]
-fn vault_status(state: tauri::State<'_, AppState>) -> &'static str {
-    match state
-        .vault
-        .lock()
-        .ok()
-        .and_then(|vault| vault.as_ref().map(Vault::is_unlocked))
-    {
-        Some(true) => "unlocked",
-        Some(false) => "locked",
-        None => "missing",
-    }
+async fn vault_status(state: tauri::State<'_, AppState>) -> Result<&'static str, CommandError> {
+    Ok(
+        match state.vault.lock().await.as_ref().map(Vault::is_unlocked) {
+            Some(true) => "unlocked",
+            Some(false) => "locked",
+            None => "missing",
+        },
+    )
 }
 
 #[tauri::command]
-fn lock_vault(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
-    let mut vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+async fn lock_vault(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().await;
     if let Some(vault) = vault.as_mut() {
         vault.lock();
     }
@@ -62,11 +65,8 @@ fn lock_vault(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
 }
 
 #[tauri::command]
-fn list_entries(state: tauri::State<'_, AppState>) -> Result<Vec<ItemSummary>, CommandError> {
-    let vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+async fn list_entries(state: tauri::State<'_, AppState>) -> Result<Vec<ItemSummary>, CommandError> {
+    let vault = state.vault.lock().await;
     vault
         .as_ref()
         .ok_or_else(|| CommandError {
@@ -85,11 +85,8 @@ fn generate_password(length: usize) -> Result<String, CommandError> {
 }
 
 #[tauri::command]
-fn copy_totp(id: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
-    let vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+async fn copy_totp(id: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+    let vault = state.vault.lock().await;
     let vault = vault.as_ref().ok_or_else(|| CommandError {
         code: "locked",
         message: "vault is locked".into(),
@@ -189,11 +186,11 @@ impl EntryInput {
 }
 
 #[tauri::command]
-fn get_entry(id: String, state: tauri::State<'_, AppState>) -> Result<EntryDetail, CommandError> {
-    let vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+async fn get_entry(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<EntryDetail, CommandError> {
+    let vault = state.vault.lock().await;
     let vault = vault.as_ref().ok_or_else(|| CommandError {
         code: "locked",
         message: "vault is locked".into(),
@@ -214,14 +211,12 @@ fn get_entry(id: String, state: tauri::State<'_, AppState>) -> Result<EntryDetai
 }
 
 #[tauri::command]
-fn create_entry(
+async fn create_entry(
     mut input: EntryInput,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<ItemSummary, CommandError> {
-    let mut vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+    let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
         code: "locked",
         message: "vault is locked".into(),
@@ -230,20 +225,19 @@ fn create_entry(
     input.apply_to(&mut item);
     let id = item.id.clone();
     vault.put(item)?;
+    network::schedule_sync(&app);
     Ok(vault.get(&id)?.into())
 }
 
 #[tauri::command]
-fn update_entry(
+async fn update_entry(
     id: String,
     expected_revision: String,
     mut input: EntryInput,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<ItemSummary, CommandError> {
-    let mut vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+    let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
         code: "locked",
         message: "vault is locked".into(),
@@ -253,6 +247,7 @@ fn update_entry(
     let VaultItem { mut item, .. } = vault.get(&id)?;
     input.apply_to(&mut item);
     vault.update(item, &expected_revision)?;
+    network::schedule_sync(&app);
     Ok(vault.get(&id)?.into())
 }
 
@@ -272,14 +267,11 @@ struct VersionSummary {
 }
 
 #[tauri::command]
-fn list_versions(
+async fn list_versions(
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<VersionSummary>, CommandError> {
-    let vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+    let vault = state.vault.lock().await;
     let vault = vault.as_ref().ok_or_else(|| CommandError {
         code: "locked",
         message: "vault is locked".into(),
@@ -319,16 +311,14 @@ fn list_versions(
 /// `heads` is the set that was shown, so a version that arrived since stays
 /// visible instead of being silently discarded.
 #[tauri::command]
-fn resolve_entry(
+async fn resolve_entry(
     id: String,
     keep_revision: String,
     heads: Vec<String>,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), CommandError> {
-    let mut vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+    let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
         code: "locked",
         message: "vault is locked".into(),
@@ -348,18 +338,16 @@ fn resolve_entry(
             actual: "<superseded>".into(),
         })?;
     vault.resolve(&id, kept.item, &heads)?;
+    network::schedule_sync(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn create_vault(
+async fn create_vault(
     password: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, CommandError> {
-    let mut vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+    let mut vault = state.vault.lock().await;
     if vault.is_some() {
         return Err(CommandError {
             code: "vault_exists",
@@ -378,24 +366,36 @@ fn create_vault(
 }
 
 #[tauri::command]
-fn unlock_vault(password: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
-    let mut vault = state.vault.lock().map_err(|_| CommandError {
-        code: "state",
-        message: "vault state unavailable".into(),
-    })?;
+async fn unlock_vault(
+    password: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
         code: "vault_missing",
         message: "vault has not been configured".into(),
     })?;
-    vault.unlock(&password).map_err(Into::into)
+    vault.unlock(&password)?;
+    // Revisions received while locked are verified now, then the peer is
+    // caught up.
+    let processed = vault.process_staged()?;
+    network::after_unlock(&app, &processed);
+    Ok(())
 }
 
 pub fn run() {
     let path = default_vault_path();
+    let network = network::Network::open(&path).expect("could not open the peer store");
     tauri::Builder::default()
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
             path,
+            network,
+        })
+        .setup(|app| {
+            network::start_listener(app.handle());
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             vault_status,
@@ -409,7 +409,15 @@ pub fn run() {
             create_entry,
             update_entry,
             list_versions,
-            resolve_entry
+            resolve_entry,
+            network::sync_status,
+            network::sync_now,
+            network::start_invite,
+            network::confirm_invite,
+            network::cancel_invite,
+            network::join_start,
+            network::join_finish,
+            network::cancel_join
         ])
         .run(tauri::generate_context!())
         .expect("error while running Open Secret Manager");

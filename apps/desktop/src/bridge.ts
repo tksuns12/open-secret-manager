@@ -1,4 +1,19 @@
-import type { DesktopBridge, EntryDetail, EntryInput, VaultEntry, VersionSummary } from "./types";
+import type { DesktopBridge, EntryDetail, EntryInput, SyncStatus, VaultEntry, VersionSummary } from "./types";
+
+type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
+type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
+type TauriGlobal = { __TAURI__?: { core?: { invoke?: Invoke }; event?: { listen?: Listen } } };
+
+function native(): Invoke | undefined {
+  return (globalThis as TauriGlobal).__TAURI__?.core?.invoke;
+}
+
+/** Pairing and sync need the native shell; the browser preview has neither. */
+async function nativeOnly<T>(cmd: string, args?: unknown): Promise<T> {
+  const invoke = native();
+  if (!invoke) throw new Error("preview");
+  return (await invoke(cmd, args)) as T;
+}
 
 let previewEntries: VaultEntry[] = [
   { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", updatedAt: "Today, 09:42", favorite: true },
@@ -98,6 +113,23 @@ export const bridge: DesktopBridge = {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) return (await invoke("list_versions", { id })) as VersionSummary[];
     throw new Error("preview");
+  },
+  async syncStatus() {
+    const invoke = native();
+    if (invoke) return (await invoke("sync_status")) as SyncStatus;
+    return { state: "unpaired", pending: 0 };
+  },
+  syncNow: () => nativeOnly("sync_now"),
+  startInvite: () => nativeOnly("start_invite"),
+  confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),
+  cancelInvite: () => nativeOnly("cancel_invite"),
+  joinStart: (code) => nativeOnly("join_start", { code }),
+  joinFinish: (password) => nativeOnly("join_finish", { password }),
+  cancelJoin: () => nativeOnly("cancel_join"),
+  async listen(event, handler) {
+    const listen = (globalThis as TauriGlobal).__TAURI__?.event?.listen;
+    if (!listen) return () => {};
+    return listen(event, (message) => handler(message.payload as never));
   },
   async resolveEntry(id, keepRevision, heads) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;

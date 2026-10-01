@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Main window may subscribe to the shell's sync and pairing events; nothing else from the core plugins.","local":true,"windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-unlisten"]}}

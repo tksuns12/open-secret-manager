@@ -35,6 +35,9 @@ pub enum SyncMessage {
     Hello {
         version: u16,
         vault_id: [u8; 32],
+        /// The port this device accepts sync connections on, if any. The
+        /// peer pairs it with the address the connection came from.
+        listen_port: Option<u16>,
     },
     Inventory {
         revisions: Vec<String>,
@@ -84,6 +87,7 @@ pub struct SyncReport {
 pub struct SyncSession {
     vault_id: [u8; 32],
     hello_received: bool,
+    peer_listen_port: Option<u16>,
     need_rounds: u32,
     sent_finished: bool,
     peer_finished: bool,
@@ -93,10 +97,11 @@ pub struct SyncSession {
 impl SyncSession {
     /// Starts a session and returns the opening messages. If the vault is
     /// unlocked, anything staged earlier is processed first.
-    pub fn start(vault: &mut Vault) -> Result<(Self, Vec<SyncMessage>)> {
+    pub fn start(vault: &mut Vault, listen_port: Option<u16>) -> Result<(Self, Vec<SyncMessage>)> {
         let mut session = Self {
             vault_id: vault.vault_id(),
             hello_received: false,
+            peer_listen_port: None,
             need_rounds: 0,
             sent_finished: false,
             peer_finished: false,
@@ -109,6 +114,7 @@ impl SyncSession {
             SyncMessage::Hello {
                 version: PROTOCOL_VERSION,
                 vault_id: session.vault_id,
+                listen_port,
             },
             SyncMessage::Inventory {
                 revisions: inventory,
@@ -125,10 +131,19 @@ impl SyncSession {
         &self.report
     }
 
+    /// The port the peer said it listens on, once its `Hello` arrived.
+    pub fn peer_listen_port(&self) -> Option<u16> {
+        self.peer_listen_port
+    }
+
     /// Handles one message from the peer and returns the replies to send.
     pub fn handle(&mut self, vault: &mut Vault, message: SyncMessage) -> Result<Vec<SyncMessage>> {
         match message {
-            SyncMessage::Hello { version, vault_id } => {
+            SyncMessage::Hello {
+                version,
+                vault_id,
+                listen_port,
+            } => {
                 if self.hello_received {
                     return Err(Error::ProtocolViolation);
                 }
@@ -139,6 +154,7 @@ impl SyncSession {
                     return Err(Error::VaultMismatch);
                 }
                 self.hello_received = true;
+                self.peer_listen_port = listen_port.filter(|port| *port != 0);
                 Ok(Vec::new())
             }
             _ if !self.hello_received => Err(Error::ProtocolViolation),

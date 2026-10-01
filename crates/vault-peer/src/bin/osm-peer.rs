@@ -32,8 +32,8 @@ use std::{
 
 use osm_vault_core::{Item, Vault};
 use osm_vault_peer::{
-    accept_pairing, connect_sync, invite, serve_sync, start_pairing, Invitation, PeerStore,
-    SyncReport, MAX_INVITATION_TTL_SECS,
+    accept_pairing, connect_sync, invite, serve_sync, start_pairing, Invitation, PairingListener,
+    PeerStore, SyncReport, MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::net::TcpListener;
@@ -75,7 +75,7 @@ async fn run(args: &[String]) -> CliResult {
             let mut peers = PeerStore::open(peers)?;
             // Invitations live only as long as this process waits for a joiner.
             let mut invitations = InvitationStore::open_in_memory(InvitationPolicy::default())?;
-            let listener = TcpListener::bind(listen).await?;
+            let listener = PairingListener::bind(listen, &mut peers).await?;
             let address = listener.local_addr()?.to_string();
             println!("LISTEN {address}");
             let invitation = invite(

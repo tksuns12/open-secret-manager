@@ -10,7 +10,12 @@
 //! it accepts any client certificate and then requires that the join
 //! request, signed by the joiner's device key, names that certificate.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use osm_vault_core::Vault;
 use osm_vault_sync::InvitationStore;
@@ -38,11 +43,12 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::{
     approve_join,
+    pairing::JoinReview,
     peers::{pin_of, TransportIdentity},
     review_join,
     wire::{decode_body, encode_frame, MAX_FRAME_BYTES},
-    Error, Invitation, JoinGrant, JoinRequest, Joiner, PeerStore, Result, SyncReport, SyncSession,
-    MAX_INVITATION_TTL_SECS,
+    Error, Invitation, JoinGrant, JoinRequest, Joiner, Peer, PeerStore, Result, SyncReport,
+    SyncSession, MAX_INVITATION_TTL_SECS,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,13 +65,144 @@ enum PairingReply {
     Declined,
 }
 
+/// Accepts pairing connections. Waiting on it never touches the vault, so an
+/// application can wait for a joiner, and for the owner's decision, without
+/// holding the vault.
+pub struct PairingListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl PairingListener {
+    pub async fn bind(address: &str, peers: &mut PeerStore) -> Result<Self> {
+        let listener = TcpListener::bind(address).await?;
+        let identity = peers.transport_identity()?;
+        Ok(Self {
+            listener,
+            acceptor: TlsAcceptor::from(server_config(&identity, ClientPolicy::AnyForPairing)?),
+        })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
+    /// Waits for the next joiner that completes the handshake and sends a
+    /// request naming the certificate it connected with. Anything else (junk,
+    /// failed handshakes, mismatched certificates) is dropped and the wait
+    /// continues.
+    pub async fn next_request(&self) -> Result<IncomingJoin> {
+        loop {
+            let (tcp, _) = self.listener.accept().await?;
+            if let Ok(incoming) = self.receive(tcp).await {
+                return Ok(incoming);
+            }
+        }
+    }
+
+    async fn receive(&self, tcp: TcpStream) -> Result<IncomingJoin> {
+        let mut stream = with_timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(tcp))
+            .await?
+            .map_err(handshake_error)?;
+        let client_pin = pin_of(
+            stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .ok_or(Error::Handshake)?,
+        );
+        let request: JoinRequest = with_timeout(FRAME_TIMEOUT, read_frame(&mut stream)).await??;
+        // The request is signed by the joiner's device key; the certificate
+        // on this connection must be the one it names.
+        if request.joiner_transport_pin() != client_pin {
+            return Err(Error::PinMismatch);
+        }
+        Ok(IncomingJoin { stream, request })
+    }
+}
+
+/// A join request received over TLS, not yet reviewed.
+pub struct IncomingJoin {
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    request: JoinRequest,
+}
+
+impl IncomingJoin {
+    /// Validates the request with [`review_join`]. Only a request that passes
+    /// should be shown to the owner.
+    pub fn review(
+        self,
+        vault: &Vault,
+        invitations: &InvitationStore,
+        peers: &mut PeerStore,
+        now: u64,
+    ) -> Result<PendingJoin> {
+        let review = review_join(vault, invitations, peers, self.request, now)?;
+        Ok(PendingJoin {
+            stream: self.stream,
+            review,
+        })
+    }
+}
+
+/// A reviewed join request waiting for the owner. Holds no vault borrow.
+pub struct PendingJoin {
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    review: JoinReview,
+}
+
+impl PendingJoin {
+    /// The short code to compare with the joiner's screen.
+    pub fn sas(&self) -> String {
+        self.review.sas()
+    }
+
+    /// Completes pairing on this device after the owner confirmed. Call
+    /// [`ApprovedJoin::send`] afterwards; it needs no vault. `sync_port`
+    /// tells the joiner where this device accepts sync connections.
+    pub fn approve(
+        self,
+        vault: &mut Vault,
+        invitations: &mut InvitationStore,
+        peers: &mut PeerStore,
+        sync_port: Option<u16>,
+        now: u64,
+    ) -> Result<ApprovedJoin> {
+        let grant = approve_join(vault, invitations, peers, self.review, sync_port, now)?;
+        Ok(ApprovedJoin {
+            stream: self.stream,
+            grant,
+        })
+    }
+
+    pub async fn decline(mut self) -> Result<()> {
+        write_frame(&mut self.stream, &PairingReply::Declined).await?;
+        let _ = self.stream.shutdown().await;
+        Ok(())
+    }
+}
+
+/// An approved pairing whose grant still has to reach the joiner.
+pub struct ApprovedJoin {
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    grant: JoinGrant,
+}
+
+impl ApprovedJoin {
+    pub async fn send(mut self) -> Result<()> {
+        write_frame(&mut self.stream, &PairingReply::Grant(self.grant)).await?;
+        let _ = self.stream.shutdown().await;
+        Ok(())
+    }
+}
+
 /// Waits for a joiner, asks the owner to confirm the short code with
-/// `confirm`, and sends the grant. Connections that fail before the owner is
-/// asked (bad handshake, invalid or replayed request) are dropped and the
-/// listener keeps waiting until the invitation window closes. Returns
+/// `confirm`, and sends the grant. Requests that fail review are dropped and
+/// the wait continues until the invitation window closes. Returns
 /// `NotConfirmed` if the owner declines.
 pub async fn accept_pairing<C, F>(
-    listener: &TcpListener,
+    listener: &PairingListener,
     vault: &mut Vault,
     invitations: &mut InvitationStore,
     peers: &mut PeerStore,
@@ -76,72 +213,23 @@ where
     C: FnMut(String) -> F,
     F: Future<Output = bool>,
 {
-    let identity = peers.transport_identity()?;
-    let acceptor = TlsAcceptor::from(server_config(&identity, ClientPolicy::AnyForPairing)?);
     let deadline = tokio::time::Instant::now() + PAIRING_TIMEOUT;
     loop {
-        let (tcp, _) = tokio::time::timeout_at(deadline, listener.accept())
+        let incoming = tokio::time::timeout_at(deadline, listener.next_request())
             .await
             .map_err(|_| Error::Timeout)??;
-        match pairing_connection(
-            tcp,
-            &acceptor,
-            vault,
-            invitations,
-            peers,
-            &mut confirm,
-            &clock,
-        )
-        .await
-        {
-            Ok(()) => return Ok(()),
-            Err(Error::NotConfirmed) => return Err(Error::NotConfirmed),
-            // Anything else was not a pairing the owner could approve.
-            Err(_) => continue,
+        let Ok(pending) = incoming.review(vault, invitations, peers, clock()) else {
+            continue;
+        };
+        if !confirm(pending.sas()).await {
+            pending.decline().await?;
+            return Err(Error::NotConfirmed);
         }
+        return pending
+            .approve(vault, invitations, peers, None, clock())?
+            .send()
+            .await;
     }
-}
-
-async fn pairing_connection<C, F>(
-    tcp: TcpStream,
-    acceptor: &TlsAcceptor,
-    vault: &mut Vault,
-    invitations: &mut InvitationStore,
-    peers: &mut PeerStore,
-    confirm: &mut C,
-    clock: &impl Fn() -> u64,
-) -> Result<()>
-where
-    C: FnMut(String) -> F,
-    F: Future<Output = bool>,
-{
-    let mut stream = with_timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
-        .await?
-        .map_err(handshake_error)?;
-    let client_pin = pin_of(
-        stream
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|chain| chain.first())
-            .ok_or(Error::Handshake)?,
-    );
-    let request: JoinRequest = with_timeout(FRAME_TIMEOUT, read_frame(&mut stream)).await??;
-    // The request is signed by the joiner's device key; the certificate on
-    // this connection must be the one it names.
-    if request.joiner_transport_pin() != client_pin {
-        return Err(Error::PinMismatch);
-    }
-    let review = review_join(vault, invitations, peers, request, clock())?;
-    if !confirm(review.sas()).await {
-        write_frame(&mut stream, &PairingReply::Declined).await?;
-        let _ = stream.shutdown().await;
-        return Err(Error::NotConfirmed);
-    }
-    let grant = approve_join(vault, invitations, peers, review, clock())?;
-    write_frame(&mut stream, &PairingReply::Grant(grant)).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
 }
 
 /// The joiner's open pairing connection, waiting for the owner.
@@ -188,29 +276,107 @@ pub async fn start_pairing(
     Ok(PairingConnection { joiner, stream })
 }
 
-/// Accepts one connection from the paired device and runs a sync session.
-/// A client presenting any other certificate is refused during the
-/// handshake.
+/// Pinned TLS settings for syncing with the paired device. Handshakes made
+/// through it never touch the vault.
+pub struct SyncEndpoint {
+    acceptor: TlsAcceptor,
+    connector: TlsConnector,
+    peer: Peer,
+}
+
+impl SyncEndpoint {
+    pub fn load(peers: &mut PeerStore) -> Result<Self> {
+        let identity = peers.transport_identity()?;
+        let peer = peers.peers()?.into_iter().next().ok_or(Error::NotPaired)?;
+        Ok(Self {
+            acceptor: TlsAcceptor::from(server_config(
+                &identity,
+                ClientPolicy::Pinned(vec![peer.transport_pin]),
+            )?),
+            connector: TlsConnector::from(client_config(&identity, peer.transport_pin)?),
+            peer,
+        })
+    }
+
+    pub fn peer(&self) -> &Peer {
+        &self.peer
+    }
+
+    /// Handshakes with an incoming connection, refusing any certificate but
+    /// the paired device's.
+    pub async fn accept(&self, tcp: TcpStream) -> Result<SyncConnection> {
+        let remote = tcp.peer_addr()?.ip();
+        let stream = with_timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(tcp))
+            .await?
+            .map_err(handshake_error)?;
+        Ok(SyncConnection {
+            stream: tokio_rustls::TlsStream::Server(stream),
+            remote,
+        })
+    }
+
+    /// Dials the paired device, refusing any certificate but its own.
+    pub async fn connect(&self, address: &str) -> Result<SyncConnection> {
+        let tcp = connect_first(&[address.to_owned()]).await?;
+        let remote = tcp.peer_addr()?.ip();
+        let stream = with_timeout(
+            HANDSHAKE_TIMEOUT,
+            self.connector.connect(server_name(), tcp),
+        )
+        .await?
+        .map_err(handshake_error)?;
+        Ok(SyncConnection {
+            stream: tokio_rustls::TlsStream::Client(stream),
+            remote,
+        })
+    }
+}
+
+/// An authenticated connection to the paired device, ready for a session.
+pub struct SyncConnection {
+    stream: tokio_rustls::TlsStream<TcpStream>,
+    remote: IpAddr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncOutcome {
+    pub report: SyncReport,
+    /// Where the peer can be reached: the address it connected from, with
+    /// the port it says it listens on. `None` if it does not listen.
+    pub peer_address: Option<String>,
+}
+
+impl SyncConnection {
+    /// Runs a session. `listen_port` tells the peer where this device can be
+    /// reached, if it listens.
+    pub async fn run(self, vault: &mut Vault, listen_port: Option<u16>) -> Result<SyncOutcome> {
+        let remote = self.remote;
+        let (report, peer_port) = run_session(self.stream, vault, listen_port).await?;
+        Ok(SyncOutcome {
+            report,
+            peer_address: peer_port.map(|port| SocketAddr::new(remote, port).to_string()),
+        })
+    }
+}
+
+/// Accepts one connection from the paired device and runs a sync session,
+/// then records where the peer listens. A client presenting any other
+/// certificate is refused during the handshake.
 pub async fn serve_sync(
     listener: &TcpListener,
     vault: &mut Vault,
     peers: &mut PeerStore,
 ) -> Result<SyncReport> {
-    let identity = peers.transport_identity()?;
-    let pins: Vec<[u8; 32]> = peers
-        .peers()?
-        .iter()
-        .map(|peer| peer.transport_pin)
-        .collect();
-    if pins.is_empty() {
-        return Err(Error::NotPaired);
-    }
-    let acceptor = TlsAcceptor::from(server_config(&identity, ClientPolicy::Pinned(pins))?);
+    let endpoint = SyncEndpoint::load(peers)?;
     let (tcp, _) = listener.accept().await?;
-    let stream = with_timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
-        .await?
-        .map_err(handshake_error)?;
-    run_session(stream, vault).await
+    let connection = endpoint.accept(tcp).await?;
+    let outcome = connection
+        .run(vault, Some(listener.local_addr()?.port()))
+        .await?;
+    if let Some(address) = &outcome.peer_address {
+        peers.set_address(&endpoint.peer().device_id, address)?;
+    }
+    Ok(outcome.report)
 }
 
 /// Connects to the paired device at `address`, pinning its certificate, and
@@ -220,27 +386,27 @@ pub async fn connect_sync(
     vault: &mut Vault,
     peers: &mut PeerStore,
 ) -> Result<SyncReport> {
-    let identity = peers.transport_identity()?;
-    let peer = peers.peers()?.into_iter().next().ok_or(Error::NotPaired)?;
-    let connector = TlsConnector::from(client_config(&identity, peer.transport_pin)?);
-    let tcp = connect_first(&[address.to_owned()]).await?;
-    let stream = with_timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name(), tcp))
-        .await?
-        .map_err(handshake_error)?;
-    run_session(stream, vault).await
+    let endpoint = SyncEndpoint::load(peers)?;
+    let connection = endpoint.connect(address).await?;
+    Ok(connection.run(vault, None).await?.report)
 }
 
-/// Drives a [`SyncSession`] over a byte stream. Reading and writing run
+/// Drives a [`SyncSession`] over a byte stream and returns the report and
+/// the port the peer says it listens on. Reading and writing run
 /// concurrently, so two peers sending large batches at once cannot block
 /// each other on full socket buffers.
-pub(crate) async fn run_session<S>(stream: S, vault: &mut Vault) -> Result<SyncReport>
+pub(crate) async fn run_session<S>(
+    stream: S,
+    vault: &mut Vault,
+    listen_port: Option<u16>,
+) -> Result<(SyncReport, Option<u16>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut reader, writer) = tokio::io::split(stream);
     let (outgoing, queued) = mpsc::channel::<Vec<u8>>(OUTGOING_FRAMES);
     let writer = tokio::spawn(write_frames(writer, queued));
-    let (mut session, opening) = SyncSession::start(vault)?;
+    let (mut session, opening) = SyncSession::start(vault, listen_port)?;
     for message in opening {
         outgoing
             .send(encode_frame(&message)?)
@@ -259,7 +425,7 @@ where
     // Closing the queue lets the writer flush what is left and shut down.
     drop(outgoing);
     writer.await.map_err(|_| Error::ConnectionClosed)??;
-    Ok(session.report().clone())
+    Ok((session.report().clone(), session.peer_listen_port()))
 }
 
 async fn write_frames<W: AsyncWrite + Unpin>(

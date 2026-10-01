@@ -25,7 +25,10 @@ pub use pairing::{
 };
 pub use peers::{Peer, PeerStore, TransportIdentity, MAX_PEERS};
 pub use session::{SyncMessage, SyncReport, SyncSession, PROTOCOL_VERSION};
-pub use transport::{accept_pairing, connect_sync, serve_sync, start_pairing, PairingConnection};
+pub use transport::{
+    accept_pairing, connect_sync, serve_sync, start_pairing, ApprovedJoin, IncomingJoin,
+    PairingConnection, PairingListener, PendingJoin, SyncConnection, SyncEndpoint, SyncOutcome,
+};
 
 #[cfg(test)]
 mod tests;

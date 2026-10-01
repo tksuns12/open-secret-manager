@@ -184,6 +184,10 @@ pub struct JoinGrant {
     recovery_nonce: [u8; 24],
     recovery_wrapped_key: Vec<u8>,
     devices: Vec<DeviceEntry>,
+    /// Port the inviter accepts sync connections on, if it listens. The
+    /// joiner pairs it with the inviter's address from the invitation; the
+    /// pairing port itself closes after pairing.
+    inviter_sync_port: Option<u16>,
     /// Inviter's pairing signature over the transcript and every field.
     signature: Vec<u8>,
 }
@@ -202,6 +206,13 @@ impl JoinGrant {
         for device in &self.devices {
             message.extend_from_slice(&device.device_id);
             message.extend_from_slice(&device.public_key);
+        }
+        match self.inviter_sync_port {
+            Some(port) => {
+                message.push(1);
+                message.extend_from_slice(&port.to_be_bytes());
+            }
+            None => message.push(0),
         }
         message
     }
@@ -313,11 +324,13 @@ pub fn review_join(
 ///
 /// The grant is built before any side effect, then the token is consumed so
 /// it cannot be replayed, and only then is the joiner authorized.
+/// `sync_port` is where this device accepts sync connections, if it listens.
 pub fn approve_join(
     vault: &mut Vault,
     invitations: &mut InvitationStore,
     peers: &mut PeerStore,
     review: JoinReview,
+    sync_port: Option<u16>,
     now: u64,
 ) -> Result<JoinGrant> {
     peers.ensure_capacity()?;
@@ -345,6 +358,7 @@ pub fn approve_join(
                 public_key: *public_key,
             })
             .collect(),
+        inviter_sync_port: sync_port.filter(|port| *port != 0),
         signature: Vec::new(),
     };
     grant.signature = vault
@@ -493,7 +507,7 @@ impl Joiner {
             device_id: inviter.device_id,
             public_key: inviter.public_key,
             transport_pin: body.inviter_transport_pin,
-            address: body.addresses.first().cloned(),
+            address: sync_address(body.addresses.first(), grant.inviter_sync_port),
             paired_at: now,
         };
         let vault = Vault::join(path, password, self.device, material)?;
@@ -541,6 +555,19 @@ fn transcript(inviter: &Inviter<'_>, request: &JoinRequest) -> [u8; 32] {
         .chain_update(request.joiner_transport_pin)
         .finalize()
         .into()
+}
+
+/// The inviter's sync address: its pairing host with the sync port from the
+/// signed grant, or the pairing address if it named no sync port.
+fn sync_address(pairing: Option<&String>, sync_port: Option<u16>) -> Option<String> {
+    let pairing = pairing?;
+    match (pairing.parse::<std::net::SocketAddr>(), sync_port) {
+        (Ok(mut address), Some(port)) => {
+            address.set_port(port);
+            Some(address.to_string())
+        }
+        _ => Some(pairing.clone()),
+    }
 }
 
 fn valid_addresses(addresses: &[String]) -> bool {

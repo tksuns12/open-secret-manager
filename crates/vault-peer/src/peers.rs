@@ -165,6 +165,18 @@ impl PeerStore {
         Ok(())
     }
 
+    /// Records where a paired device was last reachable.
+    pub fn set_address(&mut self, device_id: &[u8; 16], address: &str) -> Result<()> {
+        if address.is_empty() || address.len() > MAX_ADDRESS_LEN {
+            return Err(Error::InvalidAddress);
+        }
+        self.connection.execute(
+            "UPDATE peers SET address = ?1 WHERE device_id = ?2",
+            params![address, device_id.as_slice()],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn add(&mut self, peer: &Peer) -> Result<()> {
         if peer
             .address

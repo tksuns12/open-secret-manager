@@ -1,12 +1,25 @@
 import { useEffect, useMemo, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, KeyRound, LockKeyhole, MoreHorizontal, Plus, Search, ShieldCheck, Sparkles, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge } from "./bridge";
-import type { EntryDetail, EntryInput, EntryKind, SyncState, VaultEntry, VersionSummary } from "./types";
+import type { EntryDetail, EntryInput, EntryKind, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
 type Filter = (typeof filters)[number];
 type EditorState = { mode: "create" } | { mode: "edit"; detail: EntryDetail };
 type ReviewState = { id: string; title: string; versions: VersionSummary[] };
+type InviteState = { code: string; sas?: string };
+
+/** Topbar wording and colour for each sync state. */
+function syncLabel(status: SyncStatus): { tone: SyncState; text: string } {
+  switch (status.state) {
+    case "synced": return { tone: "connected", text: "Synced" };
+    case "idle": return { tone: "connected", text: "Paired" };
+    case "syncing": return { tone: "received", text: "Syncing…" };
+    case "received": return { tone: "received", text: "Received · unlock to apply" };
+    case "error": return { tone: "offline", text: "Sync failed" };
+    default: return { tone: "offline", text: "Local only" };
+  }
+}
 
 function App() {
   const [entries, setEntries] = useState<VaultEntry[]>([]);
@@ -18,7 +31,10 @@ function App() {
   const [selected, setSelected] = useState("1");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("All items");
-  const [sync] = useState<SyncState>("offline");
+  const [sync, setSync] = useState<SyncStatus>({ state: "unpaired", pending: 0 });
+  const [devicesOpen, setDevicesOpen] = useState(false);
+  const [invite, setInvite] = useState<InviteState | null>(null);
+  const [joining, setJoining] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [generatorOpen, setGeneratorOpen] = useState(false);
   const [editor, setEditor] = useState<EditorState | null>(null);
@@ -30,6 +46,22 @@ function App() {
       setLocked(status !== "unlocked");
       if (status === "unlocked") setEntries(await bridge.listEntries());
     }).catch(() => { setVaultStatus("missing"); setLocked(true); });
+  }, []);
+  useEffect(() => {
+    void bridge.syncStatus().then(setSync).catch(() => {});
+    const subscriptions = [
+      bridge.listen<SyncStatus>("sync-status", setSync),
+      // A sync merged revisions: reload the list if the vault is readable.
+      bridge.listen("vault-changed", () => {
+        void bridge.status().then(async (status) => { if (status === "unlocked") setEntries(await bridge.listEntries()); });
+      }),
+      bridge.listen<string>("pairing-code", (sas) => setInvite((current) => current && { ...current, sas })),
+      bridge.listen<{ paired: boolean; message?: string }>("pairing-finished", (result) => {
+        setInvite(null);
+        setNotice(result.paired ? "Device paired · it will sync shortly" : `Pairing ended · ${result.message ?? "not completed"}`);
+      }),
+    ];
+    return () => { for (const subscription of subscriptions) void subscription.then((unlisten) => unlisten()); };
   }, []);
   useEffect(() => {
     let timer = window.setTimeout(() => { void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); }, 5 * 60 * 1000);
@@ -120,6 +152,44 @@ function App() {
     }
   }
 
+  async function startInvite() {
+    try {
+      const created = await bridge.startInvite();
+      setInvite({ code: created.code });
+    } catch (error) {
+      setNotice(commandMessage(error, "An invitation could not be created"));
+    }
+  }
+
+  async function answerInvite(accept: boolean) {
+    try {
+      await bridge.confirmInvite(accept);
+      if (!accept) setInvite(null);
+    } catch (error) {
+      setNotice(commandMessage(error, "That pairing is no longer waiting"));
+    }
+  }
+
+  async function cancelInvite() {
+    await bridge.cancelInvite().catch(() => {});
+    setInvite(null);
+  }
+
+  async function syncNow() {
+    try {
+      await bridge.syncNow();
+    } catch (error) {
+      setNotice(commandMessage(error, "Sync could not start"));
+    }
+  }
+
+  async function joined() {
+    setVaultStatus("unlocked");
+    setLocked(false);
+    setEntries(await bridge.listEntries());
+    setNotice("Joined · copying the vault from the other device");
+  }
+
   async function lock() {
     await bridge.lock();
     setEntries([]);
@@ -162,34 +232,124 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark"><KeyRound size={17} strokeWidth={2.5} /></div><span>open secret</span><span className="brand-dot">·</span></div>
-        <div className="vault-chip"><div className="vault-emblem"><ShieldCheck size={16} /></div><div><strong>Personal vault</strong><span>{previewMode ? "Development preview · local only" : "Owner device · local only"}</span></div><ChevronRight size={15} className="muted" /></div>
+        <div className="vault-chip"><div className="vault-emblem"><ShieldCheck size={16} /></div><div><strong>Personal vault</strong><span>{previewMode ? "Development preview · local only" : sync.peer ? "Owner device · paired" : "Owner device · local only"}</span></div><ChevronRight size={15} className="muted" /></div>
         <button className="new-item" onClick={() => { if (!locked) setEditor({ mode: "create" }); }} disabled={locked}><Plus size={17} /> New item <span>⌘ N</span></button>
         <nav className="nav-list" aria-label="Vault filters">
           <p className="nav-caption">YOUR VAULT <span>{entries.length}</span></p>
           {filters.map((item) => <button key={item} className={`nav-item ${filter === item ? "active" : ""}`} onClick={() => setFilter(item)}><span className={`nav-icon ${item === "Favorites" ? "star" : ""}`}>{item === "All items" ? "⌂" : item === "Favorites" ? "★" : item === "Logins" ? "↗" : "▤"}</span>{item}<span className="nav-count">{item === "All items" ? entries.length : item === "Favorites" ? entries.filter((e) => e.favorite).length : item === "Logins" ? entries.filter((e) => e.kind === "login").length : entries.filter((e) => e.kind === "secure_note").length}</span></button>)}
         </nav>
-        <div className="sidebar-bottom"><button className="utility" onClick={() => setGeneratorOpen(true)}><Sparkles size={16} /> Generator</button><button className="utility"><Archive size={16} /> Archive</button><button className="utility"><Clock3 size={16} /> Activity</button><button className="utility"><MoreHorizontal size={16} /> Settings</button><div className="device-card"><div className="device-icon"><Fingerprint size={18} /></div><div><strong>This device</strong><span>{previewMode ? "Preview data only" : "Sync adapter pending"}</span></div><span className="online-dot offline-dot" /></div></div>
+        <div className="sidebar-bottom"><button className="utility" onClick={() => setGeneratorOpen(true)}><Sparkles size={16} /> Generator</button><button className="utility"><Archive size={16} /> Archive</button><button className="utility"><Clock3 size={16} /> Activity</button><button className="utility"><MoreHorizontal size={16} /> Settings</button><button className="device-card" onClick={() => setDevicesOpen(true)} disabled={previewMode}><div className="device-icon"><Fingerprint size={18} /></div><div><strong>This device</strong><span>{previewMode ? "Preview data only" : sync.peer ? `Paired with ${sync.peer}` : "Not paired · tap to pair"}</span></div><span className={`online-dot ${sync.state === "synced" || sync.state === "idle" ? "" : "offline-dot"}`} /></button></div>
       </aside>
 
       <section className="content-pane">
-        <header className="topbar"><div className="breadcrumbs"><span>Personal vault</span><ChevronRight size={15} /><strong>{filter}</strong></div><div className="top-actions"><div className={`sync-status ${sync}`}><span className="status-dot" />{sync === "connected" ? "Synced" : sync === "received" ? "Received · unlock to apply" : "Offline"}</div><button className="icon-button" title="Lock vault" onClick={lock}><LockKeyhole size={18} /></button><div className="avatar">YK</div></div></header>
+        <header className="topbar"><div className="breadcrumbs"><span>Personal vault</span><ChevronRight size={15} /><strong>{filter}</strong></div><div className="top-actions"><button className={`sync-status ${syncLabel(sync).tone}`} onClick={() => setDevicesOpen(true)} disabled={previewMode} title={sync.message ?? undefined}><span className="status-dot" />{syncLabel(sync).text}</button><button className="icon-button" title="Lock vault" onClick={lock}><LockKeyhole size={18} /></button><div className="avatar">YK</div></div></header>
         <div className="workspace">
           <div className="list-column">
             <div className="list-heading"><div><p className="eyebrow">{filter.toUpperCase()}</p><h1>{visible.length} <span>items</span></h1></div><button className="icon-button bordered" title="Import"><ArrowDownToLine size={17} /></button></div>
             <label className="search-box"><Search size={17} /><input aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
             <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{entry.username ?? "Secure note"}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}<small>{entry.updatedAt}</small></div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
           </div>
-          <div className="detail-column">{locked ? <div className="empty-detail">{vaultStatus === "missing" ? <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>Unlock in the desktop window to view encrypted records.</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div></div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div><button className="icon-button"><MoreHorizontal size={19} /></button></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button><button onClick={copyTotp}><Copy size={15} /> Copy TOTP</button><button onClick={() => setNotice("Item link copied")}>Share <span className="action-arrow">↗</span></button></div><div className="record-card"><RecordField label="Username" value={active.username ?? "—"} /><RecordField label="Password" value="••••••••••••••" secret /><RecordField label="Website" value={active.url ?? "—"} link /></div><div className="history-note"><Clock3 size={15} /><div><strong>Revision history is retained</strong><span>Every edit keeps its signed parent revision.</span></div><ChevronRight size={15} /></div>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
+          <div className="detail-column">{locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{vaultStatus === "missing" ? <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div><button className="icon-button"><MoreHorizontal size={19} /></button></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button><button onClick={copyTotp}><Copy size={15} /> Copy TOTP</button><button onClick={() => setNotice("Item link copied")}>Share <span className="action-arrow">↗</span></button></div><div className="record-card"><RecordField label="Username" value={active.username ?? "—"} /><RecordField label="Password" value="••••••••••••••" secret /><RecordField label="Website" value={active.url ?? "—"} link /></div><div className="history-note"><Clock3 size={15} /><div><strong>Revision history is retained</strong><span>Every edit keeps its signed parent revision.</span></div><ChevronRight size={15} /></div>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
         </div>
         {recoveryKey && !locked && <div className="recovery-overlay"><div className="recovery-card"><strong>Recovery key · store this offline</strong><code>{recoveryKey}</code><span>It will be cleared when you acknowledge it or the vault locks.</span><button onClick={() => setRecoveryKey(null)}>I stored it</button></div></div>}
-        <footer className="footer-bar"><div><Wifi size={14} /><span>{previewMode ? "Development preview" : "Local vault"}</span><span className="footer-separator">•</span><span>{previewMode ? "No native sync session" : "Sync adapter pending"}</span></div><button onClick={() => setNotice(previewMode ? "Sync activity is unavailable in the browser preview" : "Sync transport is not connected yet")}>View activity <ChevronRight size={14} /></button></footer>
+        <footer className="footer-bar"><div><Wifi size={14} /><span>{previewMode ? "Development preview" : "Local vault"}</span><span className="footer-separator">•</span><span>{previewMode ? "No native sync session" : syncDetail(sync)}</span></div><button onClick={() => previewMode ? setNotice("Sync is unavailable in the browser preview") : setDevicesOpen(true)}>Devices <ChevronRight size={14} /></button></footer>
       </section>
       {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
       {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Pairing and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div><DevicesPanel sync={sync} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {notice && <div className="toast"><ShieldCheck size={15} />{notice}</div>}
     </main>
   );
+}
+
+function syncDetail(status: SyncStatus): string {
+  if (status.state === "unpaired") return "Not paired";
+  if (status.state === "error") return status.message ?? "Sync failed";
+  if (status.state === "syncing") return "Syncing with paired device";
+  if (status.lastSyncedAt) return `Last synced ${new Date(status.lastSyncedAt * 1000).toLocaleTimeString()}`;
+  return "Paired · not synced yet";
+}
+
+function DevicesPanel({ sync, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onCopy }: { sync: SyncStatus; invite: InviteState | null; locked: boolean; onInvite: () => void; onAnswer: (accept: boolean) => void; onCancelInvite: () => void; onSync: () => void; onCopy: (text: string) => void }) {
+  if (sync.peer) {
+    return <div className="device-panel">
+      <div className="peer-row"><div className="device-icon"><Fingerprint size={18} /></div><div><strong>Paired device {sync.peer}</strong><span>{sync.peerAddress ?? "Its address is learned at the first sync"}</span></div></div>
+      <p className="review-hint">{syncDetail(sync)}{sync.pending > 0 ? ` · ${sync.pending} waiting for unlock` : ""}</p>
+      <p className="review-hint">Changes sync shortly after you edit, when you unlock, and when you ask. While this app is open, the paired device can reach it, even when locked.</p>
+      <button className="generate-button" onClick={onSync} disabled={sync.state === "syncing"}>Sync now</button>
+    </div>;
+  }
+  if (invite?.sas) {
+    return <div className="device-panel">
+      <p className="review-hint">Compare this code with the one on the other device. Confirm only if they are identical.</p>
+      <div className="sas-code">{invite.sas}</div>
+      <div className="form-actions"><button className="secondary" onClick={() => onAnswer(false)}>They differ</button><button className="generate-button" onClick={() => onAnswer(true)}>Codes match</button></div>
+    </div>;
+  }
+  if (invite) {
+    return <div className="device-panel">
+      <p className="review-hint">On the other device, choose “Join a vault from another device” and paste this invitation. It works once and expires in 15 minutes.</p>
+      <div className="generated-value"><code>{invite.code}</code><button onClick={() => onCopy(invite.code)} title="Copy invitation"><Copy size={16} /></button></div>
+      <p className="review-hint">Waiting for the other device…</p>
+      <div className="form-actions"><button className="secondary" onClick={onCancelInvite}>Cancel</button></div>
+    </div>;
+  }
+  return <div className="device-panel">
+    <p className="review-hint">Pair one other device. Each keeps a full encrypted copy and they sync directly, with no server. You will compare a six-digit code on both screens.</p>
+    <button className="generate-button" onClick={onInvite} disabled={locked}>{locked ? "Unlock to invite a device" : "Invite a device"}</button>
+  </div>;
+}
+
+function JoinPanel({ onCancel, onJoined, onNotice }: { onCancel: () => void; onJoined: () => void; onNotice: (text: string) => void }) {
+  const [code, setCode] = useState("");
+  const [sas, setSas] = useState<string | null>(null);
+  const [password, setPassword] = useState("");
+  const [waiting, setWaiting] = useState(false);
+
+  async function connect() {
+    try {
+      setSas((await bridge.joinStart(code.trim())).sas);
+    } catch (error) {
+      onNotice(commandMessage(error, "Could not reach the inviting device"));
+    }
+  }
+
+  async function finish() {
+    if (password.length < 12) { onNotice("Use at least 12 characters for this device password"); return; }
+    setWaiting(true);
+    try {
+      // Resolves once the owner also confirms on the inviting device.
+      await bridge.joinFinish(password);
+      setPassword("");
+      onJoined();
+    } catch (error) {
+      setWaiting(false);
+      setSas(null);
+      onNotice(commandMessage(error, "Joining did not complete"));
+    }
+  }
+
+  async function cancel() {
+    await bridge.cancelJoin().catch(() => {});
+    onCancel();
+  }
+
+  if (!sas) {
+    return <div className="empty-detail">
+      <Fingerprint size={25} /><h2>Join an existing vault</h2>
+      <span>On your other device, open Devices and choose Invite a device. Paste the invitation here.</span>
+      <textarea className="join-code" aria-label="Invitation" rows={4} value={code} onChange={(event) => setCode(event.target.value)} placeholder="OSM-PAIR1-…" />
+      <div className="form-actions join-actions"><button className="secondary" onClick={() => void cancel()}>Cancel</button><button className="generate-button" disabled={!code.trim()} onClick={() => void connect()}>Continue</button></div>
+    </div>;
+  }
+  return <div className="empty-detail">
+    <ShieldCheck size={25} /><h2>Compare the codes</h2>
+    <span>The other device shows a code too. Continue only if they are identical.</span>
+    <div className="sas-code">{sas}</div>
+    <div className="unlock-form"><input aria-label="New device password" type="password" placeholder="New password for this device" value={password} disabled={waiting} onChange={(event) => setPassword(event.target.value)} /></div>
+    <div className="form-actions join-actions"><button className="secondary" disabled={waiting} onClick={() => void cancel()}>They differ</button><button className="generate-button" disabled={waiting || !password} onClick={() => void finish()}>{waiting ? "Waiting for the other device…" : "Codes match · join"}</button></div>
+  </div>;
 }
 
 function RecordField({ label, value, secret, link }: { label: string; value: string; secret?: boolean; link?: boolean }) {
@@ -200,6 +360,13 @@ function commandMessage(error: unknown, fallback: string): string {
   const code = (error as { code?: string } | null)?.code;
   if (code === "conflict") return "This item changed since you opened it · reopen to edit";
   if (code === "unresolved") return "This item has conflicting versions · review them first";
+  if (code === "not_confirmed") return "The pairing was declined";
+  if (code === "pin_mismatch") return "That device is not the one in the invitation";
+  if (code === "invitation_expired") return "The invitation has expired · create a new one";
+  if (code === "invalid_invitation") return "That is not a valid invitation";
+  if (code === "peer_limit") return "This vault already has a paired device";
+  if (code === "peer_address") return (error as { message?: string }).message ?? fallback;
+  if (code === "network" || code === "timeout") return `${fallback} · ${(error as { message?: string }).message ?? "network error"}`;
   if (code === "invalid_item") return (error as { message?: string }).message ?? fallback;
   if (code === "locked") return "Unlock the vault first";
   return fallback;

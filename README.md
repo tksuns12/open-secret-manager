@@ -26,10 +26,11 @@ The repository is deliberately split at the security boundary:
 The prototype is intentionally offline-first. Local vault use does not depend
 on a peer or a network. Two devices can pair (owner-confirmed, one peer until
 committed membership exists) and sync over pinned TLS; a locked device stores
-what it receives and verifies it at the next unlock. Discovery and the desktop
-pairing interface are not done. Membership changes and key rotation remain
-blocked at the OpenRaft integration boundary until a committed majority
-adapter exists.
+what it receives and verifies it at the next unlock. The desktop app pairs from
+its Devices panel and syncs automatically on the local network; there is no
+discovery beyond the address in the invitation. Membership changes and key
+rotation remain blocked at the OpenRaft integration boundary until a committed
+majority adapter exists.
 
 ## Development
 

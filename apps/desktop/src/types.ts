@@ -51,6 +51,18 @@ export type VersionSummary = {
 
 export type SyncState = "connected" | "received" | "offline";
 
+/** Mirrors the desktop shell's sync status; secrets never appear here. */
+export type SyncStatus = {
+  state: "unpaired" | "idle" | "syncing" | "synced" | "received" | "error";
+  lastSyncedAt?: number;
+  message?: string;
+  /** Short ID of the paired device. */
+  peer?: string;
+  peerAddress?: string;
+  /** Revisions received while locked, verified at the next unlock. */
+  pending: number;
+};
+
 export type DesktopBridge = {
   status: () => Promise<"missing" | "locked" | "unlocked">;
   listEntries: () => Promise<VaultEntry[]>;
@@ -64,4 +76,14 @@ export type DesktopBridge = {
   updateEntry: (id: string, expectedRevision: string, input: EntryInput) => Promise<VaultEntry>;
   listVersions: (id: string) => Promise<VersionSummary[]>;
   resolveEntry: (id: string, keepRevision: string, heads: string[]) => Promise<void>;
+  syncStatus: () => Promise<SyncStatus>;
+  syncNow: () => Promise<void>;
+  startInvite: () => Promise<{ code: string; expiresAt: number }>;
+  confirmInvite: (accept: boolean) => Promise<void>;
+  cancelInvite: () => Promise<void>;
+  joinStart: (code: string) => Promise<{ sas: string }>;
+  joinFinish: (password: string) => Promise<void>;
+  cancelJoin: () => Promise<void>;
+  /** Subscribes to a shell event; resolves to an unsubscribe function. */
+  listen: <T>(event: string, handler: (payload: T) => void) => Promise<() => void>;
 };

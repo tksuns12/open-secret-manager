@@ -77,6 +77,7 @@ fn pair(dir: &Path, a: &mut Device) -> Device {
         &mut a.invitations,
         &mut a.peers,
         review,
+        Some(47820),
         NOW + 3,
     )
     .unwrap();
@@ -114,8 +115,8 @@ fn run_sync(
     b: &mut Vault,
     mut fault: impl FnMut(bool, &SyncMessage) -> Fault,
 ) -> Result<(bool, SyncReport, SyncReport), Error> {
-    let (mut session_a, opening_a) = SyncSession::start(a)?;
-    let (mut session_b, opening_b) = SyncSession::start(b)?;
+    let (mut session_a, opening_a) = SyncSession::start(a, None)?;
+    let (mut session_b, opening_b) = SyncSession::start(b, None)?;
     // (to_b, message)
     let mut queue: std::collections::VecDeque<(bool, Vec<u8>)> = opening_a
         .iter()
@@ -192,6 +193,12 @@ fn paired_devices_sync_in_both_directions() {
     assert_eq!(
         b.peers.peers().unwrap()[0].device_id,
         a.vault.device_id().unwrap()
+    );
+    // The joiner reaches the inviter at its sync port from the signed grant,
+    // not at the pairing port from the invitation, which closes after pairing.
+    assert_eq!(
+        b.peers.peers().unwrap()[0].address.as_deref(),
+        Some("127.0.0.1:47820")
     );
 
     // Initial sync copies the vault to the new device.
@@ -466,7 +473,15 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
     let (joiner, request) =
         Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
     let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
-    let grant = approve_join(&mut a.vault, &mut a.invitations, &mut a.peers, review, NOW).unwrap();
+    let grant = approve_join(
+        &mut a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        review,
+        None,
+        NOW,
+    )
+    .unwrap();
     let mut tampered: JoinGrant = over_wire(&grant);
     tampered.tamper_devices();
     let mut peers = PeerStore::open_in_memory().unwrap();
@@ -516,7 +531,15 @@ fn the_joiner_requires_owner_confirmation() {
     )
     .unwrap();
     let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
-    let grant = approve_join(&mut a.vault, &mut a.invitations, &mut a.peers, review, NOW).unwrap();
+    let grant = approve_join(
+        &mut a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        review,
+        None,
+        NOW,
+    )
+    .unwrap();
     let path = dir.path().join("b.db");
     let mut peers = PeerStore::open_in_memory().unwrap();
     assert!(matches!(
