@@ -27,8 +27,8 @@ pub mod wire;
 
 pub use error::{Error, Result};
 pub use members::{
-    serve_members, start_node, AddressBook, ControlConnection, ControlLink, MemberContact,
-    MemberEndpoint, MAX_CONTACTS, MEMBER_PROTOCOL_VERSION,
+    serve_members, start_node, AddressBook, ControlConnection, ControlLink, Incoming,
+    MemberContact, MemberEndpoint, MemberSync, MAX_CONTACTS, MEMBER_PROTOCOL_VERSION,
 };
 pub use pairing::{
     approve_enrollment, approve_join, invite, review_join, DeviceEntry, EnrollmentGrant,

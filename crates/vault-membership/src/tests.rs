@@ -1071,6 +1071,38 @@ async fn connections_are_accepted_from_recorded_and_introduced_devices_only() {
     let directory = cluster.running[&leader].directory();
     directory.introduce([(removed, pin(removed))]);
     assert_eq!(directory.device_for_pin(&pin(removed)), None);
+    // Its certificate is remembered only to tell it that it was removed.
+    assert_eq!(
+        directory.removed_device_for_pin(&pin(removed)),
+        Some(removed)
+    );
+    assert_eq!(directory.removed_device_for_pin(&pin(leader)), None);
+    assert!(!directory.is_member(removed));
+
+    // While another device's change is pending, the rest stay members;
+    // the device being removed does not.
+    let other = remaining
+        .iter()
+        .copied()
+        .find(|device| *device != leader)
+        .unwrap();
+    cluster.crash(other).await;
+    let leaving = remaining
+        .iter()
+        .copied()
+        .find(|device| *device != leader && *device != other)
+        .unwrap();
+    let removal = cluster.remove(leader, 4, leaving);
+    assert_eq!(
+        cluster.running[&leader].submit(removal).await.unwrap(),
+        Outcome::Accepted
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let state = cluster.running[&leader].state();
+    assert!(state.pending.is_some());
+    assert!(state.is_active_member(leader) && state.is_active_member(other));
+    assert!(!state.is_active_member(leaving));
+    assert!(!directory.is_member(leaving));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

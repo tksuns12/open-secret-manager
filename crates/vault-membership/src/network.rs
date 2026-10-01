@@ -384,10 +384,25 @@ impl Directory {
     }
 
     /// Whether this node's committed state lists `device` as an enrolled
-    /// member that no pending change concerns.
+    /// member that has not been removed and is not being removed. Only such
+    /// a device is synced with or believed about other members.
     pub fn is_member(&self, device: DeviceId) -> bool {
-        self.with_state(|state| state.is_settled_member(device))
+        self.with_state(|state| state.is_active_member(device))
             .unwrap_or(false)
+    }
+
+    /// The removed device that had the certificate with this pin, if any.
+    /// A removed device is never served; a transport may still complete a
+    /// handshake with it to tell it that it was removed.
+    pub fn removed_device_for_pin(&self, pin: &[u8; 32]) -> Option<DeviceId> {
+        self.with_state(|state| {
+            state
+                .removed_pins
+                .iter()
+                .find(|(_, known)| *known == pin)
+                .map(|(device, _)| *device)
+        })
+        .flatten()
     }
 
     /// Every device this node accepts, with its pin.

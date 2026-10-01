@@ -44,6 +44,10 @@ pub enum Error {
     InvalidRevision(osm_vault_core::Error),
     #[error("the vault's devices did not accept this device")]
     EnrollmentRefused,
+    #[error("that device is not a member of this vault")]
+    NotAMember,
+    #[error("this device was removed from the vault")]
+    Removed,
     #[error("invalid peer address")]
     InvalidAddress,
     #[error("no address is known for that device")]

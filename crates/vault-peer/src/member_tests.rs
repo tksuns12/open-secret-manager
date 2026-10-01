@@ -19,11 +19,15 @@ use osm_vault_sync::{
     seal_epoch_key, HpkeKeyPair, InvitationPolicy, InvitationStore, VaultId as SyncVaultId,
 };
 use tempfile::TempDir;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
 use crate::{
-    control, control_tests::until, invite, serve_members, start_node, start_pairing, AddressBook,
-    Error, MemberContact, MemberEndpoint, PairingListener, PeerStore,
+    control,
+    control_tests::{titles, until},
+    invite, serve_members, start_node, start_pairing,
+    tests::login,
+    AddressBook, Error, MemberContact, MemberEndpoint, MemberSync, PairingListener, PeerStore,
+    SyncReport,
 };
 
 const VAULT: [u8; 32] = [42; 32];
@@ -64,6 +68,8 @@ struct Host {
     endpoint: MemberEndpoint,
     node: Arc<ControlNode>,
     server: Option<JoinHandle<()>>,
+    /// Sync connections the accept loop took in.
+    incoming: Option<mpsc::Receiver<MemberSync>>,
 }
 
 impl Host {
@@ -80,6 +86,7 @@ impl Host {
             endpoint,
             node,
             server: None,
+            incoming: None,
         };
         host.listen().await;
         host
@@ -104,10 +111,13 @@ impl Host {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.endpoint
             .set_listen_port(listener.local_addr().unwrap().port());
+        let (sync, incoming) = mpsc::channel(4);
+        self.incoming = Some(incoming);
         self.server = Some(tokio::spawn(serve_members(
             listener,
             self.endpoint.clone(),
             self.node.clone(),
+            Some(sync),
         )));
     }
 
@@ -405,13 +415,22 @@ async fn the_control_plane_runs_between_devices_over_pinned_tls() {
     // so it can neither announce itself nor disturb the others.
     a.restart(VAULT).await;
     a.listen().await;
+    assert!(!a.endpoint.told_removed());
     for device in [&b, &c] {
-        assert!(a.endpoint.announce(device.id, device.pin()).await.is_err());
+        // It is told why, which is how it learns: the entry completing its
+        // removal was never sent to it.
+        assert!(matches!(
+            a.endpoint.announce(device.id, device.pin()).await,
+            Err(Error::Removed)
+        ));
         assert_eq!(
             device.node.directory().device_for_pin(&a.pin()),
             None::<DeviceId>
         );
+        // Nothing it says is taken in, such as where it now listens.
+        assert_ne!(device.addresses.get(a.id), a.contact().address);
     }
+    assert!(a.endpoint.told_removed());
     tokio::time::sleep(Duration::from_secs(3)).await;
     let term = b.node.raft().metrics().borrow().current_term;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -576,6 +595,86 @@ async fn a_device_that_missed_an_enrollment_accepts_the_new_member() {
     settle(&[&a, &b, &c, &d], &BTreeSet::from([1, 2, 3, 4])).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sync_channel_is_open_to_members_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, mut b, c) = three(&dir).await;
+    assert_eq!(a.endpoint.sync_peers(), vec![b.id, c.id]);
+    drop(a.endpoint.connect_sync(c.id).await.unwrap());
+
+    // A device still being enrolled may open control connections, so it
+    // can catch up, but nobody syncs with it.
+    let d = Bare::start(&dir, 4).await;
+    assert!(matches!(
+        d.endpoint.connect_sync(a.id).await,
+        Err(Error::NotAMember)
+    ));
+    assert!(matches!(
+        a.endpoint.connect_sync(d.id).await,
+        Err(Error::NotAMember)
+    ));
+
+    // C's removal is proposed but cannot complete while B is away. C has
+    // applied the proposal and still counts A as a member; A refuses it.
+    b.stop().await;
+    let removal = a.removal(30, &c, &[&a, &b], 2);
+    assert_eq!(a.node.submit(removal).await.unwrap(), Outcome::Accepted);
+    until("C applies the proposal", || c.state().pending.is_some()).await;
+    assert!(c.node.directory().is_member(a.id));
+    assert!(matches!(
+        c.endpoint.connect_sync(a.id).await,
+        Err(Error::NotAMember)
+    ));
+    assert!(matches!(
+        a.endpoint.connect_sync(c.id).await,
+        Err(Error::NotAMember)
+    ));
+    assert_eq!(a.endpoint.sync_peers(), vec![b.id]);
+    // The pending change does not stop the others from syncing.
+    assert!(a.node.directory().is_member(b.id));
+
+    // B returns and the removal completes; C is then told it was removed.
+    b.restart(VAULT).await;
+    b.listen().await;
+    b.endpoint.announce_all().await;
+    settle(&[&a, &b], &BTreeSet::from([1, 2])).await;
+    assert!(matches!(
+        c.endpoint.connect_sync(a.id).await,
+        Err(Error::Removed)
+    ));
+    assert!(c.endpoint.told_removed());
+}
+
+#[test]
+fn the_address_book_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("peers.db");
+    // The peer store and the address book share one file.
+    let mut peers = PeerStore::open(&path).unwrap();
+    let pin = peers.transport_identity().unwrap().pin();
+    let book = AddressBook::open(&path).unwrap();
+    book.observe(1, "192.0.2.1:47820");
+    book.suggest(1, "192.0.2.9:47820");
+    book.suggest(2, "192.0.2.2:47820");
+    book.observe(3, "");
+    book.observe(4, &"x".repeat(200));
+    drop(book);
+
+    let book = AddressBook::open(&path).unwrap();
+    assert_eq!(book.get(1).as_deref(), Some("192.0.2.1:47820"));
+    assert_eq!(book.get(2).as_deref(), Some("192.0.2.2:47820"));
+    assert_eq!(book.get(3), None);
+    assert_eq!(book.get(4), None);
+    assert_eq!(
+        PeerStore::open(&path)
+            .unwrap()
+            .transport_identity()
+            .unwrap()
+            .pin(),
+        pin
+    );
+}
+
 /// A device with a vault.
 struct Member {
     host: Host,
@@ -699,15 +798,36 @@ impl Member {
     }
 }
 
+/// Syncs two members over the member endpoint: `dialer` opens the
+/// connection and `server` takes it from its accept loop. Each brings its
+/// vault in line with its committed state first.
+async fn sync(dialer: &mut Member, server: &mut Member) -> (SyncReport, SyncReport) {
+    let target = server.host.id;
+    let dial = async {
+        let connection = dialer.host.endpoint.connect_sync(target).await.unwrap();
+        let state = dialer.host.state();
+        connection.run(&mut dialer.vault, &state).await.unwrap()
+    };
+    let serve = async {
+        let incoming = server.host.incoming.as_mut().unwrap();
+        let connection = incoming.recv().await.unwrap();
+        assert_eq!(connection.device(), dialer.host.id);
+        let state = server.host.state();
+        connection.run(&mut server.vault, &state).await.unwrap()
+    };
+    tokio::join!(dial, serve)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn devices_pair_into_the_control_plane_over_tls() {
+async fn devices_pair_sync_and_rotate_over_tls() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = Member::found(&dir).await;
+    a.vault.put(login("From A", "a-secret")).unwrap();
     let mut b = a.invite(&dir, "b", None).await;
     // B, a follower, invites the third device: its proposal is passed to
     // the leader, and the grant tells C about A, which leads.
     assert!(a.host.leads());
-    let c = b.invite(&dir, "c", None).await;
+    let mut c = b.invite(&dir, "c", None).await;
 
     let voters: BTreeSet<DeviceId> = [&a, &b, &c].iter().map(|member| member.host.id).collect();
     until("every device applies the enrollments", || {
@@ -729,6 +849,17 @@ async fn devices_pair_into_the_control_plane_over_tls() {
         "the joiner learned the leader's address from the grant"
     );
 
+    // Any member syncs with any other: C fetches the vault from A, which
+    // did not invite it, and C's edit reaches A through B.
+    let (received, sent) = sync(&mut c, &mut a).await;
+    assert_eq!((received.applied, sent.sent), (1, 1));
+    c.vault.put(login("From C", "c-secret")).unwrap();
+    let (_, received) = sync(&mut c, &mut b).await;
+    assert_eq!((received.applied, received.quarantined), (2, 0));
+    let (_, received) = sync(&mut b, &mut a).await;
+    assert_eq!((received.applied, received.quarantined), (1, 0));
+    assert_eq!(titles(&a.vault), vec!["From A", "From C"]);
+
     // A removes C; A and B take the new epoch from their envelopes.
     let removal =
         control::removal_request(&a.vault, &a.host.state(), c.vault.device_id().unwrap()).unwrap();
@@ -740,22 +871,33 @@ async fn devices_pair_into_the_control_plane_over_tls() {
         })
     })
     .await;
-    let (mut a, mut b, mut c) = (a, b, c);
-    for member in [&mut a, &mut b] {
-        let state = member.host.state();
-        let reconciled = control::reconcile(&mut member.vault, &state).unwrap();
-        assert_eq!(reconciled.activated, Some(2));
-        assert_eq!(reconciled.revoked, 1);
-    }
-    // C is cut off: nothing gives it the new key.
+    let state = a.host.state();
+    let reconciled = control::reconcile(&mut a.vault, &state).unwrap();
+    assert_eq!(reconciled.activated, Some(2));
+    assert_eq!(reconciled.revoked, 1);
+    a.vault.put(login("After removal", "new secret")).unwrap();
+    // Syncing brings B's vault in line with the removal before anything is
+    // exchanged, so it can read what A wrote under the new epoch.
+    let (_, received) = sync(&mut a, &mut b).await;
+    assert!(received.applied >= 1);
+    assert_eq!(b.vault.current_epoch(), 2);
+    assert_eq!(b.vault.revoked_devices().unwrap().len(), 1);
+    assert_eq!(titles(&b.vault), vec!["After removal", "From A", "From C"]);
+
+    // C is cut off in both directions and is told why. Nothing gives it the
+    // new key or the new revisions.
+    assert!(matches!(
+        c.host.endpoint.connect_sync(a.host.id).await,
+        Err(Error::Removed)
+    ));
+    assert!(c.host.endpoint.told_removed());
+    assert!(matches!(
+        a.host.endpoint.connect_sync(c.host.id).await,
+        Err(Error::NotAMember)
+    ));
     let state = c.host.state();
     control::reconcile(&mut c.vault, &state).unwrap();
     assert_eq!(c.vault.current_epoch(), 1);
     assert_eq!(c.vault.epoch_keys().unwrap().len(), 1);
-    assert!(c
-        .host
-        .endpoint
-        .announce(a.host.id, a.host.pin())
-        .await
-        .is_err());
+    assert_eq!(titles(&c.vault), vec!["From A", "From C"]);
 }

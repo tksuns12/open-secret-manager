@@ -16,16 +16,17 @@ The repository is deliberately split at the security boundary:
   protocol as sans-IO steps over bounded frames, carried over TLS 1.3 with
   both device certificates pinned, couples each vault to the control
   plane (enrollment, removal with key rotation, reconciliation), and carries
-  the control plane's own messages between devices over the same pinned
-  TLS. The `osm-peer` binary is a development CLI for pairing and syncing two vaults
-  from separate processes.
+  the control plane's own messages and sync between any two members over
+  the same pinned TLS. The `osm-peer` binary is a development CLI that runs
+  a device as a process: interim pairing and sync of two vaults, or a
+  member of a vault's control plane.
 - `crates/vault-membership` is the membership control plane on OpenRaft:
   signed enrollment and removal requests decided by a Raft majority, with
   SQLite-backed log and state. It also decides key epochs: a removal
   carries the next epoch key sealed to every remaining device, active only
-  once the removal completes. Tests run it in-process and over TLS between
-  listeners in one process; running it between processes and in the desktop
-  app is the remaining Phase 4 work.
+  once the removal completes. Tests run it in-process, over TLS between
+  listeners in one process, and between separate device processes; running
+  it in the desktop app is the remaining Phase 4 work.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
   route from the interface to the Rust core.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and

@@ -1,12 +1,13 @@
-//! Control-plane connections between a vault's devices, over TLS 1.3 with
-//! both certificates pinned.
+//! Connections between a vault's devices, over TLS 1.3 with both
+//! certificates pinned.
 //!
-//! A [`MemberEndpoint`] carries the control plane's RPCs: it is the
-//! [`Dialer`] a [`ControlNode`] reaches other devices through, and it
-//! accepts their connections. Which certificates it accepts is decided at
-//! every handshake by the node's [`Directory`]: the devices its own log
-//! names, and devices a member introduced. A device dials only the
-//! certificate membership records for its target.
+//! A [`MemberEndpoint`] is one device's end of them. One listener serves
+//! two channels: the control plane's RPCs (the endpoint is the [`Dialer`] a
+//! [`ControlNode`] reaches other devices through) and revision sync with
+//! any member. Which certificates it accepts is decided at every handshake
+//! by the node's [`Directory`]: the devices its own log names, and devices
+//! a member introduced. A device dials only the certificate membership
+//! records for its target.
 //!
 //! A connection opens with an `Open` frame naming the protocol version, the
 //! vault, and the channel, answered by `Welcome` or a refusal. Both carry
@@ -22,38 +23,49 @@
 //! certificate still belongs to an accepted device, and hands the RPC to
 //! the node with that device's identity, which refuses an RPC claiming
 //! another sender.
+//!
+//! The sync channel is open only between members: both ends require that
+//! their own committed state lists the other as an enrolled member that is
+//! not removed or being removed. It then carries a [`crate::SyncSession`].
+//!
+//! A removed device is served on neither channel. Its handshake is still
+//! completed, so that it can be told it was removed.
 
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
     path::Path,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
 
+use osm_vault_core::Vault;
 use osm_vault_membership::{
-    device_id_from_bytes, device_id_to_bytes, ControlNode, ControlReply, ControlRpc, DeviceId,
-    DeviceNode, Dialer, Directory, Link, LinkError, NodeOptions,
+    device_id_from_bytes, device_id_to_bytes, ControlNode, ControlReply, ControlRpc, ControlState,
+    DeviceId, DeviceNode, Dialer, Directory, Link, LinkError, NodeOptions,
 };
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     task::{JoinHandle, JoinSet},
 };
-use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
+use tokio_rustls::{client, server, TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::{
+    control,
     peers::{pin_of, TransportIdentity},
     transport::{
-        client_config, handshake_error, read_frame, read_json_frame, server_config, server_name,
-        with_timeout, write_frame, write_json_frame, ClientPolicy, PinPolicy, CONNECT_TIMEOUT,
-        HANDSHAKE_TIMEOUT,
+        client_config, handshake_error, read_frame, read_json_frame, run_session, server_config,
+        server_name, with_timeout, write_frame, write_json_frame, ClientPolicy, PinPolicy,
+        CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT,
     },
-    Error, PeerStore, Result,
+    Error, PeerStore, Result, SyncReport,
 };
 
 /// Version of the protocol between members. Version 1 was sync between two
@@ -98,17 +110,91 @@ struct KnownAddress {
     failed: bool,
 }
 
+#[derive(Default)]
+struct Book {
+    known: BTreeMap<DeviceId, KnownAddress>,
+    /// Where addresses are kept across restarts, if anywhere.
+    store: Option<Connection>,
+}
+
+impl Book {
+    fn record(&mut self, device: DeviceId, address: &str) {
+        let unchanged = self
+            .known
+            .get(&device)
+            .is_some_and(|known| known.address == address);
+        self.known.insert(
+            device,
+            KnownAddress {
+                address: address.to_owned(),
+                failed: false,
+            },
+        );
+        if unchanged {
+            return;
+        }
+        if let Some(store) = &self.store {
+            // An address is a hint: failing to store one is not an error.
+            let _ = store.execute(
+                "INSERT INTO member_addresses(device_id, address) VALUES (?1, ?2)
+                 ON CONFLICT(device_id) DO UPDATE SET address = excluded.address",
+                params![device_id_to_bytes(device).as_slice(), address],
+            );
+        }
+    }
+}
+
 /// Where each device was last reached. Addresses are hints: a connection is
 /// authenticated by the certificate pin, wherever it leads.
 #[derive(Clone, Default)]
 pub struct AddressBook {
-    known: Arc<Mutex<BTreeMap<DeviceId, KnownAddress>>>,
+    book: Arc<Mutex<Book>>,
 }
 
 impl AddressBook {
+    /// Opens the address book kept in the SQLite file at `path`, normally
+    /// the device's peer store, so addresses survive a restart.
+    /// `AddressBook::default()` keeps them in memory only.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let store = Connection::open(path)?;
+        store.busy_timeout(Duration::from_secs(5))?;
+        store.execute_batch(
+            "CREATE TABLE IF NOT EXISTS member_addresses (
+                 device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
+                 address TEXT NOT NULL CHECK(length(address) BETWEEN 1 AND 128)
+             ) STRICT;",
+        )?;
+        let known = {
+            let mut statement = store.prepare("SELECT device_id, address FROM member_addresses")?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .filter_map(|(device, address)| {
+                    let device: [u8; 16] = device.try_into().ok()?;
+                    Some((
+                        device_id_from_bytes(device),
+                        KnownAddress {
+                            address,
+                            failed: false,
+                        },
+                    ))
+                })
+                .collect()
+        };
+        Ok(Self {
+            book: Arc::new(Mutex::new(Book {
+                known,
+                store: Some(store),
+            })),
+        })
+    }
+
     pub fn get(&self, device: DeviceId) -> Option<String> {
-        let known = self.known.lock().ok()?;
-        known.get(&device).map(|known| known.address.clone())
+        let book = self.book.lock().ok()?;
+        book.known.get(&device).map(|known| known.address.clone())
     }
 
     /// Records an address this device saw for itself: where an
@@ -117,14 +203,8 @@ impl AddressBook {
         if !valid_address(address) {
             return;
         }
-        if let Ok(mut known) = self.known.lock() {
-            known.insert(
-                device,
-                KnownAddress {
-                    address: address.to_owned(),
-                    failed: false,
-                },
-            );
+        if let Ok(mut book) = self.book.lock() {
+            book.record(device, address);
         }
     }
 
@@ -134,22 +214,16 @@ impl AddressBook {
         if !valid_address(address) {
             return;
         }
-        if let Ok(mut known) = self.known.lock() {
-            if known.get(&device).is_none_or(|known| known.failed) {
-                known.insert(
-                    device,
-                    KnownAddress {
-                        address: address.to_owned(),
-                        failed: false,
-                    },
-                );
+        if let Ok(mut book) = self.book.lock() {
+            if book.known.get(&device).is_none_or(|known| known.failed) {
+                book.record(device, address);
             }
         }
     }
 
     fn failed(&self, device: DeviceId, address: &str) {
-        if let Ok(mut known) = self.known.lock() {
-            if let Some(known) = known.get_mut(&device) {
+        if let Ok(mut book) = self.book.lock() {
+            if let Some(known) = book.known.get_mut(&device) {
                 known.failed |= known.address == address;
             }
         }
@@ -160,6 +234,8 @@ impl AddressBook {
 enum Channel {
     /// Raft RPCs and requests passed to the leader.
     Control,
+    /// Revision sync between two members.
+    Sync,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -175,9 +251,16 @@ struct Open {
 
 #[derive(Serialize, Deserialize)]
 enum OpenReply {
-    Welcome { roster: Vec<MemberContact> },
+    Welcome {
+        roster: Vec<MemberContact>,
+    },
     UnsupportedVersion,
     VaultMismatch,
+    /// The channel is only for members, and the receiver's committed state
+    /// does not list the sender as one.
+    NotAMember,
+    /// The vault's devices removed the sender.
+    Removed,
 }
 
 /// The node's directory, once the node is running. Until then nothing is
@@ -196,9 +279,11 @@ impl std::fmt::Debug for Trust {
 
 impl PinPolicy for Trust {
     fn accepts(&self, pin: &[u8; 32]) -> bool {
-        self.directory
-            .get()
-            .is_some_and(|directory| directory.device_for_pin(pin).is_some())
+        // A removed device completes the handshake only to be told so.
+        self.directory.get().is_some_and(|directory| {
+            directory.device_for_pin(pin).is_some()
+                || directory.removed_device_for_pin(pin).is_some()
+        })
     }
 }
 
@@ -210,6 +295,8 @@ struct Inner {
     addresses: AddressBook,
     /// 0 until this device listens.
     listen_port: AtomicU16,
+    /// A member answered that this device was removed.
+    removed: AtomicBool,
 }
 
 /// This device's end of the connections between a vault's members.
@@ -238,6 +325,7 @@ impl MemberEndpoint {
                 trust,
                 addresses,
                 listen_port: AtomicU16::new(0),
+                removed: AtomicBool::new(false),
             }),
         })
     }
@@ -258,6 +346,28 @@ impl MemberEndpoint {
 
     pub fn listen_port(&self) -> Option<u16> {
         Some(self.inner.listen_port.load(Ordering::SeqCst)).filter(|port| *port != 0)
+    }
+
+    /// Whether a member has told this device that the vault's devices
+    /// removed it. A removed device may never receive the log entry that
+    /// completes its removal, so this is how it finds out.
+    pub fn told_removed(&self) -> bool {
+        self.inner.removed.load(Ordering::SeqCst)
+    }
+
+    /// The other members this device may sync with: those its committed
+    /// state lists as enrolled and neither removed nor being removed.
+    pub fn sync_peers(&self) -> Vec<DeviceId> {
+        let Ok(directory) = self.directory() else {
+            return Vec::new();
+        };
+        let own = self.pin();
+        directory
+            .members()
+            .into_iter()
+            .filter(|(device, pin)| *pin != own && directory.is_member(*device))
+            .map(|(device, _)| device)
+            .collect()
     }
 
     fn directory(&self) -> Result<&Directory> {
@@ -325,8 +435,8 @@ impl MemberEndpoint {
 
     /// Completes the handshake and opening exchange on an incoming
     /// connection. A certificate that belongs to no accepted device fails
-    /// the handshake.
-    pub async fn accept(&self, tcp: TcpStream) -> Result<ControlConnection> {
+    /// the handshake; a removed device is told so and refused.
+    pub async fn accept(&self, tcp: TcpStream) -> Result<Incoming> {
         let remote = tcp.peer_addr()?.ip();
         let mut stream = with_timeout(HANDSHAKE_TIMEOUT, self.inner.acceptor.accept(tcp))
             .await?
@@ -340,19 +450,27 @@ impl MemberEndpoint {
                 .ok_or(Error::Handshake)?,
         );
         let directory = self.directory()?.clone();
-        let device = directory.device_for_pin(&pin).ok_or(Error::PinMismatch)?;
-        let open: Open = with_timeout(OPEN_TIMEOUT, read_frame(&mut stream)).await??;
-        let refusal = if open.version != MEMBER_PROTOCOL_VERSION {
-            Some((OpenReply::UnsupportedVersion, Error::UnsupportedVersion))
-        } else if open.vault_id != self.inner.vault_id {
-            Some((OpenReply::VaultMismatch, Error::VaultMismatch))
-        } else {
-            None
+        let Some(device) = directory.device_for_pin(&pin) else {
+            if directory.removed_device_for_pin(&pin).is_none() {
+                return Err(Error::PinMismatch);
+            }
+            let _: Open = with_timeout(OPEN_TIMEOUT, read_frame(&mut stream)).await??;
+            return refuse(stream, OpenReply::Removed, Error::NotAMember).await;
         };
-        if let Some((reply, error)) = refusal {
-            write_frame(&mut stream, &reply).await?;
-            let _ = stream.shutdown().await;
-            return Err(error);
+        let open: Open = with_timeout(OPEN_TIMEOUT, read_frame(&mut stream)).await??;
+        if open.version != MEMBER_PROTOCOL_VERSION {
+            return refuse(
+                stream,
+                OpenReply::UnsupportedVersion,
+                Error::UnsupportedVersion,
+            )
+            .await;
+        }
+        if open.vault_id != self.inner.vault_id {
+            return refuse(stream, OpenReply::VaultMismatch, Error::VaultMismatch).await;
+        }
+        if open.channel == Channel::Sync && !directory.is_member(device) {
+            return refuse(stream, OpenReply::NotAMember, Error::NotAMember).await;
         }
         if let Some(port) = open.listen_port.filter(|port| *port != 0) {
             self.inner
@@ -367,14 +485,36 @@ impl MemberEndpoint {
             },
         )
         .await?;
-        match open.channel {
-            Channel::Control => Ok(ControlConnection {
+        Ok(match open.channel {
+            Channel::Control => Incoming::Control(ControlConnection {
                 stream,
                 device,
                 pin,
                 directory,
             }),
+            Channel::Sync => Incoming::Sync(MemberSync {
+                stream: TlsStream::Server(stream),
+                device,
+                listen_port: self.listen_port(),
+            }),
+        })
+    }
+
+    /// Opens a sync connection to `device`, which this device's committed
+    /// state must list as a member that is neither removed nor being
+    /// removed. Its certificate must be the one membership records.
+    pub async fn connect_sync(&self, device: DeviceId) -> Result<MemberSync> {
+        let directory = self.directory()?;
+        if !directory.is_member(device) {
+            return Err(Error::NotAMember);
         }
+        let pin = *directory.members().get(&device).ok_or(Error::NotAMember)?;
+        let stream = self.open(device, pin, Channel::Sync).await?;
+        Ok(MemberSync {
+            stream: TlsStream::Client(stream),
+            device,
+            listen_port: self.listen_port(),
+        })
     }
 
     /// Dials `device` at its last known address, accepting only the
@@ -421,6 +561,11 @@ impl MemberEndpoint {
             }
             OpenReply::UnsupportedVersion => Err(Error::UnsupportedVersion),
             OpenReply::VaultMismatch => Err(Error::VaultMismatch),
+            OpenReply::NotAMember => Err(Error::NotAMember),
+            OpenReply::Removed => {
+                self.inner.removed.store(true, Ordering::SeqCst);
+                Err(Error::Removed)
+            }
         }
     }
 
@@ -569,6 +714,50 @@ impl ControlConnection {
     }
 }
 
+/// Answers an opening frame with a refusal and closes the connection.
+async fn refuse(
+    mut stream: server::TlsStream<TcpStream>,
+    reply: OpenReply,
+    error: Error,
+) -> Result<Incoming> {
+    write_frame(&mut stream, &reply).await?;
+    let _ = stream.shutdown().await;
+    Err(error)
+}
+
+/// A sync connection with a member, in either direction.
+pub struct MemberSync {
+    stream: TlsStream<TcpStream>,
+    device: DeviceId,
+    listen_port: Option<u16>,
+}
+
+impl MemberSync {
+    /// The member at the other end.
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// Brings the vault in line with `state`, this device's committed
+    /// control state, and then runs a sync session, so that revisions are
+    /// judged against the current authors and removals. A locked vault
+    /// only stages what it receives. Fails with `Removed`, exchanging
+    /// nothing, if the state says this device was removed.
+    pub async fn run(self, vault: &mut Vault, state: &ControlState) -> Result<SyncReport> {
+        if control::reconcile(vault, state)?.removed {
+            return Err(Error::Removed);
+        }
+        let (report, _) = run_session(self.stream, vault, self.listen_port).await?;
+        Ok(report)
+    }
+}
+
+/// An incoming connection after the opening exchange.
+pub enum Incoming {
+    Control(ControlConnection),
+    Sync(MemberSync),
+}
+
 /// Starts this device's control-plane node on `endpoint`: the node reaches
 /// other devices through it, and it accepts the devices the node's
 /// directory lists.
@@ -595,14 +784,17 @@ pub async fn start_node(
     Ok(Arc::new(node))
 }
 
-/// Accepts connections on `listener` and serves control RPCs to `node`
-/// until dropped, which also closes the connections it is serving.
-/// Strangers fail the handshake; at most [`MAX_CONNECTIONS`] connections,
-/// handshakes included, are open at once.
+/// Accepts connections on `listener` until dropped, which also closes the
+/// connections it is serving. Control connections are served to `node`
+/// here; sync connections are handed to `sync`, whose receiver runs them
+/// against the vault, and are refused if there is none. Strangers fail the
+/// handshake; at most [`MAX_CONNECTIONS`] connections, handshakes included,
+/// are open at once.
 pub async fn serve_members(
     listener: TcpListener,
     endpoint: MemberEndpoint,
     node: Arc<ControlNode>,
+    sync: Option<mpsc::Sender<MemberSync>>,
 ) {
     let mut connections = JoinSet::new();
     loop {
@@ -616,9 +808,18 @@ pub async fn serve_members(
         }
         let endpoint = endpoint.clone();
         let node = node.clone();
+        let sync = sync.clone();
         connections.spawn(async move {
-            if let Ok(connection) = endpoint.accept(tcp).await {
-                let _ = connection.serve(&node).await;
+            match endpoint.accept(tcp).await {
+                Ok(Incoming::Control(connection)) => {
+                    let _ = connection.serve(&node).await;
+                }
+                Ok(Incoming::Sync(connection)) => {
+                    if let Some(sync) = sync {
+                        let _ = sync.send(connection).await;
+                    }
+                }
+                Err(_) => {}
             }
         });
     }

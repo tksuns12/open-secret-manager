@@ -209,7 +209,7 @@ impl Net {
     }
 }
 
-fn titles(vault: &Vault) -> Vec<String> {
+pub(crate) fn titles(vault: &Vault) -> Vec<String> {
     let mut titles: Vec<String> = vault
         .list()
         .unwrap()

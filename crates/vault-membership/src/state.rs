@@ -38,6 +38,10 @@ pub struct PendingChange {
     /// voters without the device.
     #[serde(default)]
     pub cancelled: bool,
+    /// For a removal, the device's TLS pin when the removal was proposed.
+    /// Its membership record is gone by the time the removal completes.
+    #[serde(default)]
+    pub removed_pin: Option<[u8; 32]>,
 }
 
 impl PendingChange {
@@ -74,6 +78,10 @@ pub struct ControlState {
     /// Removed devices, each with the device that removed it. Their stored
     /// revisions stay valid; they never rejoin.
     pub removed: BTreeMap<DeviceId, DeviceId>,
+    /// The TLS pin each removed device had, so that it can be recognized
+    /// and told it was removed when it next connects.
+    #[serde(default)]
+    pub removed_pins: BTreeMap<DeviceId, [u8; 32]>,
     /// The epochs whose keys each voter has been given.
     pub keys_held: BTreeMap<DeviceId, BTreeSet<u64>>,
     /// Epoch keys sealed to each device, by epoch. The founding device
@@ -141,6 +149,18 @@ impl ControlState {
         (1..=self.epoch)
             .filter(|epoch| !held.is_some_and(|held| held.contains(epoch)))
             .collect()
+    }
+
+    /// Whether `device` takes part in the vault: an enrolled voter that has
+    /// not been removed and whose removal is not pending. Unlike
+    /// [`Self::is_settled_member`] this holds while another device's change
+    /// is under way.
+    pub fn is_active_member(&self, device: DeviceId) -> bool {
+        self.is_enrolled(device)
+            && !self.removed.contains_key(&device)
+            && !self.pending.as_ref().is_some_and(|pending| {
+                matches!(&pending.change, MembershipChange::Remove { device: leaving, .. } if *leaving == device)
+            })
     }
 
     /// Whether `device` is an enrolled voter that a pending change does not
@@ -327,12 +347,19 @@ impl ControlState {
                 self.check_rotation(rotation, &remaining)?;
             }
         }
+        let removed_pin = match change {
+            MembershipChange::Remove { device, .. } => {
+                self.node(*device).map(|node| node.transport_pin)
+            }
+            MembershipChange::Enroll { .. } => None,
+        };
         self.pending = Some(PendingChange {
             request_id: signed.request_id,
             requester: signed.requester,
             change: change.clone(),
             target_voters: target,
             cancelled: false,
+            removed_pin,
         });
         Ok(())
     }
@@ -468,6 +495,9 @@ impl ControlState {
                 self.keys_held.remove(&device);
                 self.envelopes.remove(&device);
                 self.removed.insert(device, pending.requester);
+                if let Some(pin) = pending.removed_pin {
+                    self.removed_pins.insert(device, pin);
+                }
             }
         }
         Outcome::Accepted

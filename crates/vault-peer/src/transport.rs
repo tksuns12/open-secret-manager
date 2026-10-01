@@ -166,6 +166,10 @@ impl PendingJoin {
         self.review.sas()
     }
 
+    pub fn joiner_device_id(&self) -> [u8; 16] {
+        self.review.joiner_device_id()
+    }
+
     /// Completes pairing on this device after the owner confirmed. Call
     /// [`ApprovedJoin::send`] afterwards; it needs no vault. `sync_port`
     /// tells the joiner where this device accepts sync connections.
