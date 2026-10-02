@@ -14,7 +14,12 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The request the stand-in shows next, with the logins it offers. */
 async function asked(browser) {
-  const [id, origin, kind, count] = (await browser.app.expect("REQUEST")).split(" ");
+  const shown = await browser.app.expect("REQUEST").catch(async (error) => {
+    // Say how far the request got: what the pressed button shows.
+    const status = await browser.pressedStatus().catch(() => null);
+    throw new Error(`${error.message}; no request reached it, and the button shows ${JSON.stringify(status)}`);
+  });
+  const [id, origin, kind, count] = shown.split(" ");
   const logins = [];
   for (let offered = 0; offered < Number(count || 0); offered += 1) logins.push((await browser.app.expect("LOGIN")).split(" ")[0]);
   return { id, origin, kind, count, logins };
@@ -288,6 +293,15 @@ describe("with a host that answers wrongly", () => {
     return page;
   }
 
+  /** How many requests the fake host has been sent. */
+  const asked = () => browser.hostLog().filter((line) => line.includes('"fill_request"')).length;
+  /** Waits until the host has been sent a request more than `count`. */
+  async function askedMoreThan(count) {
+    for (const deadline = Date.now() + 90_000; asked() <= count; await pause(50)) {
+      assert.ok(Date.now() < deadline, "the host was never sent the request");
+    }
+  }
+
   test("a right answer is filled once, however often it is repeated", async () => {
     const page = await pressed("twice");
     await browser.until(page, "✓");
@@ -334,26 +348,39 @@ describe("with a host that answers wrongly", () => {
     await garbled.close();
   });
 
-  test("a reply that arrives after the tab moved on is not filled, even if the page hid its leaving", async () => {
+  test("a reply that arrives after the tab moved on is not filled, even if the page hid its leaving", async (t) => {
     browser.plan("late");
     tabs += 1;
+    const before = asked();
     const page = await browser.open(`https://login.test/sticky?tab=${tabs}`);
     await browser.press(page);
     await browser.until(page, "…");
+    // The host has the request before the tab moves on.
+    await askedMoreThan(before);
     // The tab now shows another document of the same site, and the page
-    // kept the extension's script from hearing that it was left.
-    // The reply comes five seconds after the request; by then the tab has
-    // moved on.
+    // kept the extension's script from hearing that it was left. Only then
+    // does the host send the right reply.
     await page.goto("https://login.test/next");
-    // Chromium closes the script's connection whatever the page does, so
-    // the request ended when the tab moved on. Firefox keeps the document
-    // and its connection: there the reply is stopped by asking the browser
+    browser.letHostAnswer();
+    // A browser that drops the document it left closes the script's
+    // connection whatever the page does, which ended the request when the
+    // tab moved on; the reply, if the host is still there to send it, meets
+    // no request. Chromium always does that. Firefox may keep the document
+    // and its connection: then the reply is stopped by asking the browser
     // which document the tab shows.
-    if (BROWSER === "firefox") {
-      await browser.until(page, "!", { says: /The page changed before the login arrived\. Nothing was filled\./ });
+    let status;
+    let stopped = false;
+    for (const deadline = Date.now() + 4000; !stopped && Date.now() < deadline; await pause(100)) {
+      status = await browser.status(page);
+      assert.notEqual(status.badge, "✓", "the late reply was filled");
+      stopped = status.badge === "!" && /The page changed before the login arrived\. Nothing was filled\./.test(status.title);
+    }
+    if (stopped) {
+      assert.equal(BROWSER, "firefox");
+      t.diagnostic("the left document was kept; the reply was stopped by asking which document the tab shows");
     } else {
-      await pause(6000);
-      assert.equal((await browser.status(page)).badge, "");
+      assert.deepEqual([status.badge, status.title.includes("\n")], ["", false], JSON.stringify(status));
+      t.diagnostic("the left document was dropped; the request had ended when the reply came");
     }
     assert.deepEqual(fields(await page.form()), EMPTY);
     // Nor is it in the page that was left, should the browser show it again.
@@ -364,8 +391,10 @@ describe("with a host that answers wrongly", () => {
   });
 
   test("the extension asks for one page's origin, and withdraws when the page goes", async () => {
+    const before = asked();
     const page = await pressed("silent");
     await browser.until(page, "…");
+    await askedMoreThan(before);
     await page.goto("https://login.test/next");
     // What the host was sent for this page: the request, with nothing of
     // the vault and nothing chosen. Then the withdrawal: the message, or

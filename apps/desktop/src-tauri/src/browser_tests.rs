@@ -453,6 +453,7 @@ fn a_browser_is_connected_by_writing_the_hosts_manifest_into_its_folder() {
         // Only the browsers found under the home folder are listed.
         let status = browser::browser_status(handle.state()).await.unwrap();
         assert_eq!(status.host.as_deref(), host.to_str());
+        assert!(!status.temporary_place);
         assert_eq!(
             state_of(&status),
             [("chrome", "not_connected"), ("firefox", "not_connected")]
@@ -582,6 +583,66 @@ fn a_browser_is_connected_by_writing_the_hosts_manifest_into_its_folder() {
             code(browser::connect_browser("chrome".into(), handle.state()).await),
             "host_missing"
         );
+    });
+}
+
+#[test]
+fn a_packaged_app_finds_the_host_beside_its_own_program() {
+    let dir = folder();
+    let programs = dir.path().join("Open Secret Manager.app/Contents/MacOS");
+    std::fs::create_dir_all(&programs).unwrap();
+    let program = programs.join("open-secret-manager");
+    std::fs::write(&program, b"").unwrap();
+    assert_eq!(browser::host_beside(&program), None);
+    // A folder of the host's name is not the host.
+    std::fs::create_dir(programs.join("osm-native-host")).unwrap();
+    assert_eq!(browser::host_beside(&program), None);
+    std::fs::remove_dir(programs.join("osm-native-host")).unwrap();
+    std::fs::write(programs.join("osm-native-host"), b"").unwrap();
+    assert_eq!(
+        browser::host_beside(&program),
+        Some(programs.join("osm-native-host"))
+    );
+}
+
+#[test]
+fn a_browser_is_not_pointed_at_a_place_that_is_gone_when_the_app_quits() {
+    let app_in = |folder: &str| {
+        PathBuf::from(folder).join("Open Secret Manager.app/Contents/MacOS/osm-native-host")
+    };
+    for stays in [
+        app_in("/Applications"),
+        app_in("/Users/someone/Applications"),
+        app_in("/Volumes/Another Disk/Apps"),
+        PathBuf::from("/usr/bin/osm-native-host"),
+    ] {
+        assert!(!browser::is_passing(&stays), "{}", stays.display());
+    }
+    let passing = [
+        app_in(
+            "/private/var/folders/q7/x/T/AppTranslocation/9F0C7B6E-1E0B-4A7B-9C3D-1D2E3F4A5B6C/d",
+        ),
+        PathBuf::from("/tmp/.mount_Open SrT3k9/usr/bin/osm-native-host"),
+    ];
+    for passing in &passing {
+        assert!(browser::is_passing(passing), "{}", passing.display());
+    }
+
+    // The app says so, and writes nothing into the browser's folder.
+    let dir = folder();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(folders(&home, "chrome").0).unwrap();
+    let app = shell(dir.path(), &home, Some(passing[0].clone()));
+    let handle = app.handle().clone();
+    tauri::async_runtime::block_on(async move {
+        let status = browser::browser_status(handle.state()).await.unwrap();
+        assert!(status.temporary_place);
+        assert_eq!(status.browsers[0].state, "not_connected");
+        assert_eq!(
+            code(browser::connect_browser("chrome".into(), handle.state()).await),
+            "temporary_place"
+        );
+        assert!(!folders(&home, "chrome").1.exists());
     });
 }
 

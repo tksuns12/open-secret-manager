@@ -137,7 +137,7 @@ export async function start(options = {}) {
   }
 }
 
-async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null }) {
+async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null, hostProgram = null }) {
   // Short, because a socket's path has to fit in about a hundred bytes.
   const home = mkdtempSync("/tmp/osm");
   closers.push(() => {
@@ -148,7 +148,7 @@ async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask
   });
   // With `appHome`, the desktop app itself is running for that home folder:
   // the browser and the host use it, and nothing stands in for the app.
-  if (appHome) return browse({ home, accountHome: appHome, closers, fakeHost, registerHost, forged, app: null, items: {}, vault: null });
+  if (appHome) return browse({ home, accountHome: appHome, closers, fakeHost, hostProgram, registerHost, forged, app: null, items: {}, vault: null });
   const env = { ...process.env, HOME: home, OSM_PASSWORD: PASSWORD };
   delete env.XDG_DATA_HOME;
 
@@ -170,11 +170,11 @@ async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask
     app = new Lines(child);
     await app.expect("LISTENING");
   }
-  return browse({ home, accountHome: home, closers, fakeHost, registerHost, forged, app, items, vault });
+  return browse({ home, accountHome: home, closers, fakeHost, hostProgram, registerHost, forged, app, items, vault });
 }
 
 /** The pages, and a browser with the extension, for the account whose home folder is `accountHome`. */
-async function browse({ home, accountHome, closers, fakeHost, registerHost, forged, app, items, vault }) {
+async function browse({ home, accountHome, closers, fakeHost, hostProgram, registerHost, forged, app, items, vault }) {
   // The pages: one server for https under every name, one for plain http.
   execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=login.test",
     "-addext", "subjectAltName=DNS:login.test,DNS:*.login.test,DNS:framing.test,DNS:other.test",
@@ -188,16 +188,23 @@ async function browse({ home, accountHome, closers, fakeHost, registerHost, forg
   // place. That one is started as the file it is, not through a script
   // written for each run: macOS holds the first start of a file it has not
   // seen until it has checked it, which can take many seconds.
-  const host = fakeHost ? path.join(here, "fake-host.mjs") : built("osm-native-host");
+  // `hostProgram` names the real host somewhere else: inside a packaged app.
+  const host = fakeHost ? path.join(here, "fake-host.mjs") : hostProgram ?? built("osm-native-host");
   const setup = { home, accountHome, closers, host, registerHost, forged, securePort, plainPort };
   const driver = BROWSER === "firefox" ? await firefoxWith(setup) : await chromiumWith(setup);
+  let pressed = null;
 
   return {
     home, app, items, vault,
     /** What the app calls the kind of browser a request came from. */
     kind: driver.kind,
     /** Tells the fake host how to answer the next request. */
-    plan(mode) { writeFileSync(path.join(home, "fake-host-plan.json"), JSON.stringify({ mode })); },
+    plan(mode) {
+      rmSync(path.join(home, "fake-host-go"), { force: true });
+      writeFileSync(path.join(home, "fake-host-plan.json"), JSON.stringify({ mode }));
+    },
+    /** Lets a fake host that was told to answer `late` send its reply now. */
+    letHostAnswer() { writeFileSync(path.join(home, "fake-host-go"), ""); },
     /** What the fake host was sent, one message per entry, and `closed` when the browser let it go. */
     hostLog() {
       const file = path.join(home, "fake-host.log");
@@ -206,7 +213,12 @@ async function browse({ home, accountHome, closers, fakeHost, registerHost, forg
     /** Opens `address` in a new tab. */
     open: driver.open,
     /** Presses the extension's toolbar button for the tab showing `page`, as the owner would. With `forged`, the button of the other extension. */
-    press: driver.press,
+    press(page, options) {
+      pressed = page;
+      return driver.press(page, options);
+    },
+    /** What the button says for the page pressed last, for a test to say how far a request got. */
+    pressedStatus: async () => (pressed ? driver.status(pressed) : null),
     /** What the toolbar button says for the tab showing `page`: `{ badge, title }`. */
     status: driver.status,
     /**

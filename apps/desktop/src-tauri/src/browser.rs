@@ -207,6 +207,7 @@ impl Browser {
                 .host
                 .as_ref()
                 .map(|host| host.to_string_lossy().into_owned()),
+            temporary_place: self.host.as_deref().is_some_and(is_passing),
             browsers,
         }
     }
@@ -240,14 +241,31 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The host program beside `program`, which is where a packaged app has it.
+pub(crate) fn host_beside(program: &Path) -> Option<PathBuf> {
+    let beside = program.parent()?.join(HOST_PROGRAM);
+    beside.is_file().then_some(beside)
+}
+
+/// Whether `host` is in a place that is gone when the app quits, so that a
+/// browser pointed at it would find nothing there later. macOS runs an app
+/// that was downloaded and not moved since from a copy in a folder of its
+/// own making, and an AppImage runs from a folder mounted for the one run.
+pub(crate) fn is_passing(host: &Path) -> bool {
+    host.components().any(|part| {
+        let part = part.as_os_str().to_string_lossy();
+        part == "AppTranslocation" || part.starts_with(".mount_")
+    })
+}
+
 /// The host program: beside the app's own, where a packaged app has it,
 /// and for a development build where the repository's workspace builds it.
 fn find_host() -> Option<PathBuf> {
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|program| Some(program.parent()?.join(HOST_PROGRAM)));
-    if let Some(beside) = beside.filter(|beside| beside.is_file()) {
-        return Some(beside);
+        .and_then(|program| host_beside(&program));
+    if beside.is_some() {
+        return beside;
     }
     #[cfg(debug_assertions)]
     for profile in ["debug", "release"] {
@@ -558,6 +576,9 @@ pub struct BrowserStatus {
     pub(crate) problem: Option<String>,
     /// The host program a browser would be pointed at, if it was found.
     pub(crate) host: Option<String>,
+    /// The host is in a place that is gone when the app quits, so no
+    /// browser can be pointed at it.
+    pub(crate) temporary_place: bool,
     /// The browsers found on this account.
     pub(crate) browsers: Vec<BrowserInfo>,
 }
@@ -590,6 +611,12 @@ pub async fn connect_browser(
         code: "host_missing",
         message: "the program browsers start was not found beside this app".into(),
     })?;
+    if is_passing(host) {
+        return Err(CommandError {
+            code: "temporary_place",
+            message: "the app is running from a place that is gone when it quits".into(),
+        });
+    }
     let path = known.manifest_path(home);
     let folder = path.parent().unwrap_or(home);
     std::fs::create_dir_all(folder).map_err(storage)?;

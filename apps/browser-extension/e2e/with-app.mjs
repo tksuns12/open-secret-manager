@@ -13,22 +13,32 @@
 // `OSM_APP_HOME` names the home folder the app runs for, if it is not this
 // account's own. With `OSM_BROWSER=firefox` the browser is Firefox, which
 // has to be connected in the app's Browser panel beforehand; for Chromium
-// the host is registered in the test browser's own scratch folder.
+// the host is registered in the test browser's own scratch folder, and
+// `OSM_HOST` names the host to register in place of the one the repository
+// builds: the one inside a packaged app, to check that app as a whole.
 import { start } from "./harness.mjs";
 
-const browser = await start({ appHome: process.env.OSM_APP_HOME ?? process.env.HOME });
+const browser = await start({ appHome: process.env.OSM_APP_HOME ?? process.env.HOME, hostProgram: process.env.OSM_HOST || null });
 try {
   const page = await browser.open("https://login.test/login");
   await browser.press(page);
   console.log("Pressed the extension's button on https://login.test/login. Decide in Open Secret Manager.");
   let said = "";
+  let begun = false;
   for (;;) {
     const status = await browser.status(page);
-    if (status.title !== said) {
-      said = status.title;
-      console.log(`button: ${status.badge || "(no mark)"} ${said.split("\n").slice(1).join(" ")}`);
+    const text = status.title.split("\n").slice(1).join(" ");
+    const now = `${status.badge || "(no mark)"} ${text}`;
+    // The mark and the words are set one after the other, so a mark
+    // without words, or words without a mark, is not the end yet.
+    if (status.badge && text && now !== said) {
+      said = now;
+      console.log(`button: ${now}`);
     }
-    if (status.badge !== "…") break;
+    if (status.badge || text) begun = true;
+    if ((status.badge === "✓" || status.badge === "!") && text) break;
+    // Nothing on the button any more: the request was withdrawn.
+    if (begun && !status.badge && !text) break;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   const form = await page.form();

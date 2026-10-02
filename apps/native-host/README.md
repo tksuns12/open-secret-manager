@@ -32,3 +32,9 @@ manifest has: `allowed_origins` is what a Chromium browser reads and
 `allowed_extensions` what Firefox reads. The desktop app's Browser panel
 writes the manifest for a browser, with one of the two, when the owner
 connects it.
+
+A packaged desktop app carries this program beside its own (in a macOS app,
+`Contents/MacOS/osm-native-host`), and the manifest names it there.
+`npm run tauri:build` in `apps/desktop` builds it from this workspace and
+packages it. A development run of the app uses `target/debug/osm-native-host`
+or `target/release/osm-native-host` here.

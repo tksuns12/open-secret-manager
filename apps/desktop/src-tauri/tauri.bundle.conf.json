@@ -1,0 +1,8 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build && npm run host"
+  },
+  "bundle": {
+    "externalBin": ["binaries/osm-native-host"]
+  }
+}

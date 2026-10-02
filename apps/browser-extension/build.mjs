@@ -1,7 +1,8 @@
 // Builds the extension for each browser into dist/<browser>: the two
-// scripts, bundled from the one source, and that browser's manifest.
+// scripts, bundled from the one source, that browser's manifest, and the
+// icons.
 import { build } from "esbuild";
-import { copyFile, mkdir, rm } from "node:fs/promises";
+import { copyFile, cp, mkdir, rm } from "node:fs/promises";
 
 const here = new URL(".", import.meta.url);
 
@@ -22,4 +23,5 @@ for (const browser of ["chromium", "firefox"]) {
     logLevel: "warning",
   });
   await copyFile(new URL(`manifest.${browser}.json`, here), new URL("manifest.json", out));
+  await cp(new URL("icons/", here), new URL("icons/", out), { recursive: true });
 }

@@ -90,3 +90,8 @@ check by hand: it presses the button on a test page and prints what the
 button says and what ended up in the page, while you decide in the app.
 With `OSM_BROWSER=firefox` it uses Firefox, which has to be connected in
 the app's Browser panel first.
+With `OSM_HOST` naming the host inside a packaged app, the Chromium check
+registers that host, which checks the package as a whole.
+
+The icons in `icons/` are the desktop app's icon at the sizes browsers ask
+for. `node icons.mjs` draws them again if that icon changes.

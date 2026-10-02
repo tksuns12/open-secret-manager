@@ -173,7 +173,7 @@ export const bridge: DesktopBridge = {
   async browserStatus() {
     const invoke = native();
     if (invoke) return (await invoke("browser_status")) as BrowserStatus;
-    return { supported: false, listening: false, problem: null, host: null, browsers: [] };
+    return { supported: false, listening: false, problem: null, host: null, temporaryPlace: false, browsers: [] };
   },
   connectBrowser: (browser) => nativeOnly("connect_browser", { browser }),
   disconnectBrowser: (browser) => nativeOnly("disconnect_browser", { browser }),

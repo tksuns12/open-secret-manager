@@ -1,6 +1,7 @@
 **/target/
 **/node_modules/
 **/dist/
+apps/desktop/src-tauri/binaries/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

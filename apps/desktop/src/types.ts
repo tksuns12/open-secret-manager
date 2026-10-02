@@ -202,6 +202,8 @@ export type BrowserStatus = {
   problem: string | null;
   /** The program a browser starts to reach this app, if it was found. */
   host: string | null;
+  /** The app runs from a place that is gone when it quits, so no browser can be pointed at it. */
+  temporaryPlace: boolean;
   /** The browsers found on this account. */
   browsers: BrowserInfo[];
 };

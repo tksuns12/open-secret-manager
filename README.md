@@ -81,6 +81,12 @@ npm install
 npm run tauri:dev
 ```
 
+`npm run tauri:build` packages the app. It builds the native messaging host
+from the Rust workspace and puts it inside the package, beside the app's own
+program, which is where the app looks for it when you connect a browser in
+its Browser panel. A development run finds the host where the workspace
+builds it (`cargo build -p osm-native-host`).
+
 The browser package uses the same TypeScript source for Chromium and Firefox:
 
 ```text

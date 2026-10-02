@@ -3,7 +3,7 @@
 // and answers a fill request wrongly on purpose. How it answers is read
 // from `fake-host-plan.json` in the home folder; what it is sent is written
 // to `fake-host.log` there.
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 const home = process.env.HOME;
@@ -16,6 +16,14 @@ function frame(body) {
 }
 const send = (message) => process.stdout.write(frame(Buffer.from(JSON.stringify(message))));
 const later = (ms, action) => setTimeout(action, ms);
+/** Runs `action` once the test says so, by putting `fake-host-go` into the home folder. */
+function whenTold(action) {
+  const waiting = setInterval(() => {
+    if (!existsSync(path.join(home, "fake-host-go"))) return;
+    clearInterval(waiting);
+    action();
+  }, 50);
+}
 
 function answer(request) {
   const { mode } = JSON.parse(readFileSync(path.join(home, "fake-host-plan.json"), "utf8"));
@@ -25,8 +33,8 @@ function answer(request) {
   send({ type: "waiting", requestId });
   switch (mode) {
     case "good": return send(good);
-    // The right reply, after a while.
-    case "late": return later(5000, () => send(good));
+    // The right reply, but not before the test says so.
+    case "late": return whenTold(() => send(good));
     // The same reply a second time, and once more after a moment.
     case "twice": send(good); send(good); return later(300, () => send(good));
     // A reply that names the request but not what it was for.

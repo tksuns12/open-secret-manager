@@ -114,6 +114,8 @@ A request makes the desktop app's window come forward. Only one request waits at
 
 The app tells a browser where the native host is only when the owner connects that browser in the app, by writing a manifest into the browser's own folder. The manifest allows one extension. A manifest in that place that names another program or allows another extension is shown as not this app's rather than as connected, and the owner can replace it. A program of the owner's account can rewrite the file again; the browser would then start whatever it names, which reaches no vault unless it is this app's host talking to this app.
 
+A packaged app has the host inside it, beside its own program, and the manifest names that file. The host is therefore as trustworthy as the app's own files: whoever can replace a file inside the app can replace the host, and equally the app. Packages built here are not signed with a developer's identity, so nothing but the file system's permissions guards either; signing is release work that has not been done. The app refuses to point a browser at a host in a place that is gone when the app quits (a downloaded Mac app run before it was moved, an AppImage), so that a manifest is not left naming a path that something else could later occupy.
+
 ## Recovery and imports
 
 Generate recovery material from operating-system randomness and display it deliberately. An encrypted backup must carry enough versioned metadata and wrapped keys to restore without a provider. Restoration authenticates the whole archive before replacing anything and creates a separate destination by default. A recovery secret is as sensitive as the vault it can unlock.

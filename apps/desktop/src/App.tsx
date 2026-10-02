@@ -634,6 +634,7 @@ function BrowserPanel({ onNotice }: { onNotice: (text: string) => void }) {
     } catch (error) {
       const code = (error as { code?: string } | null)?.code;
       onNotice(code === "host_missing" ? "The program that browsers start was not found beside this app"
+        : code === "temporary_place" ? "This app is running from a place that is gone when it quits"
         : code === "no_browser" ? `${browser.name} was not found on this device`
         : commandMessage(error, `${browser.name} could not be ${connect ? "connected" : "disconnected"}`));
     }
@@ -650,11 +651,12 @@ function BrowserPanel({ onNotice }: { onNotice: (text: string) => void }) {
       <div><strong>{browser.name}</strong><span>{browser.state === "connected" ? "Connected" : browser.state === "other" ? browser.pointsTo ? `Set up to start another program: ${browser.pointsTo}` : "Set up for something other than this app" : "Not connected"}</span></div>
       {browser.state === "connected"
         ? <button className="secondary" onClick={() => void change(browser, false)}>Disconnect</button>
-        : <button className="secondary" disabled={!status.host} onClick={() => void change(browser, true)}>{browser.state === "other" ? "Repair" : "Connect"}</button>}
+        : <button className="secondary" disabled={!status.host || status.temporaryPlace} onClick={() => void change(browser, true)}>{browser.state === "other" ? "Repair" : "Connect"}</button>}
     </div>)}
     {!status.host && <p className="review-hint">The program that browsers start to reach this app was not found beside it, so no browser can be connected.</p>}
+    {status.temporaryPlace && <p className="review-hint">This app is running from a place that is gone when it quits, so no browser can be pointed at it. Install the app first (on a Mac, move it into Applications and open it from there), then connect the browser.</p>}
     <p className="review-hint">Connecting writes one small file into the browser's own folder. It says where that program is and which one extension may start it. Disconnecting removes the file.</p>
-    <p className="review-hint">The extension itself cannot be installed yet. Until it can, connecting a browser changes nothing you would notice.</p>
+    <p className="review-hint">The extension is not in any browser's store yet. It is built from this project's source and loaded by hand, and connecting a browser changes nothing you would notice until it is.</p>
   </div>;
 }
 

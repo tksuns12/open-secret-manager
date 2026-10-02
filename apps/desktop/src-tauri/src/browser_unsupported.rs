@@ -33,6 +33,7 @@ pub struct BrowserStatus {
     listening: bool,
     problem: Option<String>,
     host: Option<String>,
+    temporary_place: bool,
     browsers: Vec<()>,
 }
 
@@ -42,6 +43,7 @@ fn status() -> BrowserStatus {
         listening: false,
         problem: Some(unsupported().message),
         host: None,
+        temporary_place: false,
         browsers: Vec::new(),
     }
 }
