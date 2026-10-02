@@ -1,4 +1,4 @@
-import type { DesktopBridge, DevicesInfo, EntryDetail, EntryInput, HeldChange, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, HeldChange, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -151,6 +151,17 @@ export const bridge: DesktopBridge = {
   },
   enableRecovery: (recoveryKey) => nativeOnly("enable_recovery", { recoveryKey }),
   syncNow: () => nativeOnly("sync_now"),
+  async listArchives() {
+    const invoke = native();
+    return invoke ? ((await invoke("list_archives")) as ArchiveInfo[]) : [];
+  },
+  openArchive: (name, password) => nativeOnly("open_archive", { name, password }),
+  copyFromArchive: (id) => nativeOnly("copy_from_archive", { id }),
+  async closeArchive() {
+    const invoke = native();
+    if (invoke) await invoke("close_archive");
+  },
+  deleteArchive: (name) => nativeOnly("delete_archive", { name }),
   startInvite: () => nativeOnly("start_invite"),
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),
   cancelInvite: () => nativeOnly("cancel_invite"),

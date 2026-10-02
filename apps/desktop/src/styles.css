@@ -32,3 +32,7 @@ button { color: inherit; border: 0; cursor: pointer; }
 .held-author { color: #94897a; font-size: 10px; line-height: 1.5; }
 /* The recovery key card takes the corner; a notice shown with it goes to the top. */
 .toast-raised { top: 76px; bottom: auto; }
+.archive-row { flex-wrap: wrap; }
+.archive-row > div:nth-child(2) span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-unlock { width: 100%; margin-top: 2px; }
+.archive-unlock .archive-cancel { color: #aa9f90; border: 1px solid #3b352d; background: transparent; font-weight: 400; }

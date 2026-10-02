@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod archive;
 mod network;
 #[cfg(test)]
 mod network_tests;
@@ -11,11 +12,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
 
-/// Lock order, where more than one is needed: `vault`, then the network's
-/// invitation store, then its peer store. Network waits (handshakes, the
-/// owner reading a pairing code) never hold any of them.
+/// Lock order, where more than one is needed: `vault`, then `archive`,
+/// then the network's invitation store, then its peer store. Network waits
+/// (handshakes, the owner reading a pairing code) never hold any of them.
 struct AppState {
     vault: Mutex<Option<Vault>>,
+    /// A copy of a vault put away earlier that the owner has opened.
+    archive: Mutex<Option<archive::Opened>>,
     path: PathBuf,
     network: network::Network,
 }
@@ -65,6 +68,8 @@ async fn lock_vault(state: tauri::State<'_, AppState>) -> Result<(), CommandErro
     if let Some(vault) = vault.as_mut() {
         vault.lock();
     }
+    // An opened archived copy is unlocked too: locking closes it.
+    *state.archive.lock().await = None;
     Ok(())
 }
 
@@ -588,6 +593,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
+            archive: Mutex::new(None),
             path,
             network,
         })
@@ -629,7 +635,12 @@ pub fn run() {
             network::cancel_invite,
             network::join_start,
             network::join_finish,
-            network::cancel_join
+            network::cancel_join,
+            archive::list_archives,
+            archive::open_archive,
+            archive::copy_from_archive,
+            archive::close_archive,
+            archive::delete_archive
         ])
         .run(tauri::generate_context!())
         .expect("error while running Open Secret Manager");

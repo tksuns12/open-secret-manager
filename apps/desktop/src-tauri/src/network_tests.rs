@@ -17,7 +17,7 @@ use tauri::{
 };
 use tokio::sync::Mutex;
 
-use crate::{network, AppState};
+use crate::{archive, network, AppState};
 
 const PASSWORD: &str = "device password";
 
@@ -27,6 +27,7 @@ fn shell(dir: &Path) -> App<MockRuntime> {
     mock_builder()
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
+            archive: Mutex::new(None),
             path,
             network,
         })
@@ -933,6 +934,97 @@ fn a_removed_device_is_reset_and_joins_again() {
             .members
             .iter()
             .any(|member| member.id == old_b));
+
+        // The copy that was put away still holds the edit that reached no
+        // one. The owner opens it with the password it had and sees how
+        // each item relates to the vault B has now.
+        let archives = archive::list_archives(b.state()).await.unwrap();
+        assert_eq!(archives.len(), 1);
+        assert!(archives[0].has_vault);
+        let name = archives[0].name.clone();
+        let wrong = archive::open_archive(name.clone(), "second password".into(), b.state())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(wrong.code, "invalid_credentials");
+        let relations = |items: &[archive::ArchivedItem]| -> Vec<(String, Option<&'static str>)> {
+            items
+                .iter()
+                .map(|item| (item.title.clone(), item.relation))
+                .collect()
+        };
+        let held = archive::open_archive(name.clone(), "joiner password".into(), b.state())
+            .await
+            .unwrap();
+        assert_eq!(
+            relations(&held),
+            [
+                ("Only on B".to_owned(), Some("absent")),
+                ("Shared".to_owned(), Some("same"))
+            ]
+        );
+
+        // Copied into the vault, the item is an ordinary item: it syncs.
+        let after = archive::copy_from_archive(held[0].id.clone(), b.state(), b.clone())
+            .await
+            .unwrap();
+        assert!(after.iter().all(|item| item.relation == Some("same")));
+        for app in [&a, &b] {
+            eventually(app, &["After removal", "Only on B", "Shared"]).await;
+        }
+        // An item the vault already has is copied under a telling title.
+        archive::copy_from_archive(held[1].id.clone(), b.state(), b.clone())
+            .await
+            .unwrap();
+        eventually(
+            &b,
+            &[
+                "After removal",
+                "Only on B",
+                "Shared",
+                "Shared (archived copy)",
+            ],
+        )
+        .await;
+
+        // Locking the vault closes the archived copy.
+        crate::lock_vault(b.state()).await.unwrap();
+        let closed = archive::copy_from_archive(held[0].id.clone(), b.state(), b.clone())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(closed.code, "no_archive");
+
+        // Only a folder this app made is ever opened or deleted.
+        for bad in [
+            "..",
+            "../vault.sqlite3",
+            "archive-",
+            "archive-x",
+            "archive-1-2-3",
+        ] {
+            let refused = archive::open_archive(bad.into(), "joiner password".into(), b.state())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(refused.code, "no_archive", "{bad}");
+            let refused = archive::delete_archive(bad.into(), b.state(), b.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code, "no_archive", "{bad}");
+        }
+        assert!(b_dir.join("vault.sqlite3").exists());
+
+        // Deleted, the copy is gone for good.
+        archive::delete_archive(name.clone(), b.state(), b.clone())
+            .await
+            .unwrap();
+        assert!(!archive.exists());
+        assert!(archive::list_archives(b.state()).await.unwrap().is_empty());
+        let gone = archive::delete_archive(name, b.state(), b.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(gone.code, "no_archive");
         for app in [&a, &b] {
             network::shutdown(app).await;
         }
@@ -1036,7 +1128,32 @@ fn putting_a_copy_away_is_finished_at_launch_if_it_was_interrupted() {
             (info.setup, info.reset_reason, info.reset_archive),
             ("none", Some("left"), Some(expected))
         );
+
+        // Without a vault here the copy can still be looked into, though
+        // there is nothing to compare it with or copy into.
+        let held = archive::open_archive("archive-1".into(), PASSWORD.into(), handle.state())
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            (held[0].title.as_str(), held[0].relation),
+            ("Kept in the archive", None)
+        );
+        let nowhere =
+            archive::copy_from_archive(held[0].id.clone(), handle.state(), handle.clone())
+                .await
+                .err()
+                .unwrap();
+        assert_eq!(nowhere.code, "locked");
+
+        // Deleting it also drops the note that pointed to it.
+        archive::delete_archive("archive-1".into(), handle.state(), handle.clone())
+            .await
+            .unwrap();
+        assert_eq!(devices(&handle).await.reset_archive, None);
     });
+    assert!(!archive.exists());
+    assert!(!dir.path().join("left-vault").exists());
 
     // A later launch moves nothing more: the stores made since stay.
     network::finish_interrupted_recovery(&path);

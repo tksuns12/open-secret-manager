@@ -200,6 +200,17 @@ impl Network {
         self.clear_removed();
     }
 
+    /// An archived copy was deleted: a note that names its folder goes
+    /// with it.
+    pub(crate) fn forget_archive(&self, folder: &Path) {
+        for reason in [PutAway::Removed, PutAway::Left] {
+            let note = self.directory.join(reason.note());
+            if std::fs::read_to_string(&note).is_ok_and(|named| Path::new(&named) == folder) {
+                let _ = std::fs::remove_file(note);
+            }
+        }
+    }
+
     fn control_path(&self) -> PathBuf {
         self.directory.join("control.sqlite3")
     }

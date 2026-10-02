@@ -66,6 +66,32 @@ export type HeldChange = {
   changed: string[];
 };
 
+/** A copy of a vault that was put away on this device, in a folder beside the vault. */
+export type ArchiveInfo = {
+  /** The folder's name; the other archive calls take it. */
+  name: string;
+  /** When it was put away, in seconds since the Unix epoch. */
+  archivedAt: number;
+  path: string;
+  /** Whether the folder holds a vault file. */
+  hasVault: boolean;
+};
+
+/** An item of an opened archived copy. Secrets are never included. */
+export type ArchivedItem = {
+  id: string;
+  title: string;
+  kind: EntryKind;
+  username: string;
+  url: string;
+  /** The archived copy holds conflicting versions of this item. */
+  conflict: boolean;
+  /** How it relates to the vault here now; absent from the payload when there is no unlocked vault to compare with. */
+  relation?: "same" | "differs" | "absent" | null;
+  /** For `differs`: which fields differ. */
+  changed: string[];
+};
+
 export type SyncState = "connected" | "received" | "offline";
 
 /** Mirrors the desktop shell's sync status; secrets never appear here. */
@@ -161,6 +187,15 @@ export type DesktopBridge = {
   resetDevice: () => Promise<string>;
   /** For a device whose vault was replaced by a new one started on another device: puts its copy in an archive folder so it can join that one. `password` is this device's. Resolves to the folder. */
   leaveVault: (password: string) => Promise<string>;
+  /** Copies of a vault put away on this device, newest first. */
+  listArchives: () => Promise<ArchiveInfo[]>;
+  /** Opens one with the password it had; resolves to its items. It stays open until closed or the vault locks. */
+  openArchive: (name: string, password: string) => Promise<ArchivedItem[]>;
+  /** Copies an item of the opened copy into the vault as a new item; resolves to the copy's items again. */
+  copyFromArchive: (id: string) => Promise<ArchivedItem[]>;
+  closeArchive: () => Promise<void>;
+  /** Deletes the folder and everything in it. */
+  deleteArchive: (name: string) => Promise<void>;
   startInvite: () => Promise<{ code: string; expiresAt: number }>;
   confirmInvite: (accept: boolean) => Promise<void>;
   cancelInvite: () => Promise<void>;
