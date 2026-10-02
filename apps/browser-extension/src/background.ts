@@ -1,86 +1,202 @@
-import { isAllowedDocument, MAX_MESSAGE_BYTES, type FillReply, type FillRequest, type HostMessage } from "./protocol";
+// The extension's background: it acts only when the owner presses its
+// toolbar button on a page. It then asks the desktop app, through the
+// native messaging host, for a login for that page's origin, and puts the
+// one the owner chooses there into the page. It holds no login before that
+// and keeps none after, and never learns what the vault contains.
 
-const NATIVE_HOST = "org.opensecretmanager.native";
+import { answers, explain, fillRequest, GIVE_UP_AFTER_MS, NATIVE_HOST, pageOrigin, readResponse, VERSION, type Cancel, type FillReply, type FillRequest } from "./protocol";
+import type { Field, FromPage, Prepared, ToPage } from "./page";
+
+/** A request the owner has yet to decide in the app. */
+type Waiting = {
+  request: FillRequest;
+  /** The connection to the document the request was made in. */
+  page: chrome.runtime.Port;
+  giveUp: ReturnType<typeof setTimeout>;
+};
+
+type Mark = "waiting" | "filled" | "problem" | "none";
+
+const TITLE = "Fill a login from Open Secret Manager";
+const NOT_CONNECTED = "This browser is not connected to Open Secret Manager. In the app, open Browser and connect it.";
+/** How long the page's script has to answer. */
+const PAGE_ANSWERS_WITHIN_MS = 5_000;
+/** How long the mark for a finished fill stays on the button. */
+const FILLED_MARK_MS = 6_000;
+
+const waiting = new Map<string, Waiting>();
 let host: chrome.runtime.Port | undefined;
-const pending = new Map<string, (reply: FillReply | Error) => void>();
-type NativeResponse = { type?: "fill_reply" | "error"; requestId?: string; origin?: string; username?: unknown; password?: unknown; totp?: unknown; code?: string };
 
+/** Says on the toolbar button, for one tab, how its request stands. */
+function show(tabId: number, mark: Mark, text: string) {
+  const badge = { waiting: "…", filled: "✓", problem: "!", none: "" }[mark];
+  const color = mark === "problem" ? "#b3402a" : "#8d673a";
+  // The tab may be gone by now; then there is nobody to tell.
+  void chrome.action.setBadgeBackgroundColor({ tabId, color }).catch(() => {});
+  void chrome.action.setBadgeText({ tabId, text: badge }).catch(() => {});
+  void chrome.action.setTitle({ tabId, title: text ? `${TITLE}\n${text}` : TITLE }).catch(() => {});
+}
+
+function isPrepared(message: unknown): message is Prepared {
+  const value = message as Partial<Prepared> | null;
+  return typeof value === "object" && value !== null && value.type === "prepared"
+    && typeof value.documentId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(value.documentId)
+    && typeof value.origin === "string"
+    && Array.isArray(value.fields) && value.fields.every((field) => field === "username" || field === "password");
+}
+
+/** What the page's script found, once it says. */
+function prepared(page: chrome.runtime.Port): Promise<Prepared> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("the page did not answer")), PAGE_ANSWERS_WITHIN_MS);
+    page.onDisconnect.addListener(() => { clearTimeout(timer); reject(new Error("the page went away")); });
+    page.onMessage.addListener((message: unknown) => {
+      if (!isPrepared(message)) return;
+      clearTimeout(timer);
+      resolve(message);
+    });
+    page.postMessage({ type: "prepare" } satisfies ToPage);
+  });
+}
+
+/** The owner pressed the button on this tab. */
+async function ask(tab: chrome.tabs.Tab) {
+  const tabId = tab.id;
+  if (tabId === undefined) return;
+  // This tab's request is already waiting in the app.
+  if ([...waiting.values()].some((other) => other.request.tabId === tabId)) return;
+  // The address comes from the browser, not from the page.
+  const origin = pageOrigin(tab.url);
+  if (!origin) { show(tabId, "problem", "Only pages opened over https can be filled."); return; }
+
+  const requestId = crypto.randomUUID();
+  let page: chrome.runtime.Port;
+  let found: Prepared;
+  try {
+    // Only the page's own document, never a frame inside it.
+    await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ["content.js"] });
+    page = chrome.tabs.connect(tabId, { name: requestId, frameId: 0 });
+    found = await prepared(page);
+  } catch {
+    show(tabId, "problem", "This page cannot be filled.");
+    return;
+  }
+  if (found.origin !== origin) {
+    page.disconnect();
+    show(tabId, "problem", "The page changed while you asked. Try again.");
+    return;
+  }
+  if (found.fields.length === 0) {
+    page.disconnect();
+    show(tabId, "problem", "No login form was found on this page.");
+    return;
+  }
+
+  const request = fillRequest(requestId, tabId, found.documentId, origin);
+  const giveUp = setTimeout(() => end(requestId, "problem", "Open Secret Manager did not answer. Nothing was filled.", true), GIVE_UP_AFTER_MS);
+  waiting.set(requestId, { request, page, giveUp });
+  // The document went away: a navigation, a reload, or the tab closing.
+  page.onDisconnect.addListener(() => end(requestId, "none", "", true));
+  show(tabId, "waiting", "Asking Open Secret Manager…");
+  try {
+    connectHost().postMessage(request);
+  } catch {
+    end(requestId, "problem", NOT_CONNECTED, false);
+  }
+}
+
+/** The host's process, started by the browser when first needed. */
 function connectHost(): chrome.runtime.Port {
   if (host) return host;
-  host = chrome.runtime.connectNative(NATIVE_HOST);
-  host.onMessage.addListener((message: unknown) => {
-    let encoded: string;
-    try { encoded = JSON.stringify(message); } catch { return; }
-    if (encoded.length > MAX_MESSAGE_BYTES) return;
-    const value = message as NativeResponse;
-    if (typeof value.requestId !== "string") return;
-    if (value.type === "error") {
-      pending.get(value.requestId)?.(new Error(typeof value.code === "string" ? value.code : "native host rejected request"));
-      pending.delete(value.requestId);
-      return;
-    }
-    if (value.type !== "fill_reply") return;
-    pending.get(value.requestId)?.(value as FillReply);
-    pending.delete(value.requestId);
+  const port = chrome.runtime.connectNative(NATIVE_HOST);
+  port.onMessage.addListener(fromHost);
+  port.onDisconnect.addListener(() => {
+    // The browser says why: no host is registered for it, the host does not
+    // allow this extension, or the host's process ended.
+    const reason = chrome.runtime.lastError?.message ?? "";
+    if (host === port) host = undefined;
+    const text = /not found|forbidden/i.test(reason) ? NOT_CONNECTED : "The connection to Open Secret Manager was lost. Nothing was filled.";
+    for (const requestId of [...waiting.keys()]) end(requestId, "problem", text, false);
   });
-  host.onDisconnect.addListener(() => { host = undefined; for (const resolve of pending.values()) resolve(new Error("Native host disconnected")); pending.clear(); });
-  return host;
+  host = port;
+  return port;
 }
 
-async function requestFill(request: FillRequest): Promise<FillReply> {
-  const port = connectHost();
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      pending.delete(request.requestId);
-      reject(new Error("native fill request expired"));
-    }, 30_000);
-    pending.set(request.requestId, (reply) => {
-      clearTimeout(timeout);
-      if (reply instanceof Error) return reject(reply);
-      // The native response is one-use and must remain bound to the request's
-      // exact origin. A host response with another origin is discarded before
-      // any credential reaches a content script.
-      if (reply.requestId !== request.requestId || reply.origin !== request.origin || !isAllowedDocument(reply.origin, request.frameOrigin, request.origin)) return reject(new Error("native response binding failed"));
-      if (reply.username !== undefined && typeof reply.username !== "string") return reject(new Error("invalid username response"));
-      if (reply.password !== undefined && typeof reply.password !== "string") return reject(new Error("invalid password response"));
-      resolve(reply);
-    });
-    port.postMessage(request);
-  });
+/** Lets the host's process end once nothing waits for it. */
+function releaseHost() {
+  if (waiting.size > 0 || !host) return;
+  const port = host;
+  host = undefined;
+  port.disconnect();
 }
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({ id: "fill-selected", title: "Open Secret Manager: fill selected login", contexts: ["page", "editable"] });
-});
-
-chrome.contextMenus.onClicked.addListener(async (_info, tab) => {
-  const tabId = tab?.id;
-  const tabUrl = tab?.url;
-  if (tabId === undefined || !tabUrl) return;
-  let origin: string;
-  try { origin = new URL(tabUrl).origin; } catch { return; }
-  const requestId = crypto.randomUUID();
-  try {
-    const result = await chrome.tabs.sendMessage(tabId, { type: "select_fill", requestId }, { frameId: 0 });
-    if (result?.cancelled || !result?.frameOrigin || !result.topOrigin || !result.documentId || !isAllowedDocument(origin, result.frameOrigin, result.topOrigin)) return;
-    const reply = await requestFill({ type: "fill_request", requestId, origin, frameOrigin: result.frameOrigin, documentId: result.documentId, tabId, frameId: result.frameId ?? 0 });
-    // Re-read the tab immediately before releasing any credential to content code.
-    const current = await chrome.tabs.get(tabId);
-    if (!current.url || new URL(current.url).origin !== origin) return;
-    await chrome.tabs.sendMessage(tabId, { ...reply, type: "release_fill", requestId, expectedOrigin: origin, documentId: result.documentId }, { frameId: 0 });
-  } catch {
-    // Native host errors are intentionally silent; the page never receives a secret.
+/** Ends a request without a fill. `withdraw` tells the host, for a request the app may still be showing. */
+function end(requestId: string, mark: Mark, text: string, withdraw: boolean) {
+  const request = waiting.get(requestId);
+  if (!request) return;
+  waiting.delete(requestId);
+  clearTimeout(request.giveUp);
+  if (withdraw) {
+    try { host?.postMessage({ type: "cancel", version: VERSION, requestId } satisfies Cancel); } catch { /* the host is gone, which withdraws it too */ }
   }
-});
+  finish(request, mark, text);
+}
 
-chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
-  if (!sender.tab?.id || !sender.tab.url) return false;
-  const value = message as { type?: string; requestId?: string; frameOrigin?: string; topOrigin?: string; frameId?: number };
-  if (value.type !== "selected_fill" || typeof value.requestId !== "string" || typeof value.frameOrigin !== "string" || typeof value.topOrigin !== "string") return false;
-  const pageOrigin = new URL(sender.tab.url).origin;
-  if (!isAllowedDocument(pageOrigin, value.frameOrigin, value.topOrigin)) return false;
-  sendResponse({ ok: true, frameId: value.frameId ?? sender.frameId ?? 0 });
-  return false;
-});
+function finish(request: Waiting, mark: Mark, text: string) {
+  try { request.page.disconnect(); } catch { /* already closed */ }
+  show(request.request.tabId, mark, text);
+  if (mark === "filled") setTimeout(() => show(request.request.tabId, "none", ""), FILLED_MARK_MS);
+  releaseHost();
+}
 
-export type { HostMessage };
+function fromHost(message: unknown) {
+  const response = readResponse(message);
+  if (!response || response.requestId === null) return;
+  // A response for a request that is not waiting is dropped: one that was
+  // never made, one that ended, and a reply that comes a second time.
+  const request = waiting.get(response.requestId);
+  if (!request) return;
+  if (response.type === "waiting") {
+    show(request.request.tabId, "waiting", "Waiting for you in Open Secret Manager. Choose a login there.");
+    return;
+  }
+  if (response.type === "error") {
+    end(response.requestId, "problem", explain(response.code), false);
+    return;
+  }
+  // A reply is used once, and only if it answers exactly this request.
+  waiting.delete(response.requestId);
+  clearTimeout(request.giveUp);
+  if (!answers(response, request.request)) {
+    finish(request, "problem", "The answer from Open Secret Manager was not for this page. Nothing was filled.");
+    return;
+  }
+  void deliver(request, response);
+}
+
+/** Puts the owner's choice into the page, if the page is still the one that asked. */
+async function deliver(request: Waiting, reply: FillReply) {
+  const { tabId, origin } = request.request;
+  // Asked of the browser again at the last moment.
+  let current: string | null = null;
+  try { current = pageOrigin((await chrome.tabs.get(tabId)).url); } catch { /* the tab is gone */ }
+  if (current !== origin) {
+    finish(request, "problem", "The page changed before the login arrived. Nothing was filled.");
+    return;
+  }
+  const filled = await new Promise<Field[]>((resolve) => {
+    const timer = setTimeout(() => resolve([]), PAGE_ANSWERS_WITHIN_MS);
+    const done = (fields: Field[]) => { clearTimeout(timer); resolve(fields); };
+    request.page.onDisconnect.addListener(() => done([]));
+    request.page.onMessage.addListener((message: FromPage) => { if (message.type === "filled") done(message.fields); });
+    try {
+      request.page.postMessage({ type: "fill", documentId: reply.documentId, origin: reply.origin, username: reply.username, password: reply.password } satisfies ToPage);
+    } catch {
+      done([]);
+    }
+  });
+  if (filled.length > 0) finish(request, "filled", `Filled the ${filled.join(" and ").replace("username", "user name")}. The form was not submitted.`);
+  else finish(request, "problem", "The login form is gone. Nothing was filled.");
+}
+
+chrome.action.onClicked.addListener((tab) => { void ask(tab); });

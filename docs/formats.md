@@ -208,7 +208,7 @@ A fill is asked for by the extension and decided in the desktop app. The request
 
 ### Implemented fill protocol (Phase 5, stop 1)
 
-Implemented so far: the origin rule, the messages, the native host, the desktop session's end, and the desktop app that serves it (below). The extension source still speaks earlier scaffold messages.
+Implemented: the origin rule, the messages, the native host, the desktop session's end, the desktop app that serves it, and the extension (both below).
 
 **Origin.** `osm-origin` is the one implementation, used by the core, the host, and the session. `Origin::of_url` gives the origin of an address stored with a login: the scheme must be `https`, there must be no user name or password, the path, query, and fragment are ignored, the host is taken as the URL standard serializes it (lower case, an international name in its ASCII form), and a missing port is 443. `Origin::parse` reads an origin from a message and accepts it only if it is already exactly that serialization, such as `https://example.com` or `https://example.com:8443`: a trailing slash, upper case, a written default port, or anything else that merely resembles an origin is refused. Two origins match only if host and port are equal. `https://example.com.` (trailing dot) is a different origin from `https://example.com`, as it is to a browser. An address without a scheme, such as `example.com`, has no origin, and its login is never offered. Redirects are not a concern of this rule: the extension reports the origin of the document it will fill.
 
@@ -256,6 +256,24 @@ When a request arrives the app unhides, shows, and focuses its window. Whether a
 | Firefox | `Library/Application Support/Mozilla/NativeMessagingHosts` | `.mozilla/native-messaging-hosts` |
 
 The host program is `osm-native-host` beside the app's own program. A development build also looks where the repository's workspace builds it. Nothing packages the host with the app yet. On a system without Unix sockets the commands exist and report that filling into a browser is unavailable.
+
+### Extension (Phase 5, stop 3)
+
+One source builds an extension for Chromium and one for Firefox (`dist/chromium`, `dist/firefox`), each with its manifest. Both ask for `activeTab`, `scripting`, and `nativeMessaging`, and for nothing else: no host permissions, no content script declared for any page, no storage. The Chromium manifest's `key` gives the extension the ID the host allows.
+
+The extension acts on a press of its toolbar button (or the keyboard shortcut the owner may assign to it), which is what gives it access to that one tab:
+
+1. The tab's address, from the browser, must be an `https` address without a user name or password; its origin is what is asked for. Otherwise the press ends with an explanation.
+2. A script is put into the tab's top document (frame 0) and connected to. It answers with a name for the document, 1 to 64 letters, digits, or hyphens, made at random when the script first ran there; the document's origin, which must equal the tab's; and which of a user name field and a password field it found. With no field found, nothing is asked.
+3. The `fill_request` goes to the host with a request ID made at random, the tab ID, frame 0, that document name, and the origin.
+4. A `waiting` response updates the button. An `error` ends the request. A `fill_reply` is taken once: the request stops waiting before anything else happens, so a repeated reply meets no request. It is filled only if it names the same request, tab, frame, document, and origin, and only if the browser, asked again, says the tab still shows a page of that origin.
+5. The script fills the fields it found when asked, if they are still in the document, by setting each value and sending `input` and `change` events. It sends no key events and does not submit. It fills once per request and only if the document name and origin it is handed are its own.
+
+The connection to the script closes when its document goes away. That ends the request: the extension sends `cancel` to the host and drops any reply that comes later. The extension itself gives up after 150 seconds. When no request waits, it closes its connection to the host, which ends the host's process.
+
+The script looks for the login form in the form of the field that has the focus, and otherwise in the whole document: the first visible password field, and the last visible text, email, or telephone field before it; or, with no password field, the focused field of those kinds or one whose `autocomplete`, `name`, or `id` names a user name or email. It does not look inside shadow roots or frames.
+
+What the button says: `…` while the request waits, `✓` after a fill, `!` when nothing was filled, with the reason in its title.
 
 ## Compatibility gate
 

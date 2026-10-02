@@ -2,10 +2,23 @@
   "manifest_version": 3,
   "name": "Open Secret Manager",
   "version": "0.1.0",
-  "description": "Explicit, origin-bound autofill for Open Secret Manager.",
+  "description": "Fills a login you choose in the Open Secret Manager app into the page you are on.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5hBmyI+7n/wl6tBjDUh0VoMH1HjstJCWAcnp4tnqZw6fsIUHG/UYDnNKaWh1+ckDPue83UHlIBfZX0ErgnszyCBYfosUNH32BAYzBXkFb2dhgt+KdccvlutMue5uGWUzeaarHm6FoweJmuDLzhKIzJqL6Q1GWiUzdLSPTocPEhbEBFPrJcA2sE/N4MAdPo8YDtwCmLP6Urn/LcamFZ4guZpam19J7Mr6U5xfetWivtqc52XRmd9Rk7tKdK43iQAbWyFZSflUyGyEIWrioAggwA5wUe/IORrdfK23OJFxhPe61W8c9yH87wpJxONjcQAmQ8IVbSZvJkOEk4Q2I14MRwIDAQAB",
-  "permissions": ["contextMenus", "nativeMessaging", "tabs"],
-  "host_permissions": ["https://*/*"],
-  "background": { "service_worker": "dist/background.js", "type": "module" },
-  "content_scripts": [{ "matches": ["https://*/*"], "js": ["dist/content.js"], "run_at": "document_idle", "all_frames": false }]
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "nativeMessaging"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Fill a login from Open Secret Manager"
+  },
+  "commands": {
+    "_execute_action": {
+      "description": "Fill a login from Open Secret Manager"
+    }
+  }
 }

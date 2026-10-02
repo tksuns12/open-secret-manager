@@ -43,9 +43,11 @@ The repository is deliberately split at the security boundary:
 - `apps/native-host` is the process a browser starts for the extension. It
   holds no vault and no key: it checks each request and passes it to the
   desktop session over a socket only the owner's account can reach.
-- `apps/browser-extension` is one WebExtension source tree with Chromium and
-  Firefox manifests. It is a scaffold: it has no build step yet and predates
-  the host's current messages, so no browser can use the app yet.
+- `apps/browser-extension` is one WebExtension source tree that builds for
+  Chromium and for Firefox. On a press of its toolbar button it asks the
+  app for a login for the page's origin and fills the one the owner chooses
+  there. It has no access to pages otherwise and stores nothing. It runs in
+  headless Chromium tests; Firefox has not been run.
 
 The prototype is intentionally offline-first. Local vault use does not depend
 on a peer or a network. Devices pair by invitation and a six-digit code the
@@ -85,7 +87,14 @@ The browser package uses the same TypeScript source for Chromium and Firefox:
 cd apps/browser-extension
 npm install
 npm run typecheck
+npm run build
+npm test
+npm run test:e2e
 ```
+
+`npm run test:e2e` runs the built extension in headless Chromium with the
+real native messaging host; see `apps/browser-extension/README.md` for what
+it needs.
 
 Before a release, read [the threat model](docs/threat-model.md), [the format
 contract](docs/formats.md), and [the implementation status](docs/implementation-status.md).

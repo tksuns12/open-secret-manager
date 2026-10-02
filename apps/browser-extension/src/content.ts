@@ -1,70 +1,108 @@
-import { exactOriginMatches, isAllowedDocument, type FillReply } from "./protocol";
+// Put into a page's own document, and only its top one, when the owner
+// asks for a fill there. It finds the login form, and later puts a user
+// name and password into it. It never submits the form and shows nothing
+// in the page. It runs apart from the page's scripts, which cannot read it.
 
-type SelectMessage = { type: "select_fill"; requestId: string };
-type ReleaseMessage = Omit<FillReply, "type"> & { type: "release_fill"; expectedOrigin: string; documentId: string };
-const marker = "data-osm-fill-ui";
+import type { ToPage, FromPage } from "./page";
+
+type Target = { username: HTMLInputElement | null; password: HTMLInputElement | null };
+
+declare global {
+  // Set once per document, so that putting the script in again does nothing.
+  // eslint-disable-next-line no-var
+  var osmFillInstalled: boolean | undefined;
+}
+
+/** Names this document. A navigation loads another, with another name. */
 const documentId = crypto.randomUUID();
-let approvedGrant: { requestId: string; origin: string; documentId: string; expiresAt: number } | null = null;
 
-function documentOrigins(): { origin: string; topOrigin: string } | null {
-  try {
-    const origin = window.location.origin;
-    const topOrigin = window.top?.location.origin ?? "null";
-    if (!isAllowedDocument(origin, origin, topOrigin)) return null;
-    return { origin, topOrigin };
-  } catch { return null; }
+/** An input the owner could type into now. */
+function usable(element: Element | null): element is HTMLInputElement {
+  return element instanceof HTMLInputElement
+    && !element.disabled
+    && !element.readOnly
+    && element.getClientRects().length > 0;
 }
 
-function focusedForm(): HTMLFormElement | null {
-  const element = document.activeElement;
-  return element instanceof HTMLInputElement ? element.form : element instanceof HTMLFormElement ? element : element?.closest("form") ?? null;
+function isPassword(input: HTMLInputElement): boolean {
+  return input.type === "password";
 }
 
-function removePrompt() { document.querySelector(`[${marker}]`)?.remove(); }
+function isName(input: HTMLInputElement): boolean {
+  return input.type === "text" || input.type === "email" || input.type === "tel";
+}
 
-function showPrompt(requestId: string, respond: (response: unknown) => void) {
-  removePrompt();
-  const origins = documentOrigins();
-  if (!origins) { respond({ cancelled: true }); return; }
-  const form = focusedForm();
-  const prompt = document.createElement("div");
-  prompt.setAttribute(marker, "true");
-  prompt.style.cssText = "position:fixed;z-index:2147483647;right:18px;bottom:18px;padding:12px 14px;border:1px solid #c98b43;border-radius:8px;background:#201912;color:#f6e5cc;font:12px system-ui;box-shadow:0 8px 28px #0008";
-  prompt.innerHTML = `<strong>Open Secret Manager</strong><div style="margin-top:5px;opacity:.75">Choose a matching login to fill this page.</div><button data-osm-ok style="margin-top:9px;padding:6px 9px;border:0;border-radius:5px;background:#dda45b;color:#201912">Continue</button><button data-osm-cancel style="margin-left:5px;padding:6px 9px;border:0;border-radius:5px;background:transparent;color:#dbc6aa">Cancel</button>`;
-  prompt.querySelector("[data-osm-ok]")?.addEventListener("click", () => {
-    const current = documentOrigins();
-    if (!current || !form || !isAllowedDocument(origins.origin, window.location.origin, origins.topOrigin)) { respond({ cancelled: true }); return removePrompt(); }
-    approvedGrant = { requestId, origin: current.origin, documentId, expiresAt: Date.now() + 30_000 };
-    respond({ frameOrigin: current.origin, topOrigin: current.topOrigin, documentId, frameId: 0 });
-    void chrome.runtime.sendMessage({ type: "selected_fill", requestId, frameOrigin: origins.origin, topOrigin: origins.topOrigin, frameId: 0 });
-    removePrompt();
+function looksLikeName(input: HTMLInputElement): boolean {
+  return /username|email/i.test(input.autocomplete) || /user|email|login/i.test(`${input.name} ${input.id}`);
+}
+
+/** The fields of a login form among `inputs`, in document order. */
+function among(inputs: HTMLInputElement[], focused: Element | null): Target | null {
+  const fields = inputs.filter(usable);
+  const password = (usable(focused) && isPassword(focused) ? focused : null) ?? fields.find(isPassword) ?? null;
+  if (password) {
+    // The user name is asked for just before the password.
+    const before = fields.filter((input) => isName(input) && (input.compareDocumentPosition(password) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
+    return { username: before[before.length - 1] ?? null, password };
+  }
+  // A form that asks for the user name first and the password on a later page.
+  const username = (usable(focused) && isName(focused) ? focused : null) ?? fields.find((input) => isName(input) && looksLikeName(input)) ?? null;
+  return username ? { username, password: null } : null;
+}
+
+/** The login form the owner means: the one being typed into, else the first one in the page. */
+function findTarget(): Target | null {
+  const focused = document.activeElement;
+  const form = focused instanceof HTMLInputElement ? focused.form : null;
+  const inForm = form ? among(Array.from(form.elements).filter((element): element is HTMLInputElement => element instanceof HTMLInputElement), focused) : null;
+  return inForm ?? among(Array.from(document.querySelectorAll("input")), focused);
+}
+
+/** Puts `value` into `input` the way typing would, so that the page notices. */
+function put(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  if (setter) setter.call(input, value);
+  else input.value = value;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+/** Whether this is the page itself, opened over https, and not a frame in another page. */
+function isTopHttpsDocument(): boolean {
+  return window.top === window && window.location.protocol === "https:";
+}
+
+if (!globalThis.osmFillInstalled) {
+  globalThis.osmFillInstalled = true;
+  // Each request has its own connection from the extension. It closes when
+  // this document goes away, which is how the extension learns of that.
+  chrome.runtime.onConnect.addListener((port) => {
+    let target: Target | null = null;
+    let used = false;
+    const say = (message: FromPage) => port.postMessage(message);
+    port.onMessage.addListener((message: ToPage) => {
+      if (message.type === "prepare") {
+        target = isTopHttpsDocument() ? findTarget() : null;
+        say({
+          type: "prepared",
+          documentId,
+          origin: window.location.origin,
+          fields: target ? [...(target.username ? ["username" as const] : []), ...(target.password ? ["password" as const] : [])] : [],
+        });
+        return;
+      }
+      if (message.type !== "fill") return;
+      // One fill for one request, into the document it was asked for.
+      const allowed = !used && target !== null && isTopHttpsDocument()
+        && message.documentId === documentId && message.origin === window.location.origin;
+      used = true;
+      const filled: ("username" | "password")[] = [];
+      if (allowed && target) {
+        if (target.username?.isConnected && usable(target.username)) { put(target.username, message.username); filled.push("username"); }
+        if (target.password?.isConnected && usable(target.password)) { put(target.password, message.password); filled.push("password"); }
+      }
+      target = null;
+      say({ type: "filled", fields: filled });
+    });
   });
-  prompt.querySelector("[data-osm-cancel]")?.addEventListener("click", () => { respond({ cancelled: true }); removePrompt(); });
-  document.documentElement.append(prompt);
 }
-
-chrome.runtime.onMessage.addListener((message: SelectMessage | ReleaseMessage, _sender, sendResponse) => {
-  if (message.type === "select_fill") {
-    const origins = documentOrigins();
-    if (!origins) return false;
-    showPrompt(message.requestId, sendResponse);
-    return true;
-  }
-  if (message.type === "release_fill") {
-    const origins = documentOrigins();
-    // Recheck both the origin and the document before assigning credentials.
-    if (!origins || !exactOriginMatches(message.expectedOrigin, origins.origin) || !approvedGrant || approvedGrant.requestId !== message.requestId || approvedGrant.documentId !== message.documentId || approvedGrant.expiresAt < Date.now()) return false;
-    approvedGrant = null;
-    const form = focusedForm();
-    if (!form) return false;
-    const password = Array.from(form.elements).find((field): field is HTMLInputElement => field instanceof HTMLInputElement && field.type === "password");
-    const username = Array.from(form.elements).find((field): field is HTMLInputElement => field instanceof HTMLInputElement && /user|email|login/i.test(`${field.name} ${field.autocomplete}`));
-    if (username && message.username !== undefined) username.value = message.username;
-    if (password && message.password !== undefined) password.value = message.password;
-    // No submit event is generated. TOTP is deliberately not auto-filled in alpha.
-    return false;
-  }
-  return false;
-});
-
-window.addEventListener("pagehide", () => { approvedGrant = null; removePrompt(); });
