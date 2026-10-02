@@ -245,20 +245,32 @@ fn desktop_shells_enroll_sync_remove_and_refuse_without_quorum() {
             ["Added on A", "Added on C", "After removal", "Shared"]
         );
 
-        // C learns that it was removed, and gets nothing more.
-        until_devices(&c, "C is told it was removed", |info| {
-            info.setup == "removed"
+        // C learns that it was removed and is reset at once: its copy,
+        // which never got the new key or anything written since, is moved
+        // aside, and C is a device without a vault again.
+        let reset = until_devices(&c, "C is reset after its removal", |info| {
+            info.setup == "none" && info.reset_archive.is_some()
         })
         .await;
-        let refused = network::sync_now(c.clone()).await.unwrap_err();
-        assert_eq!(refused.code, "removed");
-        assert_eq!(titles(&c).await, ["Added on A", "Added on C", "Shared"]);
-        assert_eq!(current_epoch(&c).await, 1);
+        assert!(c.state::<AppState>().vault.lock().await.is_none());
+        let archive = std::path::PathBuf::from(reset.reset_archive.unwrap());
+        let mut archived = Vault::open(archive.join("vault.sqlite3")).unwrap();
+        archived.unlock("third password").unwrap();
+        assert_eq!(archived.current_epoch(), 1);
+        let mut kept: Vec<String> = archived
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["Added on A", "Added on C", "Shared"]);
+        drop(archived);
         let refused = network::start_invite(c.state(), c.clone())
             .await
             .err()
             .unwrap();
-        assert_eq!(refused.code, "removed");
+        assert_eq!(refused.code, "unmanaged");
 
         // D starts joining but never finishes. Its enrollment stays
         // pending until a member cancels it; D never received a key.
@@ -596,4 +608,145 @@ fn an_interrupted_recovery_is_finished_or_discarded_at_launch() {
     // Nothing to do on an ordinary launch.
     network::finish_interrupted_recovery(&path);
     assert_eq!(Vault::open(&path).unwrap().vault_id(), new_vault);
+}
+
+#[test]
+fn a_removed_device_is_reset_and_joins_again() {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (app_a, app_b) = (shell(dir_a.path()), shell(dir_b.path()));
+    let codes = record(&app_a, "pairing-code");
+    let finished = record(&app_a, "pairing-finished");
+    let resets = record(&app_b, "device-reset");
+    let (a, b) = (app_a.handle().clone(), app_b.handle().clone());
+    let b_dir = dir_b.path().to_owned();
+
+    tauri::async_runtime::block_on(async move {
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "Shared").await;
+        pair(&a, &codes, &finished, 0, &b, Some("joiner password")).await;
+        eventually(&b, &["Shared"]).await;
+        until_devices(&a, "two members", |info| {
+            info.members.len() == 2 && info.pending.is_none()
+        })
+        .await;
+        let old_b = devices(&b).await.this_device.unwrap();
+        let old_vault_on_b = vault_id(&b).await;
+        // B has an edit that never reaches A.
+        put(&b, "Only on B").await;
+
+        // A device that is still a member is never reset.
+        let refused = network::reset_device(b.clone()).await.unwrap_err();
+        assert_eq!(refused.code, "not_removed");
+
+        // A removes B, and writes something B never gets.
+        network::remove_device(old_b.clone(), a.clone())
+            .await
+            .unwrap();
+        until_devices(&a, "the removal completes", |info| {
+            info.epoch == 2 && info.members.len() == 1 && info.pending.is_none()
+        })
+        .await;
+        for _ in 0..100 {
+            if current_epoch(&a).await == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        put(&a, "After removal").await;
+
+        // As soon as B learns of it, B is reset: its copy is moved to an
+        // archive folder, untouched, and B is a device without a vault.
+        let reset = until_devices(&b, "B is reset after its removal", |info| {
+            info.setup == "none" && info.reset_archive.is_some()
+        })
+        .await;
+        let archive = std::path::PathBuf::from(reset.reset_archive.unwrap());
+        assert_eq!(
+            nth(&resets, 0).await,
+            format!("{:?}", archive.to_string_lossy())
+        );
+        assert_eq!(archive.parent(), Some(b_dir.as_path()));
+        let mut archived = Vault::open(archive.join("vault.sqlite3")).unwrap();
+        assert_eq!(archived.vault_id(), old_vault_on_b);
+        archived.unlock("joiner password").unwrap();
+        assert_eq!(archived.list().unwrap().len(), 2);
+        drop(archived);
+        assert!(archive.join("control.sqlite3").exists());
+        for gone in ["vault.sqlite3", "control.sqlite3", "removed"] {
+            assert!(!b_dir.join(gone).exists(), "{gone} was left behind");
+        }
+        assert!(b.state::<AppState>().vault.lock().await.is_none());
+        assert_eq!(devices(&b).await.this_device, None);
+
+        // It joins like any new device, and the note about the reset goes.
+        pair(&a, &codes, &finished, 1, &b, Some("second password")).await;
+        eventually(&b, &["After removal", "Shared"]).await;
+        assert_eq!(current_epoch(&b).await, 2);
+        for app in [&a, &b] {
+            until_devices(app, "two members again", |info| {
+                info.setup == "ready" && info.members.len() == 2 && info.pending.is_none()
+            })
+            .await;
+        }
+        assert_eq!(devices(&b).await.reset_archive, None);
+        assert!(!b_dir.join("reset-after-removal").exists());
+        // It is a new device to the vault: the old identity stays removed.
+        let new_b = devices(&b).await.this_device.unwrap();
+        assert_ne!(new_b, old_b);
+        assert!(!devices(&a)
+            .await
+            .members
+            .iter()
+            .any(|member| member.id == old_b));
+        for app in [&a, &b] {
+            network::shutdown(app).await;
+        }
+    });
+}
+
+#[test]
+fn a_reset_interrupted_after_removal_is_finished_at_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.sqlite3");
+    let (mut vault, _) = Vault::create(&path, PASSWORD).unwrap();
+    vault.put(Item::new("Kept in the archive")).unwrap();
+    let old_vault = vault.vault_id();
+    drop(vault);
+    // The app stopped right after recording that this device was removed.
+    std::fs::write(dir.path().join("control.sqlite3"), b"old control").unwrap();
+    std::fs::write(dir.path().join("removed"), b"").unwrap();
+
+    let app = shell(dir.path());
+    let handle = app.handle().clone();
+    let directory = dir.path().to_owned();
+    tauri::async_runtime::block_on(async move {
+        assert_eq!(devices(&handle).await.setup, "removed");
+        network::start(&handle);
+        let reset = until_devices(&handle, "the reset is finished", |info| {
+            info.setup == "none" && info.reset_archive.is_some()
+        })
+        .await;
+        let archive = std::path::PathBuf::from(reset.reset_archive.unwrap());
+        assert_eq!(
+            Vault::open(archive.join("vault.sqlite3"))
+                .unwrap()
+                .vault_id(),
+            old_vault
+        );
+        for gone in ["vault.sqlite3", "control.sqlite3", "removed"] {
+            assert!(!directory.join(gone).exists(), "{gone} was left behind");
+        }
+
+        // A new vault here is an ordinary vault: nothing of the removal
+        // carries over to it.
+        crate::create_vault(PASSWORD.into(), handle.state(), handle.clone())
+            .await
+            .unwrap();
+        let info = devices(&handle).await;
+        assert_eq!((info.setup, info.members.len()), ("ready", 1));
+        assert_eq!(info.reset_archive, None);
+        network::shutdown(&handle).await;
+    });
 }

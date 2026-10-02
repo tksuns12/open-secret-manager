@@ -459,6 +459,7 @@ pub fn run() {
             network::remove_device,
             network::cancel_enrollment,
             network::recover_vault,
+            network::reset_device,
             network::start_invite,
             network::confirm_invite,
             network::cancel_invite,

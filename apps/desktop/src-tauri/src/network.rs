@@ -113,6 +113,8 @@ pub struct Network {
     join: Mutex<Option<JoinState>>,
     /// A member said this device was removed, or committed state does.
     removed: AtomicBool,
+    /// A reset after removal is under way.
+    resetting: AtomicBool,
     syncing: AtomicBool,
     sync_generation: AtomicU64,
 }
@@ -141,22 +143,54 @@ impl Network {
             InvitationPolicy::default(),
         )
         .map_err(|error| network_error(error.into()))?;
+        let removed = directory.join(REMOVED_MARKER).exists();
         Ok(Self {
             directory,
             peers: Mutex::new(peers),
             invitations: Mutex::new(invitations),
             addresses: StdMutex::new(addresses),
             status: StdMutex::new(SyncStatus {
-                state: "local",
+                state: if removed { "removed" } else { "local" },
+                message: removed.then(|| "this device was removed from the vault".into()),
                 ..SyncStatus::default()
             }),
             control: Mutex::new(None),
             invite: Mutex::new(None),
             join: Mutex::new(None),
-            removed: AtomicBool::new(false),
+            removed: AtomicBool::new(removed),
+            resetting: AtomicBool::new(false),
             syncing: AtomicBool::new(false),
             sync_generation: AtomicU64::new(0),
         })
+    }
+
+    /// Records that this device was removed, durably.
+    fn mark_removed(&self) {
+        self.removed.store(true, Ordering::SeqCst);
+        let _ = std::fs::write(self.directory.join(REMOVED_MARKER), b"");
+    }
+
+    fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::SeqCst)
+    }
+
+    /// Forgets a removal that no longer concerns the vault on this device.
+    fn clear_removed(&self) {
+        self.removed.store(false, Ordering::SeqCst);
+        let _ = std::fs::remove_file(self.directory.join(REMOVED_MARKER));
+    }
+
+    /// Where the copy of a vault this device was removed from was moved,
+    /// if this device has had no vault since.
+    fn reset_note(&self) -> Option<String> {
+        std::fs::read_to_string(self.directory.join(RESET_NOTE)).ok()
+    }
+
+    /// This device has a vault again: what happened to the last one no
+    /// longer needs saying.
+    fn clear_reset_note(&self) {
+        let _ = std::fs::remove_file(self.directory.join(RESET_NOTE));
+        self.clear_removed();
     }
 
     fn control_path(&self) -> PathBuf {
@@ -183,13 +217,29 @@ impl Network {
 /// vault's place, and the same file while it is still being written.
 const RECOVERED: &str = "recovered.sqlite3";
 const RECOVERED_PARTIAL: &str = "recovered.sqlite3.partial";
+/// Present once this device has learned that its vault's devices removed
+/// it, so that it still knows after a restart: its own log may never say.
+const REMOVED_MARKER: &str = "removed";
+/// Left after a removed device was reset, naming the folder its copy was
+/// moved to, until this device has a vault again. It lets the app say what
+/// happened to the vault that was here.
+const RESET_NOTE: &str = "reset-after-removal";
 /// The files that belong to one vault on this device.
-const VAULT_FILES: [&str; 3] = ["control.sqlite3", "peers.sqlite3", "invitations.sqlite3"];
+const VAULT_FILES: [&str; 4] = [
+    "control.sqlite3",
+    "peers.sqlite3",
+    "invitations.sqlite3",
+    REMOVED_MARKER,
+];
 
-/// Moves the old vault and everything that belonged to it into a new
-/// archive folder beside it, the vault file last, and puts the recovered
-/// vault in its place. Each step is a rename, and the steps can be repeated.
-fn replace_with_recovered(vault_path: &Path) -> std::io::Result<PathBuf> {
+/// Moves the vault and everything that belongs to it into a new archive
+/// folder beside it. Each step is a rename, and the steps can be repeated.
+///
+/// The vault file goes last when another vault is about to take its place,
+/// so that a vault is there until then, and first when the device is being
+/// reset, so that what an interruption leaves is a device without a vault
+/// rather than a vault that has lost its control plane.
+fn archive_vault_files(vault_path: &Path, vault_first: bool) -> std::io::Result<PathBuf> {
     let directory = vault_path.parent().unwrap_or(Path::new("."));
     let mut archive = directory.join(format!("archive-{}", now()));
     let mut attempt = 1;
@@ -202,11 +252,14 @@ fn replace_with_recovered(vault_path: &Path) -> std::io::Result<PathBuf> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    for name in VAULT_FILES
-        .iter()
-        .copied()
-        .chain(std::iter::once(vault_name.as_str()))
-    {
+    let mut names: Vec<&str> = VAULT_FILES.to_vec();
+    if vault_first {
+        names.insert(0, &vault_name);
+    } else {
+        names.push(&vault_name);
+    }
+    for name in names {
+        // The main file after its side files in either order.
         for suffix in ["-wal", "-shm", "-journal", ""] {
             let file = format!("{name}{suffix}");
             let from = directory.join(&file);
@@ -215,6 +268,13 @@ fn replace_with_recovered(vault_path: &Path) -> std::io::Result<PathBuf> {
             }
         }
     }
+    Ok(archive)
+}
+
+/// Archives the old vault and puts the recovered vault in its place.
+fn replace_with_recovered(vault_path: &Path) -> std::io::Result<PathBuf> {
+    let directory = vault_path.parent().unwrap_or(Path::new("."));
+    let archive = archive_vault_files(vault_path, false)?;
     std::fs::rename(directory.join(RECOVERED), vault_path)?;
     Ok(archive)
 }
@@ -353,8 +413,15 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             // Without a vault, a control database is what an unfinished
             // join left: its device identity is gone.
             net.delete_control_database();
+            net.clear_removed();
             return;
         };
+        // The app stopped after learning this device was removed and
+        // before it was reset: finish that.
+        if net.is_removed() {
+            let _ = reset_removed(&app).await;
+            return;
+        }
         if !net.control_path().exists() {
             return;
         }
@@ -407,19 +474,8 @@ async fn watch<R: Runtime>(app: AppHandle<R>, control: Arc<Control>) {
                 }
             }
         }
-        if network(&app).removed.load(Ordering::SeqCst) {
-            // Nothing this device says is accepted any more.
-            let tasks = std::mem::take(
-                &mut *control
-                    .tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            );
-            control.node.shutdown().await;
-            for task in tasks {
-                // This task is among them; it ends here either way.
-                task.abort();
-            }
+        if network(&app).is_removed() {
+            // The reset that follows stops this device's control plane.
             return;
         }
     }
@@ -469,7 +525,8 @@ async fn maintain<R: Runtime>(app: &AppHandle<R>, control: &Control) {
         let _ = control::submit(&control.node, request).await;
     }
     if removed {
-        net.removed.store(true, Ordering::SeqCst);
+        net.mark_removed();
+        reset_soon(app);
     }
     let devices = control.endpoint.sync_peers().len();
     update_status(app, |status| {
@@ -554,7 +611,9 @@ async fn ensure_control<R: Runtime>(app: &AppHandle<R>) -> Option<Arc<Control>> 
         }
         return Some(control);
     }
-    if net.join.lock().await.is_some() || paired_before(app).await {
+    // A removed device still holds its vault but belongs to no control
+    // plane; it must not found one for a vault that is not its to run.
+    if net.is_removed() || net.join.lock().await.is_some() || paired_before(app).await {
         return None;
     }
     found(app).await.ok()
@@ -563,6 +622,7 @@ async fn ensure_control<R: Runtime>(app: &AppHandle<R>) -> Option<Arc<Control>> 
 /// After this device creates a vault: its control plane starts with this
 /// device as the only member. If that fails now, the next unlock does it.
 pub async fn after_create<R: Runtime>(app: &AppHandle<R>) {
+    network(app).clear_reset_note();
     let _ = ensure_control(app).await;
 }
 
@@ -624,12 +684,13 @@ async fn finish_sync<R: Runtime>(
             }
         }
         Err(osm_vault_peer::Error::Removed) => {
-            network(app).removed.store(true, Ordering::SeqCst);
+            network(app).mark_removed();
             update_status(app, |status| {
                 status.state = "removed";
                 status.message = Some("this device was removed from the vault".into());
             });
             let _ = app.emit("devices-changed", ());
+            reset_soon(app);
         }
         Err(error) => update_status(app, |status| {
             if status.state != "removed" {
@@ -643,12 +704,12 @@ async fn finish_sync<R: Runtime>(
 /// Syncs with every other member. At most one round runs at a time.
 async fn sync_with_members<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
     let net = network(app);
+    if net.is_removed() {
+        return Err(network_error(osm_vault_peer::Error::Removed));
+    }
     let Some(control) = net.control().await else {
         return Ok(());
     };
-    if net.removed.load(Ordering::SeqCst) {
-        return Err(network_error(osm_vault_peer::Error::Removed));
-    }
     if net.syncing.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
@@ -760,6 +821,9 @@ pub struct DevicesInfo {
     pub(crate) epoch: u64,
     /// How many members must be reachable for any change.
     pub(crate) quorum: usize,
+    /// For a device without a vault that was removed from one: the folder
+    /// its copy of that vault was moved to.
+    pub(crate) reset_archive: Option<String>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -801,7 +865,11 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         pending: None,
         epoch: 0,
         quorum: 0,
+        reset_archive: if has_vault { None } else { net.reset_note() },
     };
+    if has_vault && net.is_removed() {
+        return Ok(empty("removed"));
+    }
     let Some(control) = net.control().await else {
         return Ok(empty(if !has_vault {
             "none"
@@ -835,16 +903,13 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         cancelled: pending.cancelled,
     });
     Ok(DevicesInfo {
-        setup: if net.removed.load(Ordering::SeqCst) {
-            "removed"
-        } else {
-            "ready"
-        },
+        setup: if net.is_removed() { "removed" } else { "ready" },
         this_device: this_device.map(|device| hex(&device)),
         quorum: state.voters().len() / 2 + 1,
         members,
         pending,
         epoch: state.epoch,
+        reset_archive: None,
     })
 }
 
@@ -852,7 +917,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
 /// member, for commands that change membership.
 async fn member_control<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<Control>, CommandError> {
     let net = network(app);
-    if net.removed.load(Ordering::SeqCst) {
+    if net.is_removed() {
         return Err(network_error(osm_vault_peer::Error::Removed));
     }
     net.control().await.ok_or(CommandError {
@@ -969,6 +1034,9 @@ pub async fn recover_vault<R: Runtime>(
             message: "finish or cancel joining first".into(),
         });
     }
+    if net.is_removed() {
+        return Err(network_error(osm_vault_peer::Error::Removed));
+    }
     if net.control().await.is_none() {
         return Err(CommandError {
             code: "unmanaged",
@@ -995,7 +1063,7 @@ pub async fn recover_vault<R: Runtime>(
     // Take in whatever committed state and received revisions this device
     // already has, then stop taking part in the old vault.
     if let Some(control) = net.control().await {
-        if !net.removed.load(Ordering::SeqCst) {
+        if !net.is_removed() {
             maintain(&app, &control).await;
         }
     }
@@ -1065,6 +1133,101 @@ pub async fn recover_vault<R: Runtime>(
         held_left_behind: report.held_left_behind,
         archive: archive.to_string_lossy().into_owned(),
     })
+}
+
+/// Returns a removed device to the state of a device without a vault, so
+/// that it can join again. Its copy of the vault, which the other devices
+/// no longer accept anything from, is moved to an archive folder, not
+/// deleted; the device then gets a new transport identity and, on joining,
+/// a new device identity. Returns the archive folder.
+///
+/// This happens on its own as soon as the device learns that it was
+/// removed, and at the next launch if the app stopped before it finished.
+async fn reset_removed<R: Runtime>(app: &AppHandle<R>) -> Result<String, CommandError> {
+    let state = app.state::<AppState>();
+    let net = &state.network;
+    if net.resetting.swap(true, Ordering::SeqCst) {
+        return Err(CommandError {
+            code: "resetting",
+            message: "this device is already being reset".into(),
+        });
+    }
+    let result = async {
+        if let Some(invite) = net.invite.lock().await.take() {
+            invite.task.abort();
+        }
+        net.join.lock().await.take();
+        if let Some(control) = net.control.lock().await.take() {
+            control.stop().await;
+        }
+        let directory = net.directory.clone();
+        let mut vault = state.vault.lock().await;
+        let mut invitations = net.invitations.lock().await;
+        let mut peers = net.peers.lock().await;
+        if vault.is_none() {
+            return Err(CommandError {
+                code: "vault_missing",
+                message: "this device has no vault to reset".into(),
+            });
+        }
+        // Close every file before moving it.
+        *vault = None;
+        *peers = PeerStore::open_in_memory().map_err(network_error)?;
+        *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
+            .map_err(|error| network_error(error.into()))?;
+        let archive = archive_vault_files(&state.path, true).map_err(storage_error)?;
+        let archive = archive.to_string_lossy().into_owned();
+        let _ = std::fs::write(directory.join(RESET_NOTE), &archive);
+        let peers_path = directory.join("peers.sqlite3");
+        *peers = PeerStore::open(&peers_path).map_err(network_error)?;
+        *net.addresses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            AddressBook::open(&peers_path).map_err(network_error)?;
+        *invitations = InvitationStore::open(
+            directory.join("invitations.sqlite3"),
+            InvitationPolicy::default(),
+        )
+        .map_err(|error| network_error(error.into()))?;
+        Ok(archive)
+    }
+    .await;
+    net.resetting.store(false, Ordering::SeqCst);
+    let archive = result?;
+    net.clear_removed();
+    update_status(app, |status| {
+        *status = SyncStatus {
+            state: "local",
+            ..SyncStatus::default()
+        }
+    });
+    let _ = app.emit("device-reset", archive.clone());
+    let _ = app.emit("vault-changed", ());
+    let _ = app.emit("devices-changed", ());
+    Ok(archive)
+}
+
+/// Resets this device in the background once it has learned that it was
+/// removed. If that fails, the device stays in the removed state, from
+/// which the owner can ask for the reset again.
+fn reset_soon<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = reset_removed(&app).await;
+    });
+}
+
+/// Resets a removed device on request, for when the reset that follows a
+/// removal did not go through.
+#[tauri::command]
+pub async fn reset_device<R: Runtime>(app: AppHandle<R>) -> Result<String, CommandError> {
+    if !network(&app).is_removed() {
+        return Err(CommandError {
+            code: "not_removed",
+            message: "only a device that was removed from its vault can be reset".into(),
+        });
+    }
+    reset_removed(&app).await
 }
 
 #[derive(Serialize)]
@@ -1349,6 +1512,7 @@ pub async fn join_finish<R: Runtime>(
         let _ = app.emit("devices-changed", ());
         return Err(error);
     }
+    net.clear_reset_note();
     maintain(&app, &control).await;
     // Fetch the vault's contents right away.
     let sync_app = app.clone();
