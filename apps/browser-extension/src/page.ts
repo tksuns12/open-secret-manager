@@ -19,3 +19,9 @@ export type Prepared = { type: "prepared"; documentId: string; origin: string; f
 export type Filled = { type: "filled"; fields: Field[] };
 
 export type FromPage = Prepared | Filled;
+
+declare global {
+  /** In a document the page's script was put into: that document's name. */
+  // eslint-disable-next-line no-var
+  var osmFillDocument: string | undefined;
+}

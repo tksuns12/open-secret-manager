@@ -46,8 +46,8 @@ The repository is deliberately split at the security boundary:
 - `apps/browser-extension` is one WebExtension source tree that builds for
   Chromium and for Firefox. On a press of its toolbar button it asks the
   app for a login for the page's origin and fills the one the owner chooses
-  there. It has no access to pages otherwise and stores nothing. It runs in
-  headless Chromium tests; Firefox has not been run.
+  there. It has no access to pages otherwise and stores nothing. Its tests
+  run it in headless Chromium and in headless Firefox.
 
 The prototype is intentionally offline-first. Local vault use does not depend
 on a peer or a network. Devices pair by invitation and a six-digit code the
@@ -90,11 +90,12 @@ npm run typecheck
 npm run build
 npm test
 npm run test:e2e
+npm run test:e2e:firefox
 ```
 
-`npm run test:e2e` runs the built extension in headless Chromium with the
-real native messaging host; see `apps/browser-extension/README.md` for what
-it needs.
+The last two run the built extension in headless Chromium and in headless
+Firefox with the real native messaging host; see
+`apps/browser-extension/README.md` for what they need.
 
 Before a release, read [the threat model](docs/threat-model.md), [the format
 contract](docs/formats.md), and [the implementation status](docs/implementation-status.md).

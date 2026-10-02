@@ -112,10 +112,11 @@ function connectHost(): chrome.runtime.Port {
   port.onMessage.addListener(fromHost);
   port.onDisconnect.addListener(() => {
     // The browser says why: no host is registered for it, the host does not
-    // allow this extension, or the host's process ended.
-    const reason = chrome.runtime.lastError?.message ?? "";
+    // allow this extension, or the host's process ended. Firefox says it on
+    // the connection itself, Chromium beside it.
+    const reason = (port as { error?: { message?: string } | null }).error?.message ?? chrome.runtime.lastError?.message ?? "";
     if (host === port) host = undefined;
-    const text = /not found|forbidden/i.test(reason) ? NOT_CONNECTED : "The connection to Open Secret Manager was lost. Nothing was filled.";
+    const text = /not found|forbidden|no such native application/i.test(reason) ? NOT_CONNECTED : "The connection to Open Secret Manager was lost. Nothing was filled.";
     for (const requestId of [...waiting.keys()]) end(requestId, "problem", text, false);
   });
   host = port;
@@ -180,7 +181,15 @@ async function deliver(request: Waiting, reply: FillReply) {
   // Asked of the browser again at the last moment.
   let current: string | null = null;
   try { current = pageOrigin((await chrome.tabs.get(tabId)).url); } catch { /* the tab is gone */ }
-  if (current !== origin) {
+  // And which document the tab shows now: the script put into the one the
+  // request was made in left that document's name there, and a document
+  // loaded since has none. This is the browser's answer, not the page's.
+  let shown: unknown = null;
+  try {
+    const [inTab] = await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, func: () => globalThis.osmFillDocument ?? null });
+    shown = inTab?.result ?? null;
+  } catch { /* the tab is gone, or is no longer one the extension may look at */ }
+  if (current !== origin || shown !== request.request.documentId) {
     finish(request, "problem", "The page changed before the login arrived. Nothing was filled.");
     return;
   }
@@ -199,4 +208,12 @@ async function deliver(request: Waiting, reply: FillReply) {
   else finish(request, "problem", "The login form is gone. Nothing was filled.");
 }
 
+/** Ends the request made in a tab, when the browser says the tab is gone. */
+function tabLeft(tabId: number) {
+  for (const [requestId, request] of waiting) {
+    if (request.request.tabId === tabId) end(requestId, "none", "", true);
+  }
+}
+
 chrome.action.onClicked.addListener((tab) => { void ask(tab); });
+chrome.tabs.onRemoved.addListener(tabLeft);

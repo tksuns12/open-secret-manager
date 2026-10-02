@@ -12,16 +12,20 @@ import { execFileSync, spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium } from "playwright";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repository = path.resolve(here, "../../..");
 const built = (name) => path.join(repository, "target/debug", name);
 
-export const HOST_NAME = "org.opensecretmanager.native";
-export const EXTENSION_ID = "hjgekjgkjnakgmiopldddikdkcjhnmge";
+/** Which browser the tests run in: `OSM_BROWSER=firefox` for Firefox, Chromium otherwise. */
+export const BROWSER = process.env.OSM_BROWSER === "firefox" ? "firefox" : "chromium";
+
+const HOST_NAME = "org.opensecretmanager.native";
+const CHROMIUM_EXTENSION_ID = "hjgekjgkjnakgmiopldddikdkcjhnmge";
+const FIREFOX_EXTENSION_ID = "extension@opensecretmanager.org";
 const PASSWORD = "correct horse battery staple";
 // Long, because macOS can hold a newly built or newly written program for
 // tens of seconds before its first start.
@@ -49,6 +53,8 @@ function respond(request, response) {
   switch (url.pathname) {
     case "/login": return send(loginForm("Sign in"));
     case "/next": return send(loginForm("Another page of the same site"));
+    // A page that keeps scripts that came later from hearing that it is being left.
+    case "/sticky": return send(loginForm("A page that hides its leaving") + `<script>window.addEventListener("pagehide", (event) => event.stopImmediatePropagation(), true);</script>`);
     case "/empty": return send(`<!doctype html><title>Nothing to fill</title><p>No form here.</p>`);
     // A page with no form of its own that shows another site's form in a frame.
     case "/framing": return send(`<!doctype html><title>Framing page</title><p>The form below belongs to another site.</p><iframe id="inner" src="https://login.test/login" width="400" height="200"></iframe>`);
@@ -118,10 +124,28 @@ class Lines {
  * host (the real one unless a test gives another); `standIn` are the
  * options `osm-fill serve` is started with, or null for no desktop session.
  */
-export async function start({ logins = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null } = {}) {
+export async function start(options = {}) {
+  const closers = [];
+  try {
+    return await prepare(closers, options);
+  } catch (error) {
+    // Leave nothing running or lying about when setting up fails.
+    for (const closer of closers.reverse()) {
+      try { await closer(); } catch { /* best effort */ }
+    }
+    throw error;
+  }
+}
+
+async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null }) {
   // Short, because a socket's path has to fit in about a hundred bytes.
   const home = mkdtempSync("/tmp/osm");
-  const closers = [() => rmSync(home, { recursive: true, force: true })];
+  closers.push(() => {
+    // Firefox makes the folders a home folder has, which macOS protects
+    // from deletion until the protection is taken off.
+    if (process.platform === "darwin") execFileSync("chmod", ["-RN", home], { stdio: "ignore" });
+    rmSync(home, { recursive: true, force: true });
+  });
   // With `appHome`, the desktop app itself is running for that home folder:
   // the browser and the host use it, and nothing stands in for the app.
   if (appHome) return browse({ home, accountHome: appHome, closers, fakeHost, registerHost, forged, app: null, items: {}, vault: null });
@@ -151,9 +175,6 @@ export async function start({ logins = [], fakeHost = false, standIn = ["ask"], 
 
 /** The pages, and a browser with the extension, for the account whose home folder is `accountHome`. */
 async function browse({ home, accountHome, closers, fakeHost, registerHost, forged, app, items, vault }) {
-  const env = { ...process.env, HOME: accountHome };
-  delete env.XDG_DATA_HOME;
-
   // The pages: one server for https under every name, one for plain http.
   execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=login.test",
     "-addext", "subjectAltName=DNS:login.test,DNS:*.login.test,DNS:framing.test,DNS:other.test",
@@ -163,80 +184,18 @@ async function browse({ home, accountHome, closers, fakeHost, registerHost, forg
   const [securePort, plainPort] = [await listen(secure), await listen(plain)];
   closers.push(() => secure.close(), () => plain.close());
 
-  // The browser's own folder, with the host registered in it as the app's
-  // Browser panel would register it in a real browser's folder.
-  const profile = path.join(home, "profile");
-  let host = built("osm-native-host");
-  if (fakeHost) {
-    // A program that answers wrongly on purpose, in the real host's place.
-    // It is started as the file it is, not through a script written for
-    // each run: macOS holds the first start of a file it has not seen
-    // until it has checked it, which can take many seconds.
-    host = path.join(here, "fake-host.mjs");
-  }
-  if (registerHost) {
-    mkdirSync(path.join(profile, "NativeMessagingHosts"), { recursive: true });
-    writeFileSync(path.join(profile, "NativeMessagingHosts", `${HOST_NAME}.json`), JSON.stringify({
-      name: HOST_NAME,
-      description: "Open Secret Manager native messaging host",
-      path: host,
-      type: "stdio",
-      allowed_origins: [`chrome-extension://${EXTENSION_ID}/`],
-    }));
-  }
-  const extension = path.resolve(here, "../dist/chromium");
-  const extensions = [extension, ...(forged ? [withoutKey(home)] : [])].join(",");
-  const context = await chromium.launchPersistentContext(profile, {
-    channel: "chromium",
-    headless: true,
-    env,
-    ignoreHTTPSErrors: true,
-    args: [
-      `--disable-extensions-except=${extensions}`,
-      `--load-extension=${extensions}`,
-      // Lets the tests press the extension's toolbar button, which is what
-      // gives the extension leave to act on the tab, as a real press does.
-      "--enable-unsafe-extension-debugging",
-      // Every `.test` name is this machine: plain.test over http, the rest
-      // over https, whatever port the address names.
-      `--host-resolver-rules=MAP plain.test 127.0.0.1:${plainPort}, MAP *.test 127.0.0.1:${securePort}`,
-    ],
-  });
-  closers.push(() => context.close());
-
-  const worker = async (id = EXTENSION_ID) => {
-    const found = () => context.serviceWorkers().find((candidate) => candidate.url().startsWith(`chrome-extension://${id}/`));
-    const deadline = Date.now() + PATIENCE_MS;
-    while (!found()) {
-      if (Date.now() > deadline) throw new Error(`the extension ${id} did not start`);
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return found();
-  };
-  // A press that comes before the extension has finished starting, right
-  // after it was put into a new browser, is lost. Wait until it listens.
-  const listening = async (id) => {
-    const deadline = Date.now() + PATIENCE_MS;
-    while (!(await (await worker(id)).evaluate(() => chrome.action.onClicked.hasListeners()))) {
-      if (Date.now() > deadline) throw new Error(`the extension ${id} does not listen for its button`);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  };
-  await listening(EXTENSION_ID);
-  // The other extension, if one was loaded, is whichever is not ours.
-  let forgedId = null;
-  if (forged) {
-    const deadline = Date.now() + PATIENCE_MS;
-    while (!forgedId) {
-      const other = context.serviceWorkers().map((candidate) => new URL(candidate.url()).host).find((id) => id !== EXTENSION_ID);
-      if (other) { forgedId = other; await listening(other); }
-      else if (Date.now() > deadline) throw new Error("the other extension did not start");
-      else await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
+  // The real host, or a program that answers wrongly on purpose in its
+  // place. That one is started as the file it is, not through a script
+  // written for each run: macOS holds the first start of a file it has not
+  // seen until it has checked it, which can take many seconds.
+  const host = fakeHost ? path.join(here, "fake-host.mjs") : built("osm-native-host");
+  const setup = { home, accountHome, closers, host, registerHost, forged, securePort, plainPort };
+  const driver = BROWSER === "firefox" ? await firefoxWith(setup) : await chromiumWith(setup);
 
   return {
-    home, context, app, items, vault, forgedId,
+    home, app, items, vault,
+    /** What the app calls the kind of browser a request came from. */
+    kind: driver.kind,
     /** Tells the fake host how to answer the next request. */
     plan(mode) { writeFileSync(path.join(home, "fake-host-plan.json"), JSON.stringify({ mode })); },
     /** What the fake host was sent, one message per entry, and `closed` when the browser let it go. */
@@ -244,45 +203,23 @@ async function browse({ home, accountHome, closers, fakeHost, registerHost, forg
       const file = path.join(home, "fake-host.log");
       return existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean) : [];
     },
-    worker,
-    async open(address) {
-      const page = await context.newPage();
-      await page.goto(address);
-      return page;
-    },
-    /** Presses the extension's toolbar button for the tab showing `page`, as the owner would. */
-    async press(page, id = EXTENSION_ID) {
-      await page.bringToFront();
-      // The press is addressed to the tab, which the browser knows under
-      // another name than the page inside it; the tab is found by its
-      // address, so tests give each tab its own.
-      const session = await context.browser().newBrowserCDPSession();
-      const { targetInfos } = await session.send("Target.getTargets", { filter: [{ type: "tab" }] });
-      const tabs = targetInfos.filter((tab) => tab.url === page.url());
-      if (tabs.length !== 1) throw new Error(`${tabs.length} tabs show ${page.url()}`);
-      await session.send("Extensions.triggerAction", { id, targetId: tabs[0].targetId });
-      await session.detach();
-    },
-    /** What the toolbar button says for the tab showing `page`. */
-    async status(page, id = EXTENSION_ID) {
-      // The extension is not told tabs' addresses, so the tab is found as
-      // the one in front in the page's window.
-      await page.bringToFront();
-      const session = await context.newCDPSession(page);
-      const { windowId } = await session.send("Browser.getWindowForTarget");
-      await session.detach();
-      return (await worker(id)).evaluate(async (windowId) => {
-        const [tab] = await chrome.tabs.query({ windowId, active: true });
-        return { badge: await chrome.action.getBadgeText({ tabId: tab.id }), title: await chrome.action.getTitle({ tabId: tab.id }) };
-      }, windowId);
-    },
-    /** Waits until the button's badge for `page` is `badge`, and returns what it says. */
-    async until(page, badge, id = EXTENSION_ID) {
+    /** Opens `address` in a new tab. */
+    open: driver.open,
+    /** Presses the extension's toolbar button for the tab showing `page`, as the owner would. With `forged`, the button of the other extension. */
+    press: driver.press,
+    /** What the toolbar button says for the tab showing `page`: `{ badge, title }`. */
+    status: driver.status,
+    /**
+     * Waits until the button's badge for `page` is `badge` and, with
+     * `says`, its title matches that; returns what it says. The two are
+     * set one after the other, so they are waited for together.
+     */
+    async until(page, badge, { forged = false, says = null } = {}) {
       const deadline = Date.now() + PATIENCE_MS;
       for (;;) {
-        const status = await this.status(page, id);
-        if (status.badge === badge) return status;
-        if (Date.now() > deadline) throw new Error(`the button never showed "${badge}"; it shows "${status.badge}": ${status.title}`);
+        const status = await driver.status(page, { forged });
+        if (status.badge === badge && (!says || says.test(status.title))) return status;
+        if (Date.now() > deadline) throw new Error(`the button never showed "${badge}"${says ? ` saying ${says}` : ""}; it shows "${status.badge}": ${status.title}`);
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     },
@@ -294,24 +231,267 @@ async function browse({ home, accountHome, closers, fakeHost, registerHost, forg
   };
 }
 
-/** What the page's form holds and what its scripts noticed. */
-export function formOf(page) {
-  return page.evaluate(() => ({
-    username: document.getElementById("username")?.value ?? null,
-    password: document.getElementById("password")?.value ?? null,
-    events: window.seen?.events ?? [],
-    submitted: window.seen?.submitted ?? null,
-    address: location.href,
-  }));
+/** Run in a page: what its form holds and what its scripts noticed. */
+const FORM = `({
+  username: document.getElementById("username")?.value ?? null,
+  password: document.getElementById("password")?.value ?? null,
+  events: window.seen?.events ?? [],
+  submitted: window.seen?.submitted ?? null,
+  address: location.href,
+})`;
+
+/** Run in a frame: what its form holds, once it is the login page. */
+const INNER = `(location.href === "https://login.test/login" && document.getElementById("password")) ? [document.getElementById("username").value, document.getElementById("password").value] : null`;
+
+async function eventually(what, attempt) {
+  const deadline = Date.now() + PATIENCE_MS;
+  for (;;) {
+    const found = await attempt();
+    if (found) return found;
+    if (Date.now() > deadline) throw new Error(`never happened: ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
-/** A copy of the built extension without the `key` that fixes its ID: to the browser, another extension. */
-function withoutKey(home) {
+/** A copy of a built extension that the browser takes for another one. */
+function forgedCopy(home, browser, change) {
   const copy = path.join(home, "forged-extension");
-  cpSync(path.resolve(here, "../dist/chromium"), copy, { recursive: true });
+  cpSync(path.resolve(here, "../dist", browser), copy, { recursive: true });
   const manifest = JSON.parse(readFileSync(path.join(copy, "manifest.json"), "utf8"));
-  delete manifest.key;
   manifest.name = "Not Open Secret Manager";
+  change(manifest);
   writeFileSync(path.join(copy, "manifest.json"), JSON.stringify(manifest));
   return copy;
+}
+
+/**
+ * Headless Chromium (Playwright's Chrome for Testing) with the extension.
+ * The toolbar button is pressed through the browser's debugging interface,
+ * which grants the tab what a real press grants.
+ */
+async function chromiumWith({ home, accountHome, closers, host, registerHost, forged, securePort, plainPort }) {
+  const { chromium } = await import("playwright");
+  const env = { ...process.env, HOME: accountHome };
+  delete env.XDG_DATA_HOME;
+  // The browser's own folder, with the host registered in it as the app's
+  // Browser panel would register it in a real browser's folder.
+  const profile = path.join(home, "profile");
+  if (registerHost) {
+    mkdirSync(path.join(profile, "NativeMessagingHosts"), { recursive: true });
+    writeFileSync(path.join(profile, "NativeMessagingHosts", `${HOST_NAME}.json`), JSON.stringify({
+      name: HOST_NAME,
+      description: "Open Secret Manager native messaging host",
+      path: host,
+      type: "stdio",
+      allowed_origins: [`chrome-extension://${CHROMIUM_EXTENSION_ID}/`],
+    }));
+  }
+  const extension = path.resolve(here, "../dist/chromium");
+  // Without the `key` that fixes its ID, the same code is another extension.
+  const extensions = [extension, ...(forged ? [forgedCopy(home, "chromium", (manifest) => { delete manifest.key; })] : [])].join(",");
+  const context = await chromium.launchPersistentContext(profile, {
+    channel: "chromium",
+    headless: true,
+    env,
+    ignoreHTTPSErrors: true,
+    args: [
+      `--disable-extensions-except=${extensions}`,
+      `--load-extension=${extensions}`,
+      // Lets the tests press the extension's toolbar button.
+      "--enable-unsafe-extension-debugging",
+      // Every `.test` name is this machine: plain.test over http, the rest
+      // over https, whatever port the address names.
+      `--host-resolver-rules=MAP plain.test 127.0.0.1:${plainPort}, MAP *.test 127.0.0.1:${securePort}`,
+    ],
+  });
+  closers.push(() => context.close());
+
+  const worker = (id) => eventually(`the extension ${id} starts`, () => context.serviceWorkers().find((candidate) => candidate.url().startsWith(`chrome-extension://${id}/`)));
+  // A press that comes before the extension has finished starting, right
+  // after it was put into a new browser, is lost. Wait until it listens.
+  const listening = (id) => eventually(`the extension ${id} listens for its button`, async () => (await worker(id)).evaluate(() => chrome.action.onClicked.hasListeners()));
+  await listening(CHROMIUM_EXTENSION_ID);
+  let forgedId = null;
+  if (forged) {
+    // The other extension is whichever is not ours.
+    forgedId = await eventually("the other extension starts", () => context.serviceWorkers().map((candidate) => new URL(candidate.url()).host).find((id) => id !== CHROMIUM_EXTENSION_ID));
+    await listening(forgedId);
+  }
+  const idOf = (which) => (which?.forged ? forgedId : CHROMIUM_EXTENSION_ID);
+
+  return {
+    kind: "Chromium",
+    async open(address) {
+      const page = await context.newPage();
+      await page.goto(address);
+      return {
+        raw: page,
+        goto: (next) => page.goto(next),
+        back: () => page.goBack(),
+        reload: () => page.reload(),
+        close: () => page.close(),
+        isClosed: () => page.isClosed(),
+        form: () => page.evaluate(FORM),
+        innerForm: () => eventually("the frame shows the login page", async () => {
+          const frame = page.frames().find((candidate) => candidate !== page.mainFrame());
+          return frame ? frame.evaluate(INNER).catch(() => null) : null;
+        }),
+      };
+    },
+    async press({ raw: page }, which) {
+      await page.bringToFront();
+      // The press is addressed to the tab, which the browser knows under
+      // another name than the page inside it; the tab is found by its
+      // address, so tests give each tab its own.
+      const session = await context.browser().newBrowserCDPSession();
+      const { targetInfos } = await session.send("Target.getTargets", { filter: [{ type: "tab" }] });
+      const tabs = targetInfos.filter((tab) => tab.url === page.url());
+      if (tabs.length !== 1) throw new Error(`${tabs.length} tabs show ${page.url()}`);
+      await session.send("Extensions.triggerAction", { id: idOf(which), targetId: tabs[0].targetId });
+      await session.detach();
+    },
+    async status({ raw: page }, which) {
+      // The extension is not told tabs' addresses, so the tab is found as
+      // the one in front in the page's window.
+      await page.bringToFront();
+      const session = await context.newCDPSession(page);
+      const { windowId } = await session.send("Browser.getWindowForTarget");
+      await session.detach();
+      return (await worker(idOf(which))).evaluate(async (windowId) => {
+        const [tab] = await chrome.tabs.query({ windowId, active: true });
+        return { badge: await chrome.action.getBadgeText({ tabId: tab.id }), title: await chrome.action.getTitle({ tabId: tab.id }) };
+      }, windowId);
+    },
+  };
+}
+
+/** Sends every `.test` name to this machine: https to one server, http to the other. Anything else is refused. */
+async function proxyTo(securePort, plainPort) {
+  const proxy = http.createServer((request, response) => {
+    const target = new URL(request.url);
+    if (!target.hostname.endsWith(".test")) { response.destroy(); return; }
+    const forward = http.request({ host: "127.0.0.1", port: plainPort, path: target.pathname + target.search, method: request.method, headers: request.headers }, (answer) => {
+      response.writeHead(answer.statusCode, answer.headers);
+      answer.pipe(response);
+    });
+    forward.on("error", () => response.destroy());
+    request.pipe(forward);
+  });
+  proxy.on("connect", (request, socket, head) => {
+    const name = request.url.split(":")[0];
+    // plain.test has no https side, so that it stays an http page.
+    if (!name.endsWith(".test") || name === "plain.test") { socket.destroy(); return; }
+    const upstream = net.connect(securePort, "127.0.0.1", () => {
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      upstream.write(head);
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+  });
+  const sockets = new Set();
+  proxy.on("connection", (socket) => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
+  const port = await listen(proxy);
+  return { port, close() { for (const socket of sockets) socket.destroy(); proxy.close(); } };
+}
+
+/**
+ * Headless Firefox with the extension installed as a temporary add-on.
+ * The toolbar button is clicked in the browser's own interface.
+ */
+async function firefoxWith({ home, accountHome, closers, host, registerHost, forged, securePort, plainPort }) {
+  const { Builder, By } = await import("selenium-webdriver");
+  const firefox = (await import("selenium-webdriver/firefox.js")).default;
+  // Firefox looks for the host's manifest under the account's home folder,
+  // which it takes from the system unless this variable says otherwise.
+  const env = { ...process.env, HOME: accountHome, CFFIXED_USER_HOME: accountHome };
+  delete env.XDG_DATA_HOME;
+  // Firefox has one place per account for it, so for the real app's
+  // account nothing is written here: connect Firefox in the app's Browser
+  // panel first.
+  if (registerHost && accountHome === home) {
+    const folder = process.platform === "darwin" ? path.join(accountHome, "Library/Application Support/Mozilla/NativeMessagingHosts") : path.join(accountHome, ".mozilla/native-messaging-hosts");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(path.join(folder, `${HOST_NAME}.json`), JSON.stringify({
+      name: HOST_NAME,
+      description: "Open Secret Manager native messaging host",
+      path: host,
+      type: "stdio",
+      allowed_extensions: [FIREFOX_EXTENSION_ID],
+    }));
+  }
+  const proxy = await proxyTo(securePort, plainPort);
+  closers.push(() => proxy.close());
+
+  const options = new firefox.Options()
+    .setBinary(process.env.OSM_FIREFOX ?? "/Applications/Firefox.app/Contents/MacOS/firefox")
+    .addArguments("-headless")
+    .setAcceptInsecureCerts(true)
+    .setPreference("network.proxy.type", 1)
+    .setPreference("network.proxy.http", "127.0.0.1")
+    .setPreference("network.proxy.http_port", proxy.port)
+    .setPreference("network.proxy.ssl", "127.0.0.1")
+    .setPreference("network.proxy.ssl_port", proxy.port)
+    .setPreference("network.proxy.no_proxies_on", "")
+    .setPreference("network.proxy.allow_hijacking_localhost", true)
+    // An http address stays http.
+    .setPreference("dom.security.https_first", false)
+    .setPreference("dom.security.https_only_mode", false);
+  // The argument lets the tests reach the browser's own interface, where
+  // the toolbar button is.
+  const service = new firefox.ServiceBuilder().setEnvironment(env).addArguments("--allow-system-access");
+  const driver = await new Builder().forBrowser("firefox").setFirefoxOptions(options).setFirefoxService(service).build();
+  closers.push(() => driver.quit());
+
+  await driver.installAddon(path.resolve(here, "../dist/firefox"), true);
+  const forgedId = "another@example.org";
+  if (forged) await driver.installAddon(forgedCopy(home, "firefox", (manifest) => { manifest.browser_specific_settings.gecko.id = forgedId; }), true);
+  /** The button itself inside an extension's toolbar item. */
+  const ACTION = ".unified-extensions-item-action-button";
+  /** The toolbar item of an extension, as Firefox names it. */
+  const button = (which) => `${(which?.forged ? forgedId : FIREFOX_EXTENSION_ID).toLowerCase().replace(/[^a-z0-9_-]/g, "_")}-browser-action`;
+  /** Runs `action` in the browser's own interface rather than in the page. */
+  const inChrome = async (action) => {
+    await driver.setContext(firefox.Context.CHROME);
+    try { return await action(); } finally { await driver.setContext(firefox.Context.CONTENT); }
+  };
+  await eventually("the extension's button is in the toolbar", () => inChrome(() => driver.executeScript("return document.getElementById(arguments[0]) !== null;", button())));
+  const first = await driver.getWindowHandle();
+
+  return {
+    kind: "Firefox",
+    async open(address) {
+      await driver.switchTo().newWindow("tab");
+      const handle = await driver.getWindowHandle();
+      await driver.get(address);
+      let closed = false;
+      const here = () => driver.switchTo().window(handle);
+      return {
+        handle,
+        async goto(next) { await here(); await driver.get(next); },
+        async back() { await here(); await driver.navigate().back(); },
+        async reload() { await here(); await driver.navigate().refresh(); },
+        async close() { await here(); await driver.close(); closed = true; await driver.switchTo().window(first); },
+        isClosed: () => closed,
+        async form() { await here(); return driver.executeScript(`return ${FORM};`); },
+        innerForm: () => eventually("the frame shows the login page", async () => {
+          await here();
+          await driver.switchTo().frame(await driver.findElement(By.id("inner")));
+          try { return await driver.executeScript(`return ${INNER};`); } finally { await driver.switchTo().defaultContent(); }
+        }),
+      };
+    },
+    async press({ handle }, which) {
+      await driver.switchTo().window(handle);
+      await inChrome(async () => { await driver.findElement(By.css(`#${button(which)} ${ACTION}`)).click(); });
+    },
+    async status({ handle }, which) {
+      await driver.switchTo().window(handle);
+      return inChrome(() => driver.executeScript(
+        "const node = document.querySelector(arguments[0]); return { badge: node.getAttribute('badge') || '', title: node.getAttribute('tooltiptext') || '' };",
+        `#${button(which)} ${ACTION}`,
+      ));
+    },
+  };
 }

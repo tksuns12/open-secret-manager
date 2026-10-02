@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
-import { formOf, start } from "./harness.mjs";
+import { BROWSER, start } from "./harness.mjs";
 
 const EMPTY = { username: "", password: "" };
 const fields = ({ username, password }) => ({ username, password });
@@ -34,22 +34,20 @@ describe("with the desktop session and the real host", () => {
 
   test("the owner's choice is filled into the page's own https form, which is not submitted", async () => {
     const page = await browser.open("https://login.test/login");
-    assert.deepEqual(fields(await formOf(page)), EMPTY);
+    assert.deepEqual(fields(await page.form()), EMPTY);
     await browser.press(page);
 
     const request = await asked(browser);
-    assert.deepEqual([request.origin, request.kind, request.logins], ["https://login.test", "Chromium", [browser.items.site]]);
-    const waiting = await browser.until(page, "…");
-    assert.match(waiting.title, /Waiting for you in Open Secret Manager/);
+    assert.deepEqual([request.origin, request.kind, request.logins], ["https://login.test", browser.kind, [browser.items.site]]);
+    await browser.until(page, "…", { says: /Waiting for you in Open Secret Manager/ });
     // Nothing reaches the page before the owner chooses.
-    assert.deepEqual(fields(await formOf(page)), EMPTY);
+    assert.deepEqual(fields(await page.form()), EMPTY);
 
     browser.app.say(`approve ${browser.items.site}`);
     assert.equal(await browser.app.expect("FILLED"), `${request.id} ${browser.items.site}`);
-    const done = await browser.until(page, "✓");
-    assert.match(done.title, /Filled the user name and password\. The form was not submitted\./);
+    await browser.until(page, "✓", { says: /Filled the user name and password\. The form was not submitted\./ });
 
-    const form = await formOf(page);
+    const form = await page.form();
     assert.deepEqual(fields(form), { username: "site@example.test", password: "site password" });
     // The page saw the values arrive as typing would deliver them, no key
     // presses, and no submission; it is still the same page.
@@ -65,9 +63,9 @@ describe("with the desktop session and the real host", () => {
     await asked(browser);
     browser.app.say(`approve ${browser.items.site}`);
     await browser.app.expect("FILLED");
-    assert.match((await browser.until(page, "✓")).title, /Filled the user name\./);
-    assert.equal(await page.inputValue("#username"), "site@example.test");
-    assert.equal(await page.evaluate(() => window.seen.submitted), false);
+    await browser.until(page, "✓", { says: /Filled the user name\./ });
+    const form = await page.form();
+    assert.deepEqual([form.username, form.submitted], ["site@example.test", false]);
     await page.close();
   });
 
@@ -77,7 +75,7 @@ describe("with the desktop session and the real host", () => {
     const status = await browser.until(page, "!");
     assert.match(status.title, /Only pages opened over https can be filled/);
     await browser.app.quiet();
-    assert.deepEqual(fields(await formOf(page)), EMPTY);
+    assert.deepEqual(fields(await page.form()), EMPTY);
     await page.close();
   });
 
@@ -96,8 +94,8 @@ describe("with the desktop session and the real host", () => {
       assert.equal(await browser.app.expect("REFUSED"), "not-for-this-page");
       browser.app.say("deny");
       await browser.app.expect("DENIED");
-      assert.match((await browser.until(page, "!")).title, /You denied this request/);
-      assert.deepEqual(fields(await formOf(page)), EMPTY, address);
+      await browser.until(page, "!", { says: /You denied this request/ });
+      assert.deepEqual(fields(await page.form()), EMPTY, address);
       await page.close();
     }
   });
@@ -105,20 +103,17 @@ describe("with the desktop session and the real host", () => {
   test("a form in a frame from another site is not filled, whatever the page around it", async () => {
     // The page has no form of its own: nothing is even asked.
     const framing = await browser.open("https://framing.test/framing");
-    const inner = () => framing.frames().find((frame) => frame.url() === "https://login.test/login");
-    await framing.waitForFunction(() => document.getElementById("inner") !== null);
-    while (!inner()) await pause(50);
+    assert.deepEqual(await framing.innerForm(), ["", ""]);
     await browser.press(framing);
-    assert.match((await browser.until(framing, "!")).title, /No login form was found on this page/);
+    await browser.until(framing, "!", { says: /No login form was found on this page/ });
     await browser.app.quiet();
-    assert.deepEqual(await inner().evaluate(() => [document.getElementById("username").value, document.getElementById("password").value]), ["", ""]);
+    assert.deepEqual(await framing.innerForm(), ["", ""]);
     await framing.close();
 
     // The page has its own form: that one is filled, with the page's own
     // login, and the frame is left alone.
     const both = await browser.open("https://framing.test/both");
-    const framed = () => both.frames().find((frame) => frame.url() === "https://login.test/login");
-    while (!framed()) await pause(50);
+    assert.deepEqual(await both.innerForm(), ["", ""]);
     await browser.press(both);
     const request = await asked(browser);
     assert.deepEqual([request.origin, request.logins], ["https://framing.test", [browser.items.framing]]);
@@ -127,8 +122,8 @@ describe("with the desktop session and the real host", () => {
     browser.app.say(`approve ${browser.items.framing}`);
     await browser.app.expect("FILLED");
     await browser.until(both, "✓");
-    assert.deepEqual(fields(await formOf(both)), { username: "framing@example.test", password: "framing password" });
-    assert.deepEqual(await framed().evaluate(() => [document.getElementById("username").value, document.getElementById("password").value]), ["", ""]);
+    assert.deepEqual(fields(await both.form()), { username: "framing@example.test", password: "framing password" });
+    assert.deepEqual(await both.innerForm(), ["", ""]);
     await both.close();
   });
 
@@ -138,6 +133,8 @@ describe("with the desktop session and the real host", () => {
       ["a same-site navigation", (page) => page.goto("https://login.test/next")],
       ["a navigation elsewhere", (page) => page.goto("https://www.login.test/login")],
       ["a reload", (page) => page.reload()],
+      // The browser may bring the very same document back.
+      ["leaving and coming back", async (page) => { await page.goto("https://login.test/next"); await page.back(); }],
       ["closing the tab", (page) => page.close()],
     ];
     for (const [what, go] of leave) {
@@ -151,7 +148,7 @@ describe("with the desktop session and the real host", () => {
       assert.equal(await browser.app.expect("REFUSED"), "not-pending", what);
       if (!page.isClosed()) {
         await pause(300);
-        assert.deepEqual(fields(await formOf(page)), EMPTY, what);
+        assert.deepEqual(fields(await page.form()), EMPTY, what);
         assert.equal((await browser.status(page)).badge, "", what);
         await page.close();
       }
@@ -168,7 +165,7 @@ describe("with the desktop session and the real host", () => {
     browser.app.say(`approve ${browser.items.site}`);
     assert.equal(await browser.app.expect("REFUSED"), "locked");
     await pause(300);
-    assert.deepEqual(fields(await formOf(page)), EMPTY);
+    assert.deepEqual(fields(await page.form()), EMPTY);
     assert.equal((await browser.status(page)).badge, "…");
 
     // Unlocked again, a new choice is filled.
@@ -178,7 +175,22 @@ describe("with the desktop session and the real host", () => {
     browser.app.say(`approve ${browser.items.site}`);
     await browser.app.expect("FILLED");
     await browser.until(page, "✓");
-    assert.deepEqual(fields(await formOf(page)), { username: "site@example.test", password: "site password" });
+    assert.deepEqual(fields(await page.form()), { username: "site@example.test", password: "site password" });
+    await page.close();
+  });
+
+  test("a request that waits longer than the extension's background stays idle is still filled", async () => {
+    const page = await browser.open("https://login.test/login");
+    await browser.press(page);
+    const request = await asked(browser);
+    // Browsers stop an extension's background after about thirty seconds
+    // with nothing to do; the app's reminders are what it has to do.
+    await pause(45_000);
+    assert.equal((await browser.status(page)).badge, "…");
+    browser.app.say(`approve ${browser.items.site}`);
+    assert.equal(await browser.app.expect("FILLED"), `${request.id} ${browser.items.site}`);
+    await browser.until(page, "✓");
+    assert.deepEqual(fields(await page.form()), { username: "site@example.test", password: "site password" });
     await page.close();
   });
 
@@ -192,14 +204,14 @@ describe("with the desktop session and the real host", () => {
     await browser.app.quiet();
     // Another tab: turned away, and told why.
     await browser.press(second);
-    assert.match((await browser.until(second, "!")).title, /Another request is waiting in Open Secret Manager/);
+    await browser.until(second, "!", { says: /Another request is waiting in Open Secret Manager/ });
     await browser.app.quiet();
 
     browser.app.say(`approve ${browser.items.site}`);
     assert.equal(await browser.app.expect("FILLED"), `${request.id} ${browser.items.site}`);
     await browser.until(first, "✓");
-    assert.deepEqual(fields(await formOf(first)), { username: "site@example.test", password: "site password" });
-    assert.deepEqual(fields(await formOf(second)), EMPTY);
+    assert.deepEqual(fields(await first.form()), { username: "site@example.test", password: "site password" });
+    assert.deepEqual(fields(await second.form()), EMPTY);
     await first.close();
     await second.close();
   });
@@ -213,8 +225,8 @@ describe("when the request cannot be decided", () => {
       await browser.press(page);
       const request = await asked(browser);
       assert.equal(await browser.app.expect("ENDED"), request.id);
-      assert.match((await browser.until(page, "!")).title, /ran out of time/);
-      assert.deepEqual(fields(await formOf(page)), EMPTY);
+      await browser.until(page, "!", { says: /ran out of time/ });
+      assert.deepEqual(fields(await page.form()), EMPTY);
     } finally { await browser.close(); }
   });
 
@@ -223,8 +235,8 @@ describe("when the request cannot be decided", () => {
     try {
       const page = await browser.open("https://login.test/login");
       await browser.press(page);
-      assert.match((await browser.until(page, "!")).title, /Open Secret Manager is not running/);
-      assert.deepEqual(fields(await formOf(page)), EMPTY);
+      await browser.until(page, "!", { says: /Open Secret Manager is not running/ });
+      assert.deepEqual(fields(await page.form()), EMPTY);
     } finally { await browser.close(); }
   });
 
@@ -233,23 +245,22 @@ describe("when the request cannot be decided", () => {
     try {
       const page = await browser.open("https://login.test/login");
       await browser.press(page);
-      assert.match((await browser.until(page, "!")).title, /This browser is not connected to Open Secret Manager/);
+      await browser.until(page, "!", { says: /This browser is not connected to Open Secret Manager/ });
       await browser.app.quiet();
-      assert.deepEqual(fields(await formOf(page)), EMPTY);
+      assert.deepEqual(fields(await page.form()), EMPTY);
     } finally { await browser.close(); }
   });
 
   test("another extension is not let through to the host", async () => {
     const browser = await start({ logins: [["site", "https://login.test/login"]], forged: true });
     try {
-      assert.notEqual(browser.forgedId, null);
       const page = await browser.open("https://login.test/login");
       // The same code under another extension's identity: the browser
       // refuses to start the host for it.
-      await browser.press(page, browser.forgedId);
-      assert.match((await browser.until(page, "!", browser.forgedId)).title, /not connected to Open Secret Manager/);
+      await browser.press(page, { forged: true });
+      await browser.until(page, "!", { forged: true, says: /not connected to Open Secret Manager/ });
       await browser.app.quiet();
-      assert.deepEqual(fields(await formOf(page)), EMPTY);
+      assert.deepEqual(fields(await page.form()), EMPTY);
 
       // The real one, in the same browser, still works.
       await browser.press(page);
@@ -257,7 +268,7 @@ describe("when the request cannot be decided", () => {
       browser.app.say(`approve ${browser.items.site}`);
       await browser.app.expect("FILLED");
       await browser.until(page, "✓");
-      assert.deepEqual(fields(await formOf(page)), { username: "site@example.test", password: "site password" });
+      assert.deepEqual(fields(await page.form()), { username: "site@example.test", password: "site password" });
     } finally { await browser.close(); }
   });
 });
@@ -281,7 +292,7 @@ describe("with a host that answers wrongly", () => {
     const page = await pressed("twice");
     await browser.until(page, "✓");
     await pause(600);
-    const form = await formOf(page);
+    const form = await page.form();
     assert.deepEqual(fields(form), { username: "fake-user", password: "fake-password" });
     assert.deepEqual(form.events, ["input:username", "change:username", "input:password", "change:password"]);
     assert.equal(form.submitted, false);
@@ -291,8 +302,8 @@ describe("with a host that answers wrongly", () => {
   test("an answer for another tab, frame, document, or origin is not filled", async () => {
     for (const mode of ["other-tab", "other-frame", "other-document", "other-origin"]) {
       const page = await pressed(mode);
-      assert.match((await browser.until(page, "!")).title, /was not for this page\. Nothing was filled/, mode);
-      assert.deepEqual(fields(await formOf(page)), EMPTY, mode);
+      await browser.until(page, "!", { says: /was not for this page\. Nothing was filled/ });
+      assert.deepEqual(fields(await page.form()), EMPTY, mode);
       await page.close();
     }
   });
@@ -301,46 +312,80 @@ describe("with a host that answers wrongly", () => {
     for (const mode of ["other-request", "extra-field", "missing-field", "wrong-kind", "unknown-type"]) {
       const page = await pressed(mode);
       // The request keeps waiting until the fake host turns it down.
-      assert.match((await browser.until(page, "!")).title, /You denied this request/, mode);
-      assert.deepEqual(fields(await formOf(page)), EMPTY, mode);
+      await browser.until(page, "!", { says: /You denied this request/ });
+      assert.deepEqual(fields(await page.form()), EMPTY, mode);
       await page.close();
     }
   });
 
   test("a host that ends without an answer, or sends bytes that are no message, fills nothing", async () => {
     const ended = await pressed("exit");
-    assert.match((await browser.until(ended, "!")).title, /connection to Open Secret Manager was lost/);
-    assert.deepEqual(fields(await formOf(ended)), EMPTY);
+    await browser.until(ended, "!", { says: /connection to Open Secret Manager was lost/ });
+    assert.deepEqual(fields(await ended.form()), EMPTY);
     await ended.close();
 
-    // The browser drops what it cannot read as a message; the request
-    // simply stays unanswered.
+    // Chromium drops what it cannot read as a message and the request
+    // stays unanswered; Firefox ends the connection. Neither fills.
     const garbled = await pressed("garbage");
-    await browser.until(garbled, "…");
-    await pause(1000);
-    assert.equal((await browser.status(garbled)).badge, "…");
-    assert.deepEqual(fields(await formOf(garbled)), EMPTY);
+    await pause(1500);
+    const status = await browser.status(garbled);
+    assert.ok(BROWSER === "firefox" ? status.badge === "!" : status.badge === "…", JSON.stringify(status));
+    assert.deepEqual(fields(await garbled.form()), EMPTY);
     await garbled.close();
+  });
+
+  test("a reply that arrives after the tab moved on is not filled, even if the page hid its leaving", async () => {
+    browser.plan("late");
+    tabs += 1;
+    const page = await browser.open(`https://login.test/sticky?tab=${tabs}`);
+    await browser.press(page);
+    await browser.until(page, "…");
+    // The tab now shows another document of the same site, and the page
+    // kept the extension's script from hearing that it was left.
+    // The reply comes five seconds after the request; by then the tab has
+    // moved on.
+    await page.goto("https://login.test/next");
+    // Chromium closes the script's connection whatever the page does, so
+    // the request ended when the tab moved on. Firefox keeps the document
+    // and its connection: there the reply is stopped by asking the browser
+    // which document the tab shows.
+    if (BROWSER === "firefox") {
+      await browser.until(page, "!", { says: /The page changed before the login arrived\. Nothing was filled\./ });
+    } else {
+      await pause(6000);
+      assert.equal((await browser.status(page)).badge, "");
+    }
+    assert.deepEqual(fields(await page.form()), EMPTY);
+    // Nor is it in the page that was left, should the browser show it again.
+    await page.back();
+    await pause(300);
+    assert.deepEqual(fields(await page.form()), EMPTY);
+    await page.close();
   });
 
   test("the extension asks for one page's origin, and withdraws when the page goes", async () => {
     const page = await pressed("silent");
     await browser.until(page, "…");
-    const address = page.url();
     await page.goto("https://login.test/next");
     // What the host was sent for this page: the request, with nothing of
-    // the vault and nothing chosen, and then the withdrawal.
+    // the vault and nothing chosen. Then the withdrawal: the message, or
+    // the connection closed, which withdraws it just the same.
     const sentForThisPage = () => {
-      const messages = browser.hostLog().filter((line) => line !== "closed").map((line) => JSON.parse(line));
-      const request = messages.filter((message) => message.type === "fill_request").at(-1);
-      return { request, cancel: messages.find((message) => message.type === "cancel" && message.requestId === request?.requestId) };
+      const lines = browser.hostLog();
+      const index = lines.findLastIndex((line) => line.includes('"fill_request"'));
+      const request = JSON.parse(lines[index]);
+      const after = lines.slice(index + 1);
+      return { request, cancel: after.filter((line) => line !== "closed").map((line) => JSON.parse(line)).find((message) => message.requestId === request.requestId), closed: after.includes("closed") };
     };
     const deadline = Date.now() + 10_000;
-    while (!sentForThisPage().cancel && Date.now() < deadline) await pause(100);
-    const { request, cancel } = sentForThisPage();
+    while (!(sentForThisPage().cancel || sentForThisPage().closed) && Date.now() < deadline) await pause(100);
+    const { request, cancel, closed } = sentForThisPage();
     assert.deepEqual(Object.keys(request).sort(), ["documentId", "frameId", "origin", "requestId", "tabId", "type", "version"]);
-    assert.deepEqual([request.version, request.frameId, request.origin], [1, 0, new URL(address).origin]);
-    assert.deepEqual(cancel, { type: "cancel", version: 1, requestId: request.requestId });
+    assert.deepEqual([request.version, request.frameId, request.origin], [1, 0, "https://login.test"]);
+    if (cancel) assert.deepEqual(cancel, { type: "cancel", version: 1, requestId: request.requestId });
+    else assert.ok(closed, "the request was neither withdrawn nor its connection closed");
+    await pause(300);
+    assert.equal((await browser.status(page)).badge, "");
     await page.close();
   });
 });

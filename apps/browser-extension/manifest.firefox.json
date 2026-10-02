@@ -14,7 +14,8 @@
     ]
   },
   "action": {
-    "default_title": "Fill a login from Open Secret Manager"
+    "default_title": "Fill a login from Open Secret Manager",
+    "default_area": "navbar"
   },
   "commands": {
     "_execute_action": {

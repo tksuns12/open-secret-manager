@@ -11,8 +11,10 @@
 //   npm run build && node e2e/with-app.mjs
 //
 // `OSM_APP_HOME` names the home folder the app runs for, if it is not this
-// account's own.
-import { formOf, start } from "./harness.mjs";
+// account's own. With `OSM_BROWSER=firefox` the browser is Firefox, which
+// has to be connected in the app's Browser panel beforehand; for Chromium
+// the host is registered in the test browser's own scratch folder.
+import { start } from "./harness.mjs";
 
 const browser = await start({ appHome: process.env.OSM_APP_HOME ?? process.env.HOME });
 try {
@@ -29,7 +31,7 @@ try {
     if (status.badge !== "…") break;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  const form = await formOf(page);
+  const form = await page.form();
   console.log(`page: user name ${JSON.stringify(form.username)}, password of ${form.password.length} characters, submitted: ${form.submitted}`);
 } finally {
   await browser.close();

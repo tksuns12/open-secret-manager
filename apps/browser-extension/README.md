@@ -50,15 +50,19 @@ manifest fixes the extension's ID, which is the one the native messaging
 host allows. Then, in the desktop app, open Browser and connect that
 browser, so that it knows where the host is.
 
-The Firefox build comes from the same source and has not been run in
-Firefox yet.
+In Firefox, open `about:debugging`, choose This Firefox, then Load
+Temporary Add-on, and pick `dist/firefox/manifest.json`. A temporary add-on
+is gone when Firefox quits; installing it for good needs it signed by
+Mozilla, which has not been done. Then connect Firefox in the app's Browser
+panel.
 
 ## Checks
 
 ```text
 npm run typecheck
 npm test             # the extension's own checks on addresses and answers
-npm run test:e2e     # in headless Chromium, see below
+npm run test:e2e           # in headless Chromium, see below
+npm run test:e2e:firefox   # the same tests in headless Firefox
 ```
 
 `npm run test:e2e` needs the host and the stand-in for the app built first
@@ -70,10 +74,19 @@ real binary, started by the browser; the app is played by `osm-fill`, which
 runs the app's own session code on a real vault. A second set of tests puts
 a host that answers wrongly on purpose in the real one's place.
 
-The toolbar button is pressed through the browser's debugging interface,
-which grants the tab what a real press grants. Nothing in these tests
+In Chromium the toolbar button is pressed through the browser's debugging
+interface, which grants the tab what a real press grants; nothing there
 clicks a real toolbar.
+
+`npm run test:e2e:firefox` runs the same tests in the Firefox installed on
+this machine (`/Applications/Firefox.app`, or the program `OSM_FIREFOX`
+names), headless, with a scratch home folder and profile, so that your own
+Firefox and its settings are not touched. The extension is installed as a
+temporary add-on and its toolbar button is clicked in Firefox's own
+interface. The driver for Firefox is fetched on first use.
 
 `node e2e/with-app.mjs` does the same against the desktop app itself, for a
 check by hand: it presses the button on a test page and prints what the
 button says and what ended up in the page, while you decide in the app.
+With `OSM_BROWSER=firefox` it uses Firefox, which has to be connected in
+the app's Browser panel first.

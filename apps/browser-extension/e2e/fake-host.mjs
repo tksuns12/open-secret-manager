@@ -25,6 +25,8 @@ function answer(request) {
   send({ type: "waiting", requestId });
   switch (mode) {
     case "good": return send(good);
+    // The right reply, after a while.
+    case "late": return later(5000, () => send(good));
     // The same reply a second time, and once more after a moment.
     case "twice": send(good); send(good); return later(300, () => send(good));
     // A reply that names the request but not what it was for.

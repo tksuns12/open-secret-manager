@@ -7,12 +7,6 @@ import type { ToPage, FromPage } from "./page";
 
 type Target = { username: HTMLInputElement | null; password: HTMLInputElement | null };
 
-declare global {
-  // Set once per document, so that putting the script in again does nothing.
-  // eslint-disable-next-line no-var
-  var osmFillInstalled: boolean | undefined;
-}
-
 /** Names this document. A navigation loads another, with another name. */
 const documentId = crypto.randomUUID();
 
@@ -72,14 +66,26 @@ function isTopHttpsDocument(): boolean {
   return window.top === window && window.location.protocol === "https:";
 }
 
-if (!globalThis.osmFillInstalled) {
-  globalThis.osmFillInstalled = true;
+// Done once per document: putting the script in again does nothing. The
+// name stays where the extension can ask the browser for it later, to see
+// that the tab still shows this document.
+if (globalThis.osmFillDocument === undefined) {
+  globalThis.osmFillDocument = documentId;
   // Each request has its own connection from the extension. It closes when
   // this document goes away, which is how the extension learns of that.
   chrome.runtime.onConnect.addListener((port) => {
     let target: Target | null = null;
     let used = false;
     const say = (message: FromPage) => port.postMessage(message);
+    // A browser may keep a document it has left, for the Back button, and
+    // with it this connection. Leaving ends the request all the same: the
+    // connection is closed here, and nothing is filled into this document
+    // afterwards even if it is shown again.
+    window.addEventListener("pagehide", () => {
+      used = true;
+      target = null;
+      port.disconnect();
+    }, { once: true });
     port.onMessage.addListener((message: ToPage) => {
       if (message.type === "prepare") {
         target = isTopHttpsDocument() ? findTarget() : null;
