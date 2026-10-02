@@ -325,7 +325,7 @@ function App() {
       {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
       {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
-      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {notice && <div className="toast"><ShieldCheck size={15} />{notice}</div>}
     </main>
   );
@@ -359,11 +359,13 @@ type DevicesPanelProps = {
   onCancelEnrollment: () => void;
   onRejoined: () => void;
   onRecovered: (recoveryKey: string, summary: string) => void;
+  /** Takes the owner to the unlock form, which this dialog covers. */
+  onUnlock: () => void;
   onNotice: (text: string) => void;
   onCopy: (text: string) => void;
 };
 
-function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onNotice, onCopy }: DevicesPanelProps) {
+function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onUnlock, onNotice, onCopy }: DevicesPanelProps) {
   const [removing, setRemoving] = useState<string | null>(null);
   const [rejoining, setRejoining] = useState(false);
   const [recovering, setRecovering] = useState(false);
@@ -393,15 +395,17 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     if (rejoining) return <JoinPanel keepsVault onCancel={() => setRejoining(false)} onJoined={() => { setRejoining(false); onRejoined(); }} onNotice={onNotice} />;
     return <div className="device-panel">
       <p className="review-hint">This device was paired by an earlier version. Your devices now agree together on which devices belong to the vault, so that a lost one can be removed. Set that up on one of the two devices only, then invite the other from it. Both keep their vaults.</p>
-      <button className="generate-button" onClick={onFound} disabled={locked}>{locked ? "Unlock to continue" : "Set it up on this device"}</button>
-      <button className="secondary" onClick={() => setRejoining(true)} disabled={locked}>I set it up on the other device · join with an invitation</button>
+      {locked
+        ? <button className="generate-button" onClick={onUnlock}>Unlock to continue</button>
+        : <><button className="generate-button" onClick={onFound}>Set it up on this device</button>
+          <button className="secondary" onClick={() => setRejoining(true)}>I set it up on the other device · join with an invitation</button></>}
     </div>;
   }
   if (devices.setup === "joining") {
     return <div className="device-panel"><p className="review-hint">This device is joining a vault. It becomes a member once the vault's devices have enrolled it.</p></div>;
   }
   if (devices.setup !== "ready") {
-    return <div className="device-panel"><p className="review-hint">{locked ? "Unlock the vault to set up its devices." : "Devices are being set up…"}</p></div>;
+    return <div className="device-panel"><p className="review-hint">{locked ? "Unlock the vault to set up its devices." : "Devices are being set up…"}</p>{locked && <button className="generate-button" onClick={onUnlock}>Unlock</button>}</div>;
   }
 
   const others = devices.members.filter((member) => !member.thisDevice);
@@ -419,9 +423,12 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     {pending && pending.kind === "remove" && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Removing device {shortDevice(pending.device)}</strong><span>Waiting for the remaining devices. The new key takes effect only when they have all agreed; bring them online to finish.</span></div></div>}
     <p className="review-hint">{syncDetail(sync)}{sync.pending > 0 ? ` · ${sync.pending} waiting for unlock` : ""}</p>
     <p className="review-hint">{quorumHint(devices)}</p>
+    {locked && <p className="review-hint">The vault is locked. This device still syncs and takes part in decisions, but adding or removing a device needs it unlocked.</p>}
     <div className="form-actions">
       {others.length > 0 && <button className="secondary" onClick={onSync} disabled={sync.state === "syncing"}>Sync now</button>}
-      <button className="generate-button" onClick={onInvite} disabled={locked || Boolean(pending)}>{locked ? "Unlock to invite a device" : "Invite a device"}</button>
+      {locked
+        ? <button className="generate-button" onClick={onUnlock}>Unlock to invite a device</button>
+        : <button className="generate-button" onClick={onInvite} disabled={Boolean(pending)}>Invite a device</button>}
     </div>
     {others.length > 0 && <button className="link-button" onClick={() => setRecovering(true)}>Lost devices and cannot remove them? Start over as a new vault…</button>}
   </div>;
