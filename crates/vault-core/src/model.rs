@@ -268,6 +268,68 @@ impl From<VaultItem> for ItemSummary {
     }
 }
 
+/// What filling a login into a page releases, and nothing else of the item.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FillCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl Drop for FillCredentials {
+    fn drop(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+    }
+}
+
+impl fmt::Debug for FillCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FillCredentials([REDACTED])")
+    }
+}
+
+/// One unlock of a vault, from the moment it is unlocked until it locks.
+/// Unlocking again starts another, so a decision the owner made during one
+/// unlock can be told apart from the next. It names the unlock and is not a
+/// secret.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnlockSession([u8; 16]);
+
+impl UnlockSession {
+    pub(crate) fn new(id: [u8; 16]) -> Self {
+        Self(id)
+    }
+}
+
+impl fmt::Display for UnlockSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for UnlockSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UnlockSession({self})")
+    }
+}
+
+impl std::str::FromStr for UnlockSession {
+    type Err = crate::Error;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || crate::Error::InvalidItem("invalid unlock session".into());
+        let mut id = [0_u8; 16];
+        if text.len() != 2 * id.len() || !text.is_ascii() {
+            return Err(invalid());
+        }
+        for (byte, pair) in id.iter_mut().zip(text.as_bytes().chunks(2)) {
+            let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
+        }
+        Ok(Self(id))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportFormat {
     BitwardenJson,

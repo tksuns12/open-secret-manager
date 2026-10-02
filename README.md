@@ -26,12 +26,24 @@ The repository is deliberately split at the security boundary:
   once the removal completes. Tests run it in-process, over TLS between
   listeners in one process, between separate device processes, and in the
   desktop shell.
+- `crates/origin` is the one rule for which page a login may be filled
+  into: HTTPS, the exact host, and the exact port.
+- `crates/browser-link` defines what the browser extension, the native
+  messaging host, and the desktop session say to each other. It cannot open
+  a vault.
+- `crates/vault-browser` is the desktop session's end of a browser fill: a
+  request waits there until the owner picks a login for the page's exact
+  origin or turns it down. The `osm-fill` binary is a development stand-in
+  for the app.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
   route from the interface to the Rust core.
+- `apps/native-host` is the process a browser starts for the extension. It
+  holds no vault and no key: it checks each request and passes it to the
+  desktop session over a socket only the owner's account can reach.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and
-  Firefox manifests. The extension asks for an explicit, origin-bound fill and
-  never stores credentials; the shipped native host fails closed until the
-  desktop session adapter is installed.
+  Firefox manifests. It is a scaffold: it has no build step yet and predates
+  the host's current messages. Until the desktop app serves the session's
+  socket, the host answers every request as unavailable.
 
 The prototype is intentionally offline-first. Local vault use does not depend
 on a peer or a network. Devices pair by invitation and a six-digit code the

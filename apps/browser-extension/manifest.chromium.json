@@ -3,6 +3,7 @@
   "name": "Open Secret Manager",
   "version": "0.1.0",
   "description": "Explicit, origin-bound autofill for Open Secret Manager.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5hBmyI+7n/wl6tBjDUh0VoMH1HjstJCWAcnp4tnqZw6fsIUHG/UYDnNKaWh1+ckDPue83UHlIBfZX0ErgnszyCBYfosUNH32BAYzBXkFb2dhgt+KdccvlutMue5uGWUzeaarHm6FoweJmuDLzhKIzJqL6Q1GWiUzdLSPTocPEhbEBFPrJcA2sE/N4MAdPo8YDtwCmLP6Urn/LcamFZ4guZpam19J7Mr6U5xfetWivtqc52XRmd9Rk7tKdK43iQAbWyFZSflUyGyEIWrioAggwA5wUe/IORrdfK23OJFxhPe61W8c9yH87wpJxONjcQAmQ8IVbSZvJkOEk4Q2I14MRwIDAQAB",
   "permissions": ["contextMenus", "nativeMessaging", "tabs"],
   "host_permissions": ["https://*/*"],
   "background": { "service_worker": "dist/background.js", "type": "module" },

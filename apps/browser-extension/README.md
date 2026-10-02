@@ -1,5 +1,12 @@
 # Browser integration
 
+This source is a scaffold and cannot be loaded into a browser yet: nothing
+builds the `dist` files its manifests name, and its messages predate the
+ones the native host now accepts (see
+[the format contract](../../docs/formats.md#implemented-fill-protocol-phase-5-stop-1)).
+The `key` in the Chromium manifest fixes the extension's ID, which the host
+allows by name. What follows describes the scaffold as written.
+
 The Chromium and Firefox manifests point to the same source modules. The
 extension asks for a native-host fill only after an explicit context-menu
 selection and a page prompt. The desktop host is expected to be unlocked and

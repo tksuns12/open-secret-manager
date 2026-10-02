@@ -20,8 +20,9 @@ use crate::{
         verify_recovery_check, KdfConfig, SecretKey, DEVICE_ID_LEN, KEY_LEN, NONCE_LEN,
         PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    Error, ForkReport, IngressReport, Item, ItemSummary, ItemVersion, QuarantinedRevision,
-    RecoveryKey, Result, RevisionInfo, StageOutcome, VaultItem,
+    Error, FillCredentials, ForkReport, IngressReport, Item, ItemKind, ItemSummary, ItemVersion,
+    Origin, QuarantinedRevision, RecoveryKey, Result, RevisionInfo, StageOutcome, UnlockSession,
+    VaultItem,
 };
 
 /// Storage layout: a per-device root key wraps the device key, the HPKE
@@ -378,6 +379,8 @@ pub struct Vault {
     revoked: BTreeSet<[u8; DEVICE_ID_LEN]>,
     /// Secret behind this device's HPKE recipient key, while unlocked.
     recipient_secret: Option<SecretKey>,
+    /// Names this unlock, while unlocked.
+    session: Option<UnlockSession>,
 }
 
 /// Seals revisions for one author. Borrowing the keys separately from the
@@ -505,6 +508,7 @@ impl Vault {
             devices: BTreeMap::new(),
             revoked: BTreeSet::new(),
             recipient_secret: None,
+            session: None,
         }
     }
 
@@ -599,6 +603,13 @@ impl Vault {
         self.devices.clear();
         self.revoked.clear();
         self.recipient_secret = None;
+        self.session = None;
+    }
+
+    /// Names this unlock: `None` while locked, and different after every
+    /// unlock.
+    pub fn unlock_session(&self) -> Option<UnlockSession> {
+        self.session.filter(|_| self.is_unlocked())
     }
 
     /// Completes an unlock: migrates an older vault, then loads the device
@@ -659,6 +670,7 @@ impl Vault {
         self.devices = devices;
         self.revoked = revoked;
         self.recipient_secret = Some(recipient_secret);
+        self.session = Some(UnlockSession::new(random_array()));
         Ok(())
     }
 
@@ -1075,6 +1087,34 @@ impl Vault {
                     || item.url.to_lowercase().contains(&query)
             })
             .collect())
+    }
+
+    /// The logins that may be filled into a page of `origin`: those whose
+    /// stored address has exactly that origin.
+    pub fn logins_for_origin(&self, origin: &Origin) -> Result<Vec<ItemSummary>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|item| fills(item.kind, &item.url, origin))
+            .collect())
+    }
+
+    /// The user name and password of a login, for filling into a page of
+    /// `origin`. Refused unless the login's stored address has exactly that
+    /// origin, whatever the caller was shown or chose.
+    pub fn credentials_for_origin(
+        &self,
+        item_id: &str,
+        origin: &Origin,
+    ) -> Result<FillCredentials> {
+        let item = self.get(item_id)?.item;
+        if !fills(item.kind, &item.url, origin) {
+            return Err(Error::OriginMismatch);
+        }
+        Ok(FillCredentials {
+            username: item.username.clone(),
+            password: item.password.clone(),
+        })
     }
 
     pub fn put(&mut self, item: Item) -> Result<RevisionInfo> {
@@ -2061,6 +2101,11 @@ fn item_heads(connection: &Connection, item_id: &str) -> Result<Vec<EncryptedRev
         .query_map([item_id], row_to_revision)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(heads)
+}
+
+/// Whether an item of this kind and stored address is a login for `origin`.
+fn fills(kind: ItemKind, address: &str, origin: &Origin) -> bool {
+    kind == ItemKind::Login && Origin::of_url(address).as_ref() == Some(origin)
 }
 
 impl Vault {

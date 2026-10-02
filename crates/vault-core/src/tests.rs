@@ -2013,3 +2013,137 @@ fn a_fork_starts_a_new_trust_domain_from_the_current_versions() {
         Err(Error::Locked)
     ));
 }
+
+fn login_at(title: &str, address: &str) -> Item {
+    let mut item = Item::new(title);
+    item.username = format!("{title}@example.test");
+    item.password = format!("{title} password");
+    item.url = address.into();
+    item.totp_secret = Some("JBSWY3DPEHPK3PXP".into());
+    item
+}
+
+#[test]
+fn a_login_is_released_only_for_the_exact_origin_of_its_address() {
+    let dir = tempdir().unwrap();
+    let (mut vault, _) = Vault::create(dir.path().join("vault.db"), "password").unwrap();
+    let exact = login_at("exact", "https://example.com/login?next=home");
+    let default_port = login_at("default-port", "https://EXAMPLE.com:443/");
+    let others = [
+        login_at("http", "http://example.com/login"),
+        login_at("subdomain", "https://login.example.com/"),
+        login_at("parent", "https://com/"),
+        login_at("port", "https://example.com:8443/login"),
+        login_at("lookalike", "https://example.com.evil.test/"),
+        login_at("userinfo", "https://example.com@evil.test/"),
+        login_at("no-scheme", "example.com/login"),
+        login_at("no-address", ""),
+    ];
+    let mut note = login_at("note", "https://example.com/");
+    note.kind = crate::ItemKind::SecureNote;
+    for item in [&exact, &default_port, &note].into_iter().chain(&others) {
+        vault.put(item.clone()).unwrap();
+    }
+
+    let origin = crate::Origin::parse("https://example.com").unwrap();
+    let mut listed: Vec<String> = vault
+        .logins_for_origin(&origin)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.title)
+        .collect();
+    listed.sort();
+    assert_eq!(listed, ["default-port", "exact"]);
+
+    let released = vault.credentials_for_origin(&exact.id, &origin).unwrap();
+    assert_eq!(released.username, "exact@example.test");
+    assert_eq!(released.password, "exact password");
+    assert_eq!(format!("{released:?}"), "FillCredentials([REDACTED])");
+    assert!(vault
+        .credentials_for_origin(&default_port.id, &origin)
+        .is_ok());
+
+    // Asking for another item by its ID does not get around the origin.
+    for item in others.iter().chain([&note]) {
+        assert!(
+            matches!(
+                vault.credentials_for_origin(&item.id, &origin),
+                Err(Error::OriginMismatch)
+            ),
+            "{}",
+            item.title
+        );
+    }
+    // Each of the other addresses is its own origin, or none.
+    let port = crate::Origin::parse("https://example.com:8443").unwrap();
+    assert_eq!(vault.logins_for_origin(&port).unwrap().len(), 1);
+    assert!(matches!(
+        vault.credentials_for_origin(&exact.id, &port),
+        Err(Error::OriginMismatch)
+    ));
+    let subdomain = crate::Origin::parse("https://login.example.com").unwrap();
+    assert_eq!(vault.logins_for_origin(&subdomain).unwrap().len(), 1);
+    let elsewhere = crate::Origin::parse("https://evil.test").unwrap();
+    // The address with a user name in front of another host has no origin.
+    assert!(vault.logins_for_origin(&elsewhere).unwrap().is_empty());
+
+    assert!(matches!(
+        vault.credentials_for_origin("missing", &origin),
+        Err(Error::NotFound)
+    ));
+    // A deleted login is released to no page.
+    let revision = vault.get(&exact.id).unwrap().revision;
+    vault.delete(&exact.id, &revision).unwrap();
+    assert!(matches!(
+        vault.credentials_for_origin(&exact.id, &origin),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(vault.logins_for_origin(&origin).unwrap().len(), 1);
+
+    vault.lock();
+    assert!(matches!(
+        vault.logins_for_origin(&origin),
+        Err(Error::Locked)
+    ));
+    assert!(matches!(
+        vault.credentials_for_origin(&default_port.id, &origin),
+        Err(Error::Locked)
+    ));
+}
+
+#[test]
+fn every_unlock_has_its_own_session() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, recovery) = Vault::create(&path, "password").unwrap();
+    let first = vault.unlock_session().unwrap();
+    assert_eq!(vault.unlock_session(), Some(first));
+    assert_eq!(first.to_string().len(), 32);
+    assert_eq!(
+        first.to_string().parse::<crate::UnlockSession>().unwrap(),
+        first
+    );
+    assert!("".parse::<crate::UnlockSession>().is_err());
+    assert!("zz".repeat(16).parse::<crate::UnlockSession>().is_err());
+    assert!("é".repeat(16).parse::<crate::UnlockSession>().is_err());
+
+    vault.lock();
+    assert_eq!(vault.unlock_session(), None);
+    // A wrong password leaves it locked and without a session.
+    assert!(vault.unlock("wrong").is_err());
+    assert_eq!(vault.unlock_session(), None);
+
+    vault.unlock("password").unwrap();
+    let second = vault.unlock_session().unwrap();
+    assert_ne!(second, first);
+    vault.lock();
+    vault.unlock_with_recovery(&recovery).unwrap();
+    let third = vault.unlock_session().unwrap();
+    assert!(third != first && third != second);
+
+    // Another handle on the same file is another unlock.
+    let mut other = Vault::open(&path).unwrap();
+    assert_eq!(other.unlock_session(), None);
+    other.unlock("password").unwrap();
+    assert_ne!(other.unlock_session(), Some(third));
+}

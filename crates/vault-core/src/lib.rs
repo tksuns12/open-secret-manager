@@ -11,10 +11,11 @@ pub use crypto::{epoch_key_check, RecoveryKey};
 pub use error::{Error, Result};
 pub use import::preview_import;
 pub use model::{
-    ForkReport, ImportFormat, ImportPreview, ImportWarning, IngressReport, Item, ItemKind,
-    ItemSummary, ItemVersion, PasswordPolicy, QuarantinedRevision, RevisionInfo, StageOutcome,
-    VaultItem,
+    FillCredentials, ForkReport, ImportFormat, ImportPreview, ImportWarning, IngressReport, Item,
+    ItemKind, ItemSummary, ItemVersion, PasswordPolicy, QuarantinedRevision, RevisionInfo,
+    StageOutcome, UnlockSession, VaultItem,
 };
+pub use osm_origin::Origin;
 pub use storage::{
     verify_pairing_signature, EncryptedRevision, EnrollmentMaterial, PendingDevice, Vault,
     CONTROL_SIGNATURE_DOMAIN, PAIRING_SIGNATURE_DOMAIN,

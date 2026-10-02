@@ -3055,6 +3055,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "osm-origin"
+version = "0.1.0"
+dependencies = [
+ "url",
+]
+
+[[package]]
 name = "osm-vault-core"
 version = "0.1.0"
 dependencies = [
@@ -3064,6 +3071,7 @@ dependencies = [
  "csv",
  "ed25519-dalek",
  "hmac 0.12.1",
+ "osm-origin",
  "rand 0.8.8",
  "rusqlite",
  "serde",

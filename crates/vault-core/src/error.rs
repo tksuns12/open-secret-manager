@@ -16,6 +16,9 @@ pub enum Error {
     NotFound,
     #[error("item already exists")]
     AlreadyExists,
+    /// The item is not a login for the origin it was asked for.
+    #[error("the item is not a login for that origin")]
+    OriginMismatch,
     #[error("revision conflict (expected {expected}, actual {actual})")]
     Conflict { expected: String, actual: String },
     #[error("item has concurrent revisions; resolve them before editing")]

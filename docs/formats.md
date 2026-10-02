@@ -8,9 +8,9 @@ This document is for engineers implementing compatible vault, sync, and client a
 | --- | --- | --- |
 | Vault core | Lock state; encryption; records; revision validation; backup/recovery; TOTP; generators; import parsing | Webviews, browser permissions, network listeners |
 | Sync service | Peer transport; pairing; ciphertext queues; anti-entropy; durable consensus adapters | Record plaintext or password-derived keys |
-| Desktop adapter | Core session lifecycle; narrow commands; explicit confirmation; clipboard and operating-system events | Independent cryptographic or origin-policy implementations |
-| Browser extension | Browser-derived tab/frame identity; explicit record selection and fill | Persistent vault keys, automatic fill, arbitrary vault enumeration |
-| Native host | Bounded framing; extension allowlist; authenticated desktop IPC; origin/request binding | A second unlocked vault process or a plaintext credential cache |
+| Desktop adapter | Core session lifecycle; narrow commands; explicit confirmation; the owner's choice of a login for a browser fill; clipboard and operating-system events | Independent cryptographic or origin-policy implementations |
+| Browser extension | Browser-derived tab/frame identity; the owner's explicit request; fill | Persistent vault keys, automatic fill, any list of vault items |
+| Native host | Bounded framing; extension allowlist; the connection to the desktop session; origin/request binding | A vault, a key, or a plaintext credential cache |
 
 The core exposes create/open/unlock/lock, record list/read/write/delete, conflict inspection/resolution, encrypted backup/restore, password change, generator, TOTP, and import preview/commit operations. Locked access returns an explicit locked error. A ciphertext ingress API has a separate result type: `stored_pending`, `accepted`, `duplicate`, or `rejected`; successful storage is not equivalent to successful validation.
 
@@ -204,7 +204,38 @@ TOTP stores the decoded secret, supported hash algorithm, digit count, and posit
 
 Native messaging uses browser-defined 32-bit native-endian length-prefixed UTF-8 JSON. The implementation may impose a smaller documented limit than the browser. Reserve stdout for framed protocol responses; diagnostics go to stderr without secrets. Extension identity is explicitly allowlisted during installation, as described by [Chrome's native messaging documentation](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging).
 
-The target fill request is `{version, request_id, tab_id, frame_id, document_id, origin, record_id}`. The desktop produces a one-use grant only after explicit selection/confirmation in an unlocked session. The response is bound to the same request and normalized HTTPS origin. No protocol message accepts a master password from page content. A missing desktop session returns unavailable. Exact origin normalization is shared with core policy and tested for default ports, IDNs, trailing dots, userinfo, opaque origins, redirects, and subdomain mismatch.
+A fill is asked for by the extension and decided in the desktop app. The request is `{version, request_id, tab_id, frame_id, document_id, origin}`; it names no record, because the owner chooses the login in the app and the extension never receives a list of vault items. The desktop session releases a login only after that choice, in the unlock it was made under. The response is bound to the same request and HTTPS origin. No protocol message accepts a master password. A missing desktop session returns unavailable.
+
+### Implemented fill protocol (Phase 5, stop 1)
+
+Implemented so far: the origin rule, the messages, the native host, and the desktop session's end as a library with a development stand-in. The desktop app does not serve the socket yet, and the extension source still speaks earlier scaffold messages.
+
+**Origin.** `osm-origin` is the one implementation, used by the core, the host, and the session. `Origin::of_url` gives the origin of an address stored with a login: the scheme must be `https`, there must be no user name or password, the path, query, and fragment are ignored, the host is taken as the URL standard serializes it (lower case, an international name in its ASCII form), and a missing port is 443. `Origin::parse` reads an origin from a message and accepts it only if it is already exactly that serialization, such as `https://example.com` or `https://example.com:8443`: a trailing slash, upper case, a written default port, or anything else that merely resembles an origin is refused. Two origins match only if host and port are equal. `https://example.com.` (trailing dot) is a different origin from `https://example.com`, as it is to a browser. An address without a scheme, such as `example.com`, has no origin, and its login is never offered. Redirects are not a concern of this rule: the extension reports the origin of the document it will fill.
+
+**Messages.** Every message is a JSON object of at most 64 KiB with a `type`, and field names in camelCase. A message with an unknown field is refused. The extension sends:
+
+| `type` | Fields | Rules |
+| --- | --- | --- |
+| `fill_request` | `version`, `requestId`, `tabId`, `frameId`, `documentId`, `origin` | `version` is 1. `requestId` and `documentId` are 1 to 64 ASCII letters, digits, or hyphens. `tabId` is not negative. `frameId` is 0: only the page itself is filled. `origin` must pass `Origin::parse`. |
+| `cancel` | `version`, `requestId` | Withdraws a request that is waiting. Nothing is answered if none is. |
+
+The extension receives:
+
+| `type` | Fields | Meaning |
+| --- | --- | --- |
+| `waiting` | `requestId` | The desktop session has the request and the owner has not decided. Sent at once and then every 20 seconds. |
+| `fill_reply` | `requestId`, `tabId`, `frameId`, `documentId`, `origin`, `username`, `password` | The owner's choice. The first five repeat the request. |
+| `error` | `requestId` (or `null`), `code` | The request ended without a login. |
+
+`code` is one of `invalid_message`, `unsupported_message`, `unsupported_version`, `extension_not_allowed`, `origin_rejected`, `frame_rejected`, `desktop_session_unavailable`, `busy` (another request is waiting), `replayed` (the request ID was used before), `denied`, `cancelled`, and `expired`. A request ID that is not of the allowed form is not repeated in the answer.
+
+**Native host.** Frames on standard input and output carry the browser's native-endian length. A length of zero or above the limit, or input that ends inside a frame, ends the host with a failure status and no answer. The browser names the calling extension on the host's command line: a Chromium browser passes the extension's origin, `chrome-extension://<id>/`, and Firefox passes the path of the host's manifest and then the add-on ID. The host passes a request on only if that names the allowed extension: ID `hjgekjgkjnakgmiopldddikdkcjhnmge` in Chromium, which follows from the `key` in `manifest.chromium.json`, or `extension@opensecretmanager.org` in Firefox. Otherwise the answer is `extension_not_allowed` and no connection is made. The private half of that key was not kept; an extension published through a store has another ID, and the constant changes with it. The host holds at most four requests open and refuses a request ID that is already open.
+
+**Socket.** The desktop session listens on the Unix socket `browser.sock` in the app's data folder (`OpenSecretManager` in the account's data folder), with mode 0600. The host connects only if that path is a socket owned by the account it runs as; the session answers only a connection from the account it runs as. Frames carry a big-endian 32-bit length and the same 64 KiB limit. Each connection carries one request: the host sends `{caller: {browser, extension}, request}`, where `browser` is `chromium` or `firefox` and `request` is the `fill_request` without its `type`. The session answers with the `waiting`, `fill_reply`, and `error` messages above and closes after the first that is not `waiting`. Closing the connection withdraws the request, and so does sending anything more on it. The host hands a response to the extension only if it parses and answers the request it forwarded: the same request ID, and for a `fill_reply` the same tab, frame, document, and origin. Anything else, a closed connection, or 60 seconds of silence becomes `desktop_session_unavailable`. A socket path longer than the operating system allows (about 104 bytes) cannot be bound.
+
+**Desktop session.** `osm-vault-browser` checks the caller and the request again, since any program of the account can reach the socket. One request waits at a time; it ends after 120 seconds without a decision. The IDs of the last 1024 requests taken in are refused. `Desk::choices` gives what the owner is asked: the origin, the kind of browser, and, if the vault is unlocked, the logins from `Vault::logins_for_origin` together with `Vault::unlock_session`, 16 random bytes that name the current unlock and exist only in memory. `Desk::approve` takes the request, the chosen item, and that session. It releases the item's user name and password only if the vault is still in that unlock, the request is still the one waiting, and `Vault::credentials_for_origin` accepts the item for the request's origin, which it does only for a login whose address has exactly that origin. A locked vault, or one that was locked and unlocked again, refuses the choice and leaves the request waiting. A request can arrive while the vault is locked and waits for the unlock.
+
+`osm-fill` is a development stand-in for the app: it opens a vault, serves the socket, and plays the owner from command-line options or commands on standard input.
 
 ## Compatibility gate
 

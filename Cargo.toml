@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/origin",
+    "crates/browser-link",
     "crates/vault-core",
+    "crates/vault-browser",
     "crates/vault-sync",
     "crates/vault-peer",
     "crates/vault-membership",
