@@ -143,6 +143,10 @@ export type DesktopBridge = {
   /** Rejects a held change; the item stays as it is here. */
   discardHeld: (revision: string) => Promise<void>;
   recoveryStatus: () => Promise<boolean>;
+  /** The recovery key of a vault made on this device that the owner has not confirmed storing; needs the vault unlocked. */
+  pendingRecoveryKey: () => Promise<string | null>;
+  /** The owner stored the recovery key; the vault stops keeping it. */
+  confirmRecoveryKey: () => Promise<void>;
   enableRecovery: (recoveryKey: string) => Promise<void>;
   syncStatus: () => Promise<SyncStatus>;
   syncNow: () => Promise<void>;

@@ -396,6 +396,10 @@ impl RecoveryKey {
     pub(crate) fn expose(&self) -> &[u8; KEY_LEN] {
         &self.0
     }
+
+    pub(crate) fn from_bytes(key: [u8; KEY_LEN]) -> Self {
+        Self(Zeroizing::new(key))
+    }
 }
 
 impl std::fmt::Display for RecoveryKey {

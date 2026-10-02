@@ -623,9 +623,17 @@ fn a_vault_that_lost_a_device_starts_over_as_a_new_vault() {
     let b_dir = dirs[1].path().to_owned();
 
     tauri::async_runtime::block_on(async move {
-        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+        // A new vault keeps its recovery key until the owner confirms
+        // having stored it.
+        let first_key = crate::create_vault(PASSWORD.into(), a.state(), a.clone())
             .await
             .unwrap();
+        assert_eq!(
+            crate::pending_recovery_key(a.state()).await.unwrap(),
+            Some(first_key)
+        );
+        crate::confirm_recovery_key(a.state()).await.unwrap();
+        assert_eq!(crate::pending_recovery_key(a.state()).await.unwrap(), None);
         put(&a, "From A").await;
         pair(&a, &codes, &finished, 0, &b, Some("joiner password")).await;
         eventually(&b, &["From A"]).await;
@@ -681,6 +689,14 @@ fn a_vault_that_lost_a_device_starts_over_as_a_new_vault() {
             vault.lock();
             vault.unlock(PASSWORD).unwrap();
         }
+        // Its recovery key is still there after locking and unlocking,
+        // until the owner confirms having stored it.
+        assert_eq!(
+            crate::pending_recovery_key(a.state()).await.unwrap(),
+            Some(recovered.recovery_key.clone())
+        );
+        crate::confirm_recovery_key(a.state()).await.unwrap();
+        assert_eq!(crate::pending_recovery_key(a.state()).await.unwrap(), None);
 
         // The old vault and its files were moved aside, not destroyed.
         let archive = std::path::PathBuf::from(&recovered.archive);
@@ -786,10 +802,12 @@ fn an_interrupted_recovery_is_finished_or_discarded_at_launch() {
     assert_eq!(Vault::open(&path).unwrap().vault_id(), old_vault);
     assert!(dir.path().join("control.sqlite3").exists());
 
-    // Stopped after the new vault was complete: the swap is finished.
-    let (fork, _, _) = vault
+    // Stopped after the new vault was complete, before its recovery key
+    // was shown: the swap is finished, and the key is still to be had.
+    let (mut fork, recovery, _) = vault
         .fork(dir.path().join("recovered.sqlite3"), PASSWORD)
         .unwrap();
+    fork.keep_recovery_key_until_confirmed(&recovery).unwrap();
     let new_vault = fork.vault_id();
     drop((fork, vault));
     network::finish_interrupted_recovery(&path);
@@ -797,6 +815,13 @@ fn an_interrupted_recovery_is_finished_or_discarded_at_launch() {
     assert_eq!(current.vault_id(), new_vault);
     current.unlock(PASSWORD).unwrap();
     assert_eq!(current.list().unwrap().len(), 1);
+    assert_eq!(
+        current
+            .unconfirmed_recovery_key()
+            .unwrap()
+            .map(|kept| kept.to_string()),
+        Some(recovery.to_string())
+    );
     assert!(!dir.path().join("recovered.sqlite3").exists());
     assert!(!dir.path().join("control.sqlite3").exists());
     let archive = std::fs::read_dir(dir.path())

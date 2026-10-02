@@ -1184,7 +1184,10 @@ pub async fn recover_vault<R: Runtime>(
             .filter(|vault| vault.is_unlocked())
             .ok_or_else(locked)?;
         let _ = std::fs::remove_file(&partial);
-        let (fork, recovery, report) = vault.fork(&partial, &password)?;
+        let (mut fork, recovery, report) = vault.fork(&partial, &password)?;
+        // The new vault keeps its recovery key until the owner confirms
+        // having stored it: this can stop before the key is shown.
+        fork.keep_recovery_key_until_confirmed(&recovery)?;
         drop(fork);
         // From here on the recovery is finished at the next launch even if
         // the app stops.

@@ -494,8 +494,11 @@ async fn create_vault<R: tauri::Runtime>(
                 message: error.to_string(),
             })?;
         }
-        let (created, recovery) =
+        let (mut created, recovery) =
             Vault::create(&state.path, &password).map_err(CommandError::from)?;
+        // Kept in the vault until the owner confirms having stored it, in
+        // case the app stops before the key has been shown.
+        let _ = created.keep_recovery_key_until_confirmed(&recovery);
         *vault = Some(created);
         recovery.to_string()
     };
@@ -534,6 +537,32 @@ async fn recovery_status(state: tauri::State<'_, AppState>) -> Result<bool, Comm
         .await
         .as_ref()
         .is_some_and(Vault::recovery_enabled))
+}
+
+/// The recovery key of a vault made on this device that the owner has not
+/// yet confirmed storing. It is shown after each unlock until then.
+#[tauri::command]
+async fn pending_recovery_key(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, CommandError> {
+    let vault = state.vault.lock().await;
+    let vault = vault.as_ref().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    Ok(vault
+        .unconfirmed_recovery_key()?
+        .map(|recovery| recovery.to_string()))
+}
+
+/// The owner has stored the recovery key: the vault stops keeping it.
+#[tauri::command]
+async fn confirm_recovery_key(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().await;
+    if let Some(vault) = vault.as_mut() {
+        vault.confirm_recovery_key_stored()?;
+    }
+    Ok(())
 }
 
 /// Turns on recovery for this device after checking the typed key against
@@ -583,6 +612,8 @@ pub fn run() {
             accept_held,
             discard_held,
             recovery_status,
+            pending_recovery_key,
+            confirm_recovery_key,
             enable_recovery,
             network::sync_status,
             network::sync_now,

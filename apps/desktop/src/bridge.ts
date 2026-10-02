@@ -141,6 +141,14 @@ export const bridge: DesktopBridge = {
     const invoke = native();
     return invoke ? Boolean(await invoke("recovery_status")) : true;
   },
+  async pendingRecoveryKey() {
+    const invoke = native();
+    return invoke ? ((await invoke("pending_recovery_key")) as string | null) : null;
+  },
+  async confirmRecoveryKey() {
+    const invoke = native();
+    if (invoke) await invoke("confirm_recovery_key");
+  },
   enableRecovery: (recoveryKey) => nativeOnly("enable_recovery", { recoveryKey }),
   syncNow: () => nativeOnly("sync_now"),
   startInvite: () => nativeOnly("start_invite"),

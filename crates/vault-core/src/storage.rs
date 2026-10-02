@@ -124,6 +124,17 @@ CREATE TRIGGER IF NOT EXISTS revoked_devices_no_delete BEFORE DELETE ON revoked_
 BEGIN SELECT RAISE(ABORT, 'revocations are immutable'); END;
 "#;
 
+/// The vault's recovery key, wrapped by the root key, from when a vault is
+/// made until the owner confirms having stored the key. The table is made
+/// when a key is first kept and is absent from every other vault.
+const UNCONFIRMED_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS unconfirmed_recovery (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+    wrapped_key BLOB NOT NULL
+) STRICT;
+"#;
+
 const DEVICES_TRIGGER: &str = r#"
 CREATE TRIGGER devices_no_update BEFORE UPDATE ON devices
 BEGIN SELECT RAISE(ABORT, 'device authorizations are immutable'); END;
@@ -3161,6 +3172,85 @@ impl Vault {
         self.header.recovery_check = Some(check);
         self.header.legacy_recovery = None;
         Ok(())
+    }
+
+    /// Keeps the vault's recovery key in the vault, wrapped by this device's
+    /// root key, until [`Vault::confirm_recovery_key_stored`]. A recovery
+    /// key is shown to the owner once, when a vault is made; if the app
+    /// stops before that, the key would be lost with no way to make
+    /// another. Kept like this, it can be shown again after any unlock.
+    ///
+    /// Only this vault's recovery key is taken. While it is kept, whoever
+    /// can unlock this device can read it, and it opens every device of the
+    /// vault that has recovery turned on.
+    pub fn keep_recovery_key_until_confirmed(&mut self, recovery: &RecoveryKey) -> Result<()> {
+        let root_key = self.key()?.clone();
+        let vault_id = self.header.vault_id;
+        let check = self
+            .header
+            .recovery_check
+            .ok_or(Error::RecoveryNotEnabled)?;
+        verify_recovery_check(recovery.expose(), &vault_id, &check)?;
+        let nonce = random_array::<NONCE_LEN>();
+        let wrapped = encrypt(
+            &root_key,
+            &nonce,
+            &key_wrap_aad(&vault_id, b"unconfirmed-recovery"),
+            recovery.expose(),
+        )?;
+        self.connection.execute_batch(UNCONFIRMED_RECOVERY_SCHEMA)?;
+        self.connection.execute(
+            "INSERT OR REPLACE INTO unconfirmed_recovery(singleton,nonce,wrapped_key) VALUES(1,?,?)",
+            params![nonce.as_slice(), wrapped],
+        )?;
+        Ok(())
+    }
+
+    /// The recovery key the owner has not yet confirmed storing, if one is
+    /// kept.
+    pub fn unconfirmed_recovery_key(&self) -> Result<Option<RecoveryKey>> {
+        let root_key = self.key()?;
+        if !self.keeps_recovery_key()? {
+            return Ok(None);
+        }
+        let kept = self
+            .connection
+            .query_row(
+                "SELECT nonce, wrapped_key FROM unconfirmed_recovery WHERE singleton=1",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((nonce, wrapped)) = kept else {
+            return Ok(None);
+        };
+        let key = decrypt(
+            root_key,
+            &array(&nonce)?,
+            &key_wrap_aad(&self.header.vault_id, b"unconfirmed-recovery"),
+            &wrapped,
+        )
+        .map_err(|_| Error::Crypto)?;
+        Ok(Some(RecoveryKey::from_bytes(array(&key)?)))
+    }
+
+    /// The owner has stored the recovery key: it is no longer kept. Works
+    /// while locked, since it only removes.
+    pub fn confirm_recovery_key_stored(&mut self) -> Result<()> {
+        if self.keeps_recovery_key()? {
+            self.connection
+                .execute("DELETE FROM unconfirmed_recovery", [])?;
+        }
+        Ok(())
+    }
+
+    fn keeps_recovery_key(&self) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='unconfirmed_recovery')",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     /// Re-roots a format 5 vault in one transaction. The shared vault key

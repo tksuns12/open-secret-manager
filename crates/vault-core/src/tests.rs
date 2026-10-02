@@ -1694,6 +1694,70 @@ fn the_owners_decision_on_a_removed_devices_revision_settles_it_on_every_device(
 }
 
 #[test]
+fn a_new_recovery_key_is_kept_until_the_owner_confirms_storing_it() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    let (mut vault, recovery) = Vault::create(&path, "password").unwrap();
+    assert!(vault.unconfirmed_recovery_key().unwrap().is_none());
+    vault.confirm_recovery_key_stored().unwrap();
+
+    // Only this vault's own recovery key is kept.
+    let (_, other) = Vault::create(dir.path().join("b.db"), "password").unwrap();
+    assert!(matches!(
+        vault.keep_recovery_key_until_confirmed(&other),
+        Err(Error::InvalidRecoveryKey)
+    ));
+    assert!(vault.unconfirmed_recovery_key().unwrap().is_none());
+    vault.keep_recovery_key_until_confirmed(&recovery).unwrap();
+
+    // It survives a restart, is readable only while unlocked, and is not
+    // in the file as it is.
+    drop(vault);
+    let stored: Vec<u8> = ["a.db", "a.db-wal"]
+        .iter()
+        .flat_map(|file| std::fs::read(dir.path().join(file)).unwrap_or_default())
+        .collect();
+    assert!(!stored
+        .windows(recovery.expose().len())
+        .any(|window| window == recovery.expose()));
+    let mut vault = Vault::open(&path).unwrap();
+    assert!(matches!(
+        vault.unconfirmed_recovery_key(),
+        Err(Error::Locked)
+    ));
+    vault.unlock("password").unwrap();
+    let kept = vault.unconfirmed_recovery_key().unwrap().unwrap();
+    assert_eq!(kept.to_string(), recovery.to_string());
+    vault.lock();
+    vault.unlock_with_recovery(&kept).unwrap();
+
+    // Confirmed, it is gone for good.
+    vault.confirm_recovery_key_stored().unwrap();
+    assert!(vault.unconfirmed_recovery_key().unwrap().is_none());
+    drop(vault);
+    let mut vault = Vault::open(&path).unwrap();
+    vault.unlock("password").unwrap();
+    assert!(vault.unconfirmed_recovery_key().unwrap().is_none());
+
+    // A fork has its own recovery key, kept in the fork.
+    let (mut fork, fork_recovery, _) = vault.fork(dir.path().join("f.db"), "password").unwrap();
+    assert!(matches!(
+        fork.keep_recovery_key_until_confirmed(&recovery),
+        Err(Error::InvalidRecoveryKey)
+    ));
+    fork.keep_recovery_key_until_confirmed(&fork_recovery)
+        .unwrap();
+    assert_eq!(
+        fork.unconfirmed_recovery_key()
+            .unwrap()
+            .unwrap()
+            .to_string(),
+        fork_recovery.to_string()
+    );
+    assert!(vault.unconfirmed_recovery_key().unwrap().is_none());
+}
+
+#[test]
 fn held_revisions_apply_once_their_author_is_authorized() {
     let dir = tempdir().unwrap();
     let (mut a, mut b, item, base, _) = untrusted_copy(dir.path());
