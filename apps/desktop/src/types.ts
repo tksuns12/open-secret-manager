@@ -151,6 +151,61 @@ export type Recovered = {
   archive: string;
 };
 
+/** A login the owner may choose for a browser fill. Its password is never included. */
+export type FillLogin = {
+  id: string;
+  title: string;
+  username: string;
+  url: string;
+  /** The item has conflicting versions; the one the vault shows is sent. */
+  conflict: boolean;
+};
+
+/** A login that is not offered although its address names the same host. */
+export type FillNotOffered = {
+  title: string;
+  url: string;
+  /** The address lacks `https://`, or is an `http://` address. */
+  reason: "no_scheme" | "not_https";
+};
+
+/** A request from a browser extension that waits for the owner. */
+export type FillAsked = {
+  requestId: string;
+  /** The origin of the page that would be filled. */
+  origin: string;
+  /** The kind of browser the request came from. */
+  browser: string;
+  secondsLeft: number;
+  /** Names the unlock the logins were listed under; null while the vault is locked or missing. Handed back with the choice. */
+  session: string | null;
+  /** The logins stored for exactly that origin. */
+  logins: FillLogin[];
+  notOffered: FillNotOffered[];
+};
+
+export type BrowserInfo = {
+  id: string;
+  name: string;
+  /** `other`: the browser is set up to start a program under this app's name that is not this app's. */
+  state: "connected" | "not_connected" | "other";
+  /** The file that tells the browser where the program is. */
+  manifest: string;
+  pointsTo: string | null;
+};
+
+export type BrowserStatus = {
+  /** Whether this system can serve a browser at all. */
+  supported: boolean;
+  /** Whether the app is listening for the browser's requests. */
+  listening: boolean;
+  problem: string | null;
+  /** The program a browser starts to reach this app, if it was found. */
+  host: string | null;
+  /** The browsers found on this account. */
+  browsers: BrowserInfo[];
+};
+
 export type DesktopBridge = {
   status: () => Promise<"missing" | "locked" | "unlocked">;
   listEntries: () => Promise<VaultEntry[]>;
@@ -205,6 +260,15 @@ export type DesktopBridge = {
   /** `password` is the new device password; omitted when this device keeps its vault. */
   joinFinish: (password?: string) => Promise<void>;
   cancelJoin: () => Promise<void>;
+  /** The request from a browser that waits for the owner, if any. */
+  fillRequest: () => Promise<FillAsked | null>;
+  /** Sends the chosen login's user name and password to the page that asked. `session` is the one the request was shown with. */
+  approveFill: (requestId: string, itemId: string, session: string) => Promise<void>;
+  denyFill: (requestId: string) => Promise<void>;
+  browserStatus: () => Promise<BrowserStatus>;
+  /** Tells a browser where to find this app; resolves to the new status. */
+  connectBrowser: (browser: string) => Promise<BrowserStatus>;
+  disconnectBrowser: (browser: string) => Promise<BrowserStatus>;
   /** Subscribes to a shell event; resolves to an unsubscribe function. */
   listen: <T>(event: string, handler: (payload: T) => void) => Promise<() => void>;
 };

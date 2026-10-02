@@ -1,6 +1,13 @@
 #![forbid(unsafe_code)]
 
 mod archive;
+#[cfg(unix)]
+mod browser;
+#[cfg(not(unix))]
+#[path = "browser_unsupported.rs"]
+mod browser;
+#[cfg(all(test, unix))]
+mod browser_tests;
 mod network;
 #[cfg(test)]
 mod network_tests;
@@ -15,12 +22,16 @@ use zeroize::{Zeroize, Zeroizing};
 /// Lock order, where more than one is needed: `vault`, then `archive`,
 /// then the network's invitation store, then its peer store. Network waits
 /// (handshakes, the owner reading a pairing code) never hold any of them.
+/// The browser session's own locks are taken last and never held across a
+/// wait.
 struct AppState {
     vault: Mutex<Option<Vault>>,
     /// A copy of a vault put away earlier that the owner has opened.
     archive: Mutex<Option<archive::Opened>>,
     path: PathBuf,
     network: network::Network,
+    /// Where a request from a browser waits for the owner.
+    browser: browser::Browser,
 }
 
 #[derive(Debug, Serialize)]
@@ -590,15 +601,18 @@ pub fn run() {
     let path = default_vault_path();
     network::finish_interrupted_recovery(&path);
     let network = network::Network::open(&path).expect("could not open the peer store");
+    let browser = browser::Browser::open(&path);
     tauri::Builder::default()
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
             archive: Mutex::new(None),
             path,
             network,
+            browser,
         })
         .setup(|app| {
             network::start(app.handle());
+            browser::start(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -640,7 +654,13 @@ pub fn run() {
             archive::open_archive,
             archive::copy_from_archive,
             archive::close_archive,
-            archive::delete_archive
+            archive::delete_archive,
+            browser::fill_request,
+            browser::approve_fill,
+            browser::deny_fill,
+            browser::browser_status,
+            browser::connect_browser,
+            browser::disconnect_browser
         ])
         .run(tauri::generate_context!())
         .expect("error while running Open Secret Manager");

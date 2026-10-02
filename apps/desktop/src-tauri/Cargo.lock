@@ -2999,6 +2999,8 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "dirs",
+ "osm-browser-link",
+ "osm-vault-browser",
  "osm-vault-core",
  "osm-vault-membership",
  "osm-vault-peer",
@@ -3055,10 +3057,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "osm-browser-link"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "osm-origin",
+ "rustix",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "osm-origin"
 version = "0.1.0"
 dependencies = [
  "url",
+]
+
+[[package]]
+name = "osm-vault-browser"
+version = "0.1.0"
+dependencies = [
+ "osm-browser-link",
+ "osm-vault-core",
+ "serde_json",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

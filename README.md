@@ -36,14 +36,16 @@ The repository is deliberately split at the security boundary:
   origin or turns it down. The `osm-fill` binary is a development stand-in
   for the app.
 - `apps/desktop` is a Tauri 2/React shell. Its native commands are the only
-  route from the interface to the Rust core.
+  route from the interface to the Rust core. While it is open it also
+  listens for the native messaging host, shows each request from a browser
+  for the owner to decide, and connects a browser by writing the host's
+  manifest into that browser's folder.
 - `apps/native-host` is the process a browser starts for the extension. It
   holds no vault and no key: it checks each request and passes it to the
   desktop session over a socket only the owner's account can reach.
 - `apps/browser-extension` is one WebExtension source tree with Chromium and
   Firefox manifests. It is a scaffold: it has no build step yet and predates
-  the host's current messages. Until the desktop app serves the session's
-  socket, the host answers every request as unavailable.
+  the host's current messages, so no browser can use the app yet.
 
 The prototype is intentionally offline-first. Local vault use does not depend
 on a peer or a network. Devices pair by invitation and a six-digit code the

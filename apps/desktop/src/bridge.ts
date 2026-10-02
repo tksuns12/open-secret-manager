@@ -1,4 +1,4 @@
-import type { ArchiveInfo, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, HeldChange, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, BrowserStatus, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -162,6 +162,21 @@ export const bridge: DesktopBridge = {
     if (invoke) await invoke("close_archive");
   },
   deleteArchive: (name) => nativeOnly("delete_archive", { name }),
+  // Requests come from a browser through the native shell; the preview
+  // never has one.
+  async fillRequest() {
+    const invoke = native();
+    return invoke ? ((await invoke("fill_request")) as FillAsked | null) : null;
+  },
+  approveFill: (requestId, itemId, session) => nativeOnly("approve_fill", { requestId, itemId, session }),
+  denyFill: (requestId) => nativeOnly("deny_fill", { requestId }),
+  async browserStatus() {
+    const invoke = native();
+    if (invoke) return (await invoke("browser_status")) as BrowserStatus;
+    return { supported: false, listening: false, problem: null, host: null, browsers: [] };
+  },
+  connectBrowser: (browser) => nativeOnly("connect_browser", { browser }),
+  disconnectBrowser: (browser) => nativeOnly("disconnect_browser", { browser }),
   startInvite: () => nativeOnly("start_invite"),
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),
   cancelInvite: () => nativeOnly("cancel_invite"),

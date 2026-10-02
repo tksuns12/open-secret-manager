@@ -36,3 +36,9 @@ button { color: inherit; border: 0; cursor: pointer; }
 .archive-row > div:nth-child(2) span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .archive-unlock { width: 100%; margin-top: 2px; }
 .archive-unlock .archive-cancel { color: #aa9f90; border: 1px solid #3b352d; background: transparent; font-weight: 400; }
+/* A request from a browser: the banner on the lock screen and the choices. */
+.fill-banner { width: min(460px, 100%); margin-bottom: 18px; text-align: left; }
+.fill-origin { overflow-wrap: anywhere; }
+.fill-choice { width: 100%; text-align: left; color: inherit; cursor: pointer; }
+.fill-choice:hover { border-color: #5a4a36; }
+.fill-choice.selected { border-color: #b98344; background: #251c13; }

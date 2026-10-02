@@ -26,9 +26,15 @@ tokio = { version = "1.53.1", features = ["macros", "net", "sync", "time"] }
 zeroize = "1.8"
 arboard = "3.4"
 
+# Browsers reach the app over a Unix socket.
+[target.'cfg(unix)'.dependencies]
+osm-browser-link = { path = "../../../crates/browser-link" }
+osm-vault-browser = { path = "../../../crates/vault-browser" }
+
 [dev-dependencies]
 tauri = { version = "2.0.0", features = ["test"] }
 tempfile = "3.24.0"
+tokio = { version = "1.53.1", features = ["io-util"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

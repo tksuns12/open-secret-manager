@@ -28,6 +28,7 @@ fn shell(dir: &Path) -> App<MockRuntime> {
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
             archive: Mutex::new(None),
+            browser: crate::browser::Browser::open(&path),
             path,
             network,
         })

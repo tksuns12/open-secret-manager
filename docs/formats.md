@@ -208,7 +208,7 @@ A fill is asked for by the extension and decided in the desktop app. The request
 
 ### Implemented fill protocol (Phase 5, stop 1)
 
-Implemented so far: the origin rule, the messages, the native host, and the desktop session's end as a library with a development stand-in. The desktop app does not serve the socket yet, and the extension source still speaks earlier scaffold messages.
+Implemented so far: the origin rule, the messages, the native host, the desktop session's end, and the desktop app that serves it (below). The extension source still speaks earlier scaffold messages.
 
 **Origin.** `osm-origin` is the one implementation, used by the core, the host, and the session. `Origin::of_url` gives the origin of an address stored with a login: the scheme must be `https`, there must be no user name or password, the path, query, and fragment are ignored, the host is taken as the URL standard serializes it (lower case, an international name in its ASCII form), and a missing port is 443. `Origin::parse` reads an origin from a message and accepts it only if it is already exactly that serialization, such as `https://example.com` or `https://example.com:8443`: a trailing slash, upper case, a written default port, or anything else that merely resembles an origin is refused. Two origins match only if host and port are equal. `https://example.com.` (trailing dot) is a different origin from `https://example.com`, as it is to a browser. An address without a scheme, such as `example.com`, has no origin, and its login is never offered. Redirects are not a concern of this rule: the extension reports the origin of the document it will fill.
 
@@ -236,6 +236,26 @@ The extension receives:
 **Desktop session.** `osm-vault-browser` checks the caller and the request again, since any program of the account can reach the socket. One request waits at a time; it ends after 120 seconds without a decision. The IDs of the last 1024 requests taken in are refused. `Desk::choices` gives what the owner is asked: the origin, the kind of browser, and, if the vault is unlocked, the logins from `Vault::logins_for_origin` together with `Vault::unlock_session`, 16 random bytes that name the current unlock and exist only in memory. `Desk::approve` takes the request, the chosen item, and that session. It releases the item's user name and password only if the vault is still in that unlock, the request is still the one waiting, and `Vault::credentials_for_origin` accepts the item for the request's origin, which it does only for a login whose address has exactly that origin. A locked vault, or one that was locked and unlocked again, refuses the choice and leaves the request waiting. A request can arrive while the vault is locked and waits for the unlock.
 
 `osm-fill` is a development stand-in for the app: it opens a vault, serves the socket, and plays the owner from command-line options or commands on standard input.
+
+### Desktop app and host manifests (Phase 5, stop 2)
+
+The app binds the socket when it starts and serves it until it exits. If the socket is already served, by another copy of the app on the same data folder, this copy does not listen and says so in its Browser panel. A socket left behind by a copy that is gone is replaced.
+
+The window learns of a request through the event `fill-request`, sent whenever a request arrives, ends, or is decided, and reads it with the command `fill_request`. That returns nothing, or `{requestId, origin, browser, secondsLeft, session, logins, notOffered}`. `session` is `Vault::unlock_session` as 32 hexadecimal digits, or null while the vault is locked or missing, in which case `logins` is empty. Each of `logins` is `{id, title, username, url, conflict}`; no password crosses to the window. `notOffered` names logins that cannot be chosen but whose address would have the page's origin if `https://` were put in front of it (`no_scheme`) or in place of `http://` (`not_https`), so that the app can say what to change; it is computed outside the origin rule and decides nothing. `approve_fill(requestId, itemId, session)` hands the owner's choice to `Desk::approve` and fails with `locked`, `fill_ended`, or `not_for_this_page`. `deny_fill(requestId)` turns the request down.
+
+When a request arrives the app unhides, shows, and focuses its window. Whether an app in the background may take the front is the operating system's decision; if the window was behind, the app also asks for attention, which on macOS makes its icon signal until the owner comes or the request ends. After the owner fills or denies a request that the window came forward for, the app hides (on macOS) or minimizes, so that the browser is in front again. The rule that a covered window locks the vault is unchanged, so the vault locks at that point.
+
+`browser_status` reports whether the app is listening, where the host program is, and each known browser whose own folder exists under the home folder. `connect_browser(id)` writes the host's manifest, `org.opensecretmanager.native.json`, into that browser's folder, replacing a file of that name; `disconnect_browser(id)` removes it. The manifest is `{name, description, path, type: "stdio"}` with `allowed_origins: ["chrome-extension://<id>/"]` for a Chromium browser or `allowed_extensions: ["extension@opensecretmanager.org"]` for Firefox, and `path` is the absolute path of the host program. A browser is `connected` only if the file is exactly that; any other content is reported as `other`. The folders, relative to the home folder:
+
+| Browser | macOS | Linux |
+| --- | --- | --- |
+| Google Chrome | `Library/Application Support/Google/Chrome/NativeMessagingHosts` | `.config/google-chrome/NativeMessagingHosts` |
+| Chromium | `Library/Application Support/Chromium/NativeMessagingHosts` | `.config/chromium/NativeMessagingHosts` |
+| Brave | `Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts` | `.config/BraveSoftware/Brave-Browser/NativeMessagingHosts` |
+| Microsoft Edge | `Library/Application Support/Microsoft Edge/NativeMessagingHosts` | `.config/microsoft-edge/NativeMessagingHosts` |
+| Firefox | `Library/Application Support/Mozilla/NativeMessagingHosts` | `.mozilla/native-messaging-hosts` |
+
+The host program is `osm-native-host` beside the app's own program. A development build also looks where the repository's workspace builds it. Nothing packages the host with the app yet. On a system without Unix sockets the commands exist and report that filling into a browser is unavailable.
 
 ## Compatibility gate
 

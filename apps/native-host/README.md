@@ -27,5 +27,8 @@ diagnostics.
 
 The messages and the socket are described in
 [the format contract](../../docs/formats.md#implemented-fill-protocol-phase-5-stop-1).
-`examples/org.opensecretmanager.native.json` shows the manifest a browser
-needs in order to find the host; nothing installs it yet.
+`examples/org.opensecretmanager.native.json` shows the two kinds of entry a
+manifest has: `allowed_origins` is what a Chromium browser reads and
+`allowed_extensions` what Firefox reads. The desktop app's Browser panel
+writes the manifest for a browser, with one of the two, when the owner
+connects it.

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Archive, ArrowDownToLine, ChevronRight, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, KeyRound, LockKeyhole, MoreHorizontal, Plus, Search, ShieldCheck, Sparkles, UnlockKeyhole, Wifi, X } from "lucide-react";
+import { Archive, ArrowDownToLine, ChevronRight, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, MoreHorizontal, Plus, Search, ShieldCheck, Sparkles, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge } from "./bridge";
-import type { ArchiveInfo, ArchivedItem, DevicesInfo, EntryDetail, EntryInput, EntryKind, HeldChange, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, ArchivedItem, BrowserInfo, BrowserStatus, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
 /** The vault locks after this long without input in the window. */
@@ -48,6 +48,13 @@ function App() {
   const [held, setHeld] = useState<HeldChange[]>([]);
   const [heldOpen, setHeldOpen] = useState(false);
   const [archivesOpen, setArchivesOpen] = useState(false);
+  const [browserOpen, setBrowserOpen] = useState(false);
+  // A request from a browser extension that waits for a decision here.
+  const [fill, setFill] = useState<FillAsked | null>(null);
+  // The request last seen waiting, and the one decided in this window, so
+  // that one which ends on its own can be told apart.
+  const fillSeen = useRef<string | null>(null);
+  const fillDecided = useRef<string | null>(null);
   // A device joining with the vault it has must stay unlocked to finish.
   const [rejoining, setRejoining] = useState(false);
   // Pairing sends the owner to another device or window. While it is in
@@ -67,7 +74,10 @@ function App() {
     void bridge.syncStatus().then(setSync).catch(() => {});
     const loadDevices = () => { void bridge.devices().then(setDevices).catch(() => {}); };
     loadDevices();
+    loadFill();
     const subscriptions = [
+      // A request arrived from a browser, or the one waiting ended.
+      bridge.listen("fill-request", loadFill),
       bridge.listen<SyncStatus>("sync-status", setSync),
       bridge.listen("devices-changed", loadDevices),
       // This device's copy of the vault was put away, because it learned
@@ -94,6 +104,16 @@ function App() {
     ];
     return () => { for (const subscription of subscriptions) void subscription.then((unlisten) => unlisten()); };
   }, []);
+  function loadFill() { void bridge.fillRequest().then(setFill).catch(() => {}); }
+  // The logins for a waiting request are listed only while the vault is
+  // unlocked, so locking and unlocking both change what is shown.
+  useEffect(loadFill, [locked]);
+  useEffect(() => {
+    const before = fillSeen.current;
+    const now = fill?.requestId ?? null;
+    fillSeen.current = now;
+    if (before && before !== now && fillDecided.current !== before) setNotice("The browser stopped waiting · nothing was sent");
+  }, [fill]);
   /** A locked vault cannot finish a pairing, so locking ends one in progress. */
   function endPairing() {
     if (!pairingRef.current) return false;
@@ -348,6 +368,32 @@ function App() {
     setNotice("Joined · copying the vault from the other device");
   }
 
+  async function sendFill(login: FillLogin) {
+    if (!fill?.session) return;
+    fillDecided.current = fill.requestId;
+    try {
+      await bridge.approveFill(fill.requestId, login.id, fill.session);
+      setFill(null);
+      setNotice(`${login.title} was sent to the page · the form was not submitted`);
+    } catch (error) {
+      fillDecided.current = null;
+      const code = (error as { code?: string } | null)?.code;
+      setNotice(code === "locked" ? "The vault locked before the login was sent · unlock and choose again"
+        : code === "fill_ended" ? "The browser no longer waits for this · nothing was sent"
+        : code === "not_for_this_page" ? "That item is not a login for this page · nothing was sent"
+        : commandMessage(error, "The login could not be sent"));
+      loadFill();
+    }
+  }
+
+  async function denyFill() {
+    if (!fill) return;
+    fillDecided.current = fill.requestId;
+    await bridge.denyFill(fill.requestId).catch(() => {});
+    setFill(null);
+    setNotice("Request denied · nothing was sent");
+  }
+
   async function lock() {
     await bridge.lock();
     setEntries([]);
@@ -401,7 +447,7 @@ function App() {
           <p className="nav-caption">YOUR VAULT <span>{entries.length}</span></p>
           {filters.map((item) => <button key={item} className={`nav-item ${filter === item ? "active" : ""}`} onClick={() => setFilter(item)}><span className={`nav-icon ${item === "Favorites" ? "star" : ""}`}>{item === "All items" ? "⌂" : item === "Favorites" ? "★" : item === "Logins" ? "↗" : "▤"}</span>{item}<span className="nav-count">{item === "All items" ? entries.length : item === "Favorites" ? entries.filter((e) => e.favorite).length : item === "Logins" ? entries.filter((e) => e.kind === "login").length : entries.filter((e) => e.kind === "secure_note").length}</span></button>)}
         </nav>
-        <div className="sidebar-bottom"><button className="utility" onClick={() => setGeneratorOpen(true)}><Sparkles size={16} /> Generator</button><button className="utility" onClick={() => setArchivesOpen(true)} disabled={previewMode}><Archive size={16} /> Archive</button><button className="utility"><Clock3 size={16} /> Activity</button><button className="utility"><MoreHorizontal size={16} /> Settings</button><button className="device-card" onClick={() => setDevicesOpen(true)} disabled={previewMode}><div className="device-icon"><Fingerprint size={18} /></div><div><strong>This device</strong><span>{previewMode ? "Preview data only" : sync.state === "removed" ? "Removed · tap for details" : sync.devices > 0 ? `Syncs with ${sync.devices} other ${sync.devices === 1 ? "device" : "devices"}` : "Only device · tap to add one"}</span></div><span className={`online-dot ${sync.state === "synced" || sync.state === "idle" ? "" : "offline-dot"}`} /></button></div>
+        <div className="sidebar-bottom"><button className="utility" onClick={() => setGeneratorOpen(true)}><Sparkles size={16} /> Generator</button><button className="utility" onClick={() => setArchivesOpen(true)} disabled={previewMode}><Archive size={16} /> Archive</button><button className="utility" onClick={() => setBrowserOpen(true)} disabled={previewMode}><Globe size={16} /> Browser</button><button className="utility"><Clock3 size={16} /> Activity</button><button className="utility"><MoreHorizontal size={16} /> Settings</button><button className="device-card" onClick={() => setDevicesOpen(true)} disabled={previewMode}><div className="device-icon"><Fingerprint size={18} /></div><div><strong>This device</strong><span>{previewMode ? "Preview data only" : sync.state === "removed" ? "Removed · tap for details" : sync.devices > 0 ? `Syncs with ${sync.devices} other ${sync.devices === 1 ? "device" : "devices"}` : "Only device · tap to add one"}</span></div><span className={`online-dot ${sync.state === "synced" || sync.state === "idle" ? "" : "offline-dot"}`} /></button></div>
       </aside>
 
       <section className="content-pane">
@@ -413,7 +459,7 @@ function App() {
             <label className="search-box"><Search size={17} /><input aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
             <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{entry.username ?? "Secure note"}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}<small>{entry.updatedAt}</small></div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
           </div>
-          <div className="detail-column">{locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{vaultStatus === "missing" ? devices.resetArchive ? devices.resetReason === "left" ? <><CircleAlert size={25} /><h2>This device's copy was put away</h2><span>You had it moved to {devices.resetArchive}. Nothing was deleted. Join the new vault with an invitation from the device that started it, or create a new vault here.</span></> : <><CircleAlert size={25} /><h2>This device was removed from its vault</h2><span>Your other devices removed it, so its copy was moved to {devices.resetArchive}. Nothing was deleted. Join again with an invitation from one of your other devices, or create a new vault here.</span></> : <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}{vaultStatus === "missing" && devices.resetArchive && <button className="link-button" onClick={() => setArchivesOpen(true)}>Look into the copy that was put away</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div><button className="icon-button"><MoreHorizontal size={19} /></button></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button><button onClick={copyTotp}><Copy size={15} /> Copy TOTP</button><button onClick={() => setNotice("Item link copied")}>Share <span className="action-arrow">↗</span></button></div><div className="record-card"><RecordField label="Username" value={active.username ?? "—"} /><RecordField label="Password" value="••••••••••••••" secret /><RecordField label="Website" value={active.url ?? "—"} link /></div><div className="history-note"><Clock3 size={15} /><div><strong>Revision history is retained</strong><span>Every edit keeps its signed parent revision.</span></div><ChevronRight size={15} /></div>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
+          <div className="detail-column">{locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{fill && <div className="conflict-banner fill-banner"><CircleAlert size={16} /><div><strong>{fill.browser} asks to fill a login into {fill.origin}</strong><span>{vaultStatus === "missing" ? "This device has no vault to fill from." : "Unlock to choose a login. Nothing is sent until you choose."}</span></div><button className="conflict-action" onClick={() => void denyFill()}>Deny</button></div>}{vaultStatus === "missing" ? devices.resetArchive ? devices.resetReason === "left" ? <><CircleAlert size={25} /><h2>This device's copy was put away</h2><span>You had it moved to {devices.resetArchive}. Nothing was deleted. Join the new vault with an invitation from the device that started it, or create a new vault here.</span></> : <><CircleAlert size={25} /><h2>This device was removed from its vault</h2><span>Your other devices removed it, so its copy was moved to {devices.resetArchive}. Nothing was deleted. Join again with an invitation from one of your other devices, or create a new vault here.</span></> : <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}{vaultStatus === "missing" && devices.resetArchive && <button className="link-button" onClick={() => setArchivesOpen(true)}>Look into the copy that was put away</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div><button className="icon-button"><MoreHorizontal size={19} /></button></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button><button onClick={copyTotp}><Copy size={15} /> Copy TOTP</button><button onClick={() => setNotice("Item link copied")}>Share <span className="action-arrow">↗</span></button></div><div className="record-card"><RecordField label="Username" value={active.username ?? "—"} /><RecordField label="Password" value="••••••••••••••" secret /><RecordField label="Website" value={active.url ?? "—"} link /></div><div className="history-note"><Clock3 size={15} /><div><strong>Revision history is retained</strong><span>Every edit keeps its signed parent revision.</span></div><ChevronRight size={15} /></div>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
         </div>
         {recoveryKey && !locked && <div className="recovery-overlay"><div className="recovery-card"><strong>Recovery key · store this offline</strong><code>{recoveryKey}</code><span>It is shown after every unlock until you confirm here that you stored it.</span><button onClick={() => { setRecoveryKey(null); void bridge.confirmRecoveryKey().catch(() => {}); }}>I stored it</button></div></div>}
         <footer className="footer-bar"><div><Wifi size={14} /><span>{previewMode ? "Development preview" : "Local vault"}</span><span className="footer-separator">•</span><span>{previewMode ? "No native sync session" : syncDetail(sync)}</span></div><button onClick={() => previewMode ? setNotice("Sync is unavailable in the browser preview") : setDevicesOpen(true)}>Devices <ChevronRight size={14} /></button></footer>
@@ -424,6 +470,8 @@ function App() {
       {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
       {archivesOpen && <div className="modal-backdrop" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">ARCHIVE</p><h2>Copies put away on this device</h2></div><button className="icon-button" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><X size={18} /></button></div><ArchivesPanel canCopy={!locked} onCopied={() => { void bridge.listEntries().then(setEntries).catch(() => {}); }} onNotice={setNotice} /></div></div>}
       {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
+      {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
+      {fill && !locked && <div className="modal-backdrop"><div className="generator-modal entry-editor" role="dialog" aria-label="Fill a login"><div className="modal-head"><div><p className="eyebrow">ASKED BY {fill.browser.toUpperCase()}</p><h2 className="fill-origin">Fill a login into {fill.origin}</h2></div></div><FillPanel key={`${fill.requestId} ${fill.session}`} asked={fill} onFill={(login) => void sendFill(login)} onDeny={() => void denyFill()} /></div></div>}
       {notice && <div className={recoveryKey && !locked ? "toast toast-raised" : "toast"}><ShieldCheck size={15} />{notice}</div>}
     </main>
   );
@@ -544,6 +592,69 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     </div>
     {others.length > 0 && <button className="link-button" onClick={() => setRecovering(true)}>Lost devices and cannot remove them? Start over as a new vault…</button>}
     {others.length > 0 && <button className="link-button" onClick={() => setLeaving(true)}>Another device started over? Put this copy away to join it…</button>}
+  </div>;
+}
+
+/** A request from a browser extension, for the owner to decide: which
+ * login, if any, goes to the page that asked. Only logins stored for
+ * exactly the page's origin can be chosen, and no password is shown. */
+function FillPanel({ asked, onFill, onDeny }: { asked: FillAsked; onFill: (login: FillLogin) => void; onDeny: () => void }) {
+  const [chosen, setChosen] = useState<string | null>(asked.logins.length === 1 ? asked.logins[0].id : null);
+  const [left, setLeft] = useState(asked.secondsLeft);
+  const [sending, setSending] = useState(false);
+  useEffect(() => {
+    const started = Date.now();
+    const timer = window.setInterval(() => setLeft(Math.max(0, asked.secondsLeft - Math.floor((Date.now() - started) / 1000))), 1000);
+    return () => window.clearInterval(timer);
+  }, [asked.secondsLeft]);
+  const login = asked.logins.find((candidate) => candidate.id === chosen);
+
+  return <div className="device-panel">
+    <p className="review-hint">You asked for this in the browser. Choose a login, and its user name and password go to that page. The form is not submitted for you.</p>
+    {asked.logins.map((candidate) => <button key={candidate.id} className={`peer-row fill-choice ${chosen === candidate.id ? "selected" : ""}`} aria-pressed={chosen === candidate.id} onClick={() => setChosen(candidate.id)}>
+      <div className="entry-logo logo-login">{candidate.title.slice(0, 1)}</div>
+      <div><strong>{candidate.title}</strong><span>{[candidate.username || "No user name", candidate.conflict ? "has conflicting versions · the one your vault shows is sent" : ""].filter(Boolean).join(" · ")}</span></div>
+    </button>)}
+    {asked.logins.length === 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>No login is stored for this page</strong><span>A login is offered only if its address is on exactly {asked.origin}: the same name, over https, on the same port.</span></div></div>}
+    {asked.notOffered.map((other) => <p key={`${other.title} ${other.url}`} className="review-hint">“{other.title}” has the address {other.url}. {other.reason === "no_scheme" ? "Put https:// in front of that address for it to be offered here." : "That is an http address, and a login is only sent to an https page."}</p>)}
+    <p className="review-hint">{left > 0 ? `The browser waits ${left} more ${left === 1 ? "second" : "seconds"}.` : "The browser has stopped waiting."}</p>
+    <div className="form-actions"><button className="secondary" disabled={sending} onClick={onDeny}>Deny</button><button className="generate-button" disabled={!login || sending} onClick={() => { if (login) { setSending(true); onFill(login); } }}>{login ? `Fill ${login.title}` : asked.logins.length === 0 ? "Nothing to fill" : "Choose a login"}</button></div>
+  </div>;
+}
+
+/** Which browsers can reach this app, and the switch for each. */
+function BrowserPanel({ onNotice }: { onNotice: (text: string) => void }) {
+  const [status, setStatus] = useState<BrowserStatus | null>(null);
+  useEffect(() => { void bridge.browserStatus().then(setStatus).catch(() => {}); }, []);
+
+  async function change(browser: BrowserInfo, connect: boolean) {
+    try {
+      setStatus(await (connect ? bridge.connectBrowser(browser.id) : bridge.disconnectBrowser(browser.id)));
+      onNotice(connect ? `${browser.name} can now reach this app` : `${browser.name} can no longer reach this app`);
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      onNotice(code === "host_missing" ? "The program that browsers start was not found beside this app"
+        : code === "no_browser" ? `${browser.name} was not found on this device`
+        : commandMessage(error, `${browser.name} could not be ${connect ? "connected" : "disconnected"}`));
+    }
+  }
+
+  if (!status) return <div className="device-panel"><p className="review-hint">Looking…</p></div>;
+  if (!status.supported) return <div className="device-panel"><p className="review-hint">Filling into a browser is not available on this system.</p></div>;
+  return <div className="device-panel">
+    <p className="review-hint">A browser extension can ask this app to fill a login into the page you are on. Each time, this window comes forward and you choose the login here; only its user name and password go to that page. The extension never sees what your vault holds.</p>
+    {!status.listening && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>This app is not listening for the browser</strong><span>{status.problem ?? "It could not start listening."}</span></div></div>}
+    {status.browsers.length === 0 && <p className="review-hint">No browser this app can connect was found on this account.</p>}
+    {status.browsers.map((browser) => <div key={browser.id} className="peer-row">
+      <div className="device-icon"><Globe size={18} /></div>
+      <div><strong>{browser.name}</strong><span>{browser.state === "connected" ? "Connected" : browser.state === "other" ? browser.pointsTo ? `Set up to start another program: ${browser.pointsTo}` : "Set up for something other than this app" : "Not connected"}</span></div>
+      {browser.state === "connected"
+        ? <button className="secondary" onClick={() => void change(browser, false)}>Disconnect</button>
+        : <button className="secondary" disabled={!status.host} onClick={() => void change(browser, true)}>{browser.state === "other" ? "Repair" : "Connect"}</button>}
+    </div>)}
+    {!status.host && <p className="review-hint">The program that browsers start to reach this app was not found beside it, so no browser can be connected.</p>}
+    <p className="review-hint">Connecting writes one small file into the browser's own folder. It says where that program is and which one extension may start it. Disconnecting removes the file.</p>
+    <p className="review-hint">The extension itself cannot be installed yet. Until it can, connecting a browser changes nothing you would notice.</p>
   </div>;
 }
 
