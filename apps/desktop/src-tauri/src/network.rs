@@ -70,6 +70,12 @@ pub struct SyncStatus {
     devices: usize,
     /// Revisions received while locked, waiting for unlock.
     pending: usize,
+    /// Members, as hex device IDs, at whose address something answered
+    /// with a certificate other than the one membership records. This
+    /// device refuses that, and nothing proves why it happened; it is what
+    /// a device sees when another one started over as a new vault, so the
+    /// interface asks the owner about it.
+    pub(crate) replaced: Vec<String>,
 }
 
 /// This device's running control plane: its node, its endpoint, and the
@@ -497,6 +503,20 @@ async fn abandon_control<R: Runtime>(app: &AppHandle<R>) {
     net.delete_control_database();
 }
 
+/// The port this device accepts its vault's members on.
+#[cfg(test)]
+pub async fn listen_port<R: Runtime>(app: &AppHandle<R>) -> Option<u16> {
+    network(app).control().await?.endpoint.listen_port()
+}
+
+/// Records `address` as where this device last saw `device` listen.
+#[cfg(test)]
+pub async fn observe_address<R: Runtime>(app: &AppHandle<R>, device: &str, address: &str) {
+    let control = network(app).control().await.unwrap();
+    let device = device_id_from_bytes(parse_device(device).unwrap());
+    control.endpoint.addresses().observe(device, address);
+}
+
 /// Stops this device's control plane, as closing the app does.
 #[cfg(test)]
 pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
@@ -825,6 +845,13 @@ async fn sync_with_members<R: Runtime>(app: &AppHandle<R>) -> Result<(), Command
     let peers = control.endpoint.sync_peers();
     let mut reports = Vec::new();
     let mut failure = None;
+    // Members that answered as themselves, and members at whose address
+    // something else did.
+    let (mut answered, mut replaced) = (Vec::new(), Vec::new());
+    let member_ids: Vec<String> = peers
+        .iter()
+        .map(|device| hex(&device_id_to_bytes(*device)))
+        .collect();
     if !peers.is_empty() {
         update_status(app, |status| status.state = "syncing");
     }
@@ -836,15 +863,35 @@ async fn sync_with_members<R: Runtime>(app: &AppHandle<R>) -> Result<(), Command
                 .run_shared(&state.vault, &control.node.state())
                 .await
         };
+        let id = hex(&device_id_to_bytes(device));
         match session.await {
-            Ok(report) => reports.push(report),
+            Ok(report) => {
+                answered.push(id);
+                reports.push(report);
+            }
             Err(osm_vault_peer::Error::Removed) => {
                 failure = Some(osm_vault_peer::Error::Removed);
                 break;
             }
-            Err(error) => failure = Some(error),
+            Err(error) => {
+                if matches!(error, osm_vault_peer::Error::PinMismatch) {
+                    replaced.push(id);
+                }
+                failure = Some(error);
+            }
         }
     }
+    update_status(app, |status| {
+        // A member that could not be reached this time stays as it was.
+        status
+            .replaced
+            .retain(|id| member_ids.contains(id) && !answered.contains(id));
+        for id in replaced {
+            if !status.replaced.contains(&id) {
+                status.replaced.push(id);
+            }
+        }
+    });
     net.syncing.store(false, Ordering::SeqCst);
     // One member being away is not a failed sync if another answered.
     let result = match failure {

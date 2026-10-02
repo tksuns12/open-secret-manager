@@ -13,6 +13,7 @@ type InviteState = { code: string; sas?: string };
 
 /** Topbar wording and colour for each sync state. */
 function syncLabel(status: SyncStatus): { tone: SyncState; text: string } {
+  if (status.replaced.length > 0 && status.state !== "syncing") return { tone: "offline", text: "A device changed · see Devices" };
   switch (status.state) {
     case "synced": return { tone: "connected", text: "Synced" };
     case "idle": return { tone: "connected", text: "Devices linked" };
@@ -34,7 +35,7 @@ function App() {
   const [selected, setSelected] = useState("1");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("All items");
-  const [sync, setSync] = useState<SyncStatus>({ state: "local", devices: 0, pending: 0 });
+  const [sync, setSync] = useState<SyncStatus>({ state: "local", devices: 0, pending: 0, replaced: [] });
   const [devices, setDevices] = useState<DevicesInfo>({ setup: "none", members: [], epoch: 0, quorum: 0 });
   const [devicesOpen, setDevicesOpen] = useState(false);
   const [invite, setInvite] = useState<InviteState | null>(null);
@@ -141,6 +142,13 @@ function App() {
     if (locked || previewMode) { setHeld([]); return; }
     void bridge.listHeld().then(setHeld).catch(() => setHeld([]));
   }, [locked, entries, previewMode]);
+  // Something else answers where one of the vault's devices used to: most
+  // likely that device started over as a new vault and this one was left
+  // behind. The owner is told once; the Devices panel says what to do.
+  const deviceReplaced = sync.replaced.length > 0;
+  useEffect(() => {
+    if (deviceReplaced) setNotice("One of your devices answers as a different device · open Devices");
+  }, [deviceReplaced]);
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(null), 3200);
@@ -423,6 +431,7 @@ function App() {
 
 function syncDetail(status: SyncStatus): string {
   if (status.state === "removed") return "This device was removed from the vault";
+  if (status.replaced.length > 0 && status.state !== "syncing") return `Device ${shortDevice(status.replaced[0])} answers as a different device`;
   if (status.state === "local") return "Only device";
   if (status.state === "error") return status.message ?? "Sync failed";
   if (status.state === "syncing") return "Syncing with your devices";
@@ -511,10 +520,12 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
 
   const others = devices.members.filter((member) => !member.thisDevice);
   const pending = devices.pending;
+  const replaced = sync.replaced.filter((id) => others.some((member) => member.id === id));
   return <div className="device-panel">
+    {replaced.length > 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Device {shortDevice(replaced[0])} answers as a different device</strong><span>Something else now answers at its address, so this device refuses it and cannot sync with it. If you started over as a new vault on that device, this copy was left behind: put it away to join the new vault. If you did not, change nothing here.</span></div><button className="conflict-action" onClick={() => setLeaving(true)}>Put this copy away…</button></div>}
     {devices.members.map((member) => <div key={member.id} className="peer-row">
       <div className="device-icon"><Fingerprint size={18} /></div>
-      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : member.address ?? "Address not known yet"}</span></div>
+      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}</span></div>
       {!member.thisDevice && !pending && (removing === member.id
         ? <div className="form-actions"><button className="secondary" onClick={() => setRemoving(null)}>Keep</button><button className="generate-button" onClick={() => { setRemoving(null); onRemove(member.id); }}>Remove</button></div>
         : <button className="secondary" disabled={locked} onClick={() => setRemoving(member.id)}>Remove…</button>)}

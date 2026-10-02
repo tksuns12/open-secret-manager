@@ -124,7 +124,7 @@ export const bridge: DesktopBridge = {
   async syncStatus() {
     const invoke = native();
     if (invoke) return (await invoke("sync_status")) as SyncStatus;
-    return { state: "local", devices: 0, pending: 0 };
+    return { state: "local", devices: 0, pending: 0, replaced: [] };
   },
   async devices() {
     const invoke = native();

@@ -719,7 +719,14 @@ fn a_vault_that_lost_a_device_starts_over_as_a_new_vault() {
         })
         .await;
         put(&b, "Written on the lost device").await;
+        // What B finds where A listens is not the device its vault knows.
+        // B refuses it and says so, which is what prompts the owner. (A
+        // keeps its port outside tests; here B is told where A listens.)
+        let a_port = network::listen_port(&a).await.unwrap();
+        network::observe_address(&b, &old_device, &format!("127.0.0.1:{a_port}")).await;
         assert!(network::sync_now(b.clone()).await.is_err());
+        let status = network::sync_status(b.state()).await.unwrap();
+        assert_eq!(status.replaced, std::slice::from_ref(&old_device));
         assert_eq!(titles(&a).await, ["From A", "From B"]);
         assert_eq!(devices(&a).await.members.len(), 1);
 
@@ -744,6 +751,8 @@ fn a_vault_that_lost_a_device_starts_over_as_a_new_vault() {
             ("none", Some("left"), Some(archive.as_str()))
         );
         assert!(b.state::<AppState>().vault.lock().await.is_none());
+        let status = network::sync_status(b.state()).await.unwrap();
+        assert!(status.replaced.is_empty());
         // Its copy, with the edit that reached no one, is in the archive.
         let archive = std::path::PathBuf::from(archive);
         assert_eq!(archive.parent(), Some(b_dir.as_path()));

@@ -104,6 +104,8 @@ export type SyncStatus = {
   devices: number;
   /** Revisions received while locked, verified at the next unlock. */
   pending: number;
+  /** Members, as hex device IDs, at whose address something answered as a different device. This device refuses that; it is what a device sees when another one started over as a new vault. */
+  replaced: string[];
 };
 
 export type MemberInfo = {
