@@ -1530,8 +1530,15 @@ impl Vault {
         self.key()?;
         revision.validate_shape(&self.header.vault_id)?;
         if !self.is_active_author(&revision.author_device_id) {
-            self.quarantine(revision)?;
-            return Err(Error::Quarantined);
+            // A removed device's revision already in the history was
+            // accepted, by the owner or along with a revision that builds
+            // on it. Receiving it again is a replay, not a new hold.
+            let accepted = self.devices.contains_key(&revision.author_device_id)
+                && revision_by_id(&self.connection, &revision.revision_id())?.is_some();
+            if !accepted {
+                self.quarantine(revision)?;
+                return Err(Error::Quarantined);
+            }
         }
         self.commit_revision(revision, None, None)
     }
@@ -1646,6 +1653,7 @@ impl Vault {
                     revision: revision.revision_id(),
                     item_id: revision.item_id.clone(),
                     author_device_id: revision.author_device_id,
+                    known_author: self.held_is_verifiable(revision),
                     parents: revision.parents.clone(),
                     item,
                 })
@@ -1653,14 +1661,39 @@ impl Vault {
             .collect()
     }
 
-    /// Accepts a held revision by re-authoring its content as this device
-    /// against the same parents; the unauthorized signature is never
-    /// trusted. The result may be a concurrent head to resolve. The held
-    /// entry is released in the same transaction; on `MissingParent` it
-    /// stays held.
+    /// Whether a held revision can join the history as it was signed: its
+    /// author is a device this vault knows, in practice one that was
+    /// removed, and its signature and content verify.
+    fn held_is_verifiable(&self, held: &EncryptedRevision) -> bool {
+        self.devices.contains_key(&held.author_device_id) && self.verify_revision(held).is_ok()
+    }
+
+    /// Accepts a held revision. The result may be a concurrent head to
+    /// resolve; it never overrides an edit made since. The held entry is
+    /// released in the same transaction; on `MissingParent` it stays held.
+    ///
+    /// From a device this vault knows, this device writes a revision with
+    /// the same content that names the held one as its parent. That vouches
+    /// for it: it joins the history as it was signed, here and on every
+    /// device the new revision reaches, including one that had accepted it
+    /// before learning that its author was removed.
+    ///
+    /// From a device this vault does not know, the signature cannot be
+    /// checked and is never trusted: the content is written again as this
+    /// device against the same parents, and the held revision is dropped.
     pub fn accept_quarantined(&mut self, revision_id: &str) -> Result<RevisionInfo> {
         self.key()?;
         let held = quarantined_by_id(&self.connection, revision_id)?.ok_or(Error::NotFound)?;
+        if self.held_is_verifiable(&held) {
+            let plaintext = self.open_revision(&held)?;
+            let revision = self.signer()?.seal(
+                &held.item_id,
+                vec![revision_id.to_owned()],
+                held.tombstone,
+                &plaintext,
+            )?;
+            return self.commit_revision(revision, None, None);
+        }
         let plaintext = self.decrypt_unverified(&held)?;
         let revision = self.signer()?.seal(
             &held.item_id,
@@ -1671,17 +1704,50 @@ impl Vault {
         self.commit_revision(revision, None, Some(revision_id))
     }
 
-    /// Drops a held revision. If the same revision is received again it is
-    /// held again rather than silently ignored.
-    pub fn discard_quarantined(&mut self, revision_id: &str) -> Result<()> {
+    /// Rejects a held revision.
+    ///
+    /// From a device this vault knows, this device writes a revision that
+    /// keeps the item as it is here now (deleted, if it is not here) and
+    /// names the held revision as a parent, beside the item's current head.
+    /// The held revision joins the history already superseded, so every
+    /// device the new revision reaches ends at this device's version,
+    /// including one that had accepted the held revision. Returns that
+    /// revision. `Unresolved` if the item has conflicting versions here:
+    /// there is no one version to keep until they are resolved. On
+    /// `MissingParent` nothing changes.
+    ///
+    /// From a device this vault does not know, the held revision is dropped
+    /// on this device only and `None` is returned. If it is received again
+    /// it is held again rather than silently ignored.
+    pub fn discard_quarantined(&mut self, revision_id: &str) -> Result<Option<RevisionInfo>> {
         self.key()?;
-        let removed = self
-            .connection
-            .execute("DELETE FROM quarantine WHERE revision=?", [revision_id])?;
-        if removed == 0 {
-            return Err(Error::NotFound);
+        let held = quarantined_by_id(&self.connection, revision_id)?.ok_or(Error::NotFound)?;
+        if !self.held_is_verifiable(&held) {
+            self.connection
+                .execute("DELETE FROM quarantine WHERE revision=?", [revision_id])?;
+            return Ok(None);
         }
-        Ok(())
+        let mut heads = item_heads(&self.connection, &held.item_id)?;
+        if heads.len() > 1 {
+            return Err(Error::Unresolved);
+        }
+        let current = heads.pop();
+        let (tombstone, plaintext) = match &current {
+            Some(head) => (head.tombstone, self.open_revision(head)?),
+            None => (true, Zeroizing::new(Vec::new())),
+        };
+        // A head the held revision already names is superseded by it.
+        let mut parents: Vec<String> = current
+            .map(|head| head.revision_id())
+            .into_iter()
+            .filter(|head| !held.parents.contains(head))
+            .chain([revision_id.to_owned()])
+            .collect();
+        parents.sort();
+        let revision = self
+            .signer()?
+            .seal(&held.item_id, parents, tombstone, &plaintext)?;
+        self.commit_revision(revision, None, None).map(Some)
     }
 
     /// Verifies, stores, and materializes a revision. `local` carries the

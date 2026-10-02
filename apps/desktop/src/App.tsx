@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, KeyRound, LockKeyhole, MoreHorizontal, Plus, Search, ShieldCheck, Sparkles, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge } from "./bridge";
-import type { DevicesInfo, EntryDetail, EntryInput, EntryKind, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { DevicesInfo, EntryDetail, EntryInput, EntryKind, HeldChange, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
 /** The vault locks after this long without input in the window. */
@@ -44,6 +44,8 @@ function App() {
   const [generatorOpen, setGeneratorOpen] = useState(false);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [review, setReview] = useState<ReviewState | null>(null);
+  const [held, setHeld] = useState<HeldChange[]>([]);
+  const [heldOpen, setHeldOpen] = useState(false);
   // A device joining with the vault it has must stay unlocked to finish.
   const [rejoining, setRejoining] = useState(false);
   // Pairing sends the owner to another device or window. While it is in
@@ -69,7 +71,7 @@ function App() {
       // This device learned that it was removed: its copy of the vault was
       // put away and it is a device without a vault again.
       bridge.listen<string>("device-reset", () => {
-        setEntries([]); setLocked(true); setVaultStatus("missing"); setRecoveryKey(null); setEditor(null); setReview(null);
+        setEntries([]); setLocked(true); setVaultStatus("missing"); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false);
         setInvite(null); setRejoining(false); setJoining(false); setDevicesOpen(false);
         loadDevices();
         setNotice("This device was removed from the vault · its copy was moved to an archive folder");
@@ -97,7 +99,7 @@ function App() {
     return true;
   }
   function lockQuietly() {
-    void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null);
+    void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false);
     if (endPairing()) setNotice("Vault locked after five minutes without activity · the pairing was cancelled");
   }
   useEffect(() => {
@@ -129,6 +131,12 @@ function App() {
     void bridge.recoveryStatus().then(setRecoveryOn).catch(() => {});
     void bridge.devices().then(setDevices).catch(() => {});
   }, [devicesOpen, locked]);
+  // Held changes are read with the vault. A sync can add to them, and a
+  // decision made on another device settles them here; both reload the list.
+  useEffect(() => {
+    if (locked || previewMode) { setHeld([]); return; }
+    void bridge.listHeld().then(setHeld).catch(() => setHeld([]));
+  }, [locked, entries, previewMode]);
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(null), 3200);
@@ -176,6 +184,22 @@ function App() {
       setNotice("Conflict resolved");
     } catch (error) {
       setNotice(commandMessage(error, "The conflict could not be resolved"));
+    }
+  }
+
+  async function decideHeld(change: HeldChange, keep: boolean) {
+    try {
+      if (keep) await bridge.acceptHeld(change.revision);
+      else await bridge.discardHeld(change.revision);
+      // Reloading the items reloads what is still held.
+      setEntries(await bridge.listEntries());
+      const follows = change.removedDevice && sync.devices > 0 ? " · your other devices follow at the next sync" : "";
+      setNotice(keep ? `Change kept${follows}` : `Change rejected${follows}`);
+    } catch (error) {
+      // Settled meanwhile, here or by a decision made on another device.
+      const settled = (error as { code?: string } | null)?.code === "not_found";
+      if (settled) setEntries(await bridge.listEntries().catch(() => entries));
+      setNotice(settled ? "That change was already settled" : commandMessage(error, "That change could not be settled"));
     }
   }
 
@@ -319,6 +343,7 @@ function App() {
     setRecoveryKey(null);
     setEditor(null);
     setReview(null);
+    setHeldOpen(false);
     setNotice(endPairing() ? "Vault locked · the pairing was cancelled" : "Vault locked");
   }
 
@@ -368,6 +393,7 @@ function App() {
         <div className="workspace">
           <div className="list-column">
             <div className="list-heading"><div><p className="eyebrow">{filter.toUpperCase()}</p><h1>{visible.length} <span>items</span></h1></div><button className="icon-button bordered" title="Import"><ArrowDownToLine size={17} /></button></div>
+            {!locked && held.length > 0 && <div className="conflict-banner held-banner"><CircleAlert size={16} /><div><strong>{held.length} {held.length === 1 ? "change is" : "changes are"} held for review</strong><span>Written by a device that is not one of this vault's devices. Not part of your vault until you decide.</span></div><button className="conflict-action" onClick={() => setHeldOpen(true)}>Review</button></div>}
             <label className="search-box"><Search size={17} /><input aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
             <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{entry.username ?? "Secure note"}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}<small>{entry.updatedAt}</small></div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
           </div>
@@ -379,6 +405,7 @@ function App() {
       {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
       {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
+      {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
       {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {notice && <div className="toast"><ShieldCheck size={15} />{notice}</div>}
     </main>
@@ -497,6 +524,36 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
   </div>;
 }
 
+/** What a held change would do, in the owner's terms. */
+function heldHeading(change: HeldChange): string {
+  switch (change.change) {
+    case "new": return `New item · ${change.title}`;
+    case "delete": return change.title ? `Deletes ${change.title}` : "Deletes an item that is already gone here";
+    case "restore": return `Brings back ${change.title}, which is deleted here`;
+    default: return `Changes ${change.title}`;
+  }
+}
+
+/** Changes written by a device outside the vault's devices, for the owner
+ * to keep or reject. No secret is shown: a changed password is only named. */
+function HeldPanel({ held, otherDevices, onDecide }: { held: HeldChange[]; otherDevices: boolean; onDecide: (change: HeldChange, keep: boolean) => void }) {
+  return <>
+    <p className="review-hint">These changes were written by a device that is not one of this vault's devices, usually one you removed. They are not part of your vault until you decide. Passwords are not shown here; a changed one is only named.</p>
+    <div className="version-list">{held.map((change) => {
+      const deletion = change.change === "delete";
+      return <div key={change.revision} className="version-card">
+        <div className="version-meta"><strong>{heldHeading(change)}</strong><code>{change.revision.slice(0, 10)}</code></div>
+        <span className="held-author">{change.removedDevice ? `From device ${change.device}, which was removed from this vault.${otherDevices ? " Your decision reaches your other devices at the next sync." : ""}` : `From device ${change.device}, which this device does not know. If you have just added a device, sync first: its changes are accepted on their own once this device knows it.`}</span>
+        {!deletion && <dl><dt>Title</dt><dd>{change.title}</dd><dt>Username</dt><dd>{change.username || "—"}</dd><dt>Website</dt><dd>{change.url || "—"}</dd>{change.change === "edit" && <><dt>Differs in</dt><dd>{change.changed.join(", ") || "nothing you would see"}</dd></>}</dl>}
+        {deletion
+          // Deleting on the word of a device outside the vault is not the emphasized answer.
+          ? <div className="form-actions"><button className="secondary" onClick={() => onDecide(change, true)}>Delete the item</button><button className="generate-button" onClick={() => onDecide(change, false)}>Keep the item</button></div>
+          : <div className="form-actions"><button className="secondary" onClick={() => onDecide(change, false)}>Reject</button><button className="generate-button" onClick={() => onDecide(change, true)}>Keep this change</button></div>}
+      </div>;
+    })}</div>
+  </>;
+}
+
 /** The last resort when too many devices are lost for the rest to remove
  * them: this device starts a new vault from what it holds. */
 function RecoverPanel({ onCancel, onRecovered, onNotice }: { onCancel: () => void; onRecovered: (recoveryKey: string, summary: string) => void; onNotice: (text: string) => void }) {
@@ -608,6 +665,7 @@ function commandMessage(error: unknown, fallback: string): string {
   const code = (error as { code?: string } | null)?.code;
   if (code === "conflict") return "This item changed since you opened it · reopen to edit";
   if (code === "unresolved") return "This item has conflicting versions · review them first";
+  if (code === "missing_parent") return "That change builds on one this device has not received yet · sync first";
   if (code === "not_confirmed") return "The pairing was declined";
   if (code === "pin_mismatch") return "That device is not the one in the invitation";
   if (code === "invitation_expired") return "The invitation has expired · create a new one";

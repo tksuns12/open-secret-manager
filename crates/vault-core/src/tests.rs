@@ -1583,6 +1583,117 @@ fn endorsing_a_removed_devices_heads_keeps_them_for_devices_that_join_later() {
 }
 
 #[test]
+fn the_owners_decision_on_a_removed_devices_revision_settles_it_on_every_device() {
+    let dir = tempdir().unwrap();
+    let (mut a, _) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let item = login("Shared");
+    let base = a.put(item.clone()).unwrap().revision;
+    let mut r = join(dir.path(), "r.db", &a);
+    authorize(&mut a, &r);
+    // `late` hears of the removal last and takes R's edits in until then;
+    // `held` knows of it from the start, as A does.
+    let mut late = join(dir.path(), "late.db", &a);
+    authorize(&mut a, &late);
+    let mut held = join(dir.path(), "held.db", &a);
+    authorize(&mut a, &held);
+    for vault in [&mut r, &mut late, &mut held] {
+        deliver(vault, &a);
+    }
+    let r_id = r.device_id().unwrap();
+    a.revoke_device(r_id).unwrap();
+    held.revoke_device(r_id).unwrap();
+    let hold = |vault: &mut Vault, revision: &crate::EncryptedRevision| {
+        assert!(matches!(
+            vault.apply_encrypted_revision(revision.clone()),
+            Err(Error::Quarantined)
+        ));
+    };
+
+    // Kept: A writes a revision on top of R's, which then joins the history
+    // as R signed it.
+    let r1 = edit(&mut r, &item, &base, "r1");
+    hold(&mut a, &r1);
+    hold(&mut held, &r1);
+    late.apply_encrypted_revision(r1.clone()).unwrap();
+    assert!(a.quarantined().unwrap()[0].known_author);
+    let kept = a.accept_quarantined(&r1.revision_id()).unwrap();
+    assert_eq!(kept.parents, [r1.revision_id()]);
+    assert_eq!(
+        Some(wire(&a, &kept.revision).author_device_id),
+        a.device_id()
+    );
+    assert!(a.quarantined().unwrap().is_empty());
+    assert!(a.encrypted_revisions().unwrap().contains(&r1));
+    assert_eq!(a.get(&item.id).unwrap().item.password, "r1");
+    // The device that had taken it in sees no conflict, the one holding it
+    // lets it go, and receiving it again holds nothing.
+    for vault in [&mut late, &mut held] {
+        deliver(vault, &a);
+        assert!(vault.quarantined().unwrap().is_empty());
+        assert_eq!(
+            head_set(vault, &item.id),
+            std::slice::from_ref(&kept.revision)
+        );
+    }
+    a.apply_encrypted_revision(r1.clone()).unwrap();
+    assert!(a.quarantined().unwrap().is_empty());
+
+    // Rejected: A keeps what it has and supersedes R's revision, also where
+    // it had been taken in and had become a second version.
+    let r2 = edit(&mut r, &item, &r1.revision_id(), "r2");
+    hold(&mut a, &r2);
+    hold(&mut held, &r2);
+    late.apply_encrypted_revision(r2.clone()).unwrap();
+    assert!(late.get(&item.id).unwrap().conflict);
+    let rejected = a.discard_quarantined(&r2.revision_id()).unwrap().unwrap();
+    let mut both = vec![kept.revision.clone(), r2.revision_id()];
+    both.sort();
+    assert_eq!(rejected.parents, both);
+    for vault in [&mut late, &mut held] {
+        deliver(vault, &a);
+    }
+    for vault in [&a, &late, &held] {
+        assert!(vault.quarantined().unwrap().is_empty());
+        assert_eq!(
+            head_set(vault, &item.id),
+            std::slice::from_ref(&rejected.revision)
+        );
+        assert_eq!(vault.get(&item.id).unwrap().item.password, "r1");
+    }
+
+    // An item R created after its removal is deleted by rejecting it.
+    let created = r.put(login("Made after removal")).unwrap();
+    let new_item = wire(&r, &created.revision);
+    hold(&mut a, &new_item);
+    late.apply_encrypted_revision(new_item).unwrap();
+    assert!(late.get(&created.item_id).is_ok());
+    let deletion = a.discard_quarantined(&created.revision).unwrap().unwrap();
+    assert_eq!(deletion.parents, std::slice::from_ref(&created.revision));
+    deliver(&mut late, &a);
+    for vault in [&a, &late] {
+        assert!(matches!(vault.get(&created.item_id), Err(Error::NotFound)));
+    }
+
+    // While the item has conflicting versions here there is no one version
+    // to keep: the revision stays held until they are resolved.
+    let head = a.get(&item.id).unwrap().revision;
+    let r3 = edit(&mut r, &item, &r2.revision_id(), "r3");
+    hold(&mut a, &r3);
+    edit(&mut a, &item, &head, "from A");
+    let concurrent = edit(&mut late, &item, &head, "from late");
+    a.apply_encrypted_revision(concurrent).unwrap();
+    assert!(matches!(
+        a.discard_quarantined(&r3.revision_id()),
+        Err(Error::Unresolved)
+    ));
+    assert_eq!(a.quarantined().unwrap().len(), 1);
+    // Keeping it adds a version to that conflict without replacing any.
+    a.accept_quarantined(&r3.revision_id()).unwrap();
+    assert_eq!(a.versions(&item.id).unwrap().len(), 3);
+    assert!(a.quarantined().unwrap().is_empty());
+}
+
+#[test]
 fn held_revisions_apply_once_their_author_is_authorized() {
     let dir = tempdir().unwrap();
     let (mut a, mut b, item, base, _) = untrusted_copy(dir.path());

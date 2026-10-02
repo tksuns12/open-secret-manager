@@ -1,4 +1,4 @@
-import type { DesktopBridge, DevicesInfo, EntryDetail, EntryInput, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { DesktopBridge, DevicesInfo, EntryDetail, EntryInput, HeldChange, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -114,6 +114,13 @@ export const bridge: DesktopBridge = {
     if (invoke) return (await invoke("list_versions", { id })) as VersionSummary[];
     throw new Error("preview");
   },
+  // Held changes come from other devices too; the preview has none.
+  async listHeld() {
+    const invoke = native();
+    return invoke ? ((await invoke("list_held")) as HeldChange[]) : [];
+  },
+  acceptHeld: (revision) => nativeOnly("accept_held", { revision }),
+  discardHeld: (revision) => nativeOnly("discard_held", { revision }),
   async syncStatus() {
     const invoke = native();
     if (invoke) return (await invoke("sync_status")) as SyncStatus;

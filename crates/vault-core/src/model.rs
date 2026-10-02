@@ -180,8 +180,12 @@ pub struct QuarantinedRevision {
     pub revision: String,
     pub item_id: String,
     pub author_device_id: [u8; 16],
-    /// Parents named by the unauthorized author; accepting re-authors the
-    /// content against these.
+    /// The author is a device this vault knows, in practice one that was
+    /// removed, and the revision verifies under its key. Accepting or
+    /// rejecting it then settles it on every device; otherwise accepting
+    /// re-authors the content and rejecting only drops it here.
+    pub known_author: bool,
+    /// Parents named by the author.
     pub parents: Vec<String>,
     /// `None` when the held revision deletes the item.
     pub item: Option<Item>,
@@ -193,6 +197,7 @@ impl fmt::Debug for QuarantinedRevision {
             .field("revision", &self.revision)
             .field("item_id", &self.item_id)
             .field("author_device_id", &self.author_device_id)
+            .field("known_author", &self.known_author)
             .field("parents", &self.parents)
             .field("deleted", &self.item.is_none())
             .finish()

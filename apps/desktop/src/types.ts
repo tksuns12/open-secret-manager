@@ -49,6 +49,23 @@ export type VersionSummary = {
   thisDevice: boolean;
 };
 
+/** A change held for review: written by a device that is not, or is no longer, one of the vault's devices. Secrets are never included. */
+export type HeldChange = {
+  revision: string;
+  /** Short hex prefix of the author device ID. */
+  device: string;
+  /** The author was removed from the vault and the change verifies as its own; otherwise this device does not know who wrote it. */
+  removedDevice: boolean;
+  /** `restore` is an edit of an item that is deleted here. */
+  change: "new" | "edit" | "delete" | "restore";
+  /** The held version's fields, or for a deletion the item's as it is here now. */
+  title: string;
+  username: string;
+  url: string;
+  /** For an edit: which fields differ from the item as it is here now. */
+  changed: string[];
+};
+
 export type SyncState = "connected" | "received" | "offline";
 
 /** Mirrors the desktop shell's sync status; secrets never appear here. */
@@ -117,6 +134,12 @@ export type DesktopBridge = {
   updateEntry: (id: string, expectedRevision: string, input: EntryInput) => Promise<VaultEntry>;
   listVersions: (id: string) => Promise<VersionSummary[]>;
   resolveEntry: (id: string, keepRevision: string, heads: string[]) => Promise<void>;
+  /** Changes held for the owner's review; needs the vault unlocked. */
+  listHeld: () => Promise<HeldChange[]>;
+  /** Keeps a held change as a change made by this device. */
+  acceptHeld: (revision: string) => Promise<void>;
+  /** Rejects a held change; the item stays as it is here. */
+  discardHeld: (revision: string) => Promise<void>;
   recoveryStatus: () => Promise<boolean>;
   enableRecovery: (recoveryKey: string) => Promise<void>;
   syncStatus: () => Promise<SyncStatus>;

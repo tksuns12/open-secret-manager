@@ -35,6 +35,7 @@ impl From<osm_vault_core::Error> for CommandError {
             osm_vault_core::Error::Conflict { .. } => "conflict",
             osm_vault_core::Error::InvalidItem(_) => "invalid_item",
             osm_vault_core::Error::Unresolved => "unresolved",
+            osm_vault_core::Error::MissingParent => "missing_parent",
             osm_vault_core::Error::InvalidRecoveryKey => "invalid_recovery_key",
             osm_vault_core::Error::RecoveryNotEnabled => "recovery_not_enabled",
             osm_vault_core::Error::UpgradeRequiresPassword => "upgrade_requires_password",
@@ -345,6 +346,134 @@ async fn resolve_entry(
     Ok(())
 }
 
+/// A change held for the owner's review: one written by a device that is
+/// not, or is no longer, one of the vault's devices. Secrets stay in Rust;
+/// the interface learns only whether they differ from what is here now.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeldChange {
+    revision: String,
+    /// Short hex prefix of the author device ID.
+    device: String,
+    /// The author is a device that was removed from the vault and the
+    /// change verifies as its own. Otherwise this device does not know who
+    /// wrote it.
+    removed_device: bool,
+    /// `new`, `edit`, `delete`, or `restore`: an edit of an item that is
+    /// deleted here.
+    change: &'static str,
+    /// The held version's fields, or for a deletion the item's as it is
+    /// here now.
+    title: String,
+    username: String,
+    url: String,
+    /// For an edit: what differs from the item as it is here now.
+    changed: Vec<&'static str>,
+}
+
+fn changed_fields(held: &Item, current: &Item) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    let mut note = |differs: bool, name| {
+        if differs {
+            changed.push(name);
+        }
+    };
+    note(held.title != current.title, "title");
+    note(held.username != current.username, "username");
+    note(held.password != current.password, "password");
+    note(held.url != current.url, "website");
+    note(held.totp_secret != current.totp_secret, "one-time code");
+    note(held.notes != current.notes, "notes");
+    note(
+        held.kind != current.kind
+            || held.favorite != current.favorite
+            || held.custom_fields != current.custom_fields
+            || held.tags != current.tags,
+        "other details",
+    );
+    changed
+}
+
+#[tauri::command]
+async fn list_held(state: tauri::State<'_, AppState>) -> Result<Vec<HeldChange>, CommandError> {
+    let vault = state.vault.lock().await;
+    let vault = vault.as_ref().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    let mut changes = Vec::new();
+    for held in vault.quarantined()? {
+        let current = match vault.get(&held.item_id) {
+            Ok(current) => Some(current.item),
+            Err(osm_vault_core::Error::NotFound) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let change = match (&held.item, &current) {
+            (None, _) => "delete",
+            (Some(_), Some(_)) => "edit",
+            (Some(_), None) if held.parents.is_empty() => "new",
+            (Some(_), None) => "restore",
+        };
+        let shown = held.item.as_ref().or(current.as_ref());
+        let field = |pick: fn(&Item) -> &String| shown.map(pick).cloned().unwrap_or_default();
+        changes.push(HeldChange {
+            device: held.author_device_id[..4]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            removed_device: held.known_author,
+            change,
+            title: field(|item| &item.title),
+            username: field(|item| &item.username),
+            url: field(|item| &item.url),
+            changed: match (&held.item, &current) {
+                (Some(held), Some(current)) => changed_fields(held, current),
+                _ => Vec::new(),
+            },
+            revision: held.revision,
+        });
+    }
+    Ok(changes)
+}
+
+/// Keeps a held change. It becomes part of the vault as a change made by
+/// this device and reaches the other devices at the next sync. If the item
+/// was edited since, it becomes a second version to review.
+#[tauri::command]
+async fn accept_held<R: tauri::Runtime>(
+    revision: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle<R>,
+) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().await;
+    let vault = vault.as_mut().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    vault.accept_quarantined(&revision)?;
+    network::schedule_sync(&app);
+    Ok(())
+}
+
+/// Rejects a held change: the item stays as it is on this device. For a
+/// change by a removed device, the other devices follow at the next sync.
+#[tauri::command]
+async fn discard_held<R: tauri::Runtime>(
+    revision: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle<R>,
+) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().await;
+    let vault = vault.as_mut().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    if vault.discard_quarantined(&revision)?.is_some() {
+        network::schedule_sync(&app);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_vault<R: tauri::Runtime>(
     password: String,
@@ -450,6 +579,9 @@ pub fn run() {
             update_entry,
             list_versions,
             resolve_entry,
+            list_held,
+            accept_held,
+            discard_held,
             recovery_status,
             enable_recovery,
             network::sync_status,
