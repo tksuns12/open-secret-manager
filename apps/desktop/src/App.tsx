@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, KeyRound, LockKeyhole, MoreHorizontal, Plus, Search, ShieldCheck, Sparkles, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge } from "./bridge";
 import type { DevicesInfo, EntryDetail, EntryInput, EntryKind, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
+/** The vault locks after this long without input in the window. */
+const IDLE_LOCK_MS = 5 * 60 * 1000;
 type Filter = (typeof filters)[number];
 type EditorState = { mode: "create" } | { mode: "edit"; detail: EntryDetail };
 type ReviewState = { id: string; title: string; versions: VersionSummary[] };
@@ -42,6 +44,13 @@ function App() {
   const [generatorOpen, setGeneratorOpen] = useState(false);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [review, setReview] = useState<ReviewState | null>(null);
+  // A device joining with the vault it has must stay unlocked to finish.
+  const [rejoining, setRejoining] = useState(false);
+  // Pairing sends the owner to another device or window. While it is in
+  // progress, covering this window does not lock the vault; the idle timer
+  // still does, so the vault stays open at most that long unattended.
+  const pairing = Boolean(invite) || rejoining;
+  const pairingRef = useRef(pairing);
 
   useEffect(() => {
     void bridge.status().then(async (status) => {
@@ -70,14 +79,36 @@ function App() {
     ];
     return () => { for (const subscription of subscriptions) void subscription.then((unlisten) => unlisten()); };
   }, []);
+  /** A locked vault cannot finish a pairing, so locking ends one in progress. */
+  function endPairing() {
+    if (!pairingRef.current) return false;
+    void bridge.cancelInvite().catch(() => {});
+    void bridge.cancelJoin().catch(() => {});
+    setInvite(null);
+    setRejoining(false);
+    return true;
+  }
+  function lockQuietly() {
+    void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null);
+    if (endPairing()) setNotice("Vault locked after five minutes without activity · the pairing was cancelled");
+  }
   useEffect(() => {
-    let timer = window.setTimeout(() => { void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); }, 5 * 60 * 1000);
-    const reset = () => { window.clearTimeout(timer); timer = window.setTimeout(() => { void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); }, 5 * 60 * 1000); };
-    const onVisibility = () => { if (document.visibilityState === "hidden") { void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); } else reset(); };
+    let timer = window.setTimeout(lockQuietly, IDLE_LOCK_MS);
+    const reset = () => { window.clearTimeout(timer); timer = window.setTimeout(lockQuietly, IDLE_LOCK_MS); };
+    const onVisibility = () => {
+      if (document.visibilityState !== "hidden") reset();
+      else if (!pairingRef.current) lockQuietly();
+    };
     for (const event of ["pointerdown", "keydown", "touchstart"]) window.addEventListener(event, reset, { passive: true });
     document.addEventListener("visibilitychange", onVisibility);
     return () => { window.clearTimeout(timer); for (const event of ["pointerdown", "keydown", "touchstart"]) window.removeEventListener(event, reset); document.removeEventListener("visibilitychange", onVisibility); };
   }, []);
+  useEffect(() => {
+    pairingRef.current = pairing;
+    // Pairing ended while the window was covered: lock now, as covering it
+    // would have.
+    if (!pairing && document.visibilityState === "hidden") lockQuietly();
+  }, [pairing]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n" && !locked) { event.preventDefault(); setEditor({ mode: "create" }); }
@@ -265,7 +296,7 @@ function App() {
     setRecoveryKey(null);
     setEditor(null);
     setReview(null);
-    setNotice("Vault locked");
+    setNotice(endPairing() ? "Vault locked · the pairing was cancelled" : "Vault locked");
   }
 
   async function unlock() {
@@ -325,7 +356,7 @@ function App() {
       {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
       {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
-      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {notice && <div className="toast"><ShieldCheck size={15} />{notice}</div>}
     </main>
   );
@@ -361,13 +392,15 @@ type DevicesPanelProps = {
   onRecovered: (recoveryKey: string, summary: string) => void;
   /** Takes the owner to the unlock form, which this dialog covers. */
   onUnlock: () => void;
+  /** Whether this device is joining with the vault it already has. */
+  rejoining: boolean;
+  onRejoining: (active: boolean) => void;
   onNotice: (text: string) => void;
   onCopy: (text: string) => void;
 };
 
-function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onUnlock, onNotice, onCopy }: DevicesPanelProps) {
+function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onUnlock, rejoining, onRejoining: setRejoining, onNotice, onCopy }: DevicesPanelProps) {
   const [removing, setRemoving] = useState<string | null>(null);
-  const [rejoining, setRejoining] = useState(false);
   const [recovering, setRecovering] = useState(false);
 
   if (recovering) return <RecoverPanel onCancel={() => setRecovering(false)} onRecovered={onRecovered} onNotice={onNotice} />;
@@ -387,7 +420,7 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     return <div className="device-panel">
       <p className="review-hint">On the other device, choose “Join a vault from another device” and paste this invitation. It works once and expires in 15 minutes.</p>
       <div className="generated-value"><code>{invite.code}</code><button onClick={() => onCopy(invite.code)} title="Copy invitation"><Copy size={16} /></button></div>
-      <p className="review-hint">Waiting for the other device…</p>
+      <p className="review-hint">Waiting for the other device… Until this pairing ends, switching to another window does not lock the vault here; it still locks after five minutes without activity.</p>
       <div className="form-actions"><button className="secondary" onClick={onCancelInvite}>Cancel</button></div>
     </div>;
   }
