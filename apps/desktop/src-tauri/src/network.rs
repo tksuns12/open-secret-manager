@@ -180,16 +180,23 @@ impl Network {
         let _ = std::fs::remove_file(self.directory.join(REMOVED_MARKER));
     }
 
-    /// Where the copy of a vault this device was removed from was moved,
-    /// if this device has had no vault since.
-    fn reset_note(&self) -> Option<String> {
-        std::fs::read_to_string(self.directory.join(RESET_NOTE)).ok()
+    /// Why this device's copy of a vault was put away and where it was
+    /// moved, if this device has had no vault since.
+    fn reset_note(&self) -> Option<(PutAway, String)> {
+        [PutAway::Removed, PutAway::Left]
+            .into_iter()
+            .find_map(|reason| {
+                let archive = std::fs::read_to_string(self.directory.join(reason.note())).ok()?;
+                Some((reason, archive))
+            })
     }
 
     /// This device has a vault again: what happened to the last one no
     /// longer needs saying.
     fn clear_reset_note(&self) {
-        let _ = std::fs::remove_file(self.directory.join(RESET_NOTE));
+        for reason in [PutAway::Removed, PutAway::Left] {
+            let _ = std::fs::remove_file(self.directory.join(reason.note()));
+        }
         self.clear_removed();
     }
 
@@ -224,6 +231,14 @@ const REMOVED_MARKER: &str = "removed";
 /// moved to, until this device has a vault again. It lets the app say what
 /// happened to the vault that was here.
 const RESET_NOTE: &str = "reset-after-removal";
+/// Left after the owner had this device's copy put away so that the device
+/// can join another vault, naming the archive folder, until this device has
+/// a vault again.
+const LEFT_NOTE: &str = "left-vault";
+/// Present while a copy is being put away: why, and the archive folder it
+/// is going to, on two lines. An interruption is finished at the next
+/// launch from this.
+const PUTTING_AWAY: &str = "putting-away";
 /// The files that belong to one vault on this device.
 const VAULT_FILES: [&str; 4] = [
     "control.sqlite3",
@@ -232,15 +247,40 @@ const VAULT_FILES: [&str; 4] = [
     REMOVED_MARKER,
 ];
 
-/// Moves the vault and everything that belongs to it into a new archive
-/// folder beside it. Each step is a rename, and the steps can be repeated.
-///
-/// The vault file goes last when another vault is about to take its place,
-/// so that a vault is there until then, and first when the device is being
-/// reset, so that what an interruption leaves is a device without a vault
-/// rather than a vault that has lost its control plane.
-fn archive_vault_files(vault_path: &Path, vault_first: bool) -> std::io::Result<PathBuf> {
-    let directory = vault_path.parent().unwrap_or(Path::new("."));
+/// Why a device's copy of its vault was put away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PutAway {
+    /// The vault's devices removed this one.
+    Removed,
+    /// The owner asked for it on this device, to join another vault.
+    Left,
+}
+
+impl PutAway {
+    /// The note file that says so until this device has a vault again.
+    fn note(self) -> &'static str {
+        match self {
+            Self::Removed => RESET_NOTE,
+            Self::Left => LEFT_NOTE,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::Left => "left",
+        }
+    }
+
+    fn named(name: &str) -> Option<Self> {
+        [Self::Removed, Self::Left]
+            .into_iter()
+            .find(|reason| reason.name() == name)
+    }
+}
+
+/// Makes a new, empty archive folder beside the vault.
+fn new_archive(directory: &Path) -> std::io::Result<PathBuf> {
     let mut archive = directory.join(format!("archive-{}", now()));
     let mut attempt = 1;
     while archive.exists() {
@@ -248,6 +288,26 @@ fn archive_vault_files(vault_path: &Path, vault_first: bool) -> std::io::Result<
         attempt += 1;
     }
     std::fs::create_dir(&archive)?;
+    Ok(archive)
+}
+
+/// Moves the vault and everything that belongs to it into a new archive
+/// folder beside it.
+fn archive_vault_files(vault_path: &Path, vault_first: bool) -> std::io::Result<PathBuf> {
+    let archive = new_archive(vault_path.parent().unwrap_or(Path::new(".")))?;
+    move_vault_files(vault_path, &archive, vault_first)?;
+    Ok(archive)
+}
+
+/// Moves the vault and everything that belongs to it into `archive`. Each
+/// step is a rename, and the steps can be repeated.
+///
+/// The vault file goes last when another vault is about to take its place,
+/// so that a vault is there until then, and first when the device is being
+/// reset, so that what an interruption leaves is a device without a vault
+/// rather than a vault that has lost its control plane.
+fn move_vault_files(vault_path: &Path, archive: &Path, vault_first: bool) -> std::io::Result<()> {
+    let directory = vault_path.parent().unwrap_or(Path::new("."));
     let vault_name = vault_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -268,7 +328,32 @@ fn archive_vault_files(vault_path: &Path, vault_first: bool) -> std::io::Result<
             }
         }
     }
+    Ok(())
+}
+
+/// Puts this device's copy of its vault away: everything moves to a new
+/// archive folder, and a note says why and where. What is under way is
+/// written down first, so that an interruption is finished at the next
+/// launch instead of leaving half of the files behind.
+fn put_away(vault_path: &Path, reason: PutAway) -> std::io::Result<PathBuf> {
+    let directory = vault_path.parent().unwrap_or(Path::new("."));
+    let archive = new_archive(directory)?;
+    std::fs::write(
+        directory.join(PUTTING_AWAY),
+        format!("{}\n{}", reason.name(), archive.to_string_lossy()),
+    )?;
+    finish_put_away(vault_path, reason, &archive)?;
     Ok(archive)
+}
+
+fn finish_put_away(vault_path: &Path, reason: PutAway, archive: &Path) -> std::io::Result<()> {
+    let directory = vault_path.parent().unwrap_or(Path::new("."));
+    move_vault_files(vault_path, archive, true)?;
+    std::fs::write(
+        directory.join(reason.note()),
+        archive.to_string_lossy().as_bytes(),
+    )?;
+    std::fs::remove_file(directory.join(PUTTING_AWAY))
 }
 
 /// Archives the old vault and puts the recovered vault in its place.
@@ -279,14 +364,27 @@ fn replace_with_recovered(vault_path: &Path) -> std::io::Result<PathBuf> {
     Ok(archive)
 }
 
-/// At launch, before the vault is opened: finishes a recovery that was
-/// interrupted after the new vault was complete, and discards one that was
-/// interrupted before.
+/// At launch, before the vault or any of its stores is opened: finishes a
+/// recovery that was interrupted after the new vault was complete, discards
+/// one that was interrupted before, and finishes putting a copy away.
 pub fn finish_interrupted_recovery(vault_path: &Path) {
     let directory = vault_path.parent().unwrap_or(Path::new("."));
     let _ = std::fs::remove_file(directory.join(RECOVERED_PARTIAL));
     if directory.join(RECOVERED).exists() {
         let _ = replace_with_recovered(vault_path);
+    }
+    let marker = directory.join(PUTTING_AWAY);
+    if let Ok(under_way) = std::fs::read_to_string(&marker) {
+        let finished = under_way.split_once('\n').and_then(|(reason, archive)| {
+            let archive = Path::new(archive);
+            // Only a folder this app made beside the vault is trusted.
+            (archive.parent() == Some(directory) && archive.is_dir())
+                .then(|| finish_put_away(vault_path, PutAway::named(reason)?, archive).ok())
+                .flatten()
+        });
+        if finished.is_none() {
+            let _ = std::fs::remove_file(marker);
+        }
     }
 }
 
@@ -821,9 +919,12 @@ pub struct DevicesInfo {
     pub(crate) epoch: u64,
     /// How many members must be reachable for any change.
     pub(crate) quorum: usize,
-    /// For a device without a vault that was removed from one: the folder
-    /// its copy of that vault was moved to.
+    /// For a device without a vault whose copy of one was put away: the
+    /// folder it was moved to.
     pub(crate) reset_archive: Option<String>,
+    /// Why it was put away: `removed` by the vault's devices, or `left` at
+    /// the owner's request on this device.
+    pub(crate) reset_reason: Option<&'static str>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -858,6 +959,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         .and_then(|vault| vault.device_id());
     let has_vault = this_device.is_some();
     let joining = net.join.lock().await.is_some();
+    let note = if has_vault { None } else { net.reset_note() };
     let empty = |setup| DevicesInfo {
         setup,
         this_device: this_device.map(|device| hex(&device)),
@@ -865,7 +967,8 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         pending: None,
         epoch: 0,
         quorum: 0,
-        reset_archive: if has_vault { None } else { net.reset_note() },
+        reset_reason: note.as_ref().map(|(reason, _)| reason.name()),
+        reset_archive: note.as_ref().map(|(_, archive)| archive.clone()),
     };
     if has_vault && net.is_removed() {
         return Ok(empty("removed"));
@@ -910,6 +1013,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         pending,
         epoch: state.epoch,
         reset_archive: None,
+        reset_reason: None,
     })
 }
 
@@ -1144,6 +1248,16 @@ pub async fn recover_vault<R: Runtime>(
 /// This happens on its own as soon as the device learns that it was
 /// removed, and at the next launch if the app stopped before it finished.
 async fn reset_removed<R: Runtime>(app: &AppHandle<R>) -> Result<String, CommandError> {
+    put_copy_away(app, PutAway::Removed).await
+}
+
+/// Stops taking part in the vault on this device and moves its copy and
+/// everything that belongs to it to an archive folder, leaving a device
+/// without a vault. Returns the archive folder.
+async fn put_copy_away<R: Runtime>(
+    app: &AppHandle<R>,
+    reason: PutAway,
+) -> Result<String, CommandError> {
     let state = app.state::<AppState>();
     let net = &state.network;
     if net.resetting.swap(true, Ordering::SeqCst) {
@@ -1175,9 +1289,8 @@ async fn reset_removed<R: Runtime>(app: &AppHandle<R>) -> Result<String, Command
         *peers = PeerStore::open_in_memory().map_err(network_error)?;
         *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
             .map_err(|error| network_error(error.into()))?;
-        let archive = archive_vault_files(&state.path, true).map_err(storage_error)?;
+        let archive = put_away(&state.path, reason).map_err(storage_error)?;
         let archive = archive.to_string_lossy().into_owned();
-        let _ = std::fs::write(directory.join(RESET_NOTE), &archive);
         let peers_path = directory.join("peers.sqlite3");
         *peers = PeerStore::open(&peers_path).map_err(network_error)?;
         *net.addresses
@@ -1228,6 +1341,55 @@ pub async fn reset_device<R: Runtime>(app: AppHandle<R>) -> Result<String, Comma
         });
     }
     reset_removed(&app).await
+}
+
+/// Puts this device's copy of its vault away at the owner's request, so
+/// that the device can join another vault: the one another device started
+/// over as when this vault's devices could no longer agree. Nothing tells a
+/// device that this happened, and nothing removed it, so only the owner can
+/// say so, on this device, with its password. The copy is moved to an
+/// archive folder, not deleted. Returns that folder.
+///
+/// It changes nothing in the vault's membership: the devices that still
+/// use this vault keep counting this one, which no longer answers. That is
+/// why it is for a vault that was replaced, and why a device of a vault
+/// still in use is removed from another device instead.
+#[tauri::command]
+pub async fn leave_vault<R: Runtime>(
+    password: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
+) -> Result<String, CommandError> {
+    let net = &state.network;
+    if net.join.lock().await.is_some() {
+        return Err(CommandError {
+            code: "joining",
+            message: "finish or cancel joining first".into(),
+        });
+    }
+    let others = match net.control().await {
+        Some(control) => control.node.state().members().len() > 1,
+        None => false,
+    };
+    if !others {
+        return Err(CommandError {
+            code: "only_device",
+            message: "this device is the only device of its vault".into(),
+        });
+    }
+    {
+        // The password is the owner's confirmation. It is checked on a
+        // second handle, so a locked vault stays locked if it is wrong.
+        let vault = state.vault.lock().await;
+        if vault.is_none() {
+            return Err(CommandError {
+                code: "vault_missing",
+                message: "this device has no vault".into(),
+            });
+        }
+        osm_vault_core::Vault::open(&state.path)?.unlock(&password)?;
+    }
+    put_copy_away(&app, PutAway::Left).await
 }
 
 #[derive(Serialize)]

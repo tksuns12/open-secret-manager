@@ -620,6 +620,7 @@ fn a_vault_that_lost_a_device_starts_over_as_a_new_vault() {
     let handles: Vec<_> = apps.iter().map(|app| app.handle().clone()).collect();
     let (a, b, c) = (handles[0].clone(), handles[1].clone(), handles[2].clone());
     let a_dir = dirs[0].path().to_owned();
+    let b_dir = dirs[1].path().to_owned();
 
     tauri::async_runtime::block_on(async move {
         crate::create_vault(PASSWORD.into(), a.state(), a.clone())
@@ -705,13 +706,59 @@ fn a_vault_that_lost_a_device_starts_over_as_a_new_vault() {
         assert_eq!(titles(&a).await, ["From A", "From B"]);
         assert_eq!(devices(&a).await.members.len(), 1);
 
-        // Devices join the new vault by pairing, as with any vault.
-        pair(&a, &codes, &finished, 1, &c, Some("third password")).await;
-        eventually(&c, &["From A", "From B"]).await;
-        assert_eq!(vault_id(&c).await, vault_id(&a).await);
-        for app in [&a, &c] {
+        // Nothing removed B, so nothing resets it. The owner has its copy
+        // put away, which takes B's password; a wrong one changes nothing,
+        // and the only device of a vault has nothing to leave for.
+        let wrong = network::leave_vault("not the password".into(), b.state(), b.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(wrong.code, "invalid_credentials");
+        assert_eq!(vault_id(&b).await, old_vault);
+        let alone = network::leave_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(alone.code, "only_device");
+        let archive = network::leave_vault("joiner password".into(), b.state(), b.clone())
+            .await
+            .unwrap();
+        let info = devices(&b).await;
+        assert_eq!(
+            (info.setup, info.reset_reason, info.reset_archive.as_deref()),
+            ("none", Some("left"), Some(archive.as_str()))
+        );
+        assert!(b.state::<AppState>().vault.lock().await.is_none());
+        // Its copy, with the edit that reached no one, is in the archive.
+        let archive = std::path::PathBuf::from(archive);
+        assert_eq!(archive.parent(), Some(b_dir.as_path()));
+        let mut archived = Vault::open(archive.join("vault.sqlite3")).unwrap();
+        assert_eq!(archived.vault_id(), old_vault);
+        archived.unlock("joiner password").unwrap();
+        assert_eq!(archived.list().unwrap().len(), 3);
+        drop(archived);
+        for gone in ["vault.sqlite3", "control.sqlite3", "putting-away"] {
+            assert!(!b_dir.join(gone).exists(), "{gone} was left behind");
+        }
+
+        // Devices join the new vault by pairing, as with any vault: the one
+        // that was left behind, and one that is new.
+        pair(&a, &codes, &finished, 1, &b, Some("second password")).await;
+        eventually(&b, &["From A", "From B"]).await;
+        assert_eq!(devices(&b).await.reset_archive, None);
+        assert!(!b_dir.join("left-vault").exists());
+        for app in [&a, &b] {
             until_devices(app, "two members of the new vault", |info| {
                 info.members.len() == 2 && info.pending.is_none()
+            })
+            .await;
+        }
+        pair(&a, &codes, &finished, 2, &c, Some("third password")).await;
+        eventually(&c, &["From A", "From B"]).await;
+        for app in [&b, &c] {
+            assert_eq!(vault_id(app).await, vault_id(&a).await);
+        }
+        for app in [&a, &b, &c] {
+            until_devices(app, "three members of the new vault", |info| {
+                info.members.len() == 3 && info.pending.is_none()
             })
             .await;
         }
@@ -910,4 +957,69 @@ fn a_reset_interrupted_after_removal_is_finished_at_launch() {
         assert_eq!(info.reset_archive, None);
         network::shutdown(&handle).await;
     });
+}
+
+#[test]
+fn putting_a_copy_away_is_finished_at_launch_if_it_was_interrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.sqlite3");
+    let (mut vault, _) = Vault::create(&path, PASSWORD).unwrap();
+    vault.put(Item::new("Kept in the archive")).unwrap();
+    let old_vault = vault.vault_id();
+    drop(vault);
+    std::fs::write(dir.path().join("control.sqlite3"), b"old control").unwrap();
+    drop(PeerStore::open(dir.path().join("peers.sqlite3")).unwrap());
+    let old_peers = std::fs::read(dir.path().join("peers.sqlite3")).unwrap();
+
+    // The app stopped after moving the vault file and before the rest.
+    let archive = dir.path().join("archive-1");
+    std::fs::create_dir(&archive).unwrap();
+    std::fs::write(
+        dir.path().join("putting-away"),
+        format!("left\n{}", archive.to_string_lossy()),
+    )
+    .unwrap();
+    std::fs::rename(&path, archive.join("vault.sqlite3")).unwrap();
+
+    network::finish_interrupted_recovery(&path);
+    for gone in [
+        "vault.sqlite3",
+        "control.sqlite3",
+        "peers.sqlite3",
+        "putting-away",
+    ] {
+        assert!(!dir.path().join(gone).exists(), "{gone} was left behind");
+    }
+    assert_eq!(
+        Vault::open(archive.join("vault.sqlite3"))
+            .unwrap()
+            .vault_id(),
+        old_vault
+    );
+    assert_eq!(
+        std::fs::read(archive.join("peers.sqlite3")).unwrap(),
+        old_peers
+    );
+
+    // The device starts as one without a vault and says what happened.
+    let app = shell(dir.path());
+    let handle = app.handle().clone();
+    let expected = archive.to_string_lossy().into_owned();
+    tauri::async_runtime::block_on(async move {
+        let info = devices(&handle).await;
+        assert_eq!(
+            (info.setup, info.reset_reason, info.reset_archive),
+            ("none", Some("left"), Some(expected))
+        );
+    });
+
+    // A later launch moves nothing more: the stores made since stay.
+    network::finish_interrupted_recovery(&path);
+    assert!(dir.path().join("peers.sqlite3").exists());
+
+    // A marker that names no folder of this app's is dropped, not followed.
+    std::fs::write(dir.path().join("putting-away"), "left\n/tmp").unwrap();
+    network::finish_interrupted_recovery(&path);
+    assert!(!dir.path().join("putting-away").exists());
+    assert!(dir.path().join("peers.sqlite3").exists());
 }

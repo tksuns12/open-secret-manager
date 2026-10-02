@@ -136,6 +136,7 @@ export const bridge: DesktopBridge = {
   cancelEnrollment: () => nativeOnly("cancel_enrollment"),
   recoverVault: (password) => nativeOnly("recover_vault", { password }),
   resetDevice: () => nativeOnly("reset_device"),
+  leaveVault: (password) => nativeOnly("leave_vault", { password }),
   async recoveryStatus() {
     const invoke = native();
     return invoke ? Boolean(await invoke("recovery_status")) : true;

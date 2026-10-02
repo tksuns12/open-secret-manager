@@ -104,8 +104,10 @@ export type DevicesInfo = {
   epoch: number;
   /** How many devices must be reachable for any change. */
   quorum: number;
-  /** Set on a device without a vault that was removed from one: the folder its copy was moved to. */
+  /** Set on a device without a vault whose copy of one was put away: the folder it was moved to. */
   resetArchive?: string;
+  /** Why: `removed` by the vault's devices, or `left` at the owner's request on this device. */
+  resetReason?: "removed" | "left";
 };
 
 /** What starting over as a new vault produced. */
@@ -153,6 +155,8 @@ export type DesktopBridge = {
   recoverVault: (password: string) => Promise<Recovered>;
   /** For a removed device: puts its copy in an archive folder so it can join again. Resolves to that folder. */
   resetDevice: () => Promise<string>;
+  /** For a device whose vault was replaced by a new one started on another device: puts its copy in an archive folder so it can join that one. `password` is this device's. Resolves to the folder. */
+  leaveVault: (password: string) => Promise<string>;
   startInvite: () => Promise<{ code: string; expiresAt: number }>;
   confirmInvite: (accept: boolean) => Promise<void>;
   cancelInvite: () => Promise<void>;

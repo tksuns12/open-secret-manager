@@ -30,3 +30,5 @@ button { color: inherit; border: 0; cursor: pointer; }
 .recovery-prompt { padding: 12px; border: 1px solid #65472b; border-radius: 8px; background: #251c13; }.recovery-prompt .unlock-form { width: 100%; margin-top: 0; }
 .held-banner { margin: 0 0 14px; }
 .held-author { color: #94897a; font-size: 10px; line-height: 1.5; }
+/* The recovery key card takes the corner; a notice shown with it goes to the top. */
+.toast-raised { top: 76px; bottom: auto; }
