@@ -72,6 +72,11 @@ cargo test --workspace
 cargo fmt --all -- --check
 ```
 
+The storage and wire formats are frozen: each crate's `fixtures/` folder holds
+files written by the code, which the tests read with every build. Read
+[the format contract](docs/formats.md#frozen-formats-phase-6-stop-1) before
+changing what is stored or sent; a frozen file is never edited or made again.
+
 The desktop shell is developed separately because Tauri bundles platform
 toolchains and native WebView dependencies:
 

@@ -3,6 +3,8 @@
 **/dist/
 apps/desktop/src-tauri/binaries/
 *.sqlite3
+# Frozen files that tests read; see docs/formats.md.
+!crates/*/fixtures/**/*.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
 .DS_Store

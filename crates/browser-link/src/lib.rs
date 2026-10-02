@@ -21,3 +21,6 @@ pub use message::{
     Waiting, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME, VERSION,
 };
 pub use osm_origin::Origin;
+
+#[cfg(test)]
+mod fixture_tests;

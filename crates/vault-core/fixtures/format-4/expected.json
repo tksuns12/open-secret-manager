@@ -1,0 +1,50 @@
+{
+  "about": "What a reader should find in vault.sqlite3 and backup.json beside this file. The password and the recovery key open only these fixtures.",
+  "deleted": [
+    "fixture-note"
+  ],
+  "live": [
+    {
+      "item": {
+        "custom_fields": {
+          "Branch": "Main Street",
+          "PIN": "0000"
+        },
+        "favorite": true,
+        "id": "fixture-bank",
+        "kind": "login",
+        "notes": "line one\nline two",
+        "password": "p@ss \"quoted\" \\ and 🔑",
+        "tags": [
+          "money",
+          "important"
+        ],
+        "title": "Bank",
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+        "url": "https://bank.example.test:8443/",
+        "username": "account 42"
+      },
+      "revision": "2b12728baf9621e841823046341b0671aed4dd0d246c278d23e9341c2b0986f7"
+    },
+    {
+      "item": {
+        "custom_fields": {},
+        "favorite": false,
+        "id": "fixture-mail",
+        "kind": "login",
+        "notes": "edited twice",
+        "password": "third password, with ünïcödé",
+        "tags": [],
+        "title": "Mail",
+        "totp_secret": null,
+        "url": "https://mail.example.test/login",
+        "username": "owner@example.test"
+      },
+      "revision": "1aa7862523249ab8c5ee3a8ba3d7b9ed0bb89e1247837750975c2de752bda623"
+    }
+  ],
+  "made_by_commit": "c8a755d",
+  "password": "fixture password, not a secret",
+  "recovery_key": "OSM-RK1-JrTS2w4YVW9jrnaAjb9rOOvxVU35qghSW7fESxxCUZE",
+  "stored_revisions": 6
+}

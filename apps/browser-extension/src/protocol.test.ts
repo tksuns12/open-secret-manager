@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { answers, explain, fillRequest, MAX_MESSAGE_BYTES, pageOrigin, readResponse, type FillReply } from "./protocol.ts";
+import { readFileSync } from "node:fs";
+import { answers, cancel, explain, fillRequest, MAX_MESSAGE_BYTES, NATIVE_HOST, pageOrigin, readResponse, VERSION, type FillReply } from "./protocol.ts";
 
 test("only an https page has an origin to ask for", () => {
   assert.equal(pageOrigin("https://example.com/login?next=/home#form"), "https://example.com");
@@ -97,4 +98,39 @@ test("every refusal is explained in words, and none claims a fill", () => {
   }
   assert.match(explain("desktop_session_unavailable"), /not running/);
   assert.match(explain("busy"), /Another request/);
+});
+
+// The messages as the Rust side wrote them when the format was frozen. The
+// host and the desktop session are tested against the same file, so the two
+// implementations stay on one format.
+const frozen = JSON.parse(readFileSync(new URL("../../../crates/browser-link/fixtures/messages.json", import.meta.url), "utf8"));
+
+test("the extension writes and reads the frozen messages the host is tested against", () => {
+  assert.equal(VERSION, frozen.version);
+  assert.equal(NATIVE_HOST, frozen.host_name);
+  const firefox = JSON.parse(readFileSync(new URL("../manifest.firefox.json", import.meta.url), "utf8"));
+  assert.equal(firefox.browser_specific_settings.gecko.id, frozen.firefox_extension_id);
+
+  // What the extension sends is what the host was frozen reading.
+  const asked = JSON.parse(frozen.from_extension.fill_request);
+  assert.deepEqual(fillRequest(asked.requestId, asked.tabId, asked.documentId, asked.origin), asked);
+  assert.deepEqual(cancel(asked.requestId), JSON.parse(frozen.from_extension.cancel));
+
+  // What the host was frozen writing is what the extension reads.
+  const waiting = JSON.parse(frozen.to_extension.waiting);
+  assert.deepEqual(readResponse(waiting), waiting);
+  const filled = JSON.parse(frozen.to_extension.fill_reply);
+  const read = readResponse(filled);
+  assert.deepEqual(read, filled);
+  assert.ok(read?.type === "fill_reply" && answers(read, asked));
+  const unnamed = JSON.parse(frozen.to_extension.error_naming_no_request);
+  assert.deepEqual(readResponse(unnamed), unnamed);
+  const codes = Object.keys(frozen.to_extension.errors);
+  assert.equal(codes.length, 12);
+  for (const code of codes) {
+    const failure = JSON.parse(frozen.to_extension.errors[code]);
+    assert.deepEqual(readResponse(failure), failure, code);
+    assert.equal(failure.code, code);
+    assert.match(explain(code), /\S/, code);
+  }
 });

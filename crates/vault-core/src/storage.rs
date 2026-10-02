@@ -1548,16 +1548,17 @@ impl Vault {
         for revision in payload.revisions {
             vault.apply_encrypted_revision(revision)?;
         }
+        // Revoked after the accepted revisions, so those of a removed
+        // device are restored as accepted, and before the held ones, so a
+        // removed device's revision that was held stays held.
+        for device_id in payload.revoked {
+            vault.revoke_device(device_id)?;
+        }
         for held in payload.quarantine {
             match vault.apply_encrypted_revision(held) {
                 Ok(_) | Err(Error::Quarantined) => {}
                 Err(error) => return Err(error),
             }
-        }
-        // Revoked last, so the removed devices' accepted revisions above
-        // were restored as accepted.
-        for device_id in payload.revoked {
-            vault.revoke_device(device_id)?;
         }
         Ok(vault)
     }
@@ -2165,7 +2166,11 @@ fn read_backup(path: &Path) -> Result<BackupEnvelope> {
     serde_json::from_slice(&bytes).map_err(|_| Error::InvalidBackup("invalid envelope".into()))
 }
 
-fn backup_aad(vault_id: &[u8; 32], recovery_nonce: &str, recovery_wrapped_key: &str) -> Vec<u8> {
+pub(crate) fn backup_aad(
+    vault_id: &[u8; 32],
+    recovery_nonce: &str,
+    recovery_wrapped_key: &str,
+) -> Vec<u8> {
     let mut aad = b"osm-portable-backup-v1\0".to_vec();
     aad.extend_from_slice(vault_id);
     aad.extend_from_slice(&(recovery_nonce.len() as u64).to_be_bytes());

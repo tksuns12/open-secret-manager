@@ -20,6 +20,13 @@ rust-version = "1.80"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+# Development and test builds optimize the crates this project depends on,
+# not its own: tests unlock vaults written with the real password hashing
+# cost and seal items of the largest size, which takes many seconds with
+# unoptimized hashing, ciphers, and SQLite.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 strip = "symbols"
 lto = "thin"

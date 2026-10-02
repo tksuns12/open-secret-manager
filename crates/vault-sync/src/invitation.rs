@@ -22,7 +22,7 @@ impl InvitationToken {
         &self.0
     }
 
-    fn digest(&self) -> [u8; 32] {
+    pub(crate) fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(INVITATION_HASH_DOMAIN);
         hasher.update(self.0);
@@ -64,6 +64,9 @@ pub struct ApprovedInvitation {
     pub recipient: DeviceId,
 }
 
+/// The layout of the invitation store.
+const STORE_VERSION: u32 = 1;
+
 pub struct InvitationStore {
     connection: Connection,
     policy: InvitationPolicy,
@@ -80,6 +83,7 @@ impl InvitationStore {
     }
 
     fn from_connection(connection: Connection, policy: InvitationPolicy) -> Result<Self> {
+        crate::claim_store_version(&connection, STORE_VERSION)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;

@@ -1,0 +1,181 @@
+{
+  "about": "What a reader should find in vault.sqlite3 and backup.json beside this file. The password and the recovery key open only these fixtures.",
+  "current_format": {
+    "authors": [
+      {
+        "device_id": "30350e66e99369ce1bd12709b94212a0",
+        "public_key": "03e7c0a342e99bd8d69757087b3ef4e837f1cc9feb187a152bcd98a52f95e707"
+      },
+      {
+        "device_id": "7cc90c28838ba42228980665a790bae4",
+        "public_key": "934ae8421e378dd50799ca99bb995e4aaf30ef5475027239a7749e8894fcb3c0"
+      }
+    ],
+    "conflict": {
+      "item_id": "fixture-shared",
+      "versions": [
+        {
+          "author_device_id": "7cc90c28838ba42228980665a790bae4",
+          "item": {
+            "custom_fields": {},
+            "favorite": false,
+            "id": "fixture-shared",
+            "kind": "login",
+            "notes": "edited on the second device",
+            "password": "",
+            "tags": [],
+            "title": "Shared, as the second device has it",
+            "totp_secret": null,
+            "url": "",
+            "username": ""
+          },
+          "revision": "d72e5096fead95d68575a275f3cacba3b164e1fc1b46b21bf06989c63f7844db"
+        },
+        {
+          "author_device_id": "30350e66e99369ce1bd12709b94212a0",
+          "item": {
+            "custom_fields": {},
+            "favorite": false,
+            "id": "fixture-shared",
+            "kind": "login",
+            "notes": "edited on this device",
+            "password": "",
+            "tags": [],
+            "title": "Shared, as this device has it",
+            "totp_secret": null,
+            "url": "",
+            "username": ""
+          },
+          "revision": "d76b0d177e52a603d7211f4ad4f8049deccdc5fe7d9d189c92714d19970db10a"
+        }
+      ]
+    },
+    "current_epoch": 2,
+    "device_id": "30350e66e99369ce1bd12709b94212a0",
+    "device_public_key": "03e7c0a342e99bd8d69757087b3ef4e837f1cc9feb187a152bcd98a52f95e707",
+    "epoch_key_checks": [
+      {
+        "check": "7871f4fa631cb7092d2466c8760e77e32183f642f60f4040425406348c083fcc",
+        "epoch": 1
+      },
+      {
+        "check": "a189772dcd85b3bc65f125b74b3a3689e81ac3d2fc2cfb580a86aaeda334589c",
+        "epoch": 2
+      }
+    ],
+    "held": [
+      {
+        "author_device_id": "7cc90c28838ba42228980665a790bae4",
+        "item": {
+          "custom_fields": {},
+          "favorite": false,
+          "id": "fixture-from-second",
+          "kind": "login",
+          "notes": "",
+          "password": "",
+          "tags": [],
+          "title": "Edited after the removal",
+          "totp_secret": null,
+          "url": "",
+          "username": ""
+        },
+        "item_id": "fixture-from-second",
+        "known_author": true,
+        "parents": [
+          "1b3c3aac5ca77276ac8b40d44294fe3a4a4b22aea5b19608998b3fc5a29197b6"
+        ],
+        "revision": "47f898c309c2edd0c52a72f16f09165dd6d70af742e506153d346d9a1ee3bcbd"
+      },
+      {
+        "author_device_id": "549c3574d28f1535cba779e9d0bdae3d",
+        "item": {
+          "custom_fields": {},
+          "favorite": false,
+          "id": "fixture-from-stranger",
+          "kind": "login",
+          "notes": "",
+          "password": "",
+          "tags": [],
+          "title": "Written by an unknown device",
+          "totp_secret": null,
+          "url": "",
+          "username": ""
+        },
+        "item_id": "fixture-from-stranger",
+        "known_author": false,
+        "parents": [],
+        "revision": "c8bfaf66b79cbef50dcb74031bff8a436bc8f86e85bdba840fb624137bc12471"
+      }
+    ],
+    "recovery_check": "6655c1781bbef8cbf334536e204efe1a90f7dbfb648fdb0a6ee363a0a525f11f",
+    "recovery_key_kept": true,
+    "removed": [
+      "7cc90c28838ba42228980665a790bae4"
+    ],
+    "revision_ids": [
+      "0439d7e32202994ae66eff8c9301de45c6bea6ffa0a57cb974f4958e9ced5e11",
+      "88ed9195fe416cf1781d067933cc93bcde7ca66c726965e2860b186fbaedfe10",
+      "8c996fe31438cef047c8a8db30369984e4ee00e92305af571d35fb232a47ae14",
+      "897e3e6c569197820b6cdc26137379ae70a294505c2b4734b692117092f65afe",
+      "4c6980cc0d901095fbdbde8b55016a1a1876f8b41898cbcad9fdc976516baaa7",
+      "1267a76cde27f5baa0a3912676e0903cfe494c4453bda10390fd3ff1574f191d",
+      "f969da921a407d06a15110bd6d0bd1abf6a17504dd50f7ee65d0a3a38a135681",
+      "d76b0d177e52a603d7211f4ad4f8049deccdc5fe7d9d189c92714d19970db10a",
+      "d72e5096fead95d68575a275f3cacba3b164e1fc1b46b21bf06989c63f7844db",
+      "1b3c3aac5ca77276ac8b40d44294fe3a4a4b22aea5b19608998b3fc5a29197b6",
+      "1317e9dd2613594d0973b5f56c1f5b714470b158b76db262b105665cfede2d9c"
+    ],
+    "staged_missing_parents": [
+      "c8bfaf66b79cbef50dcb74031bff8a436bc8f86e85bdba840fb624137bc12471"
+    ],
+    "staged_while_locked": "2ab2c6dbfaeb6ead8841af9f86d68f20c370c71f863e5edd387454ef4ce76076",
+    "vault_id": "9a6f7389064ff0a44695dd3c27396db10b85ec897a576a45a6aa57ef586976c0",
+    "write_fence": 2
+  },
+  "deleted": [
+    "fixture-note"
+  ],
+  "live": [
+    {
+      "item": {
+        "custom_fields": {
+          "Branch": "Main Street",
+          "PIN": "0000"
+        },
+        "favorite": true,
+        "id": "fixture-bank",
+        "kind": "login",
+        "notes": "line one\nline two",
+        "password": "p@ss \"quoted\" \\ and 🔑",
+        "tags": [
+          "money",
+          "important"
+        ],
+        "title": "Bank",
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+        "url": "https://bank.example.test:8443/",
+        "username": "account 42"
+      },
+      "revision": "1267a76cde27f5baa0a3912676e0903cfe494c4453bda10390fd3ff1574f191d"
+    },
+    {
+      "item": {
+        "custom_fields": {},
+        "favorite": false,
+        "id": "fixture-mail",
+        "kind": "login",
+        "notes": "edited twice",
+        "password": "third password, with ünïcödé",
+        "tags": [],
+        "title": "Mail",
+        "totp_secret": null,
+        "url": "https://mail.example.test/login",
+        "username": "owner@example.test"
+      },
+      "revision": "8c996fe31438cef047c8a8db30369984e4ee00e92305af571d35fb232a47ae14"
+    }
+  ],
+  "made_by_commit": "fe01f0a",
+  "password": "fixture password, not a secret",
+  "recovery_key": "OSM-RK1-zoOL99qnr6dRJpvf7OaC8IOZyuy_xP0otCDOhNBJppA"
+}

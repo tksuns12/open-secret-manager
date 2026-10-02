@@ -275,3 +275,6 @@ impl SyncSession {
         Ok(vec![SyncMessage::Finished])
     }
 }
+
+#[cfg(test)]
+mod fixtures;

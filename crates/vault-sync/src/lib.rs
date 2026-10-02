@@ -12,6 +12,7 @@ mod inbox;
 mod invitation;
 mod membership;
 mod protocol;
+mod store_version;
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 pub use error::{Error, Result};
@@ -30,3 +31,7 @@ pub use protocol::{
     DeviceId, MessageId, ProtocolLimits, RevisionId, SignedRevision, VaultId, WireRevision,
     MAX_CIPHERTEXT_BYTES,
 };
+pub use store_version::claim_store_version;
+
+#[cfg(test)]
+mod fixture_tests;

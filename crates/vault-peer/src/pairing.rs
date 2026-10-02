@@ -795,3 +795,6 @@ fn push_field(target: &mut Vec<u8>, value: &[u8]) {
     target.extend_from_slice(&(value.len() as u64).to_be_bytes());
     target.extend_from_slice(value);
 }
+
+#[cfg(test)]
+mod fixtures;

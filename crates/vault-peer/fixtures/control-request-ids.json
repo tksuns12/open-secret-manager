@@ -1,0 +1,18 @@
+{
+  "about": "The ID of each kind of control request: the first 16 bytes of SHA-256 over osm-control-request-id-v1, a zero byte, the vault ID, the kind's length as 8 big-endian bytes, the kind, and the subject.",
+  "cancel_pending_enrollment": "fa45889c19a1b2494bec19de984b68b3",
+  "enroll_device": "4a08ab1a685255f1089f721d859ead1a",
+  "genesis": "b1967f21e052950e7da0a29e3e4f7cae",
+  "grant_device_epochs": "3145da14991ba4e113829c1b35139139",
+  "inputs": {
+    "device": "404142434445464748494a4b4c4d4e4f",
+    "epoch": 3,
+    "granted_epochs": [
+      1,
+      2
+    ],
+    "pending_enrollment": "e0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+    "vault_id": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+  },
+  "remove_device_into_epoch": "d40ad071b4f03b960b45bd177e04c597"
+}

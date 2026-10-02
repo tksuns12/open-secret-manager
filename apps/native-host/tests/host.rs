@@ -25,7 +25,9 @@ use osm_vault_core::{Item, Vault};
 use serde_json::{json, Value};
 
 const PASSWORD: &str = "correct horse battery staple";
-const PATIENCE: Duration = Duration::from_secs(30);
+/// Long, because macOS can hold a program's start for tens of seconds while
+/// it checks newly built files; a host held that long is not a failed test.
+const PATIENCE: Duration = Duration::from_secs(90);
 const A_WHILE: Duration = Duration::from_millis(300);
 
 /// A home folder with a path short enough for a socket inside it.

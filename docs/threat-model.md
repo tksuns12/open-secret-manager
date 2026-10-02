@@ -40,7 +40,7 @@ An administrator, debugger, injected process, compromised extension, or compromi
 
 Encryption does not erase plaintext a peer previously learned. Removing a device cannot retract old epoch keys, old backups, or already copied passwords. Rotating a vault key also does not rotate passwords at external websites; the owner must change exposed credentials there.
 
-Immutable signed revisions reveal tampering, but a completely rolled-back local database can still look internally valid. Without a fresh trusted peer or external checkpoint, the product cannot prove that an isolated snapshot is current. Backup restoration must display that limit.
+Immutable signed revisions reveal tampering, but a completely rolled-back local database can still look internally valid. Without a fresh trusted peer or external checkpoint, the product cannot prove that an isolated snapshot is current. Backup restoration must display that limit. The same holds within one file: every value that decides what is shown or who may write is under a key, but the set of rows is not, so whoever can write the vault file can hide an item or an edit by removing its rows, though not show anything else in its place.
 
 Raft assumes crash faults, not Byzantine participants. A malicious enrolled voter is outside its consensus safety model. Signatures authenticate an author; they do not make an authorized compromised device honest. OpenRaft is the consensus implementation, not a substitute for application authorization.
 

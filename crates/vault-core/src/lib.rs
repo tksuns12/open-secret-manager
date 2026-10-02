@@ -42,4 +42,8 @@ impl Vault {
 }
 
 #[cfg(test)]
+mod fixture_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vector_tests;

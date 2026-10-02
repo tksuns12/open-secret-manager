@@ -1168,3 +1168,5 @@ async fn a_device_far_behind_catches_up_from_a_snapshot() {
     assert_eq!(cluster.running[&4].state().epoch, 2);
     cluster.settle(&voters, &voters).await;
 }
+
+mod fixtures;

@@ -158,6 +158,7 @@ impl AddressBook {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let store = Connection::open(path)?;
         store.busy_timeout(Duration::from_secs(5))?;
+        osm_vault_sync::claim_store_version(&store, crate::peers::STORE_VERSION)?;
         store.execute_batch(
             "CREATE TABLE IF NOT EXISTS member_addresses (
                  device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
@@ -841,3 +842,6 @@ pub async fn serve_members(
         });
     }
 }
+
+#[cfg(test)]
+mod fixtures;

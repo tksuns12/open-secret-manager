@@ -1,0 +1,38 @@
+{
+  "about": "The messages of a browser fill as the Rust code wrote them when the format was frozen. Each is the JSON text a frame carries. A frame is four length bytes and that text: in the machine's byte order between browser and host, shown here for a little-endian machine, and big-endian between the host and the desktop session.",
+  "chromium_extension_id": "hjgekjgkjnakgmiopldddikdkcjhnmge",
+  "firefox_extension_id": "extension@opensecretmanager.org",
+  "frames_of_the_fill_request": {
+    "browser_on_a_little_endian_machine": "c00000007b2274797065223a2266696c6c5f72657175657374222c2276657273696f6e223a312c22726571756573744964223a2237663663306131652d306239632d346635642d396135372d326631663866336639643131222c227461624964223a31322c226672616d654964223a302c22646f63756d656e744964223a2230643362366135322d366231632d346330652d386136652d306137643663316232653366222c226f726967696e223a2268747470733a2f2f6578616d706c652e636f6d227d",
+    "socket": "000000c07b2274797065223a2266696c6c5f72657175657374222c2276657273696f6e223a312c22726571756573744964223a2237663663306131652d306239632d346635642d396135372d326631663866336639643131222c227461624964223a31322c226672616d654964223a302c22646f63756d656e744964223a2230643362366135322d366231632d346330652d386136652d306137643663316232653366222c226f726967696e223a2268747470733a2f2f6578616d706c652e636f6d227d"
+  },
+  "from_extension": {
+    "cancel": "{\"type\":\"cancel\",\"version\":1,\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\"}",
+    "fill_request": "{\"type\":\"fill_request\",\"version\":1,\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://example.com\"}"
+  },
+  "host_name": "org.opensecretmanager.native",
+  "host_to_session": {
+    "from_chromium": "{\"caller\":{\"browser\":\"chromium\",\"extension\":\"chrome-extension://hjgekjgkjnakgmiopldddikdkcjhnmge/\"},\"request\":{\"version\":1,\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://example.com\"}}",
+    "from_firefox": "{\"caller\":{\"browser\":\"firefox\",\"extension\":\"extension@opensecretmanager.org\"},\"request\":{\"version\":1,\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://example.com\"}}"
+  },
+  "to_extension": {
+    "error_naming_no_request": "{\"type\":\"error\",\"requestId\":null,\"code\":\"invalid_message\"}",
+    "errors": {
+      "busy": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"busy\"}",
+      "cancelled": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"cancelled\"}",
+      "denied": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"denied\"}",
+      "desktop_session_unavailable": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"desktop_session_unavailable\"}",
+      "expired": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"expired\"}",
+      "extension_not_allowed": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"extension_not_allowed\"}",
+      "frame_rejected": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"frame_rejected\"}",
+      "invalid_message": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"invalid_message\"}",
+      "origin_rejected": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"origin_rejected\"}",
+      "replayed": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"replayed\"}",
+      "unsupported_message": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"unsupported_message\"}",
+      "unsupported_version": "{\"type\":\"error\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"code\":\"unsupported_version\"}"
+    },
+    "fill_reply": "{\"type\":\"fill_reply\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://example.com\",\"username\":\"owner@example.test\",\"password\":\"p@ss \\\"quoted\\\" \\\\ and 🔑\"}",
+    "waiting": "{\"type\":\"waiting\",\"requestId\":\"7f6c0a1e-0b9c-4f5d-9a57-2f1f8f3f9d11\"}"
+  },
+  "version": 1
+}

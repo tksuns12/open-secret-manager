@@ -4,7 +4,7 @@
 // one the owner chooses there into the page. It holds no login before that
 // and keeps none after, and never learns what the vault contains.
 
-import { answers, explain, fillRequest, GIVE_UP_AFTER_MS, NATIVE_HOST, pageOrigin, readResponse, VERSION, type Cancel, type FillReply, type FillRequest } from "./protocol";
+import { answers, cancel, explain, fillRequest, GIVE_UP_AFTER_MS, NATIVE_HOST, pageOrigin, readResponse, type FillReply, type FillRequest } from "./protocol";
 import type { Field, FromPage, Prepared, ToPage } from "./page";
 
 /** A request the owner has yet to decide in the app. */
@@ -138,7 +138,7 @@ function end(requestId: string, mark: Mark, text: string, withdraw: boolean) {
   waiting.delete(requestId);
   clearTimeout(request.giveUp);
   if (withdraw) {
-    try { host?.postMessage({ type: "cancel", version: VERSION, requestId } satisfies Cancel); } catch { /* the host is gone, which withdraws it too */ }
+    try { host?.postMessage(cancel(requestId)); } catch { /* the host is gone, which withdraws it too */ }
   }
   finish(request, mark, text);
 }

@@ -47,6 +47,9 @@ pub(crate) fn pin_of(certificate: &[u8]) -> [u8; 32] {
     Sha256::digest(certificate).into()
 }
 
+/// The layout of the peer store file, which the address book shares.
+pub(crate) const STORE_VERSION: u32 = 1;
+
 /// This device's transport identity. A store written before the vault had a
 /// control plane may also name the one device it was paired with.
 ///
@@ -70,6 +73,7 @@ impl PeerStore {
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
+        osm_vault_sync::claim_store_version(&connection, STORE_VERSION)?;
         connection.execute_batch(
             "PRAGMA journal_mode = DELETE;
              PRAGMA synchronous = FULL;

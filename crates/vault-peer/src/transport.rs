@@ -735,3 +735,6 @@ pub(crate) fn client_config_for_tests(
 pub(crate) fn server_name_for_tests() -> ServerName<'static> {
     server_name()
 }
+
+#[cfg(test)]
+mod fixtures;

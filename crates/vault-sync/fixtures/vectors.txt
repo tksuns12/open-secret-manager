@@ -1,0 +1,14 @@
+# Inputs and what the sync code made of them when the formats were frozen.
+# Bytes are lowercase hexadecimal. The keys are counting patterns and protect
+# nothing. The envelope is HPKE (RFC 9180) base mode with DHKEM(X25519,
+# HKDF-SHA256), HKDF-SHA256, and AES-256-GCM, info osm-epoch-key-hpke-v1; its
+# sender's key is random, so it is sealed once and only opened afterwards.
+vault_id = 101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+epoch = 3
+recipient_device = 505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f
+recipient_secret = 303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f
+recipient_public_key = 7808d98283260794bb05f2ae69674ca2fe2e55c16c863031f90235576f0f3b0e
+epoch_key = a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+envelope = 4f534b31101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f0000000000000003505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f7808d98283260794bb05f2ae69674ca2fe2e55c16c863031f90235576f0f3b0ebed78f6d62f399a0791a35bdd7765c17f41ac1ace29ed375e80a2062c35bff47b975a3ad4b3732119bcab3e28450231c725c6b9bc9ac29c812e3e6ea7382c73131ceebbb23f352c677b8b5c7a74ddb2b
+invitation_token = 707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f
+invitation_token_stored_as = eede81614bad3112a3e6ac2dc6022c99b3840d104bd83e6aad9ec590ca30807b

@@ -85,6 +85,14 @@ Firefox and its settings are not touched. The extension is installed as a
 temporary add-on and its toolbar button is clicked in Firefox's own
 interface. The driver for Firefox is fetched on first use.
 
+If every test waits at "Asking Open Secret Manager…" and fails after 90
+seconds, the browser started the host and the host never ran. That has
+happened with the project on an external disk: macOS wants the test browser
+to have the permission for removable volumes before a program it starts may
+read from that disk. Copying this folder, `target/debug/osm-native-host`,
+and `target/debug/osm-fill` to the same places under a folder on the
+internal disk, and running the tests there, got round it.
+
 `node e2e/with-app.mjs` does the same against the desktop app itself, for a
 check by hand: it presses the button on a test page and prints what the
 button says and what ended up in the page, while you decide in the app.

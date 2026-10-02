@@ -419,3 +419,6 @@ fn random_key() -> Result<Zeroizing<[u8; 32]>> {
     getrandom::fill(key.as_mut()).map_err(|_| osm_vault_sync::Error::Randomness)?;
     Ok(key)
 }
+
+#[cfg(test)]
+mod fixtures;

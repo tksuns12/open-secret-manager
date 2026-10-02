@@ -34,6 +34,10 @@ use crate::{
 
 type Result<T> = std::result::Result<T, StorageError<DeviceId>>;
 
+/// The layout of the control-plane database: the tables below, with every
+/// value but the snapshot's data as JSON text.
+const STORE_VERSION: u32 = 1;
+
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
@@ -159,6 +163,7 @@ pub fn open(
     crash: CrashPlan,
 ) -> Result<(LogStore, StateMachineStore)> {
     let connection = Connection::open(path).map_err(read_error)?;
+    osm_vault_sync::claim_store_version(&connection, STORE_VERSION).map_err(read_error)?;
     connection.execute_batch(SCHEMA).map_err(write_error)?;
     let state = match connection
         .query_row(

@@ -68,6 +68,11 @@ export function fillRequest(requestId: string, tabId: number, documentId: string
   return { type: "fill_request", version: VERSION, requestId, tabId, frameId: 0, documentId, origin };
 }
 
+/** Withdraws a request whose page went away. */
+export function cancel(requestId: string): Cancel {
+  return { type: "cancel", version: VERSION, requestId };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
