@@ -1,0 +1,99 @@
+# For an outside reviewer
+
+Open Secret Manager is a password manager in which each device keeps its own
+encrypted vault and the devices sync with each other directly on a local
+network, with no server. This packet says what to look at and in what order,
+where the evidence is, and what we would most like a reviewer to answer. It
+has not been reviewed by anyone outside the project; this is the request.
+
+## Read first
+
+1. [Threat model](threat-model.md): the attackers, the boundaries, and what
+   is out of scope.
+2. [Formats](formats.md): every stored and wire format, frozen since Phase
+   6a, with the rules for changing one.
+3. [Implementation status](implementation-status.md): the evidence for each
+   part, labelled by how it was checked, and what each part still lacks.
+4. [Release](release.md): the supported configurations, the remaining risks
+   we publish, and how a package is built and checked.
+5. [Disaster recovery](disaster-recovery.md): what the owner keeps and does
+   when devices are lost.
+
+## The code
+
+About 39,000 lines of Rust and TypeScript, tests included.
+
+| Part | Lines | What it does | Look at |
+| --- | --- | --- | --- |
+| `crates/vault-core` | 10,600 | The encrypted vault: keys, revisions, signatures, the history of each item, held revisions, backups, recovery, imports | `src/crypto.rs` (every primitive and each AAD); `src/storage.rs`: `verify_revision`, `validate_shape`, `is_active_author`, `apply_encrypted_revision`, `restore_backup`, `fork`, `reset_password` |
+| `crates/vault-membership` | 4,500 | Which devices belong to a vault, decided by a Raft majority (OpenRaft 0.9) over signed requests | `src/state.rs`: `is_enrolled`, `complete`, and how keys and authority follow signed enrollment rather than Raft membership |
+| `crates/vault-peer` | 7,900 | Pairing with a six-digit code the owner compares on both screens, sync, and the members' channel, over TLS 1.3 with pinned certificates | `src/pairing.rs`: `transcript`, `short_code`; `src/transport.rs`: frame limits before authentication; `src/control.rs`: what a vault takes from committed membership |
+| `crates/vault-sync` | 2,300 | Key envelopes (HPKE) and one-use invitation tokens | the envelope and token code and its fixtures |
+| `crates/origin` | 280 | The one rule for which page a login may be filled into | all of it |
+| `crates/browser-link`, `apps/native-host`, `crates/vault-browser` | 4,400 | The browser fill path: messages and frames, the host a browser starts (it holds no vault), and the desktop's end where a request waits for the owner | `crates/vault-browser/src/desk.rs`: `approve`; `apps/native-host/src/main.rs`: what it checks before passing a request on |
+| `apps/desktop/src-tauri` | 6,700 | The desktop app's native side: commands, devices and sync, the browser socket, archives, backups | `src/lib.rs` (which secrets cross to the window: the stored password and one-time secret never do), `src/browser.rs` (`approve_fill`), `src/network.rs` (`recover_vault`, `restore`) |
+| `apps/desktop/src-tauri/session` | 400 | The only `unsafe` code in the project: registering for macOS notifications, to lock on sleep and screen lock | `src/macos.rs` |
+| `apps/desktop/src`, `apps/browser-extension/src` | 2,300 | The window, and the extension | `apps/browser-extension/src/background.ts` (what a reply must match before it is filled) |
+
+Everything else in the Rust workspaces forbids `unsafe`. Nothing writes a
+log.
+
+## Trust boundaries in one paragraph each
+
+**Disk.** A vault file holds ciphertext, signed revision headers, and
+wrapped keys. The password (Argon2id) or the recovery key unwraps a
+per-device root key, which unwraps the rest. A file writer can hide rows
+and roll the whole file back without detection; both are published risks.
+
+**Devices.** Every revision is signed by its device and verified against
+the vault's authorized authors before it joins the history; anything else
+is held for the owner. Which devices are authors follows signed enrollment
+and removal, committed by a majority of the devices. Raft itself is not
+trusted for authority: its membership entries carry no signature.
+
+**Network.** Members talk over TLS 1.3 with both certificates pinned in
+committed membership. Before authentication, frames are limited to 64 KiB
+and to a time limit. Pairing binds both sides to a transcript whose short
+code the owner compares.
+
+**Browser.** The extension asks only when the owner presses its button; the
+host relays and checks; the desktop app releases a login only when the
+owner picks it in the app, for the page's exact origin, and only under the
+unlock the choice was made in.
+
+## The evidence
+
+- `scripts/check.sh --network --browsers` runs every check: formatting,
+  lints with warnings as errors, 242 Rust tests (the vault, membership,
+  pairing and sync in process, between processes, and in desktop shells),
+  the extension's 19 tests in headless Chromium and Firefox, and the
+  dependency policy and advisory audits.
+- Frozen formats: files every build reads, in each crate's `fixtures/`.
+- Property tests on every parser that takes outside input, and crash tests
+  that kill a process writing to a vault (Phase 6a stop 2).
+- The release scripts and the reproducibility check: see
+  [release.md](release.md).
+
+## What we would most like answered
+
+1. Is any secret disclosed to a party the threat model excludes: to a device
+   that was removed, to a page other than the login's exact origin, or to
+   the window of the desktop app?
+2. Can a device that was never enrolled, or was removed, get its revisions
+   accepted or be given a key, by any sequence of Raft entries, requests,
+   or sync messages? (A property test found one such path in Phase 6a and
+   it was fixed; see `is_enrolled`.)
+3. Are the AAD and signature domains in `crypto.rs` enough to keep values
+   from one place being accepted in another?
+4. Is the pairing transcript and its six-digit code a sound way to bind the
+   two devices, given that the owner compares it by eye?
+5. Is anything in the frozen formats a mistake that will be costly to keep?
+
+## What is known to be missing
+
+The full list is the right-hand column of the delivery matrix in
+[implementation-status.md](implementation-status.md). In short: no outside
+review until this one; packages signed with a developer identity and
+notarized are waiting on that identity; coverage-guided fuzzing was not run;
+the native lifecycle locks and the new backup screens were checked through
+the code, not in a running window; mobile apps do not exist yet.

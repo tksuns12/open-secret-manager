@@ -12,11 +12,21 @@
   "app": {
     "withGlobalTauri": true,
     "windows": [{ "title": "Open Secret Manager", "width": 1200, "height": 760, "minWidth": 960, "minHeight": 680 }],
-    "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420" }
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost",
+      "devCsp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420"
+    }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png"],
+    "copyright": "Copyright 2026 Open Secret Manager contributors. GPL-3.0-only.",
+    "category": "Utility",
+    "shortDescription": "A password manager whose devices sync with each other, with no server",
+    "longDescription": "Each device keeps its own encrypted vault, and your devices sync with each other directly on your network. There is no account, server, or relay.",
+    "macOS": {
+      "minimumSystemVersion": "14.0"
+    }
   }
 }

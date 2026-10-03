@@ -24,6 +24,7 @@ desktop=apps/desktop/src-tauri/Cargo.toml
 step() { printf '\n== %s\n' "$*"; }
 
 step "Formatting"
+for script in scripts/*.sh; do sh -n "$script"; done
 cargo fmt --all -- --check
 cargo fmt --manifest-path "$desktop" --all -- --check
 

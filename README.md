@@ -128,6 +128,10 @@ Firefox with the real native messaging host; see
 
 Before a release, read [the threat model](docs/threat-model.md), [the format
 contract](docs/formats.md), and [the implementation status](docs/implementation-status.md).
+[Release](docs/release.md) states the supported configurations and the
+remaining risks, and how a package is built, reproduced, and checked;
+[the review packet](docs/review-packet.md) is the starting point for an
+outside reviewer.
 They distinguish implemented primitives from the integration and platform
 review gates that remain for a public stable release.
 
