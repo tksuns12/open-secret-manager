@@ -195,3 +195,43 @@ impl Invitation {
         postcard::to_allocvec(&self.body).unwrap()
     }
 }
+
+/// An invitation and a join request carry a bearer token, which their
+/// printed forms leave out.
+#[test]
+fn an_invitation_and_a_join_request_print_no_token() {
+    let token: [u8; 32] = counting(0x70);
+    let invitation = Invitation {
+        body: InvitationBody {
+            version: PAIRING_VERSION,
+            vault_id: counting(0x10),
+            inviter_device_id: counting(0x40),
+            inviter_public_key: counting(0x60),
+            inviter_transport_pin: counting(0x20),
+            addresses: vec!["192.0.2.10:47820".into()],
+            token,
+            expires_at: 1_800_000_000,
+        },
+    };
+    let request = JoinRequest {
+        version: PAIRING_VERSION,
+        vault_id: counting(0x10),
+        token,
+        joiner_device_id: counting(0x90),
+        joiner_public_key: counting(0xb0),
+        joiner_hpke_key: counting(0x30),
+        joiner_transport_pin: counting(0xd0),
+        signature: vec![0; 64],
+    };
+    let text = invitation.encode().unwrap();
+    for printed in [format!("{invitation:?}"), format!("{request:?}")] {
+        for secret in [
+            hex(&token),
+            format!("{token:?}"),
+            text.to_string(),
+            text[10..30].to_owned(),
+        ] {
+            assert!(!printed.contains(&secret), "{printed}");
+        }
+    }
+}

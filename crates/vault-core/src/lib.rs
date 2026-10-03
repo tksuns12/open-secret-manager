@@ -48,6 +48,8 @@ mod fixture_tests;
 #[cfg(test)]
 mod hostile_tests;
 #[cfg(test)]
+mod hygiene_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod vector_tests;

@@ -190,6 +190,7 @@ pub async fn open_archive(
     password: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ArchivedItem>, CommandError> {
+    let password = zeroize::Zeroizing::new(password);
     let folder = archive_folder(&state, &name)?;
     let path = vault_file(&state, &folder);
     if !path.is_file() {

@@ -99,8 +99,10 @@ async fn list_entries(state: tauri::State<'_, AppState>) -> Result<Vec<ItemSumma
 
 #[tauri::command]
 fn generate_password(length: usize) -> Result<String, CommandError> {
-    let mut policy = PasswordPolicy::default();
-    policy.length = length;
+    let policy = PasswordPolicy {
+        length,
+        ..PasswordPolicy::default()
+    };
     osm_vault_core::generate_password(&policy).map_err(Into::into)
 }
 
@@ -496,6 +498,9 @@ async fn create_vault<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle<R>,
 ) -> Result<String, CommandError> {
+    // Wiped when dropped. The copies the bridge made on the way are beyond
+    // reach.
+    let password = Zeroizing::new(password);
     let recovery = {
         let mut vault = state.vault.lock().await;
         if vault.is_some() {
@@ -528,6 +533,7 @@ async fn unlock_vault<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle<R>,
 ) -> Result<(), CommandError> {
+    let password = Zeroizing::new(password);
     {
         let mut vault = state.vault.lock().await;
         let vault = vault.as_mut().ok_or_else(|| CommandError {
@@ -588,6 +594,7 @@ async fn enable_recovery(
     recovery_key: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
+    let recovery_key = Zeroizing::new(recovery_key);
     let recovery = osm_vault_core::RecoveryKey::parse(recovery_key.trim())?;
     let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {

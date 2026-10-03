@@ -1,0 +1,33 @@
+{
+  "about": "What scripts/dependencies.mjs allows. The project is GPL-3.0-only, so every dependency must be under a license a GPL-3.0 program may include, and come from the official registry. An exception names a dependency whose metadata says too little, with the license its own files state.",
+  "own_license": "GPL-3.0-only",
+  "licenses": [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "BlueOak-1.0.0"
+  ],
+  "cargo_sources": [
+    "registry+https://github.com/rust-lang/crates.io-index"
+  ],
+  "npm_registry": "https://registry.npmjs.org/",
+  "exceptions": {
+    "caniuse-lite": {
+      "license": "CC-BY-4.0",
+      "reason": "Browser data that Vite reads at build time; it is not in the built app. The FSF lists CC-BY-4.0 as compatible with GPLv3."
+    }
+  }
+}

@@ -1,0 +1,20 @@
+# Advisories `cargo audit` reports that are accepted, each with why. The
+# check script runs the audit with warnings denied, so anything not listed
+# here, a yanked crate included, stops it.
+
+[advisories]
+ignore = [
+    # proc-macro-error is unmaintained. It builds glib's macros, part of the
+    # GTK stack Tauri uses on Linux only; nothing on macOS uses it.
+    "RUSTSEC-2024-0370",
+    # glib 0.18 has an unsound iterator over variant strings, which nothing
+    # here calls. Linux only, through Tauri's GTK stack.
+    "RUSTSEC-2024-0429",
+    # The unic crates are unmaintained. urlpattern uses them, through
+    # tauri-utils, to match the URL patterns of Tauri's own configuration.
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098",
+    "RUSTSEC-2025-0100",
+]

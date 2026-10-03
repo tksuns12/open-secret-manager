@@ -65,12 +65,21 @@ lost.
 
 ## Development
 
-The Rust workspace is the source of truth for security-sensitive behaviour:
+The Rust workspace is the source of truth for security-sensitive behaviour.
+Every check the project has runs from one script; there is no CI, so run it
+before a commit:
 
 ```text
-cargo test --workspace
-cargo fmt --all -- --check
+scripts/check.sh              # formatting, lints, all tests, both interfaces, licenses
+scripts/check.sh --network    # also the advisory audits of every dependency
+scripts/check.sh --browsers   # also the extension in headless Chromium and Firefox
 ```
+
+Every dependency has to come from the official registry under a license a
+GPL-3.0 program may include (`dependency-policy.json`, checked by
+`scripts/dependencies.mjs`). Advisories the audit reports and the project
+accepts are listed with their reasons in `.cargo/audit.toml`; any other one,
+a yanked crate included, fails the check.
 
 The storage and wire formats are frozen: each crate's `fixtures/` folder holds
 files written by the code, which the tests read with every build. Read

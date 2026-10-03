@@ -1189,6 +1189,7 @@ pub async fn recover_vault<R: Runtime>(
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<Recovered, CommandError> {
+    let password = zeroize::Zeroizing::new(password);
     let net = &state.network;
     if net.join.lock().await.is_some() {
         return Err(CommandError {
@@ -1421,6 +1422,7 @@ pub async fn leave_vault<R: Runtime>(
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<String, CommandError> {
+    let password = zeroize::Zeroizing::new(password);
     let net = &state.network;
     if net.join.lock().await.is_some() {
         return Err(CommandError {
@@ -1650,6 +1652,8 @@ pub async fn join_start<R: Runtime>(
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<JoinInfo, CommandError> {
+    // An invitation holds a bearer token.
+    let code = zeroize::Zeroizing::new(code);
     let net = &state.network;
     if net.join.lock().await.take().is_some() {
         abandon_control(&app).await;
@@ -1702,6 +1706,7 @@ pub async fn join_finish<R: Runtime>(
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<(), CommandError> {
+    let password = password.map(zeroize::Zeroizing::new);
     let net = &state.network;
     let keeps_vault = match net.join.lock().await.as_ref() {
         Some(join) => join.connection.joiner().has_vault(),

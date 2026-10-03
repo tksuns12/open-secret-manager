@@ -1172,7 +1172,7 @@ impl Vault {
         let mut ids = BTreeSet::new();
         for item in &items {
             item.validate()?;
-            if serde_json::to_vec(item)?.len() > MAX_ITEM_BYTES {
+            if Zeroizing::new(serde_json::to_vec(item)?).len() > MAX_ITEM_BYTES {
                 return Err(Error::InvalidItem("serialized item is too large".into()));
             }
             if !ids.insert(item.id.clone()) || !head_ids(&self.connection, &item.id)?.is_empty() {

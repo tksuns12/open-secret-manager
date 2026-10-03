@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::{
     crypto::random_array, Error, ImportFormat, ImportPreview, ImportWarning, Item, ItemKind, Result,
@@ -81,6 +82,47 @@ struct BitwardenField {
     value: Option<String>,
 }
 
+// What an export holds is wiped once it has been read: values moved into
+// items leave empty strings behind, and anything skipped is not left in
+// freed memory. The file's own bytes belong to the caller.
+impl Drop for BitwardenItem {
+    fn drop(&mut self) {
+        self.name.zeroize();
+        self.notes.zeroize();
+        for values in [&mut self.card, &mut self.identity].into_iter().flatten() {
+            values.values_mut().for_each(wipe);
+        }
+    }
+}
+
+impl Drop for BitwardenLogin {
+    fn drop(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+        self.totp.zeroize();
+        for uri in &mut self.uris {
+            uri.uri.zeroize();
+        }
+    }
+}
+
+impl Drop for BitwardenField {
+    fn drop(&mut self) {
+        self.name.zeroize();
+        self.value.zeroize();
+    }
+}
+
+/// Wipes the strings inside a JSON value.
+fn wipe(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(values) => values.iter_mut().for_each(wipe),
+        Value::Object(fields) => fields.values_mut().for_each(wipe),
+        _ => {}
+    }
+}
+
 fn too_many() -> Error {
     Error::InvalidImport(format!("more than {MAX_IMPORT_ITEMS} entries"))
 }
@@ -101,7 +143,8 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
     }
     let mut items = Vec::with_capacity(export.items.len());
     let mut warnings = Vec::new();
-    for (index, source) in export.items.into_iter().enumerate() {
+    let mut export = export;
+    for (index, mut source) in std::mem::take(&mut export.items).into_iter().enumerate() {
         let row = index + 1;
         let kind = match source.item_type {
             1 => ItemKind::Login,
@@ -123,29 +166,32 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
             });
             continue;
         }
-        let login = source.login;
+        // Values are taken out, not copied, so that what is wiped when the
+        // parsed export is dropped is what was not used.
         let mut custom_fields = BTreeMap::new();
-        for field in source.fields {
-            if let (Some(name), Some(value)) = (field.name, field.value) {
+        for field in &mut source.fields {
+            if let (Some(name), Some(value)) = (field.name.take(), field.value.take()) {
                 if !name.is_empty() {
                     custom_fields.insert(name, value);
                 }
             }
         }
-        flatten_values(&mut custom_fields, source.card);
-        flatten_values(&mut custom_fields, source.identity);
-        let (username, password, url, totp_secret) = login
+        flatten_values(&mut custom_fields, source.card.as_mut());
+        flatten_values(&mut custom_fields, source.identity.as_mut());
+        let (username, password, url, totp_secret) = source
+            .login
+            .as_mut()
             .map(|login| {
                 (
-                    login.username,
-                    login.password,
+                    std::mem::take(&mut login.username),
+                    std::mem::take(&mut login.password),
                     login
                         .uris
-                        .into_iter()
-                        .map(|uri| uri.uri)
-                        .find(|uri| !uri.is_empty())
+                        .iter_mut()
+                        .find(|uri| !uri.uri.is_empty())
+                        .map(|uri| std::mem::take(&mut uri.uri))
                         .unwrap_or_default(),
-                    login.totp.filter(|value| !value.trim().is_empty()),
+                    login.totp.take().filter(|value| !value.trim().is_empty()),
                 )
             })
             .unwrap_or_default();
@@ -157,12 +203,12 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
         }
         items.push(Item {
             id: Uuid::new_v4().to_string(),
-            title: source.name,
+            title: std::mem::take(&mut source.name),
             kind,
             username,
             password,
             url,
-            notes: source.notes,
+            notes: std::mem::take(&mut source.notes),
             totp_secret,
             custom_fields,
             tags: Vec::new(),
@@ -172,16 +218,26 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
     Ok((items, warnings))
 }
 
-fn flatten_values(target: &mut BTreeMap<String, String>, values: Option<BTreeMap<String, Value>>) {
-    for (name, value) in values.unwrap_or_default() {
+fn flatten_values(
+    target: &mut BTreeMap<String, String>,
+    values: Option<&mut BTreeMap<String, Value>>,
+) {
+    for (name, value) in values.into_iter().flatten() {
         let string = match value {
-            Value::String(value) => value,
+            Value::String(value) => std::mem::take(value),
             Value::Number(value) => value.to_string(),
             Value::Bool(value) => value.to_string(),
             _ => continue,
         };
-        if !string.is_empty() {
-            target.entry(name).or_insert(string);
+        match target.entry(name.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) if !string.is_empty() => {
+                slot.insert(string);
+            }
+            // Not used: a field of that name is there already.
+            _ => {
+                let mut string = string;
+                string.zeroize();
+            }
         }
     }
 }
