@@ -493,10 +493,7 @@ proptest! {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.sqlite3");
-        let mut bytes = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/control.sqlite3"),
-        )
-        .unwrap();
+        let mut bytes = std::fs::read(super::fixtures::folder().join("control.sqlite3")).unwrap();
         for (at, with) in &flips {
             let at = at.index(bytes.len());
             bytes[at] ^= with;

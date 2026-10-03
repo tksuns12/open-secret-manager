@@ -21,8 +21,16 @@ const FORMATS: [(u32, u32); 7] = [(1, 1), (2, 2), (3, 3), (4, 3), (5, 3), (6, 4)
 pub(crate) const CURRENT: u32 = 7;
 const CURRENT_BACKUP: u32 = 4;
 
+/// This crate's folder: where it was built, or `OSM_TEST_CRATE_DIR` when the
+/// tests run on another machine with a copy of the crate's files, as on a
+/// phone (`scripts/test-on-android.sh`).
+pub(crate) fn crate_dir() -> PathBuf {
+    std::env::var_os("OSM_TEST_CRATE_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+}
+
 pub(crate) fn fixture(format: u32, name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    crate_dir()
         .join("fixtures")
         .join(format!("format-{format}"))
         .join(name)
@@ -438,7 +446,7 @@ fn a_backup_of_the_current_format_restores_and_an_older_one_is_refused_untouched
 fn the_frozen_files_are_the_ones_that_were_committed() {
     use sha2::{Digest, Sha256};
 
-    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let folder = crate_dir().join("fixtures");
     let sums = std::fs::read_to_string(folder.join("SHA256SUMS")).unwrap();
     let mut listed = BTreeSet::new();
     for line in sums.lines() {

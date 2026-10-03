@@ -13,8 +13,15 @@ use std::{
 
 pub const PASSWORD: &str = "correct horse battery staple";
 
+/// The `osm-peer` program: where it was built, or in `OSM_TEST_CRATE_DIR`
+/// when the tests run on another machine with a copy of the crate's
+/// programs, as on a phone (`scripts/test-on-android.sh`).
 pub fn osm_peer() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_osm-peer"));
+    let program = std::env::var_os("OSM_TEST_CRATE_DIR").map_or_else(
+        || std::path::PathBuf::from(env!("CARGO_BIN_EXE_osm-peer")),
+        |folder| std::path::Path::new(&folder).join("osm-peer"),
+    );
+    let mut command = Command::new(program);
     command.env("OSM_PASSWORD", PASSWORD);
     command
 }

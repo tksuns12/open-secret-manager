@@ -8,7 +8,7 @@
 //! ignored test below, or the vector test with `OSM_WRITE_NEW_FIXTURES=1`,
 //! while the file does not exist.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ed25519_dalek::SigningKey;
 use openraft::{Entry, LogId, SnapshotMeta, Vote};
@@ -25,8 +25,13 @@ use crate::{
     SubmitRefusal,
 };
 
-fn folder() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+/// This crate's fixtures, in this crate's folder: where it was built, or
+/// `OSM_TEST_CRATE_DIR` when the tests run on another machine with a copy
+/// of the crate's files, as on a phone (`scripts/test-on-android.sh`).
+pub(super) fn folder() -> PathBuf {
+    std::env::var_os("OSM_TEST_CRATE_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+        .join("fixtures")
 }
 
 fn hex(bytes: &[u8]) -> String {

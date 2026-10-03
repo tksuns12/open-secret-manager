@@ -5,8 +5,6 @@
 //! vault's rows with these encodings alone, so the vectors are the ones the
 //! file was written with.
 
-use std::path::Path;
-
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -238,7 +236,7 @@ fn differences(path: &str, frozen: &Value, made: &Value, found: &mut Vec<String>
 
 #[test]
 fn the_encodings_are_the_frozen_ones() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vectors.json");
+    let path = crate::fixture_tests::crate_dir().join("fixtures/vectors.json");
     let made = vectors();
     // A frozen file is not written over. To add one for a new format, run
     // once with `OSM_WRITE_NEW_FIXTURES=1` while it does not exist.

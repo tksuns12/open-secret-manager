@@ -11,8 +11,13 @@ use crate::{
     InvitationToken, VaultId,
 };
 
+/// The frozen vectors, in this crate's folder: where it was built, or
+/// `OSM_TEST_CRATE_DIR` when the tests run on another machine with a copy
+/// of the crate's files, as on a phone (`scripts/test-on-android.sh`).
 fn file() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vectors.txt")
+    std::env::var_os("OSM_TEST_CRATE_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+        .join("fixtures/vectors.txt")
 }
 
 fn hex(bytes: &[u8]) -> String {
