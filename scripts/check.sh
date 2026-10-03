@@ -8,8 +8,9 @@
 #   scripts/check.sh --browsers   also the extension in headless Chromium
 #                                 and Firefox (see its README)
 #   scripts/check.sh --mobile     also the phone interface's bindings in an
-#                                 iOS simulator and on a running Android
-#                                 emulator or device
+#                                 iOS simulator, and those and the Android
+#                                 app on a running emulator or device
+#                                 (OSM_DEVICE_PIN if it has a screen lock)
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -67,7 +68,7 @@ fi
 
 if [ "$mobile" = yes ]; then
     step "Phone interface on a simulator and an emulator"
-    scripts/test-mobile-bindings.sh
+    scripts/test-mobile.sh
 fi
 
 step "All checks passed"

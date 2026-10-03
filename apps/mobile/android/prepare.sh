@@ -31,6 +31,8 @@ mkdir -p "$android/vault/src/main/java/org/opensecretmanager/vault"
 cp "$work/kotlin/org/opensecretmanager/vault/osm_mobile.kt" \
     "$android/vault/src/main/java/org/opensecretmanager/vault/"
 
-mkdir -p "$android/vault/src/androidTest/assets"
-cp crates/vault-core/fixtures/format-7/vault.sqlite3 \
-    "$android/vault/src/androidTest/assets/format-7-vault.sqlite3"
+for module in vault app; do
+    mkdir -p "$android/$module/src/androidTest/assets"
+    cp crates/vault-core/fixtures/format-7/vault.sqlite3 \
+        "$android/$module/src/androidTest/assets/format-7-vault.sqlite3"
+done

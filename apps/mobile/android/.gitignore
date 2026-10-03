@@ -2,6 +2,7 @@
 /vault/src/main/jniLibs/
 /vault/src/main/java/org/opensecretmanager/vault/osm_mobile.kt
 /vault/src/androidTest/assets/
+/app/src/androidTest/assets/
 # Gradle's own.
 .gradle/
 build/

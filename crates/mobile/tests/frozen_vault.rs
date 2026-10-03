@@ -1,7 +1,7 @@
 //! The interface on a copy of the frozen format 7 vault, whose password and
 //! contents are written down (`crates/vault-core/fixtures`). The Swift and
 //! Kotlin tests on the simulator and the emulator check the same things
-//! through the generated bindings (`scripts/test-mobile-bindings.sh`).
+//! through the generated bindings (`scripts/test-mobile.sh`).
 
 use std::path::PathBuf;
 

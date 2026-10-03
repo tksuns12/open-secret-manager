@@ -1,15 +1,23 @@
 #!/bin/sh
-# Runs the phone interface's tests through its generated bindings: Swift in
-# an iOS simulator, Kotlin on an Android emulator or device. Both open a
-# copy of the frozen format 7 vault and check what
-# crates/mobile/tests/frozen_vault.rs checks in Rust.
+# Runs the phone tests on a simulator and an emulator.
 #
-#   scripts/test-mobile-bindings.sh [ios] [android]
+#   scripts/test-mobile.sh [ios] [android] [join]
 #
-# iOS needs `rustup target add aarch64-apple-ios-sim` and Xcode; the
-# simulator is made for the run in a device set of its own and deleted.
-# Android needs `rustup target add aarch64-linux-android`, the Android SDK
-# and NDK, and a running emulator or attached device (adb).
+# ios      the phone interface through its Swift bindings, in an iOS
+#          simulator, on a copy of the frozen format 7 vault: what
+#          crates/mobile/tests/frozen_vault.rs checks in Rust.
+# android  the same through the Kotlin bindings, then the Android app's
+#          screens, on a running emulator or attached device (adb). On an
+#          emulator with a fingerprint enrolled, its sensor is touched
+#          throughout, so that unlocking with a fingerprint is tested too.
+# join     the Android app joining a desktop-side device on this machine
+#          over the network (scripts/test-mobile-join.sh).
+#
+# Without arguments: ios and android. iOS needs `rustup target add
+# aarch64-apple-ios-sim` and Xcode; the simulator is made for the run in a
+# device set of its own and deleted. Android needs `rustup target add
+# aarch64-linux-android` and the Android SDK and NDK. OSM_DEVICE_PIN
+# unlocks a device or emulator that has a screen lock.
 set -eu
 cd "$(dirname "$0")/.."
 root=$PWD
@@ -66,7 +74,30 @@ ios)
 android)
     echo "== Android"
     "$root/apps/mobile/android/prepare.sh" "$work"
-    (cd apps/mobile/android && ./gradlew --quiet :vault:connectedDebugAndroidTest)
+    adb=${ADB:-adb}
+    command -v "$adb" >/dev/null || adb="${ANDROID_HOME:-$HOME/Library/Android/sdk}/platform-tools/adb"
+    # The app is tested in front, with the input focus: the screen on and
+    # unlocked, and no system dialog over it.
+    "$adb" shell input keyevent KEYCODE_WAKEUP
+    if [ -n "${OSM_DEVICE_PIN:-}" ]; then
+        "$adb" shell input keyevent KEYCODE_MENU
+        "$adb" shell input text "$OSM_DEVICE_PIN"
+        "$adb" shell input keyevent KEYCODE_ENTER
+    fi
+    "$adb" shell wm dismiss-keyguard
+    "$adb" shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
+    # An emulator's fingerprint sensor, touched until the tests end.
+    (while :; do "$adb" emu finger touch 1 >/dev/null 2>&1; sleep 2; done) &
+    toucher=$!
+    status=0
+    (cd apps/mobile/android && ./gradlew --quiet :vault:connectedDebugAndroidTest :app:connectedDebugAndroidTest) || status=$?
+    kill "$toucher" 2>/dev/null || true
+    wait "$toucher" 2>/dev/null || true
+    [ "$status" = 0 ] || exit "$status"
+    ;;
+join)
+    echo "== Android app joins a desktop-side device"
+    scripts/test-mobile-join.sh
     ;;
 *)
     echo "unknown platform: $platform" >&2

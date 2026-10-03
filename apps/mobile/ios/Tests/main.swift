@@ -1,7 +1,7 @@
 // The phone interface through its generated Swift bindings, on a copy of
 // the frozen format 7 vault: the same checks as
 // crates/mobile/tests/frozen_vault.rs. Run in an iOS simulator by
-// scripts/test-mobile-bindings.sh, with the folder holding the copy as its
+// scripts/test-mobile.sh, with the folder holding the copy as its
 // argument. It prints what passed and exits non-zero at the first failure.
 
 import Foundation

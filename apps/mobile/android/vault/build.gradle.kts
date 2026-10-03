@@ -1,6 +1,6 @@
 // The shared code's interface for Android: the Kotlin bindings UniFFI
 // generates and the library built for arm64, both put in place by
-// prepare.sh, which scripts/test-mobile-bindings.sh runs first.
+// prepare.sh, which scripts/test-mobile.sh runs first.
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
