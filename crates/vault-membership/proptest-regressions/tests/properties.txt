@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8e0b259450318388dc9e92343e82d618d6be23bb7641e74801e47f8d5e61ce27 # shrinks to steps = [Voters([1]), Genesis { by: 0, forged: false, epoch: 1 }, Voters([4]), Voters([1, 3, 5]), Enroll { by: 0, forged: false, device: 3174220253937765803, id: 1 }, Settle, Complete { pending: true, id: 0 }, Remove { by: 5692498358978999112, forged: false, device: 5205438455376412726, id: 2, sound: true }, Voters([1, 3, 5]), Complete { pending: true, id: 0 }, Voters([4])]
+cc 93bb0cac53fddcbdb5677823a8348675acb287de68852e442a179654cec53051 # shrinks to steps = [Voters([1]), Genesis { by: 0, forged: false, epoch: 1 }, Voters([3]), Voters([1, 4]), Remove { by: 0, forged: false, device: 6338859563799442091, id: 1, sound: true }, Settle, Complete { pending: true, id: 0 }, Enroll { by: 0, forged: false, device: 292679638743932707, id: 2 }, Settle, Complete { pending: true, id: 0 }, Voters([1, 2, 3, 4, 5]), Remove { by: 1898510441782022417, forged: false, device: 16084668300352425183, id: 3, sound: true }, Voters([1, 2, 3, 5]), Complete { pending: true, id: 0 }]

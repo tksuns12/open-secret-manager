@@ -442,15 +442,56 @@ impl std::fmt::Debug for Vault {
 
 impl Vault {
     pub fn create(path: impl AsRef<Path>, password: &str) -> Result<(Self, RecoveryKey)> {
-        let path = path.as_ref();
-        let placeholder = OpenOptions::new().write(true).create_new(true).open(path)?;
-        drop(placeholder);
+        Self::build_new(path.as_ref(), |partial| {
+            Self::initialize_created(partial, password)
+        })
+    }
 
-        let result = Self::initialize_created(path, password);
-        if result.is_err() {
-            let _ = std::fs::remove_file(path);
+    /// Makes a new vault file at `path` with `build`, which writes it, and
+    /// unlocks it, at the path it is given. The file is written beside
+    /// `path` and moved there only once it is complete, so a crash part way
+    /// leaves nothing at `path` that would be taken for a vault; what it
+    /// leaves beside it is replaced by the next attempt. A file already at
+    /// `path` is never replaced.
+    fn build_new<T>(
+        path: &Path,
+        build: impl FnOnce(&Path) -> Result<(Self, T)>,
+    ) -> Result<(Self, T)> {
+        if path.symlink_metadata().is_ok() {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
         }
-        result
+        let partial = partial_path(path);
+        match std::fs::remove_file(&partial) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&partial)?,
+        );
+        let (built, extra) = match build(&partial) {
+            Ok(built) => built,
+            Err(error) => {
+                let _ = std::fs::remove_file(&partial);
+                return Err(error);
+            }
+        };
+        // Closed before it is moved: SQLite names its journal after the path
+        // a file was opened at.
+        let root_key = built.root_key.clone().ok_or(Error::Locked)?;
+        drop(built);
+        if let Err(error) = move_into_place(&partial, path) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(error.into());
+        }
+        let connection = open_connection(path)?;
+        let header = read_header(&connection)?;
+        let mut vault = Self::from_parts(path, connection, header);
+        vault.activate(root_key, None)?;
+        Ok((vault, extra))
     }
 
     fn initialize_created(path: &Path, password: &str) -> Result<(Self, RecoveryKey)> {
@@ -1222,13 +1263,11 @@ impl Vault {
         report.held_left_behind = count("quarantine")?;
         report.staged_left_behind = count("ingress")?;
 
-        let path = path.as_ref();
-        let (mut fork, recovery) = Self::create(path, password)?;
-        if let Err(error) = fork.seed(versions) {
-            drop(fork);
-            let _ = std::fs::remove_file(path);
-            return Err(error);
-        }
+        let (fork, recovery) = Self::build_new(path.as_ref(), |partial| {
+            let (mut fork, recovery) = Self::initialize_created(partial, password)?;
+            fork.seed(versions)?;
+            Ok((fork, recovery))
+        })?;
         Ok((fork, recovery, report))
     }
 
@@ -1415,11 +1454,26 @@ impl Vault {
         if encoded.len() as u64 > MAX_BACKUP_BYTES {
             return Err(Error::InvalidBackup("backup is too large".into()));
         }
+        // Written beside its place and moved there once complete, so a crash
+        // never leaves a part of a backup that looks like one.
         let path = path.as_ref();
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        if let Err(error) = file.write_all(&encoded).and_then(|_| file.sync_all()) {
-            drop(file);
-            let _ = std::fs::remove_file(path);
+        if path.symlink_metadata().is_ok() {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
+        }
+        let partial = partial_path(path);
+        match std::fs::remove_file(&partial) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let written = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .and_then(|mut file| file.write_all(&encoded).and_then(|_| file.sync_all()))
+            .and_then(|()| move_into_place(&partial, path));
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&partial);
             return Err(error.into());
         }
         Ok(())
@@ -1480,18 +1534,11 @@ impl Vault {
             return Err(Error::InvalidBackup("vault identity mismatch".into()));
         }
 
-        let vault_path = vault_path.as_ref();
-        let placeholder = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(vault_path)?;
-        drop(placeholder);
-        let result =
-            Self::initialize_restored(vault_path, new_password, vault_id, recovery, payload);
-        if result.is_err() {
-            let _ = std::fs::remove_file(vault_path);
-        }
-        result
+        Self::build_new(vault_path.as_ref(), |partial| {
+            Self::initialize_restored(partial, new_password, vault_id, recovery, payload)
+                .map(|vault| (vault, ()))
+        })
+        .map(|(vault, ())| vault)
     }
 
     fn initialize_restored(
@@ -1936,6 +1983,35 @@ impl Vault {
         Ok(ordered)
     }
 
+    /// Lets the vault file grow by at most `pages` more pages through this
+    /// vault's connection, as a full disk would, for tests.
+    #[cfg(test)]
+    pub(crate) fn limit_growth_for_tests(&self, pages: u32) {
+        let count: u32 = self
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        self.connection
+            .pragma_update(None, "max_page_count", count + pages)
+            .unwrap();
+    }
+
+    /// The content of every stored revision, verified, for tests that check
+    /// that a damaged file never shows anything else.
+    #[cfg(test)]
+    pub(crate) fn history_for_tests(&self) -> Result<Vec<Option<Item>>> {
+        self.encrypted_revisions()?
+            .iter()
+            .map(|revision| {
+                if revision.tombstone {
+                    self.open_revision(revision).map(|_| None)
+                } else {
+                    self.open_item(revision).map(Some)
+                }
+            })
+            .collect()
+    }
+
     /// Seals an arbitrary revision as this device, bypassing head checks, so
     /// tests can construct invalid ancestry.
     #[cfg(test)]
@@ -2194,6 +2270,30 @@ fn decode_array<const N: usize>(value: &str) -> Result<[u8; N]> {
         .as_slice()
         .try_into()
         .map_err(|_| Error::InvalidBackup("invalid field length".into()))
+}
+
+/// Where a new file for `path` is written before it is moved there.
+fn partial_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    path.with_file_name(name)
+}
+
+/// Moves a finished file to `to`, failing if something is there already,
+/// and makes the move durable.
+fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => std::fs::remove_file(from)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
+        // A file system without hard links.
+        Err(_) if to.symlink_metadata().is_err() => std::fs::rename(from, to)?,
+        Err(error) => return Err(error),
+    }
+    if let Some(folder) = to.parent().filter(|folder| !folder.as_os_str().is_empty()) {
+        // Not every system can sync a folder; the move itself is done.
+        let _ = std::fs::File::open(folder).and_then(|folder| folder.sync_all());
+    }
+    Ok(())
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {
@@ -3020,14 +3120,10 @@ impl Vault {
         {
             return Err(Error::Crypto);
         }
-        let path = path.as_ref();
-        let placeholder = OpenOptions::new().write(true).create_new(true).open(path)?;
-        drop(placeholder);
-        let result = Self::initialize_joined(path, password, device, material);
-        if result.is_err() {
-            let _ = std::fs::remove_file(path);
-        }
-        result
+        Self::build_new(path.as_ref(), |partial| {
+            Self::initialize_joined(partial, password, device, material).map(|vault| (vault, ()))
+        })
+        .map(|(vault, ())| vault)
     }
 
     fn initialize_joined(

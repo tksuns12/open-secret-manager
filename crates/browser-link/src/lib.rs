@@ -24,3 +24,5 @@ pub use osm_origin::Origin;
 
 #[cfg(test)]
 mod fixture_tests;
+#[cfg(test)]
+mod properties;

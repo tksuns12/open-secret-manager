@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 23b376852146743b86cb55c2dd2a688251f0d53038596540fc6e9d7d3a1e6ba0 # shrinks to export = String("hunter2-do-not-repeat")
+cc 37cc305b5c88b8ff4888a8dc8438ab7779a003aa2040d91dcd77697d2bfda51b # shrinks to format = ChromeCsv, bytes = [104, 116, 116, 112, 82, 101, 97, 108, 109, 44, 112, 97, 115, 115, 119, 111, 114, 100, 44, 117, 115, 101, 114, 110, 97, 109, 101, 44, 102, 111, 114, 109, 65, 99, 116, 105, 111, 110, 79, 114, 105, 103, 105, 110, 44, 110, 97, 109, 101, 44, 117, 114, 108, 44, 101, 120, 116, 114, 97, 10, 104, 117, 110, 116, 101, 114, 50, 45, 100, 111, 45, 110, 111, 116, 45, 114, 101, 112, 101, 97, 116, 44, 104, 117, 110, 116, 101, 114, 50, 45, 100, 111, 45, 110, 111, 116, 45, 114, 101, 112, 101, 97, 116, 44, 34, 10, 34]

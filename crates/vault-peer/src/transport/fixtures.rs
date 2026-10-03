@@ -222,3 +222,16 @@ fn a_peer_store_marked_by_a_later_build_is_refused_and_an_unmarked_one_is_the_fi
     drop(peers);
     assert_eq!(version(&path), 1);
 }
+
+proptest::proptest! {
+    /// Any bytes read as the answer to a join request are refused, or are
+    /// the one form of an answer.
+    #[test]
+    fn any_bytes_are_refused_or_are_the_one_form_of_an_answer(
+        body in proptest::collection::vec(proptest::arbitrary::any::<u8>(), 0..300),
+    ) {
+        if let Ok(reply) = crate::wire::decode_body::<PairingReply>(&body) {
+            proptest::prop_assert_eq!(&crate::wire::encode_frame(&reply).unwrap()[4..], body.as_slice());
+        }
+    }
+}

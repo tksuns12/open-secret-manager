@@ -62,3 +62,19 @@ fn the_opening_exchange_between_members_is_the_frozen_one() {
     assert!(crate::wire::decode_body::<OpenReply>(&[5]).is_err());
     assert!(crate::wire::decode_body::<OpenReply>(&[4, 0]).is_err());
 }
+
+proptest::proptest! {
+    /// Any bytes read as the opening of a connection are refused, or are
+    /// the one form of a message.
+    #[test]
+    fn any_bytes_are_refused_or_are_the_one_form_of_an_opening(
+        body in proptest::collection::vec(proptest::arbitrary::any::<u8>(), 0..300),
+    ) {
+        if let Ok(open) = crate::wire::decode_body::<Open>(&body) {
+            proptest::prop_assert_eq!(&crate::wire::encode_frame(&open).unwrap()[4..], body.as_slice());
+        }
+        if let Ok(reply) = crate::wire::decode_body::<OpenReply>(&body) {
+            proptest::prop_assert_eq!(&crate::wire::encode_frame(&reply).unwrap()[4..], body.as_slice());
+        }
+    }
+}

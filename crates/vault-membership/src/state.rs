@@ -111,14 +111,17 @@ impl ControlState {
     }
 
     /// Whether `device` is a voter whose enrollment the vault's devices
-    /// signed for: an author under the key membership records for it.
+    /// signed for, and whose removal they have not: an author under the key
+    /// membership records for it, not among the removed devices.
     ///
     /// Authority and epoch keys follow this, never voting rights alone. A
     /// Raft membership entry carries no signature, so a device that held
-    /// only a voter's transport identity could add voters; without a signed
-    /// enrollment they can neither make requests nor be given keys.
+    /// only a voter's transport identity could add voters, a removed device
+    /// among them; without a standing signed enrollment they can neither
+    /// make requests nor be given keys.
     pub fn is_enrolled(&self, device: DeviceId) -> bool {
         self.voters().contains(&device)
+            && !self.removed.contains_key(&device)
             && self
                 .node(device)
                 .is_some_and(|node| self.authors.get(&device) == Some(&node.public_key))
@@ -494,9 +497,12 @@ impl ControlState {
                 }
                 self.keys_held.remove(&device);
                 self.envelopes.remove(&device);
-                self.removed.insert(device, pending.requester);
+                // A device can be removed again if a membership entry, which
+                // carries no signature, made it a voter again; the record of
+                // its first removal stands.
+                self.removed.entry(device).or_insert(pending.requester);
                 if let Some(pin) = pending.removed_pin {
-                    self.removed_pins.insert(device, pin);
+                    self.removed_pins.entry(device).or_insert(pin);
                 }
             }
         }

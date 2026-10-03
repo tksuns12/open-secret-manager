@@ -114,7 +114,14 @@ impl PairingListener {
                 .and_then(|chain| chain.first())
                 .ok_or(Error::Handshake)?,
         );
-        let request: JoinRequest = with_timeout(FRAME_TIMEOUT, read_frame(&mut stream)).await??;
+        // Anyone who can reach the listener gets this far, so the request
+        // has a small bound and little time: it is sent at once and is a
+        // few hundred bytes.
+        let request: JoinRequest = with_timeout(
+            HANDSHAKE_TIMEOUT,
+            read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES),
+        )
+        .await??;
         // The request is signed by the joiner's device key; the certificate
         // on this connection must be the one it names.
         if request.joiner_transport_pin() != client_pin {
@@ -246,8 +253,11 @@ impl PairingConnection {
     /// device's control-plane node next; the vault is created with
     /// [`Joiner::finish_enrollment`] once the enrollment completes.
     pub async fn receive_enrollment(mut self) -> Result<(Joiner, EnrollmentGrant)> {
-        let reply: PairingReply =
-            with_timeout(PAIRING_TIMEOUT, read_frame(&mut self.stream)).await??;
+        let reply: PairingReply = with_timeout(
+            PAIRING_TIMEOUT,
+            read_frame_within(&mut self.stream, MAX_HANDSHAKE_FRAME_BYTES),
+        )
+        .await??;
         match reply {
             PairingReply::Enrollment(grant) => Ok((self.joiner, grant)),
             PairingReply::Declined => Err(Error::NotConfirmed),
@@ -459,7 +469,8 @@ pub(crate) async fn write_json_frame<W: AsyncWrite + Unpin>(
 pub(crate) async fn read_json_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T> {
-    serde_json::from_slice(&read_body(reader).await?).map_err(|_| Error::MalformedFrame)
+    serde_json::from_slice(&read_body(reader, MAX_FRAME_BYTES).await?)
+        .map_err(|_| Error::MalformedFrame)
 }
 
 /// Reads one frame. The declared length is checked before the body is
@@ -467,18 +478,40 @@ pub(crate) async fn read_json_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
 pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T> {
-    decode_body(&read_body(reader).await?)
+    read_frame_within(reader, MAX_FRAME_BYTES).await
 }
 
-async fn read_body<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+/// The largest message read before a peer is known to be a member: a join
+/// request, the answer to it, and the opening exchange between members.
+/// Each is a few kilobytes at most.
+pub(crate) const MAX_HANDSHAKE_FRAME_BYTES: usize = 64 * 1024;
+
+/// Reads one frame of at most `limit` bytes.
+pub(crate) async fn read_frame_within<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<T> {
+    decode_body(&read_body(reader, limit).await?)
+}
+
+async fn read_body<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> Result<Vec<u8>> {
     let mut prefix = [0u8; 4];
     reader.read_exact(&mut prefix).await.map_err(io_error)?;
     let length = u32::from_be_bytes(prefix) as usize;
-    if length > MAX_FRAME_BYTES {
+    if length > limit {
         return Err(Error::FrameTooLarge);
     }
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).await.map_err(io_error)?;
+    // Kept as it arrives: a peer that declares a large frame and sends
+    // little makes this side hold little.
+    let mut body = Vec::with_capacity(length.min(MAX_HANDSHAKE_FRAME_BYTES));
+    (&mut *reader)
+        .take(length as u64)
+        .read_to_end(&mut body)
+        .await
+        .map_err(io_error)?;
+    if body.len() != length {
+        return Err(Error::ConnectionClosed);
+    }
     Ok(body)
 }
 

@@ -10,6 +10,7 @@ osm-browser-link = { path = "../../crates/browser-link" }
 serde_json = "1.0"
 
 [dev-dependencies]
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 osm-vault-browser = { path = "../../crates/vault-browser" }
 osm-vault-core = { path = "../../crates/vault-core" }
 tempfile = "3.24.0"

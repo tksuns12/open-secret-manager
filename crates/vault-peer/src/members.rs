@@ -61,9 +61,10 @@ use crate::{
     control,
     peers::{pin_of, TransportIdentity},
     transport::{
-        client_config, handshake_error, read_frame, read_json_frame, run_session, server_config,
-        server_name, with_timeout, write_frame, write_json_frame, ClientPolicy, PinPolicy,
-        SharedVault, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, NO_VAULT,
+        client_config, handshake_error, read_frame_within, read_json_frame, run_session,
+        server_config, server_name, with_timeout, write_frame, write_json_frame, ClientPolicy,
+        PinPolicy, SharedVault, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_FRAME_BYTES,
+        NO_VAULT,
     },
     Error, PeerStore, Result, SyncReport,
 };
@@ -455,10 +456,18 @@ impl MemberEndpoint {
             if directory.removed_device_for_pin(&pin).is_none() {
                 return Err(Error::PinMismatch);
             }
-            let _: Open = with_timeout(OPEN_TIMEOUT, read_frame(&mut stream)).await??;
+            let _: Open = with_timeout(
+                OPEN_TIMEOUT,
+                read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES),
+            )
+            .await??;
             return refuse(stream, OpenReply::Removed, Error::NotAMember).await;
         };
-        let open: Open = with_timeout(OPEN_TIMEOUT, read_frame(&mut stream)).await??;
+        let open: Open = with_timeout(
+            OPEN_TIMEOUT,
+            read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES),
+        )
+        .await??;
         if open.version != MEMBER_PROTOCOL_VERSION {
             return refuse(
                 stream,
@@ -554,7 +563,12 @@ impl MemberEndpoint {
             },
         )
         .await?;
-        match with_timeout(OPEN_TIMEOUT, read_frame(&mut stream)).await?? {
+        match with_timeout(
+            OPEN_TIMEOUT,
+            read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES),
+        )
+        .await??
+        {
             OpenReply::Welcome { roster } => {
                 addresses.observe(device, &address);
                 self.learn(device, &roster);

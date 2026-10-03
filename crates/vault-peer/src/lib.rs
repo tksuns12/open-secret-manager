@@ -45,6 +45,8 @@ mod fixture;
 #[cfg(test)]
 mod member_tests;
 #[cfg(test)]
+mod properties;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod transport_tests;

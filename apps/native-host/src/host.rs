@@ -171,6 +171,7 @@ mod tests {
     use std::io;
 
     use osm_browser_link::CHROMIUM_EXTENSION_ID;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -252,5 +253,41 @@ mod tests {
                 Response::refusal("e", Refusal::ExtensionNotAllowed),
             ]
         );
+    }
+
+    proptest! {
+        /// Whatever the extension sends, the host answers each message at
+        /// most once, and with nowhere to pass a request on, only with a
+        /// refusal: never with anything a page could be filled with.
+        #[test]
+        fn the_host_answers_any_message_with_at_most_one_refusal(
+            caller in prop_oneof![
+                Just(allowed()),
+                Just(None),
+                Just(Some(Caller::Firefox("another@example.test".into()))),
+            ],
+            bodies in prop::collection::vec(
+                prop_oneof![
+                    prop::collection::vec(any::<u8>(), 0..120),
+                    ("[a-zA-Z0-9-]{0,70}", ".{0,30}")
+                        .prop_map(|(id, origin): (String, String)| fill(&id, &origin)),
+                    "[a-zA-Z0-9-]{0,70}".prop_map(|id: String| {
+                        format!(r#"{{"type":"cancel","version":1,"requestId":"{id}"}}"#).into_bytes()
+                    }),
+                ],
+                1..6,
+            ),
+        ) {
+            let written = Written::default();
+            let mut host = Host::at(caller, None, written.clone());
+            for body in &bodies {
+                host.handle(body);
+            }
+            let responses = written.responses();
+            prop_assert!(responses.len() <= bodies.len());
+            for response in responses {
+                prop_assert!(matches!(response, Response::Error(_)), "{response:?}");
+            }
+        }
     }
 }

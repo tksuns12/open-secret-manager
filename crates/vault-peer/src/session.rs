@@ -30,7 +30,7 @@ const MAX_BATCH_REVISIONS: usize = 64;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NEED_ROUNDS: u32 = 8;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum SyncMessage {
     Hello {
         version: u16,
@@ -88,7 +88,13 @@ pub struct SyncSession {
     vault_id: [u8; 32],
     hello_received: bool,
     peer_listen_port: Option<u16>,
+    /// Rounds in which this side asked for missing parents.
     need_rounds: u32,
+    inventory_received: bool,
+    /// Rounds in which the peer asked for missing parents.
+    peer_need_rounds: u32,
+    /// The peer's `Done`s, each the end of an answer to this side.
+    dones_received: u32,
     sent_finished: bool,
     peer_finished: bool,
     report: SyncReport,
@@ -103,6 +109,9 @@ impl SyncSession {
             hello_received: false,
             peer_listen_port: None,
             need_rounds: 0,
+            inventory_received: false,
+            peer_need_rounds: 0,
+            dones_received: 0,
             sent_finished: false,
             peer_finished: false,
             report: SyncReport::default(),
@@ -159,9 +168,12 @@ impl SyncSession {
             }
             _ if !self.hello_received => Err(Error::ProtocolViolation),
             SyncMessage::Inventory { revisions } => {
-                if revisions.len() > MAX_INVENTORY {
+                // A peer sends its inventory once; again would have this
+                // side send everything again.
+                if self.inventory_received || revisions.len() > MAX_INVENTORY {
                     return Err(Error::ProtocolViolation);
                 }
+                self.inventory_received = true;
                 let theirs: HashSet<String> = revisions.into_iter().collect();
                 let missing: Vec<String> = vault
                     .revision_ids()?
@@ -171,7 +183,10 @@ impl SyncSession {
                 self.send_revisions(vault, &missing)
             }
             SyncMessage::Need { revisions } => {
-                if revisions.len() > MAX_INVENTORY {
+                // A peer asks for missing parents in as many rounds as the
+                // protocol has, as this side does.
+                self.peer_need_rounds += 1;
+                if self.peer_need_rounds > MAX_NEED_ROUNDS || revisions.len() > MAX_INVENTORY {
                     return Err(Error::ProtocolViolation);
                 }
                 self.send_revisions(vault, &revisions)
@@ -186,7 +201,15 @@ impl SyncSession {
                 self.process(vault)?;
                 Ok(Vec::new())
             }
-            SyncMessage::Done => self.after_done(vault),
+            SyncMessage::Done => {
+                // One for the answer to this side's inventory, and one for
+                // each round in which this side asked for missing parents.
+                self.dones_received += 1;
+                if self.dones_received > self.need_rounds + 1 {
+                    return Err(Error::ProtocolViolation);
+                }
+                self.after_done(vault)
+            }
             SyncMessage::Finished => {
                 if self.peer_finished {
                     return Err(Error::ProtocolViolation);

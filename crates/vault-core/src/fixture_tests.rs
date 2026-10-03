@@ -86,7 +86,7 @@ fn texts(value: &Value) -> Vec<String> {
 }
 
 /// A copy of a format's vault file that a test may change.
-fn copy_of(format: u32) -> (TempDir, PathBuf) {
+pub(crate) fn copy_of(format: u32) -> (TempDir, PathBuf) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.sqlite3");
     std::fs::copy(fixture(format, "vault.sqlite3"), &path).unwrap();

@@ -207,3 +207,74 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Addresses that look more or less like web addresses.
+    fn addresses() -> impl Strategy<Value = String> {
+        let scheme = prop_oneof![
+            Just("https://"),
+            Just("HTTPS://"),
+            Just("http://"),
+            Just("https:"),
+            Just("ftp://"),
+            Just(""),
+        ];
+        let userinfo = prop_oneof![Just(""), Just("user@"), Just("user:pass@"), Just(":@")];
+        let host = prop_oneof![
+            "[a-zA-Z0-9.-]{0,20}",
+            Just("bücher.example".to_owned()),
+            Just("[::1]".to_owned()),
+            Just("127.0.0.1".to_owned()),
+            Just("0x7f.1".to_owned()),
+            Just("example.com.".to_owned()),
+            "[^/:@?#]{0,8}",
+        ];
+        let port = prop_oneof![
+            Just(String::new()),
+            Just(":".to_owned()),
+            (0_u32..70_000).prop_map(|port| format!(":{port}")),
+            Just(":0443".to_owned()),
+        ];
+        let rest = prop_oneof![
+            Just(""),
+            Just("/"),
+            Just("/login?next=/#x"),
+            Just("?q"),
+            Just("#f")
+        ];
+        (scheme, userinfo, host, port, rest).prop_map(|(scheme, userinfo, host, port, rest)| {
+            format!("{scheme}{userinfo}{host}{port}{rest}")
+        })
+    }
+
+    proptest! {
+        /// An origin is read only from its own canonical text, and that
+        /// text is what it shows.
+        #[test]
+        fn an_origin_is_read_only_from_its_canonical_text(text in prop_oneof![addresses(), ".{0,40}"]) {
+            if let Some(origin) = Origin::parse(&text) {
+                prop_assert_eq!(origin.to_string(), text.clone());
+                prop_assert_eq!(Origin::of_url(&text), Some(origin));
+            }
+        }
+
+        /// A stored address has an origin only if it is HTTPS without a user
+        /// name or password, and that origin reads back as itself.
+        #[test]
+        fn a_stored_address_has_an_https_origin_that_reads_back(address in prop_oneof![addresses(), ".{0,40}"]) {
+            if let Some(origin) = Origin::of_url(&address) {
+                let text = origin.to_string();
+                prop_assert!(text.starts_with("https://"));
+                prop_assert_eq!(Origin::parse(&text), Some(origin.clone()));
+                let url = Url::parse(&address).unwrap();
+                prop_assert_eq!(url.scheme(), "https");
+                prop_assert!(url.username().is_empty() && url.password().is_none());
+            }
+        }
+    }
+}

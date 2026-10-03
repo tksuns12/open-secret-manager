@@ -35,3 +35,5 @@ pub use store_version::claim_store_version;
 
 #[cfg(test)]
 mod fixture_tests;
+#[cfg(test)]
+mod properties;

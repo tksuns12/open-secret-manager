@@ -1170,3 +1170,4 @@ async fn a_device_far_behind_catches_up_from_a_snapshot() {
 }
 
 mod fixtures;
+mod properties;

@@ -9,6 +9,9 @@ use crate::{
 };
 
 const MAX_IMPORT_BYTES: usize = 128 * 1024 * 1024;
+/// More entries than any export of a person's logins has; a file with more
+/// is some other file.
+const MAX_IMPORT_ITEMS: usize = 100_000;
 
 pub fn preview_import(format: ImportFormat, bytes: &[u8]) -> Result<ImportPreview> {
     if bytes.len() > MAX_IMPORT_BYTES {
@@ -21,6 +24,9 @@ pub fn preview_import(format: ImportFormat, bytes: &[u8]) -> Result<ImportPrevie
     };
     if items.is_empty() {
         return Err(Error::InvalidImport("no valid entries found".into()));
+    }
+    if items.len() > MAX_IMPORT_ITEMS {
+        return Err(too_many());
     }
     Ok(ImportPreview {
         items,
@@ -75,9 +81,24 @@ struct BitwardenField {
     value: Option<String>,
 }
 
+fn too_many() -> Error {
+    Error::InvalidImport(format!("more than {MAX_IMPORT_ITEMS} entries"))
+}
+
 fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
-    let export: BitwardenExport = serde_json::from_slice(bytes)
-        .map_err(|error| Error::InvalidImport(format!("invalid Bitwarden JSON: {error}")))?;
+    // Where the file stops being a Bitwarden export, and nothing of what it
+    // says there: the parser's own message quotes the value it met, which
+    // can be a password.
+    let export: BitwardenExport = serde_json::from_slice(bytes).map_err(|error| {
+        Error::InvalidImport(format!(
+            "not a Bitwarden JSON export (line {}, column {})",
+            error.line(),
+            error.column()
+        ))
+    })?;
+    if export.items.len() > MAX_IMPORT_ITEMS {
+        return Err(too_many());
+    }
     let mut items = Vec::with_capacity(export.items.len());
     let mut warnings = Vec::new();
     for (index, source) in export.items.into_iter().enumerate() {
@@ -196,14 +217,18 @@ fn parse_csv(bytes: &[u8], flavor: CsvFlavor) -> Result<(Vec<Item>, Vec<ImportWa
     for (offset, record) in reader.records().enumerate() {
         let row = offset + 2;
         let record = record?;
+        if items.len() >= MAX_IMPORT_ITEMS {
+            return Err(too_many());
+        }
         let url = field(&record, &indices, "url");
         let username = field(&record, &indices, "username");
         let password = field(&record, &indices, "password");
         let mut title = field(&record, &indices, "name");
-        if title.is_empty() {
-            title = if !url.is_empty() {
+        // An item needs a title that is more than blanks.
+        if title.trim().is_empty() {
+            title = if !url.trim().is_empty() {
                 url.clone()
-            } else if !username.is_empty() {
+            } else if !username.trim().is_empty() {
                 username.clone()
             } else {
                 format!("Imported login {row}")
