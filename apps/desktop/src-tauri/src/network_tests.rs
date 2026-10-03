@@ -19,9 +19,9 @@ use tokio::sync::Mutex;
 
 use crate::{archive, network, AppState};
 
-const PASSWORD: &str = "device password";
+pub(crate) const PASSWORD: &str = "device password";
 
-fn shell(dir: &Path) -> App<MockRuntime> {
+pub(crate) fn shell(dir: &Path) -> App<MockRuntime> {
     let path = dir.join("vault.sqlite3");
     let network = network::Network::open(&path).unwrap();
     mock_builder()
@@ -31,14 +31,15 @@ fn shell(dir: &Path) -> App<MockRuntime> {
             browser: crate::browser::Browser::open(&path),
             path,
             network,
+            chosen_backup: std::sync::Mutex::new(None),
         })
         .build(mock_context(noop_assets()))
         .unwrap()
 }
 
-type Seen = Arc<StdMutex<Vec<String>>>;
+pub(crate) type Seen = Arc<StdMutex<Vec<String>>>;
 
-fn record(app: &App<MockRuntime>, event: &str) -> Seen {
+pub(crate) fn record(app: &App<MockRuntime>, event: &str) -> Seen {
     let seen = Seen::default();
     let sink = seen.clone();
     app.listen_any(event, move |event| {
@@ -48,7 +49,7 @@ fn record(app: &App<MockRuntime>, event: &str) -> Seen {
 }
 
 /// The `index`th payload of an event, once it has arrived.
-async fn nth(seen: &Seen, index: usize) -> String {
+pub(crate) async fn nth(seen: &Seen, index: usize) -> String {
     for _ in 0..600 {
         if let Some(payload) = seen.lock().unwrap().get(index).cloned() {
             return payload;
@@ -58,7 +59,7 @@ async fn nth(seen: &Seen, index: usize) -> String {
     panic!("event never arrived");
 }
 
-async fn titles(app: &AppHandle<MockRuntime>) -> Vec<String> {
+pub(crate) async fn titles(app: &AppHandle<MockRuntime>) -> Vec<String> {
     let state = app.state::<AppState>();
     let vault = state.vault.lock().await;
     let mut titles: Vec<String> = vault
@@ -74,7 +75,7 @@ async fn titles(app: &AppHandle<MockRuntime>) -> Vec<String> {
 }
 
 /// Polls until `app` lists exactly `expected`, failing after a minute.
-async fn eventually(app: &AppHandle<MockRuntime>, expected: &[&str]) {
+pub(crate) async fn eventually(app: &AppHandle<MockRuntime>, expected: &[&str]) {
     for _ in 0..600 {
         if titles(app).await == expected {
             return;
@@ -84,18 +85,18 @@ async fn eventually(app: &AppHandle<MockRuntime>, expected: &[&str]) {
     assert_eq!(titles(app).await, expected);
 }
 
-async fn put(app: &AppHandle<MockRuntime>, title: &str) {
+pub(crate) async fn put(app: &AppHandle<MockRuntime>, title: &str) {
     let state = app.state::<AppState>();
     let mut vault = state.vault.lock().await;
     vault.as_mut().unwrap().put(Item::new(title)).unwrap();
 }
 
-async fn devices(app: &AppHandle<MockRuntime>) -> network::DevicesInfo {
+pub(crate) async fn devices(app: &AppHandle<MockRuntime>) -> network::DevicesInfo {
     network::devices(app.clone()).await.unwrap()
 }
 
 /// Polls until the devices `app` reports satisfy `wanted`.
-async fn until_devices(
+pub(crate) async fn until_devices(
     app: &AppHandle<MockRuntime>,
     what: &str,
     wanted: impl Fn(&network::DevicesInfo) -> bool,
@@ -119,7 +120,7 @@ async fn current_epoch(app: &AppHandle<MockRuntime>) -> u64 {
 /// Invites a device on `inviter` and joins on `joiner`: the owner sees the
 /// same code on both and confirms on each. `invites` counts the inviter's
 /// earlier invitations in this test.
-async fn pair(
+pub(crate) async fn pair(
     inviter: &AppHandle<MockRuntime>,
     codes: &Seen,
     finished: &Seen,
@@ -607,7 +608,7 @@ fn changes_held_for_review_are_kept_or_rejected_on_every_device() {
     });
 }
 
-async fn vault_id(app: &AppHandle<MockRuntime>) -> [u8; 32] {
+pub(crate) async fn vault_id(app: &AppHandle<MockRuntime>) -> [u8; 32] {
     let state = app.state::<AppState>();
     let vault = state.vault.lock().await;
     vault.as_ref().unwrap().vault_id()

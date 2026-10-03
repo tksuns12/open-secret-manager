@@ -20,9 +20,9 @@ use crate::{
         verify_recovery_check, KdfConfig, SecretKey, DEVICE_ID_LEN, KEY_LEN, NONCE_LEN,
         PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    Error, FillCredentials, ForkReport, IngressReport, Item, ItemKind, ItemSummary, ItemVersion,
-    Origin, QuarantinedRevision, RecoveryKey, Result, RevisionInfo, StageOutcome, UnlockSession,
-    VaultItem,
+    BackupCheck, Error, FillCredentials, ForkReport, IngressReport, Item, ItemKind, ItemSummary,
+    ItemVersion, Origin, QuarantinedRevision, RecoveryKey, Result, RevisionInfo, StageOutcome,
+    UnlockSession, VaultItem,
 };
 
 /// Storage layout: a per-device root key wraps the device key, the HPKE
@@ -1037,7 +1037,25 @@ impl Vault {
             &self.header.password_wrapped_key,
         )
         .map_err(|_| Error::InvalidCredentials)?;
+        self.store_password(new_password, &root_key)
+    }
 
+    /// For a forgotten password: unlocks the vault with the recovery key and
+    /// makes `new_password` the one that unlocks it from now on. The old
+    /// password no longer does. Nothing changes if the recovery key is
+    /// wrong.
+    pub fn reset_password(&mut self, recovery: &RecoveryKey, new_password: &str) -> Result<()> {
+        self.unlock_with_recovery(recovery)?;
+        let root_key = self.key()?.clone();
+        if let Err(error) = self.store_password(new_password, &root_key) {
+            self.lock();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Wraps the root key with a new password, under a new salt.
+    fn store_password(&mut self, new_password: &str, root_key: &[u8; KEY_LEN]) -> Result<()> {
         let salt = random_array::<SALT_LEN>();
         let nonce = random_array::<NONCE_LEN>();
         let wrapping_key = derive_password_key(new_password, &salt, self.header.kdf)?;
@@ -1477,6 +1495,58 @@ impl Vault {
             return Err(error.into());
         }
         Ok(())
+    }
+
+    /// Reads back a backup this device wrote, with its own key: it must be
+    /// whole, of this vault, and opened by this vault's recovery key. Says
+    /// what it holds.
+    pub fn check_backup(&self, path: impl AsRef<Path>) -> Result<BackupCheck> {
+        let key = self.key()?;
+        let recovery = self
+            .header
+            .recovery
+            .as_ref()
+            .ok_or(Error::RecoveryNotEnabled)?;
+        let envelope = read_backup(path.as_ref())?;
+        if envelope.magic != "OSM-BACKUP" {
+            return Err(Error::InvalidBackup("invalid magic".into()));
+        }
+        if envelope.format_version != BACKUP_FORMAT_VERSION {
+            return Err(Error::UnsupportedVersion(envelope.format_version));
+        }
+        if decode_array::<32>(&envelope.vault_id)? != self.header.vault_id {
+            return Err(Error::InvalidBackup("a backup of another vault".into()));
+        }
+        if envelope.recovery_nonce != encode(&recovery.nonce)
+            || envelope.recovery_wrapped_key != encode(&recovery.wrapped_key)
+        {
+            return Err(Error::InvalidBackup(
+                "not opened by this vault's recovery key".into(),
+            ));
+        }
+        let nonce = decode_array::<NONCE_LEN>(&envelope.nonce)?;
+        let ciphertext = decode(&envelope.ciphertext)?;
+        let aad = backup_aad(
+            &self.header.vault_id,
+            &envelope.recovery_nonce,
+            &envelope.recovery_wrapped_key,
+        );
+        let plaintext = Zeroizing::new(
+            decrypt(key, &nonce, &aad, &ciphertext)
+                .map_err(|_| Error::InvalidBackup("authentication failed".into()))?,
+        );
+        let payload: BackupPayload = serde_json::from_slice(&plaintext)
+            .map_err(|_| Error::InvalidBackup("invalid payload".into()))?;
+        let items: BTreeSet<&str> = payload
+            .revisions
+            .iter()
+            .map(|revision| revision.item_id.as_str())
+            .collect();
+        Ok(BackupCheck {
+            items: items.len(),
+            revisions: payload.revisions.len(),
+            held: payload.quarantine.len(),
+        })
     }
 
     pub fn restore_backup(

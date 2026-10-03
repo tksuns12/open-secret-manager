@@ -196,6 +196,119 @@ fn recovery_unlock_and_backup_restore_preserve_identity() {
 }
 
 #[test]
+fn a_forgotten_password_is_replaced_with_the_recovery_key() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, recovery) = Vault::create(&path, "forgotten password").unwrap();
+    let item = login("Kept");
+    let item_id = item.id.clone();
+    vault.put(item).unwrap();
+    vault.lock();
+
+    // Another vault's recovery key changes nothing.
+    let (_, other) = Vault::create(dir.path().join("other.db"), "x").unwrap();
+    assert!(matches!(
+        vault.reset_password(&other, "new password"),
+        Err(Error::InvalidCredentials)
+    ));
+    assert!(!vault.is_unlocked());
+    drop(vault);
+    let mut vault = Vault::open(&path).unwrap();
+    vault.unlock("forgotten password").unwrap();
+    vault.lock();
+
+    // The right one unlocks it, and the new password replaces the old.
+    vault.reset_password(&recovery, "new password").unwrap();
+    assert_eq!(vault.get(&item_id).unwrap().item.title, "Kept");
+    drop(vault);
+    let mut reopened = Vault::open(&path).unwrap();
+    assert!(matches!(
+        reopened.unlock("forgotten password"),
+        Err(Error::InvalidCredentials)
+    ));
+    reopened.unlock("new password").unwrap();
+    reopened.lock();
+    reopened.unlock_with_recovery(&recovery).unwrap();
+
+    // A device without recovery cannot.
+    let (a, _) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let mut joined = Vault::join(
+        dir.path().join("b.db"),
+        "joined password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    joined.lock();
+    assert!(matches!(
+        joined.reset_password(&recovery, "new password"),
+        Err(Error::RecoveryNotEnabled)
+    ));
+}
+
+#[test]
+fn a_backup_is_read_back_whole_by_the_device_that_wrote_it() {
+    let dir = tempdir().unwrap();
+    let backup = dir.path().join("vault.osmbak");
+    let (mut vault, _) = Vault::create(dir.path().join("vault.db"), "password").unwrap();
+    let mut edited = login("Edited");
+    let first = vault.put(edited.clone()).unwrap();
+    edited.notes = "second version".into();
+    vault.update(edited, &first.revision).unwrap();
+    let gone = vault.put(login("Deleted")).unwrap();
+    vault.delete(&gone.item_id, &gone.revision).unwrap();
+    vault.export_backup(&backup).unwrap();
+    assert_eq!(
+        vault.check_backup(&backup).unwrap(),
+        crate::BackupCheck {
+            items: 2,
+            revisions: 4,
+            held: 0
+        }
+    );
+
+    // A changed byte, a cut file, and another vault's backup are refused.
+    let bytes = fs::read(&backup).unwrap();
+    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let ciphertext = envelope["ciphertext"].as_str().unwrap().to_owned();
+    let middle = ciphertext.len() / 2;
+    let swapped = if &ciphertext[middle..=middle] == "A" {
+        "B"
+    } else {
+        "A"
+    };
+    envelope["ciphertext"] = format!(
+        "{}{}{}",
+        &ciphertext[..middle],
+        swapped,
+        &ciphertext[middle + 1..]
+    )
+    .into();
+    let changed = dir.path().join("changed.osmbak");
+    fs::write(&changed, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    assert!(matches!(
+        vault.check_backup(&changed),
+        Err(Error::InvalidBackup(_))
+    ));
+    let cut = dir.path().join("cut.osmbak");
+    fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(matches!(
+        vault.check_backup(&cut),
+        Err(Error::InvalidBackup(_))
+    ));
+    let (other, _) = Vault::create(dir.path().join("other.db"), "password").unwrap();
+    let theirs = dir.path().join("theirs.osmbak");
+    other.export_backup(&theirs).unwrap();
+    assert!(matches!(
+        vault.check_backup(&theirs),
+        Err(Error::InvalidBackup(_))
+    ));
+    // It needs the vault's key.
+    vault.lock();
+    assert!(matches!(vault.check_backup(&backup), Err(Error::Locked)));
+}
+
+#[test]
 fn backup_tampering_is_detected() {
     let dir = tempdir().unwrap();
     let vault_path = dir.path().join("vault.db");

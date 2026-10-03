@@ -151,6 +151,30 @@ export type Recovered = {
   archive: string;
 };
 
+/** A backup just saved, as read back from its file. */
+export type SavedBackup = {
+  path: string;
+  /** Items in it, deleted ones included. */
+  items: number;
+  /** Versions of those items, kept as history. */
+  revisions: number;
+  /** Changes held for review. */
+  held: number;
+};
+
+/** What restoring a backup as a new vault produced. */
+export type Restored = {
+  /** The new vault's recovery key, shown once. */
+  recoveryKey: string;
+  items: number;
+  /** Items carried with more than one version, still to be resolved. */
+  conflicts: number;
+  /** Changes held for review in the backup, which stay in the copy restored as it was. */
+  heldLeftBehind: number;
+  /** Folder holding the backup restored as it was, with its history; the new password opens it from the Archive. */
+  archive: string;
+};
+
 /** A login the owner may choose for a browser fill. Its password is never included. */
 export type FillLogin = {
   id: string;
@@ -240,6 +264,18 @@ export type DesktopBridge = {
   foundControlPlane: () => Promise<void>;
   removeDevice: (device: string) => Promise<void>;
   cancelEnrollment: () => Promise<void>;
+  /** Why the vault file on this device cannot be opened, or `null` if there is none or it opens. */
+  vaultProblem: () => Promise<string | null>;
+  /** Moves a vault file that cannot be opened to an archive folder; resolves to that folder. */
+  putUnreadableAway: () => Promise<string>;
+  /** Asks where to save a backup and saves it; `null` if the owner closed the dialog. */
+  saveBackup: () => Promise<SavedBackup | null>;
+  /** Asks for a backup to restore; resolves to its file name, or `null`. The path stays with the shell. */
+  chooseBackup: () => Promise<string | null>;
+  /** Restores the chosen backup as a new vault on this device, which has none. */
+  restoreBackup: (recoveryKey: string, password: string) => Promise<Restored>;
+  /** For a forgotten password: unlocks with the recovery key and sets a new password on this device. */
+  resetPassword: (recoveryKey: string, newPassword: string) => Promise<void>;
   /** Starts over from this device as a new vault; `password` is the vault password. */
   recoverVault: (password: string) => Promise<Recovered>;
   /** For a removed device: puts its copy in an archive folder so it can join again. Resolves to that folder. */

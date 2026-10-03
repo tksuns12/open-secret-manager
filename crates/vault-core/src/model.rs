@@ -172,6 +172,17 @@ pub struct ForkReport {
     pub staged_left_behind: usize,
 }
 
+/// What a backup holds, as read back by the device that wrote it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackupCheck {
+    /// Items with any revision, deleted ones included.
+    pub items: usize,
+    /// Revisions of those items: every version, kept as history.
+    pub revisions: usize,
+    /// Revisions held for the owner's review.
+    pub held: usize,
+}
+
 /// A revision held because its author is not an authorized device. It was
 /// encrypted with the vault key but is not part of the item's history until
 /// the owner accepts it.

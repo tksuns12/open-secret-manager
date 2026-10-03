@@ -49,6 +49,7 @@ fn shell(dir: &Path, home: &Path, host: Option<PathBuf>) -> App<MockRuntime> {
             browser: browser::Browser::with(&path, Some(home.to_owned()), host),
             path,
             network,
+            chosen_backup: std::sync::Mutex::new(None),
         })
         .build(mock_context(noop_assets()))
         .unwrap()

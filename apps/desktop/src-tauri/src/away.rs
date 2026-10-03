@@ -55,6 +55,7 @@ mod tests {
                 browser: browser::Browser::open(&path),
                 path,
                 network,
+                chosen_backup: std::sync::Mutex::new(None),
             })
             .build(mock_context(noop_assets()))
             .unwrap();

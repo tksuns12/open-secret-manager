@@ -2,6 +2,9 @@
 
 mod archive;
 mod away;
+mod backup;
+#[cfg(test)]
+mod backup_tests;
 #[cfg(unix)]
 mod browser;
 #[cfg(not(unix))]
@@ -33,6 +36,8 @@ struct AppState {
     network: network::Network,
     /// Where a request from a browser waits for the owner.
     browser: browser::Browser,
+    /// The backup the owner picked to restore, until it is restored.
+    chosen_backup: std::sync::Mutex<Option<PathBuf>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +89,19 @@ async fn lock_everything(state: &AppState) -> bool {
     }
     let archive = state.archive.lock().await.take();
     unlocked || archive.is_some()
+}
+
+/// Why the vault file on this device cannot be opened, if one is here and
+/// cannot be: damaged, written by a later version, or not a vault.
+#[tauri::command]
+async fn vault_problem(state: tauri::State<'_, AppState>) -> Result<Option<String>, CommandError> {
+    let vault = state.vault.lock().await;
+    if vault.is_some() || state.path.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    Ok(Vault::open(&state.path)
+        .err()
+        .map(|error| error.to_string()))
 }
 
 #[tauri::command]
@@ -636,7 +654,9 @@ pub fn run() {
             path,
             network,
             browser,
+            chosen_backup: std::sync::Mutex::new(None),
         })
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             network::start(app.handle());
             browser::start(app.handle());
@@ -645,6 +665,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             vault_status,
+            vault_problem,
             lock_vault,
             list_entries,
             generate_password,
@@ -663,6 +684,10 @@ pub fn run() {
             pending_recovery_key,
             confirm_recovery_key,
             enable_recovery,
+            backup::save_backup,
+            backup::choose_backup,
+            backup::restore_backup,
+            backup::reset_password,
             network::sync_status,
             network::sync_now,
             network::devices,
@@ -670,6 +695,7 @@ pub fn run() {
             network::remove_device,
             network::cancel_enrollment,
             network::recover_vault,
+            network::put_unreadable_away,
             network::reset_device,
             network::leave_vault,
             network::start_invite,

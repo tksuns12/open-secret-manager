@@ -66,6 +66,12 @@ lost, one device can start over as a new vault with new keys from what it
 holds; the others join it again. Three or more devices tolerate one being
 lost.
 
+A backup is one encrypted file the app saves where you choose and reads back
+at once; it opens with the vault's recovery key. If every device is lost, a
+new computer restores it as a new vault, and the recovery key also replaces a
+forgotten password. [Disaster recovery](docs/disaster-recovery.md) says what
+to keep and what to do in each case.
+
 ## Development
 
 The Rust workspace is the source of truth for security-sensitive behaviour.

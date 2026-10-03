@@ -42,3 +42,6 @@ button { color: inherit; border: 0; cursor: pointer; }
 .fill-choice { width: 100%; text-align: left; color: inherit; cursor: pointer; }
 .fill-choice:hover { border-color: #5a4a36; }
 .fill-choice.selected { border-color: #b98344; background: #251c13; }
+.saved-banner { color: #86b768; background: #1b2318; }
+.saved-banner strong { color: #a9cc8f; }
+.saved-banner span { color: #8aa478; overflow-wrap: anywhere; }

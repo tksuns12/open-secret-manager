@@ -135,6 +135,15 @@ export const bridge: DesktopBridge = {
   removeDevice: (device) => nativeOnly("remove_device", { device }),
   cancelEnrollment: () => nativeOnly("cancel_enrollment"),
   recoverVault: (password) => nativeOnly("recover_vault", { password }),
+  async vaultProblem() {
+    const invoke = native();
+    return invoke ? ((await invoke("vault_problem")) as string | null) : null;
+  },
+  putUnreadableAway: () => nativeOnly("put_unreadable_away"),
+  saveBackup: () => nativeOnly("save_backup"),
+  chooseBackup: () => nativeOnly("choose_backup"),
+  restoreBackup: (recoveryKey, password) => nativeOnly("restore_backup", { recoveryKey, password }),
+  resetPassword: (recoveryKey, newPassword) => nativeOnly("reset_password", { recoveryKey, newPassword }),
   resetDevice: () => nativeOnly("reset_device"),
   leaveVault: (password) => nativeOnly("leave_vault", { password }),
   async recoveryStatus() {

@@ -378,7 +378,36 @@ fn replace_with_recovered(vault_path: &Path) -> std::io::Result<PathBuf> {
     let directory = vault_path.parent().unwrap_or(Path::new("."));
     let archive = archive_vault_files(vault_path, false)?;
     std::fs::rename(directory.join(RECOVERED), vault_path)?;
+    // Nothing was here to put away: no folder is left for nothing.
+    let _ = std::fs::remove_dir(&archive);
     Ok(archive)
+}
+
+/// Closes this device's peer and invitation stores, runs `step` on the
+/// files beside the vault, and opens the stores again from what is there
+/// afterwards: the same files, or new ones where `step` moved them away.
+fn with_stores_closed<T>(
+    net: &Network,
+    peers: &mut PeerStore,
+    invitations: &mut InvitationStore,
+    step: impl FnOnce() -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
+    *peers = PeerStore::open_in_memory().map_err(network_error)?;
+    *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
+        .map_err(|error| network_error(error.into()))?;
+    let result = step();
+    let peers_path = net.directory.join("peers.sqlite3");
+    *peers = PeerStore::open(&peers_path).map_err(network_error)?;
+    *net.addresses
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        AddressBook::open(&peers_path).map_err(network_error)?;
+    *invitations = InvitationStore::open(
+        net.directory.join("invitations.sqlite3"),
+        InvitationPolicy::default(),
+    )
+    .map_err(|error| network_error(error.into()))?;
+    result
 }
 
 /// At launch, before the vault or any of its stores is opened: finishes a
@@ -1258,24 +1287,12 @@ pub async fn recover_vault<R: Runtime>(
         let mut vault = state.vault.lock().await;
         let mut invitations = net.invitations.lock().await;
         let mut peers = net.peers.lock().await;
-        // Close every file of the old vault before moving it.
+        // Close every file of the old vault before moving it. The new vault
+        // has its own transport identity and address book.
         *vault = None;
-        *peers = PeerStore::open_in_memory().map_err(network_error)?;
-        *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
-            .map_err(|error| network_error(error.into()))?;
-        let archive = replace_with_recovered(&state.path).map_err(storage_error)?;
-        // The new vault has its own transport identity and address book.
-        let peers_path = directory.join("peers.sqlite3");
-        *peers = PeerStore::open(&peers_path).map_err(network_error)?;
-        *net.addresses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            AddressBook::open(&peers_path).map_err(network_error)?;
-        *invitations = InvitationStore::open(
-            directory.join("invitations.sqlite3"),
-            InvitationPolicy::default(),
-        )
-        .map_err(|error| network_error(error.into()))?;
+        let archive = with_stores_closed(net, &mut peers, &mut invitations, || {
+            replace_with_recovered(&state.path).map_err(storage_error)
+        })?;
         let mut recovered = osm_vault_core::Vault::open(&state.path)?;
         recovered.unlock(&password)?;
         *vault = Some(recovered);
@@ -1299,6 +1316,147 @@ pub async fn recover_vault<R: Runtime>(
         held_left_behind: report.held_left_behind,
         archive: archive.to_string_lossy().into_owned(),
     })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Restored {
+    /// The new vault's recovery key, to show the owner once.
+    pub(crate) recovery_key: String,
+    pub(crate) items: usize,
+    /// Items carried with more than one version, still to be resolved.
+    pub(crate) conflicts: usize,
+    /// Revisions held for review in the backup, which stay in the copy
+    /// restored as it was.
+    pub(crate) held_left_behind: usize,
+    /// The folder holding the backup restored as it was, with its history,
+    /// which the new password opens from the Archive dialog.
+    pub(crate) archive: String,
+}
+
+/// Makes a new vault on this device from a backup, for when no device of
+/// the vault is left to join from. The backup is restored as it was into an
+/// archive folder, with its history, and the new vault is made from what it
+/// shows, as starting over does: a new identity, new keys, and a new
+/// recovery key, with this device its first member. A device of the old
+/// vault that still exists is left behind as after starting over.
+///
+/// Only a device without a vault restores, and not over a vault file that
+/// could not be opened: that is put away first ([`put_unreadable_away`]).
+pub async fn restore<R: Runtime>(
+    app: &AppHandle<R>,
+    backup: &Path,
+    recovery: &osm_vault_core::RecoveryKey,
+    password: &str,
+) -> Result<Restored, CommandError> {
+    let state = app.state::<AppState>();
+    let net = &state.network;
+    if net.join.lock().await.is_some() {
+        return Err(CommandError {
+            code: "joining",
+            message: "finish or cancel joining first".into(),
+        });
+    }
+    // Held throughout, so that no vault is made here meanwhile.
+    let mut vault = state.vault.lock().await;
+    if vault.is_some() {
+        return Err(CommandError {
+            code: "vault_exists",
+            message: "this device has a vault; only a device without one restores".into(),
+        });
+    }
+    if state.path.symlink_metadata().is_ok() {
+        return Err(unreadable_here());
+    }
+    let directory = net.directory.clone();
+    let kept = new_archive(&directory).map_err(storage_error)?;
+    let file_name = state.path.file_name().unwrap_or_default();
+    let restored = match osm_vault_core::Vault::restore_backup(
+        backup,
+        kept.join(file_name),
+        recovery,
+        password,
+    ) {
+        Ok(restored) => restored,
+        Err(error) => {
+            // The folder was made above and holds nothing.
+            let _ = std::fs::remove_dir_all(&kept);
+            return Err(error.into());
+        }
+    };
+    let (partial, complete) = (directory.join(RECOVERED_PARTIAL), directory.join(RECOVERED));
+    let _ = std::fs::remove_file(&partial);
+    let (mut fork, new_recovery, report) = restored.fork(&partial, password)?;
+    // Kept until the owner confirms having stored it: this can stop before
+    // the key is shown.
+    fork.keep_recovery_key_until_confirmed(&new_recovery)?;
+    drop((fork, restored));
+    // From here on the new vault takes its place at the next launch even if
+    // the app stops.
+    std::fs::rename(&partial, &complete).map_err(storage_error)?;
+    std::fs::rename(&complete, &state.path).map_err(storage_error)?;
+    let mut made = osm_vault_core::Vault::open(&state.path)?;
+    made.unlock(password)?;
+    *vault = Some(made);
+    drop(vault);
+    update_status(app, |status| {
+        *status = SyncStatus {
+            state: "local",
+            ..SyncStatus::default()
+        }
+    });
+    // The new vault's control plane starts with this device alone.
+    after_create(app).await;
+    let _ = app.emit("vault-changed", ());
+    let _ = app.emit("devices-changed", ());
+    Ok(Restored {
+        recovery_key: new_recovery.to_string(),
+        items: report.items,
+        conflicts: report.conflicts,
+        held_left_behind: report.held_left_behind,
+        archive: kept.to_string_lossy().into_owned(),
+    })
+}
+
+fn unreadable_here() -> CommandError {
+    CommandError {
+        code: "unreadable_vault",
+        message: "a vault file this device cannot open is here; put it away first".into(),
+    }
+}
+
+/// Moves a vault file this device cannot open, with the files that belong
+/// to it, to an archive folder, leaving a device without a vault that can
+/// join, restore, or create one. Nothing is deleted. Returns the folder.
+#[tauri::command]
+pub async fn put_unreadable_away<R: Runtime>(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
+) -> Result<String, CommandError> {
+    let net = &state.network;
+    let mut vault = state.vault.lock().await;
+    if vault.is_some() || state.path.symlink_metadata().is_err() {
+        return Err(CommandError {
+            code: "not_unreadable",
+            message: "there is no vault file here that cannot be opened".into(),
+        });
+    }
+    // If it opens now, it is used rather than moved.
+    if let Ok(opened) = osm_vault_core::Vault::open(&state.path) {
+        *vault = Some(opened);
+        return Err(CommandError {
+            code: "opened",
+            message: "the vault file opens now".into(),
+        });
+    }
+    let mut invitations = net.invitations.lock().await;
+    let mut peers = net.peers.lock().await;
+    let archive = with_stores_closed(net, &mut peers, &mut invitations, || {
+        archive_vault_files(&state.path, true).map_err(storage_error)
+    })?;
+    drop((vault, invitations, peers));
+    let _ = app.emit("devices-changed", ());
+    Ok(archive.to_string_lossy().into_owned())
 }
 
 /// Returns a removed device to the state of a device without a vault, so
@@ -1336,7 +1494,6 @@ async fn put_copy_away<R: Runtime>(
         if let Some(control) = net.control.lock().await.take() {
             control.stop().await;
         }
-        let directory = net.directory.clone();
         let mut vault = state.vault.lock().await;
         let mut invitations = net.invitations.lock().await;
         let mut peers = net.peers.lock().await;
@@ -1348,23 +1505,10 @@ async fn put_copy_away<R: Runtime>(
         }
         // Close every file before moving it.
         *vault = None;
-        *peers = PeerStore::open_in_memory().map_err(network_error)?;
-        *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
-            .map_err(|error| network_error(error.into()))?;
-        let archive = put_away(&state.path, reason).map_err(storage_error)?;
-        let archive = archive.to_string_lossy().into_owned();
-        let peers_path = directory.join("peers.sqlite3");
-        *peers = PeerStore::open(&peers_path).map_err(network_error)?;
-        *net.addresses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            AddressBook::open(&peers_path).map_err(network_error)?;
-        *invitations = InvitationStore::open(
-            directory.join("invitations.sqlite3"),
-            InvitationPolicy::default(),
-        )
-        .map_err(|error| network_error(error.into()))?;
-        Ok(archive)
+        let archive = with_stores_closed(net, &mut peers, &mut invitations, || {
+            put_away(&state.path, reason).map_err(storage_error)
+        })?;
+        Ok(archive.to_string_lossy().into_owned())
     }
     .await;
     net.resetting.store(false, Ordering::SeqCst);
