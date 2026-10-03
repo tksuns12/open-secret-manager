@@ -59,12 +59,14 @@ to enroll the new one, and any device can later be removed, which moves the
 others to a new key. The desktop app does this from its Devices panel and
 syncs with every member automatically on the local network; a locked device
 still takes part and stores what it receives until the next unlock. There is
-no discovery beyond the address in the invitation. With two devices both must
-be reachable for any change, so a lost device cannot be removed from a
-two-device vault. For that case, and any other in which too many devices are
-lost, one device can start over as a new vault with new keys from what it
-holds; the others join it again. Three or more devices tolerate one being
-lost.
+no discovery beyond the address in the invitation. Each device is invited
+either to vote or not: the devices that vote decide together, and a change
+needs most of them reachable, so with two voters both must be. A device that
+does not vote, such as a phone, holds the keys and syncs like the others and
+never holds a change up; a vault of one voting computer can remove a lost
+phone alone. When too many voting devices are lost to remove them, one device
+can start over as a new vault with new keys from what it holds; the others
+join it again. Three or more voting devices tolerate one being lost.
 
 A backup is one encrypted file the app saves where you choose and reads back
 at once; it opens with the vault's recovery key. If every device is lost, a

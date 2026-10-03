@@ -34,7 +34,7 @@ pub(super) fn folder() -> PathBuf {
         .join("fixtures")
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -130,7 +130,7 @@ fn the_frozen_control_database_is_the_one_that_was_committed() {
 /// Reads a stored JSON text as `T` and checks that this build writes the
 /// same text back. Texts are compared, not parsed values: a device ID is a
 /// number too large for most JSON readers to hold.
-fn round_trip<T: DeserializeOwned + Serialize>(stored: &str) -> T {
+pub(super) fn round_trip<T: DeserializeOwned + Serialize>(stored: &str) -> T {
     let parsed: T = serde_json::from_str(stored).unwrap();
     assert_eq!(serde_json::to_string(&parsed).unwrap(), stored);
     parsed
@@ -278,7 +278,7 @@ fn a_control_database_marked_by_a_later_build_is_refused_and_an_unmarked_one_is_
 }
 
 /// `N` bytes counting up from `first`.
-fn counting<const N: usize>(first: u8) -> [u8; N] {
+pub(super) fn counting<const N: usize>(first: u8) -> [u8; N] {
     std::array::from_fn(|index| first.wrapping_add(index as u8))
 }
 
@@ -343,7 +343,7 @@ fn vectors() -> Value {
                 authors: vec![(device, counting(0x01)), (other, counting(0x02))],
             }),
             "enroll": request_vector(&signer, &vault_id, 2, ControlRequest::ProposeChange(
-                MembershipChange::Enroll { device: other, node: node.clone() },
+                MembershipChange::Enroll { device: other, node: node.clone(), votes: true },
             )),
             "remove": request_vector(&signer, &vault_id, 3, ControlRequest::ProposeChange(
                 MembershipChange::Remove { device: other, rotation },
@@ -383,7 +383,7 @@ fn vectors() -> Value {
 }
 
 /// Says where two values differ, so that a failure names the encoding.
-fn differences(path: &str, frozen: &Value, made: &Value, found: &mut Vec<String>) {
+pub(super) fn differences(path: &str, frozen: &Value, made: &Value, found: &mut Vec<String>) {
     match (frozen, made) {
         (Value::Object(frozen), Value::Object(made)) => {
             for name in frozen.keys().chain(made.keys()) {

@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    control::{self, Reconciled},
+    control::{self, Reconciled, Voting},
     members::{valid_contacts, MemberContact},
     Error, PeerStore, Result,
 };
@@ -367,21 +367,27 @@ pub fn review_join(
 /// new invitation.
 ///
 /// `members` are the vault's members from this device's committed state,
-/// this device included (`MemberEndpoint::roster`), and `listen_port` is
-/// where this device accepts member connections, if it listens.
+/// this device included (`MemberEndpoint::roster`), `voting` is whether the
+/// joiner will vote, and `listen_port` is where this device accepts member
+/// connections, if it listens.
 pub fn approve_enrollment(
     vault: &Vault,
     invitations: &mut InvitationStore,
     review: JoinReview,
     members: Vec<MemberContact>,
+    voting: Voting,
     listen_port: Option<u16>,
     now: u64,
 ) -> Result<(SignedRequest, EnrollmentGrant)> {
     if !valid_contacts(&members) {
         return Err(Error::InvalidAddress);
     }
-    let request =
-        control::enrollment_request(vault, review.request.joiner_device_id, review.joiner_node())?;
+    let request = control::enrollment_request(
+        vault,
+        review.request.joiner_device_id,
+        review.joiner_node(),
+        voting,
+    )?;
     let mut grant = EnrollmentGrant {
         version: PAIRING_VERSION,
         vault_id: vault.vault_id(),

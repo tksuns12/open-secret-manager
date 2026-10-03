@@ -28,11 +28,12 @@
 //! ```text
 //! found                 FOUNDED
 //! invite                INVITE, SAS (answer y), ENROLLING, ENROLLED <device>
+//! invite without-vote   the same, for a device that will not vote
 //! add <title>           ADDED
 //! list                  ITEM <title>..., LISTED
 //! sync [<device>]       SYNCED or SYNC-FAILED per member, SYNC-DONE
 //! remove <device>       REMOVED <device>
-//! status                STATUS epoch= vault_epoch= members= held= staged= removed=
+//! status                STATUS epoch= vault_epoch= members= held= staged= removed= voters=
 //! listen <addr>         LISTEN <addr>
 //! quit
 //! ```
@@ -58,7 +59,8 @@ use osm_vault_membership::{
 };
 use osm_vault_peer::{
     control, invite, serve_members, start_node, start_pairing, AddressBook, Invitation,
-    MemberEndpoint, MemberSync, PairingListener, PeerStore, SyncReport, MAX_INVITATION_TTL_SECS,
+    MemberEndpoint, MemberSync, PairingListener, PeerStore, SyncReport, Voting,
+    MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::{
@@ -373,7 +375,8 @@ impl Device {
                 control::found(&vault, &mut peers, &self.node).await?;
                 println!("FOUNDED");
             }
-            ["invite"] => self.invite(lines).await?,
+            ["invite"] => self.invite(lines, Voting::Votes).await?,
+            ["invite", "without-vote"] => self.invite(lines, Voting::WithoutVote).await?,
             ["add", title] => {
                 self.vault.lock().await.put(Item::new(*title))?;
                 println!("ADDED");
@@ -416,7 +419,7 @@ impl Device {
                 let state = self.node.state();
                 let vault = self.vault.lock().await;
                 println!(
-                    "STATUS epoch={} vault_epoch={} members={} held={} staged={} removed={}",
+                    "STATUS epoch={} vault_epoch={} members={} held={} staged={} removed={} voters={}",
                     state.epoch,
                     vault.current_epoch(),
                     state.members().len(),
@@ -426,6 +429,7 @@ impl Device {
                         .map_or("locked".to_owned(), |held| held.len().to_string()),
                     vault.staged_revision_ids()?.len(),
                     self.endpoint.told_removed() || state.removed.contains_key(&self.node.device()),
+                    state.voters().len(),
                 );
             }
             ["listen", address] => self.listen(address).await?,
@@ -443,8 +447,9 @@ impl Device {
 
     /// Invites one device: the owner compares the short codes and answers
     /// `y`, the enrollment is proposed to the vault's devices, and the
-    /// joiner is told once they accept it.
-    async fn invite(&self, lines: &mut Lines) -> CliResult {
+    /// joiner is told once they accept it. `voting` says whether it will
+    /// vote.
+    async fn invite(&self, lines: &mut Lines, voting: Voting) -> CliResult {
         let listener = {
             let mut peers = self.peers.lock().await;
             PairingListener::bind("127.0.0.1:0", &mut peers).await?
@@ -490,6 +495,7 @@ impl Device {
                 &vault,
                 &mut invitations,
                 self.endpoint.roster(),
+                voting,
                 self.endpoint.listen_port(),
                 now(),
             )?

@@ -28,7 +28,7 @@ use crate::{
     tests::login,
     transport::{client_config_for_tests, server_name_for_tests},
     AddressBook, Error, MemberContact, MemberEndpoint, MemberSync, PairingListener, PeerStore,
-    SyncReport,
+    SyncReport, Voting,
 };
 
 const VAULT: [u8; 32] = [42; 32];
@@ -264,6 +264,7 @@ impl Bare {
             ControlRequest::ProposeChange(MembershipChange::Enroll {
                 device: joiner.id,
                 node: joiner.info(),
+                votes: true,
             }),
         );
         assert_eq!(self.node.submit(proposal).await.unwrap(), Outcome::Accepted);
@@ -742,7 +743,13 @@ impl Member {
     /// short codes, the owner's confirmation, the enrollment proposal, and
     /// the grant. `granter` is unlocked and gives the new voter the keys.
     async fn invite(&mut self, dir: &TempDir, name: &str, granter: Option<&Member>) -> Member {
-        self.enroll(dir, name, granter, None).await
+        self.enroll(dir, name, granter, None, Voting::Votes).await
+    }
+
+    /// As [`Self::invite`], for a device that will not vote.
+    async fn invite_without_vote(&mut self, dir: &TempDir, name: &str) -> Member {
+        self.enroll(dir, name, None, None, Voting::WithoutVote)
+            .await
     }
 
     /// As [`Self::invite`]; with `existing`, the joining device already
@@ -754,6 +761,7 @@ impl Member {
         name: &str,
         granter: Option<&Member>,
         existing: Option<Vault>,
+        voting: Voting,
     ) -> Member {
         let pairing = PairingListener::bind("127.0.0.1:0", &mut self.host.peers)
             .await
@@ -797,6 +805,7 @@ impl Member {
                 &self.vault,
                 &mut self.invitations,
                 self.host.endpoint.roster(),
+                voting,
                 self.host.endpoint.listen_port(),
                 NOW,
             )
@@ -824,7 +833,7 @@ impl Member {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        until("the joiner is a voter", || {
+        until("the joiner is a member", || {
             self.host.state().is_settled_member(device)
         })
         .await;
@@ -967,6 +976,59 @@ async fn devices_pair_sync_and_rotate_over_tls() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phone_joins_without_a_vote_syncs_and_is_removed_by_the_one_voter_while_it_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    a.vault.put(login("From A", "a-secret")).unwrap();
+    let mut phone = a.invite_without_vote(&dir, "phone").await;
+    let (a_id, phone_id) = (a.host.id, phone.host.id);
+
+    // A votes; the phone is a member without a vote, and holds the key.
+    until("both devices apply the enrollment", || {
+        [&a, &phone].iter().all(|member| {
+            let state = member.host.state();
+            state.pending.is_none()
+                && state.members() == BTreeSet::from([a_id, phone_id])
+                && state.voters() == BTreeSet::from([a_id])
+                && state.without_vote == BTreeSet::from([phone_id])
+                && state.missing_epochs(phone_id).is_empty()
+        })
+    })
+    .await;
+    assert_eq!(phone.vault.current_epoch(), 1);
+
+    // It syncs both ways like any member.
+    let (received, _) = sync(&mut phone, &mut a).await;
+    assert_eq!(received.applied, 1);
+    phone
+        .vault
+        .put(login("From the phone", "phone-secret"))
+        .unwrap();
+    let (_, received) = sync(&mut phone, &mut a).await;
+    assert_eq!((received.applied, received.quarantined), (1, 0));
+    assert_eq!(titles(&a.vault), vec!["From A", "From the phone"]);
+
+    // The phone is lost while off. A, the one voter, is a majority alone
+    // and removes it, rotating the key to itself.
+    phone.host.stop().await;
+    let removal =
+        control::removal_request(&a.vault, &a.host.state(), phone.vault.device_id().unwrap())
+            .unwrap();
+    control::submit(&a.host.node, removal).await.unwrap();
+    until("the removal completes", || {
+        let state = a.host.state();
+        state.epoch == 2 && state.pending.is_none() && state.removed.contains_key(&phone_id)
+    })
+    .await;
+    let state = a.host.state();
+    assert_eq!(state.members(), BTreeSet::from([a_id]));
+    assert!(state.node(phone_id).is_none());
+    let reconciled = control::reconcile(&mut a.vault, &state).unwrap();
+    assert_eq!(reconciled.activated, Some(2));
+    assert_eq!(reconciled.revoked, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn devices_that_dial_each_other_at_once_both_finish() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = Member::found(&dir).await;
@@ -1059,7 +1121,9 @@ async fn a_device_paired_before_the_control_plane_joins_with_its_vault() {
 
     // B joins with the vault it has: same device, same key, nothing
     // re-created, and its unsynced edit is still there.
-    let mut b = a.enroll(&dir, "b", None, Some(b_vault)).await;
+    let mut b = a
+        .enroll(&dir, "b", None, Some(b_vault), Voting::Votes)
+        .await;
     assert_eq!(b.vault.device_id(), Some(b_device));
     assert_eq!(b.host.id, b_id);
     let state = a.host.state();

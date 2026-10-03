@@ -22,6 +22,7 @@ mod session;
 mod transport;
 pub mod wire;
 
+pub use control::Voting;
 pub use error::{Error, Result};
 pub use members::{
     serve_members, start_node, AddressBook, ControlConnection, ControlLink, Incoming,

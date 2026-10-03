@@ -186,7 +186,7 @@ export const bridge: DesktopBridge = {
   },
   connectBrowser: (browser) => nativeOnly("connect_browser", { browser }),
   disconnectBrowser: (browser) => nativeOnly("disconnect_browser", { browser }),
-  startInvite: () => nativeOnly("start_invite"),
+  startInvite: (votes) => nativeOnly("start_invite", { votes }),
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),
   cancelInvite: () => nativeOnly("cancel_invite"),
   joinStart: (code) => nativeOnly("join_start", { code }),

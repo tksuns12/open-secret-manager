@@ -7,7 +7,9 @@ use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 
-use crate::{invite, start_pairing, Error, Invitation, MemberContact, PairingListener, PeerStore};
+use crate::{
+    invite, start_pairing, Error, Invitation, MemberContact, PairingListener, PeerStore, Voting,
+};
 
 const NOW: u64 = 1_800_000_000;
 
@@ -91,8 +93,14 @@ async fn the_pairing_listener_ignores_junk_and_the_joiner_hears_a_refusal() {
                 &mut a.peers,
                 NOW,
             )?;
-            let (_, approved) =
-                pending.approve_enrollment(&a.vault, &mut a.invitations, members, None, NOW)?;
+            let (_, approved) = pending.approve_enrollment(
+                &a.vault,
+                &mut a.invitations,
+                members,
+                Voting::Votes,
+                None,
+                NOW,
+            )?;
             approved.refuse().await
         },
         async {

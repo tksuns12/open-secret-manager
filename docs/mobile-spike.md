@@ -61,10 +61,10 @@ so the peak is about the same everywhere.
 - **The code can be shared as it is.** The apps need a narrow interface to
   it (unlock, list, read, copy, pair, sync) and native shells for what only
   the system offers: autofill, secure key storage, lifecycle.
-- **Membership.** Every member today is a voter, so a phone that is off or
-  out of reach counts against the majority every change needs. Phones should
-  be members that receive keys and sync without voting, which the control
-  plane does not support yet.
+- **Membership.** At the time of the spike every member was a voter, so a
+  phone that is off or out of reach would count against the majority every
+  change needs. Phones should be members that receive keys and sync without
+  voting; the control plane supports that since Phase 6b stop 1.
 
 ## Not done
 

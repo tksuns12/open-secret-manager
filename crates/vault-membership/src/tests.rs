@@ -193,6 +193,7 @@ impl Cluster {
             ControlRequest::ProposeChange(MembershipChange::Enroll {
                 device,
                 node: self.node_info(device),
+                votes: true,
             }),
         )
     }
@@ -223,14 +224,26 @@ impl Cluster {
         .to_vec()
     }
 
+    fn enroll_without_vote(&self, requester: DeviceId, id: u8, device: DeviceId) -> SignedRequest {
+        self.request(
+            requester,
+            id,
+            ControlRequest::ProposeChange(MembershipChange::Enroll {
+                device,
+                node: self.node_info(device),
+                votes: false,
+            }),
+        )
+    }
+
     /// Removes `device`, rotating from the epoch the requester last applied
-    /// to a new key for every other voter it knows of.
+    /// to a new key for every other member it knows of, voting or not.
     fn remove(&self, requester: DeviceId, id: u8, device: DeviceId) -> SignedRequest {
         let state = self.running[&requester].state();
         let remaining: Vec<DeviceId> = state
-            .voters()
+            .members()
             .into_iter()
-            .filter(|voter| *voter != device)
+            .filter(|member| *member != device)
             .collect();
         self.request(
             requester,
@@ -410,6 +423,7 @@ async fn requests_are_authorized_against_the_committed_membership() {
         ControlRequest::ProposeChange(MembershipChange::Enroll {
             device: 4,
             node: cluster.node_info(4),
+            votes: true,
         }),
         cluster.signer(2).as_ref(),
     );
@@ -1027,6 +1041,7 @@ async fn connections_are_accepted_from_recorded_and_introduced_devices_only() {
         ControlRequest::ProposeChange(MembershipChange::Enroll {
             device: 4,
             node: duplicate,
+            votes: true,
         }),
     );
     assert!(invalid(&node.submit(reused).await.unwrap()));
@@ -1171,3 +1186,4 @@ async fn a_device_far_behind_catches_up_from_a_snapshot() {
 
 mod fixtures;
 mod properties;
+mod without_vote;

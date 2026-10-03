@@ -38,12 +38,23 @@ pub struct Rotation {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipChange {
-    /// Add a device as a voter, after it has caught up as a learner. It
-    /// receives epoch keys only once it is a voter, through
-    /// [`ControlRequest::GrantKeys`].
-    Enroll { device: DeviceId, node: DeviceNode },
-    /// Remove a voter. The rotation's epoch becomes current when the
-    /// removal completes, so the removed device never receives it.
+    /// Add a device, after it has caught up as a learner. It receives epoch
+    /// keys only once it is enrolled, through [`ControlRequest::GrantKeys`].
+    ///
+    /// A device that `votes` then becomes a voter. One that does not stays a
+    /// learner: it is sent the log and given keys like any member, and
+    /// counts toward no majority, so being off or out of reach never holds
+    /// up a change. That suits a phone.
+    Enroll {
+        device: DeviceId,
+        node: DeviceNode,
+        /// Absent in what is stored for a voting enrollment, as it was
+        /// before members without a vote existed.
+        #[serde(default = "yes", skip_serializing_if = "is_yes")]
+        votes: bool,
+    },
+    /// Remove a member, voting or not. The rotation's epoch becomes current
+    /// when the removal completes, so the removed device never receives it.
     Remove {
         device: DeviceId,
         rotation: Rotation,
@@ -167,8 +178,14 @@ impl SignedRequest {
                     message.extend_from_slice(public_key);
                 }
             }
-            ControlRequest::ProposeChange(MembershipChange::Enroll { device, node }) => {
-                message.push(2);
+            ControlRequest::ProposeChange(MembershipChange::Enroll {
+                device,
+                node,
+                votes,
+            }) => {
+                // Without a vote under a tag of its own, so that neither kind
+                // of enrollment can pass for the other.
+                message.push(if *votes { 2 } else { 6 });
                 message.extend_from_slice(&device.to_be_bytes());
                 message.extend_from_slice(&node.public_key);
                 message.extend_from_slice(&node.transport_pin);
@@ -214,6 +231,14 @@ impl SignedRequest {
     }
 }
 
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
+}
+
 fn push_len(message: &mut Vec<u8>, len: usize) {
     message.extend_from_slice(&(len as u64).to_be_bytes());
 }
@@ -251,7 +276,8 @@ impl RequestSigner for KeySigner {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Rejection {
-    /// The requester is not a voter in the committed membership.
+    /// The requester is not an enrolled member in the committed membership
+    /// (before the control plane is founded: not a voter).
     Unauthorized,
     BadSignature,
     /// No genesis has been committed yet.

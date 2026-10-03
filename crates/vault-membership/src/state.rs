@@ -4,8 +4,12 @@
 //! Besides membership, the state carries the vault's key epochs: the current
 //! epoch, a check committing every member to the same key for each epoch,
 //! and each device's epoch keys sealed to its recipient key. A removal
-//! carries the next epoch's key for every remaining voter, and that epoch
+//! carries the next epoch's key for every remaining member, and that epoch
 //! becomes current only in the entry that completes the removal.
+//!
+//! A member is a voter or, if its enrollment said so, a learner without a
+//! vote. Both are sent the log and given keys; only voters count toward the
+//! majority every change needs.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -82,11 +86,16 @@ pub struct ControlState {
     /// and told it was removed when it next connects.
     #[serde(default)]
     pub removed_pins: BTreeMap<DeviceId, [u8; 32]>,
-    /// The epochs whose keys each voter has been given.
+    /// The epochs whose keys each member has been given.
     pub keys_held: BTreeMap<DeviceId, BTreeSet<u64>>,
     /// Epoch keys sealed to each device, by epoch. The founding device
     /// holds its keys without envelopes.
     pub envelopes: BTreeMap<DeviceId, BTreeMap<u64, Vec<u8>>>,
+    /// Devices enrolled without a vote: learners in the Raft membership.
+    /// Absent from what is stored while there are none, as before they
+    /// existed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub without_vote: BTreeSet<DeviceId>,
 }
 
 impl ControlState {
@@ -110,9 +119,10 @@ impl ControlState {
         self.membership.membership().get_node(&device)
     }
 
-    /// Whether `device` is a voter whose enrollment the vault's devices
-    /// signed for, and whose removal they have not: an author under the key
-    /// membership records for it, not among the removed devices.
+    /// Whether `device` is a member whose enrollment the vault's devices
+    /// signed for, and whose removal they have not: a voter, or a device in
+    /// the membership that was enrolled without a vote, an author under the
+    /// key membership records for it, and not among the removed devices.
     ///
     /// Authority and epoch keys follow this, never voting rights alone. A
     /// Raft membership entry carries no signature, so a device that held
@@ -120,17 +130,29 @@ impl ControlState {
     /// among them; without a standing signed enrollment they can neither
     /// make requests nor be given keys.
     pub fn is_enrolled(&self, device: DeviceId) -> bool {
-        self.voters().contains(&device)
+        let in_membership = if self.without_vote.contains(&device) {
+            self.node(device).is_some()
+        } else {
+            self.voters().contains(&device)
+        };
+        in_membership
             && !self.removed.contains_key(&device)
             && self
                 .node(device)
                 .is_some_and(|node| self.authors.get(&device) == Some(&node.public_key))
     }
 
-    /// The enrolled voters; see [`Self::is_enrolled`].
+    /// Whether `device` is an enrolled member that votes.
+    pub fn votes(&self, device: DeviceId) -> bool {
+        self.is_enrolled(device) && self.voters().contains(&device)
+    }
+
+    /// The enrolled members, voting or not; see [`Self::is_enrolled`].
     pub fn members(&self) -> BTreeSet<DeviceId> {
-        self.voters()
-            .into_iter()
+        self.membership
+            .membership()
+            .nodes()
+            .map(|(device, _)| *device)
             .filter(|device| self.is_enrolled(*device))
             .collect()
     }
@@ -142,10 +164,11 @@ impl ControlState {
             .map(|(_, outcome)| outcome)
     }
 
-    /// Epochs up to the current one whose keys `device`, a voter, has not
-    /// been given yet. Empty for a device that is not a voter.
+    /// Epochs up to the current one whose keys `device`, a voter or a
+    /// member without a vote, has not been given yet. Empty for any other
+    /// device.
     pub fn missing_epochs(&self, device: DeviceId) -> Vec<u64> {
-        if !self.voters().contains(&device) {
+        if !self.voters().contains(&device) && !self.without_vote.contains(&device) {
             return Vec::new();
         }
         let held = self.keys_held.get(&device);
@@ -154,7 +177,7 @@ impl ControlState {
             .collect()
     }
 
-    /// Whether `device` takes part in the vault: an enrolled voter that has
+    /// Whether `device` takes part in the vault: an enrolled member that has
     /// not been removed and whose removal is not pending. Unlike
     /// [`Self::is_settled_member`] this holds while another device's change
     /// is under way.
@@ -166,7 +189,7 @@ impl ControlState {
             })
     }
 
-    /// Whether `device` is an enrolled voter that a pending change does not
+    /// Whether `device` is an enrolled member that a pending change does not
     /// concern, so it is a full member.
     pub fn is_settled_member(&self, device: DeviceId) -> bool {
         self.is_uniform()
@@ -212,20 +235,23 @@ impl ControlState {
     }
 
     fn decide(&mut self, signed: &SignedRequest) -> Outcome {
-        // Only a current voter may ask for anything, and only with its own
-        // key as recorded in the committed membership. Once the control
-        // plane is founded it must also be enrolled: genesis and every
-        // enrollment since were signed, so authority traces back to the
-        // founder rather than to whatever the Raft membership contains.
-        if !self.voters().contains(&signed.requester) {
+        // Before the control plane is founded only a voter may ask, to found
+        // it; afterwards only an enrolled member, voting or not: genesis and
+        // every enrollment since were signed, so authority traces back to
+        // the founder rather than to whatever the Raft membership contains.
+        // Either way with its own key as the committed membership records
+        // it.
+        let may_ask = if self.epoch == 0 {
+            self.voters().contains(&signed.requester)
+        } else {
+            self.is_enrolled(signed.requester)
+        };
+        if !may_ask {
             return Outcome::Rejected(Rejection::Unauthorized);
         }
         let Some(requester) = self.node(signed.requester) else {
             return Outcome::Rejected(Rejection::Unauthorized);
         };
-        if self.epoch != 0 && !self.is_enrolled(signed.requester) {
-            return Outcome::Rejected(Rejection::Unauthorized);
-        }
         if !signed.verify(&self.vault_id, &requester.public_key) {
             return Outcome::Rejected(Rejection::BadSignature);
         }
@@ -300,12 +326,19 @@ impl ControlState {
         }
         let mut target = self.voters();
         match change {
-            MembershipChange::Enroll { device, node } => {
+            MembershipChange::Enroll {
+                device,
+                node,
+                votes,
+            } => {
                 if self.removed.contains_key(device) {
                     return Err(invalid("a removed device cannot rejoin"));
                 }
-                if !target.insert(*device) {
-                    return Err(invalid("device is already a voter"));
+                if target.contains(device) || self.is_enrolled(*device) {
+                    return Err(invalid("device is already a member"));
+                }
+                if *votes {
+                    target.insert(*device);
                 }
                 if self
                     .authors
@@ -338,14 +371,16 @@ impl ControlState {
                 if *device == signed.requester {
                     return Err(invalid("a device cannot remove itself"));
                 }
-                if !target.remove(device) {
-                    return Err(invalid("device is not a voter"));
+                if !target.remove(device) && !self.is_enrolled(*device) {
+                    return Err(invalid("device is not a member"));
                 }
-                // The new key goes to the enrolled devices that remain.
+                // The new key goes to the enrolled members that remain,
+                // voting or not.
                 let remaining = target
                     .iter()
                     .copied()
-                    .filter(|voter| self.is_enrolled(*voter))
+                    .chain(self.without_vote.iter().copied())
+                    .filter(|member| member != device && self.is_enrolled(*member))
                     .collect();
                 self.check_rotation(rotation, &remaining)?;
             }
@@ -427,7 +462,8 @@ impl ControlState {
             return Err(Rejection::NotPending);
         }
         // The device never received keys: grants wait until its enrollment
-        // completes. The leader now steers back to the voters without it.
+        // completes. The leader now steers back to the membership without
+        // it.
         pending.target_voters.remove(device);
         pending.cancelled = true;
         Ok(())
@@ -436,7 +472,7 @@ impl ControlState {
     fn grant(&mut self, device: DeviceId, envelopes: &[Vec<u8>]) -> Result<(), Rejection> {
         if !self.is_settled_member(device) {
             return Err(invalid(
-                "keys go only to a voter whose enrollment is complete",
+                "keys go only to a member whose enrollment is complete",
             ));
         }
         if envelopes.is_empty() || envelopes.len() > MAX_EPOCHS {
@@ -472,11 +508,10 @@ impl ControlState {
     /// Not deduplicated by ID: once accepted, the change is no longer
     /// pending, so a repeat is simply `NotPending`.
     fn complete(&mut self, request_id: &[u8; 16]) -> Outcome {
-        let effective = self.pending.as_ref().is_some_and(|pending| {
-            pending.request_id == *request_id
-                && self.is_uniform()
-                && self.voters() == pending.target_voters
-        });
+        let effective = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == *request_id && self.in_effect(pending));
         if !effective {
             return Outcome::Rejected(Rejection::NotPending);
         }
@@ -484,12 +519,20 @@ impl ControlState {
             return Outcome::Rejected(Rejection::NotPending);
         };
         match pending.change {
-            MembershipChange::Enroll { device, node } => {
+            MembershipChange::Enroll {
+                device,
+                node,
+                votes,
+            } => {
                 if !pending.cancelled {
                     self.authors.insert(device, node.public_key);
+                    if !votes {
+                        self.without_vote.insert(device);
+                    }
                 }
             }
             MembershipChange::Remove { device, rotation } => {
+                self.without_vote.remove(&device);
                 self.epoch = rotation.epoch;
                 self.epoch_checks.insert(rotation.epoch, rotation.check);
                 for (recipient, envelope) in rotation.envelopes {
@@ -507,6 +550,29 @@ impl ControlState {
             }
         }
         Outcome::Accepted
+    }
+}
+
+impl ControlState {
+    /// Whether the committed membership is what the pending change leads
+    /// to: uniform, with its target voters, and, for a member without a
+    /// vote, with that device present when it joins and gone when it is
+    /// removed.
+    pub fn in_effect(&self, pending: &PendingChange) -> bool {
+        if !(self.is_uniform() && self.voters() == pending.target_voters) {
+            return false;
+        }
+        match &pending.change {
+            MembershipChange::Enroll {
+                device,
+                votes: false,
+                ..
+            } if !pending.cancelled => self.node(*device).is_some(),
+            MembershipChange::Remove { device, .. } if self.without_vote.contains(device) => {
+                self.node(*device).is_none()
+            }
+            _ => true,
+        }
     }
 }
 

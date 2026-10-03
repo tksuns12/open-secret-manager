@@ -427,7 +427,7 @@ impl Directory {
                     .map(|(device, node)| (*device, node.transport_pin)),
             );
             if let Some(pending) = state.pending.as_ref().filter(|pending| !pending.cancelled) {
-                if let crate::MembershipChange::Enroll { device, node } = &pending.change {
+                if let crate::MembershipChange::Enroll { device, node, .. } = &pending.change {
                     pins.insert(*device, node.transport_pin);
                 }
             }

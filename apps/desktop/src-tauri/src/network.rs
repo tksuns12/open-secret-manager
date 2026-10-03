@@ -34,7 +34,7 @@ use osm_vault_membership::{
 };
 use osm_vault_peer::{
     control, invite, serve_members, start_node, AddressBook, Invitation, MemberEndpoint,
-    MemberSync, PairingConnection, PairingListener, PeerStore, PendingJoin, PreparedJoin,
+    MemberSync, PairingConnection, PairingListener, PeerStore, PendingJoin, PreparedJoin, Voting,
     MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
@@ -979,6 +979,9 @@ pub struct MemberInfo {
     pub(crate) this_device: bool,
     address: Option<String>,
     leader: bool,
+    /// Whether it counts toward the majority a change needs. A member
+    /// without a vote, such as a phone, is given the keys and syncs.
+    pub(crate) votes: bool,
 }
 
 #[derive(Serialize)]
@@ -987,6 +990,8 @@ pub struct PendingInfo {
     /// `enroll` or `remove`.
     pub(crate) kind: &'static str,
     pub(crate) device: String,
+    /// Whether the device being enrolled or removed votes.
+    pub(crate) votes: bool,
     /// An enrollment that was cancelled and is being undone.
     cancelled: bool,
 }
@@ -1082,6 +1087,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
             this_device: device == control.device,
             address: control.endpoint.addresses().get(device),
             leader: leader == Some(device),
+            votes: state.votes(device),
         })
         .collect();
     let pending = state.pending.as_ref().map(|pending| PendingInfo {
@@ -1090,6 +1096,10 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
             MembershipChange::Remove { .. } => "remove",
         },
         device: hex(&device_id_to_bytes(pending.subject())),
+        votes: match &pending.change {
+            MembershipChange::Enroll { votes, .. } => *votes,
+            MembershipChange::Remove { device, .. } => state.voters().contains(device),
+        },
         cancelled: pending.cancelled,
     });
     Ok(DevicesInfo {
@@ -1609,11 +1619,20 @@ pub struct InviteInfo {
 /// Issues an invitation and waits in the background for the joiner. When
 /// one arrives with a valid request, the short code is sent to the interface
 /// as `pairing-code`, and the owner answers with [`confirm_invite`].
+///
+/// `votes` says whether the new device will count toward the majority a
+/// change needs: yes for a computer that is usually on, no for a phone.
 #[tauri::command]
 pub async fn start_invite<R: Runtime>(
+    votes: bool,
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<InviteInfo, CommandError> {
+    let voting = if votes {
+        Voting::Votes
+    } else {
+        Voting::WithoutVote
+    };
     let net = &state.network;
     let control = member_control(&app).await?;
     let mut invite_slot = net.invite.lock().await;
@@ -1650,8 +1669,13 @@ pub async fn start_invite<R: Runtime>(
         expires_at: invitation.expires_at(),
     };
     let (decision, decided) = oneshot::channel();
-    let task =
-        tauri::async_runtime::spawn(wait_for_joiner(app.clone(), control, listener, decided));
+    let task = tauri::async_runtime::spawn(wait_for_joiner(
+        app.clone(),
+        control,
+        listener,
+        voting,
+        decided,
+    ));
     *invite_slot = Some(InviteState {
         decision: Some(decision),
         task,
@@ -1663,11 +1687,12 @@ async fn wait_for_joiner<R: Runtime>(
     app: AppHandle<R>,
     control: Arc<Control>,
     listener: PairingListener,
+    voting: Voting,
     decided: oneshot::Receiver<bool>,
 ) {
     let outcome = tokio::time::timeout(
         Duration::from_secs(MAX_INVITATION_TTL_SECS),
-        pair_one(&app, &control, &listener, decided),
+        pair_one(&app, &control, &listener, voting, decided),
     )
     .await
     .unwrap_or_else(|_| {
@@ -1695,6 +1720,7 @@ async fn pair_one<R: Runtime>(
     app: &AppHandle<R>,
     control: &Control,
     listener: &PairingListener,
+    voting: Voting,
     decided: oneshot::Receiver<bool>,
 ) -> Result<(), CommandError> {
     let state = app.state::<AppState>();
@@ -1732,6 +1758,7 @@ async fn pair_one<R: Runtime>(
                 vault,
                 &mut invitations,
                 control.endpoint.roster(),
+                voting,
                 control.endpoint.listen_port(),
                 now(),
             )

@@ -115,12 +115,24 @@ pub fn genesis_request(vault: &Vault) -> Result<SignedRequest> {
     )
 }
 
+/// Whether a device being enrolled will vote in membership changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Voting {
+    /// It counts toward the majority every change needs: for a device that
+    /// is usually on.
+    Votes,
+    /// It is given the keys and syncs like any member, and counts toward no
+    /// majority, so being off never holds up a change: for a phone.
+    WithoutVote,
+}
+
 /// Proposes enrolling a device. Only for a device the owner confirmed by
 /// pairing; see `approve_enrollment`.
 pub fn enrollment_request(
     vault: &Vault,
     device: [u8; 16],
     node: DeviceNode,
+    voting: Voting,
 ) -> Result<SignedRequest> {
     let vault_id = vault.vault_id();
     sign(
@@ -129,6 +141,7 @@ pub fn enrollment_request(
         ControlRequest::ProposeChange(MembershipChange::Enroll {
             device: device_id_from_bytes(device),
             node,
+            votes: voting == Voting::Votes,
         }),
     )
 }
@@ -181,19 +194,19 @@ pub fn cancel_request(vault: &Vault, request_id: [u8; 16]) -> Result<SignedReque
     )
 }
 
-/// Grants every enrolled voter the epoch keys it lacks and this device
-/// holds. Any unlocked member may send these; the first to commit wins and
-/// a repeat is recognized.
+/// Grants every enrolled member, voting or not, the epoch keys it lacks and
+/// this device holds. Any unlocked member may send these; the first to
+/// commit wins and a repeat is recognized.
 pub fn grant_requests(vault: &Vault, state: &ControlState) -> Result<Vec<SignedRequest>> {
     let vault_id = vault.vault_id();
     let keys: BTreeMap<u64, _> = vault.epoch_keys()?.into_iter().collect();
     let mut requests = Vec::new();
-    for voter in state.voters() {
-        if !state.is_settled_member(voter) {
+    for member in state.members() {
+        if !state.is_settled_member(member) {
             continue;
         }
         let epochs: Vec<u64> = state
-            .missing_epochs(voter)
+            .missing_epochs(member)
             .into_iter()
             .filter(|epoch| keys.contains_key(epoch))
             .collect();
@@ -202,9 +215,9 @@ pub fn grant_requests(vault: &Vault, state: &ControlState) -> Result<Vec<SignedR
         }
         let envelopes = epochs
             .iter()
-            .map(|epoch| seal(state, voter, *epoch, &keys[epoch]))
+            .map(|epoch| seal(state, member, *epoch, &keys[epoch]))
             .collect::<Result<Vec<_>>>()?;
-        let subject: Vec<u8> = device_id_to_bytes(voter)
+        let subject: Vec<u8> = device_id_to_bytes(member)
             .into_iter()
             .chain(epochs.iter().flat_map(|epoch| epoch.to_be_bytes()))
             .collect();
@@ -212,7 +225,7 @@ pub fn grant_requests(vault: &Vault, state: &ControlState) -> Result<Vec<SignedR
             vault,
             request_id(&vault_id, b"grant", &subject),
             ControlRequest::GrantKeys {
-                device: voter,
+                device: member,
                 envelopes,
             },
         )?);

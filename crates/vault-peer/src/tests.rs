@@ -9,7 +9,7 @@ use crate::{
     approve_enrollment, invite, review_join,
     wire::{decode_body, encode_frame, FrameDecoder, MAX_FRAME_BYTES},
     EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, MemberContact, PeerStore, SyncMessage,
-    SyncReport, SyncSession,
+    SyncReport, SyncSession, Voting,
 };
 
 pub(crate) const NOW: u64 = 1_800_000_000;
@@ -441,6 +441,7 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
         &mut a.invitations,
         review,
         members,
+        Voting::Votes,
         Some(47820),
         NOW,
     )
@@ -501,8 +502,16 @@ fn the_joiner_requires_owner_confirmation() {
     .unwrap();
     let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
     let members = own_contact(&mut a);
-    let (_, grant) =
-        approve_enrollment(&a.vault, &mut a.invitations, review, members, None, NOW).unwrap();
+    let (_, grant) = approve_enrollment(
+        &a.vault,
+        &mut a.invitations,
+        review,
+        members,
+        Voting::Votes,
+        None,
+        NOW,
+    )
+    .unwrap();
     let path = dir.path().join("b.db");
     assert!(matches!(
         joiner.finish_enrollment(&grant, false, &ControlState::default(), &path, "p"),

@@ -57,7 +57,8 @@ enum Step {
     /// A membership entry naming these voters, signed by nobody.
     Voters(Vec<DeviceId>),
     /// The membership entry that makes a pending change take effect, as a
-    /// leader writes it.
+    /// leader writes it: its target voters, with the members without a vote
+    /// that stay as learners.
     Settle,
     Genesis {
         by: usize,
@@ -69,6 +70,7 @@ enum Step {
         forged: bool,
         device: usize,
         id: u8,
+        votes: bool,
     },
     Remove {
         by: usize,
@@ -101,8 +103,8 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         2 => prop::sample::subsequence(DEVICES.to_vec(), 1..=5).prop_map(Step::Voters),
         4 => Just(Step::Settle),
         1 => (any::<usize>(), forged, 1_u64..3).prop_map(|(by, forged, epoch)| Step::Genesis { by, forged, epoch }),
-        3 => (any::<usize>(), forged, any::<usize>(), any::<u8>())
-            .prop_map(|(by, forged, device, id)| Step::Enroll { by, forged, device, id }),
+        3 => (any::<usize>(), forged, any::<usize>(), any::<u8>(), any::<bool>())
+            .prop_map(|(by, forged, device, id, votes)| Step::Enroll { by, forged, device, id, votes }),
         3 => (any::<usize>(), forged, any::<usize>(), any::<u8>(), prop::bool::weighted(0.8))
             .prop_map(|(by, forged, device, id, sound)| Step::Remove { by, forged, device, id, sound }),
         1 => (any::<usize>(), forged, any::<bool>(), any::<u8>())
@@ -156,11 +158,11 @@ fn entry(state: &ControlState, step: &Step) -> (EntryPayload<ControlConfig>, Opt
         )
     };
     let pending = state.pending.as_ref().map(|pending| pending.request_id);
-    let membership = |voters: BTreeSet<DeviceId>| {
+    let membership = |voters: BTreeSet<DeviceId>, nodes: BTreeSet<DeviceId>| {
         (
             EntryPayload::Membership(Membership::new(
                 vec![voters],
-                DEVICES
+                nodes
                     .iter()
                     .map(|device| (*device, node(*device)))
                     .collect::<BTreeMap<_, _>>(),
@@ -169,14 +171,34 @@ fn entry(state: &ControlState, step: &Step) -> (EntryPayload<ControlConfig>, Opt
         )
     };
     match step {
-        Step::Voters(voters) => membership(voters.iter().copied().collect()),
-        Step::Settle => membership(
-            state
+        // Anything: every device is in it, the ones not named as learners.
+        Step::Voters(voters) => membership(
+            voters.iter().copied().collect(),
+            DEVICES.iter().copied().collect(),
+        ),
+        Step::Settle => {
+            let voters = state
                 .pending
                 .as_ref()
                 .map(|pending| pending.target_voters.clone())
-                .unwrap_or_else(|| state.voters()),
-        ),
+                .unwrap_or_else(|| state.voters());
+            let mut nodes: BTreeSet<DeviceId> =
+                voters.iter().chain(&state.without_vote).copied().collect();
+            match state
+                .pending
+                .as_ref()
+                .map(|pending| (&pending.change, pending.cancelled))
+            {
+                Some((MembershipChange::Enroll { device, .. }, false)) => {
+                    nodes.insert(*device);
+                }
+                Some((MembershipChange::Remove { device, .. }, _)) => {
+                    nodes.remove(device);
+                }
+                _ => {}
+            }
+            membership(voters, nodes)
+        }
         Step::Genesis { by, forged, epoch } => signed(
             pick(&state.voters(), *by),
             *forged,
@@ -192,6 +214,7 @@ fn entry(state: &ControlState, step: &Step) -> (EntryPayload<ControlConfig>, Opt
             forged,
             device,
             id,
+            votes,
         } => {
             let outside: BTreeSet<DeviceId> = DEVICES
                 .iter()
@@ -206,6 +229,7 @@ fn entry(state: &ControlState, step: &Step) -> (EntryPayload<ControlConfig>, Opt
                 ControlRequest::ProposeChange(MembershipChange::Enroll {
                     device,
                     node: node(device),
+                    votes: *votes,
                 }),
             )
         }
@@ -216,7 +240,7 @@ fn entry(state: &ControlState, step: &Step) -> (EntryPayload<ControlConfig>, Opt
             id,
             sound,
         } => {
-            let device = pick(&state.voters(), *device);
+            let device = pick(&state.members(), *device);
             let epoch = state.epoch + 1;
             let remaining: Vec<DeviceId> = state
                 .members()
@@ -267,6 +291,7 @@ fn entry(state: &ControlState, step: &Step) -> (EntryPayload<ControlConfig>, Opt
             let candidates: BTreeSet<DeviceId> = state
                 .voters()
                 .into_iter()
+                .chain(state.without_vote.iter().copied())
                 .chain(state.removed.keys().copied())
                 .collect();
             let device = pick(&candidates, *device);
@@ -311,13 +336,16 @@ proptest! {
             let log_id = LogId::new(CommittedLeaderId::new(1, 1), index as u64 + 1);
             let outcome = state.apply(log_id, &payload);
 
-            // A request takes effect only from a voter that is enrolled,
-            // or before genesis from a voter, and never from a device that
-            // was removed.
+            // A request takes effect only from an enrolled member, voting
+            // or not, or before genesis from a voter, and never from a
+            // device that was removed.
             if let (EntryPayload::Normal(ControlEntry::Request(request)), Outcome::Accepted) = (&payload, &outcome) {
                 let by = request.requester;
-                prop_assert!(before.voters().contains(&by), "{step:?} from a non-voter");
-                prop_assert!(before.epoch == 0 || before.is_enrolled(by), "{step:?} from a device not enrolled");
+                if before.epoch == 0 {
+                    prop_assert!(before.voters().contains(&by), "{step:?} before genesis from a non-voter");
+                } else {
+                    prop_assert!(before.is_enrolled(by), "{step:?} from a device not enrolled");
+                }
                 prop_assert!(!before.removed.contains_key(&by), "{step:?} accepted from a removed device");
                 prop_assert_eq!(Some(by), signer, "a request signed by another device was accepted");
             }
@@ -347,6 +375,27 @@ proptest! {
             }
             for held in state.keys_held.values() {
                 prop_assert!(held.iter().all(|epoch| (1..=state.epoch).contains(epoch)));
+            }
+            // Only a completed, signed enrollment without a vote makes a
+            // device a member without one, and only its completed removal
+            // ends that; no membership entry does either.
+            if state.without_vote != before.without_vote {
+                let completed = matches!(&payload, EntryPayload::Normal(ControlEntry::Complete { .. }))
+                    && outcome == Outcome::Accepted;
+                prop_assert!(completed, "{step:?} changed the members without a vote");
+                let change = before.pending.as_ref().map(|pending| (&pending.change, pending.cancelled));
+                for added in state.without_vote.difference(&before.without_vote) {
+                    prop_assert!(
+                        matches!(change, Some((MembershipChange::Enroll { device, votes: false, .. }, false)) if device == added),
+                        "{added} became a member without a vote at {step:?}"
+                    );
+                }
+                for gone in before.without_vote.difference(&state.without_vote) {
+                    prop_assert!(
+                        matches!(change, Some((MembershipChange::Remove { device, .. }, _)) if device == gone),
+                        "{gone} stopped being a member without a vote at {step:?}"
+                    );
+                }
             }
         }
     }
@@ -410,6 +459,7 @@ fn a_removed_device_put_back_among_the_voters_gets_no_keys_and_no_say() {
         ControlRequest::ProposeChange(MembershipChange::Enroll {
             device: 2,
             node: node(2),
+            votes: true,
         }),
     );
     assert_eq!(apply(&mut state, enroll), Outcome::Accepted);
@@ -454,6 +504,7 @@ fn a_removed_device_put_back_among_the_voters_gets_no_keys_and_no_say() {
         ControlRequest::ProposeChange(MembershipChange::Enroll {
             device: 3,
             node: node(3),
+            votes: true,
         }),
     );
     assert!(matches!(apply(&mut state, its_own), Outcome::Rejected(_)));

@@ -44,7 +44,13 @@ fn command(device: &mut Running, text: &str, done: &str) -> String {
 /// Pairs a new device with `inviter`: both show the short code, the owner
 /// confirms on each, and the new device is enrolled by the vault's devices.
 fn join(inviter: &mut Running, files: &Files) -> (Running, String) {
-    let code = command(inviter, "invite", "INVITE");
+    join_with(inviter, files, "invite")
+}
+
+/// As [`join`], with the inviter's command: `invite`, or `invite
+/// without-vote`.
+fn join_with(inviter: &mut Running, files: &Files, invite: &str) -> (Running, String) {
+    let code = command(inviter, invite, "INVITE");
     let mut joiner = Running::start(&[
         "join-device",
         &code,
@@ -297,4 +303,33 @@ fn a_locked_device_takes_part_and_receives_without_its_password() {
     for device in [a, b, c] {
         quit(device);
     }
+}
+
+#[test]
+fn a_phone_joins_without_a_vote_and_the_one_voter_removes_it_while_it_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = |name| Files::new(dir.path(), name);
+    let (a_files, phone_files) = (files("a"), files("phone"));
+    run(&["create", &a_files.vault]);
+    let (mut a, _) = a_files.start("127.0.0.1:0");
+    command(&mut a, "found", "FOUNDED");
+    command(&mut a, "add Mail", "ADDED");
+
+    // The phone joins as a member without a vote and syncs like any other.
+    let (mut phone, phone_id) = join_with(&mut a, &phone_files, "invite without-vote");
+    for device in [&mut a, &mut phone] {
+        wait_status(device, &["epoch=1", "members=2", "voters=1"]);
+    }
+    sync(&mut phone, None);
+    assert_eq!(items(&mut phone), ["Mail"]);
+
+    // The phone is off. With two voters A could not remove it; as the one
+    // voter it does so alone.
+    quit(phone);
+    command(&mut a, &format!("remove {phone_id}"), "REMOVED");
+    wait_status(
+        &mut a,
+        &["epoch=2", "vault_epoch=2", "members=1", "voters=1"],
+    );
+    quit(a);
 }

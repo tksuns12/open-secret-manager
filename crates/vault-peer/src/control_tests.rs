@@ -17,7 +17,7 @@ use crate::{
     control::{self, Reconciled},
     invite, review_join,
     tests::{address, login, over_wire, sync, NOW},
-    EnrollmentGrant, Error, Invitation, Joiner, PeerStore,
+    EnrollmentGrant, Error, Invitation, Joiner, PeerStore, Voting,
 };
 
 const PASSWORD: &str = "member password";
@@ -168,6 +168,7 @@ impl Net {
             &mut inviter.invitations,
             review,
             Vec::new(),
+            Voting::Votes,
             None,
             NOW + 3,
         )

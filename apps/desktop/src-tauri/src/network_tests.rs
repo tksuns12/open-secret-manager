@@ -128,7 +128,20 @@ pub(crate) async fn pair(
     joiner: &AppHandle<MockRuntime>,
     password: Option<&str>,
 ) {
-    let invitation = network::start_invite(inviter.state(), inviter.clone())
+    pair_as(inviter, codes, finished, invites, joiner, password, true).await;
+}
+
+/// As [`pair`], with the owner's choice of whether the new device votes.
+pub(crate) async fn pair_as(
+    inviter: &AppHandle<MockRuntime>,
+    codes: &Seen,
+    finished: &Seen,
+    invites: usize,
+    joiner: &AppHandle<MockRuntime>,
+    password: Option<&str>,
+    votes: bool,
+) {
+    let invitation = network::start_invite(votes, inviter.state(), inviter.clone())
         .await
         .unwrap();
     let joining = network::join_start(invitation.code.clone(), joiner.state(), joiner.clone())
@@ -269,7 +282,7 @@ fn desktop_shells_enroll_sync_remove_and_refuse_without_quorum() {
         kept.sort();
         assert_eq!(kept, ["Added on A", "Added on C", "Shared"]);
         drop(archived);
-        let refused = network::start_invite(c.state(), c.clone())
+        let refused = network::start_invite(true, c.state(), c.clone())
             .await
             .err()
             .unwrap();
@@ -277,7 +290,9 @@ fn desktop_shells_enroll_sync_remove_and_refuse_without_quorum() {
 
         // D starts joining but never finishes. Its enrollment stays
         // pending until a member cancels it; D never received a key.
-        let invitation = network::start_invite(a.state(), a.clone()).await.unwrap();
+        let invitation = network::start_invite(true, a.state(), a.clone())
+            .await
+            .unwrap();
         let joining = network::join_start(invitation.code.clone(), d.state(), d.clone())
             .await
             .unwrap();
@@ -1175,4 +1190,45 @@ fn putting_a_copy_away_is_finished_at_launch_if_it_was_interrupted() {
     network::finish_interrupted_recovery(&path);
     assert!(!dir.path().join("putting-away").exists());
     assert!(dir.path().join("peers.sqlite3").exists());
+}
+
+#[test]
+fn a_device_without_a_vote_syncs_and_when_lost_is_removed_by_the_other_alone() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let apps: Vec<_> = dirs.iter().map(|dir| shell(dir.path())).collect();
+    let codes = record(&apps[0], "pairing-code");
+    let finished = record(&apps[0], "pairing-finished");
+    let (a, b) = (apps[0].handle().clone(), apps[1].handle().clone());
+
+    tauri::async_runtime::block_on(async move {
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "From A").await;
+        // The owner invites a phone: it will not vote.
+        pair_as(&a, &codes, &finished, 0, &b, Some("phone password"), false).await;
+        eventually(&b, &["From A"]).await;
+        let info = until_devices(&a, "two members, one of them voting", |info| {
+            info.members.len() == 2 && info.pending.is_none()
+        })
+        .await;
+        assert_eq!(info.quorum, 1);
+        for member in &info.members {
+            assert_eq!(member.votes, member.this_device, "{}", member.id);
+        }
+        put(&b, "From B").await;
+        network::schedule_sync(&b);
+        eventually(&a, &["From A", "From B"]).await;
+
+        // The phone is lost. Two voting devices would need both for any
+        // change; here A, the only one that votes, removes it alone.
+        let b_id = devices(&b).await.this_device.unwrap();
+        network::shutdown(&b).await;
+        network::remove_device(b_id, a.clone()).await.unwrap();
+        until_devices(&a, "the phone removed", |info| {
+            info.members.len() == 1 && info.pending.is_none()
+        })
+        .await;
+        assert_eq!(current_epoch(&a).await, 2);
+    });
 }

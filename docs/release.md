@@ -64,8 +64,9 @@ evidence in the delivery matrix and the threat model.
 - A device that was lost keeps everything it had. Removing it, starting
   over, or restoring a backup stops it from receiving anything new; it does
   not take back what it read.
-- A two-device vault cannot remove a lost device; it starts over as a new
-  vault instead.
+- A vault with two voting devices cannot remove one that is lost; it starts
+  over as a new vault instead. A device invited without a vote can always
+  be removed by the voting ones.
 - The membership control plane tolerates crashes and partitions, not a
   malicious member. Whoever copies a device's transport key and control
   database can act as that device in it and stall changes; keys and

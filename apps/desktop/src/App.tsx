@@ -285,9 +285,9 @@ function App() {
     }
   }
 
-  async function startInvite() {
+  async function startInvite(votes: boolean) {
     try {
-      const created = await bridge.startInvite();
+      const created = await bridge.startInvite(votes);
       setInvite({ code: created.code });
     } catch (error) {
       setNotice(commandMessage(error, "An invitation could not be created"));
@@ -530,7 +530,7 @@ function App() {
       {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
       {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onNotice={setNotice} /></div></div>}
       {archivesOpen && <div className="modal-backdrop" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">ARCHIVE</p><h2>Copies put away on this device</h2></div><button className="icon-button" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><X size={18} /></button></div><ArchivesPanel canCopy={!locked} onCopied={() => { void bridge.listEntries().then(setEntries).catch(() => {}); }} onNotice={setNotice} /></div></div>}
-      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={() => void startInvite()} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes) => void startInvite(votes)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
       {fill && !locked && <div className="modal-backdrop"><div className="generator-modal entry-editor" role="dialog" aria-label="Fill a login"><div className="modal-head"><div><p className="eyebrow">ASKED BY {fill.browser.toUpperCase()}</p><h2 className="fill-origin">Fill a login into {fill.origin}</h2></div></div><FillPanel key={`${fill.requestId} ${fill.session}`} asked={fill} onFill={(login) => void sendFill(login)} onDeny={() => void denyFill()} /></div></div>}
       {notice && <div className={recoveryKey && !locked ? "toast toast-raised" : "toast"}><ShieldCheck size={15} />{notice}</div>}
@@ -558,7 +558,7 @@ type DevicesPanelProps = {
   devices: DevicesInfo;
   invite: InviteState | null;
   locked: boolean;
-  onInvite: () => void;
+  onInvite: (votes: boolean) => void;
   onAnswer: (accept: boolean) => void;
   onCancelInvite: () => void;
   onSync: () => void;
@@ -580,6 +580,7 @@ type DevicesPanelProps = {
 
 function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onUnlock, rejoining, onRejoining: setRejoining, onReset, onNotice, onCopy }: DevicesPanelProps) {
   const [removing, setRemoving] = useState<string | null>(null);
+  const [choosing, setChoosing] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const [leaving, setLeaving] = useState(false);
@@ -627,6 +628,15 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     return <div className="device-panel"><p className="review-hint">{locked ? "Unlock the vault to set up its devices." : "Devices are being set up…"}</p>{locked && <button className="generate-button" onClick={onUnlock}>Unlock</button>}</div>;
   }
 
+  if (choosing && !invite) {
+    return <div className="device-panel">
+      <p className="review-hint">What kind of device are you adding? The devices that vote decide together which devices belong to the vault: adding or removing one needs most of them online. A device that does not vote holds the keys and syncs like the others, and being off never holds anything up.</p>
+      <button className="generate-button" onClick={() => { setChoosing(false); onInvite(true); }}>A computer that is usually on · it votes</button>
+      <button className="secondary" onClick={() => { setChoosing(false); onInvite(false); }}>A phone, or a computer often off · it does not vote</button>
+      <div className="form-actions"><button className="secondary" onClick={() => setChoosing(false)}>Cancel</button></div>
+    </div>;
+  }
+
   const others = devices.members.filter((member) => !member.thisDevice);
   const pending = devices.pending;
   const replaced = sync.replaced.filter((id) => others.some((member) => member.id === id));
@@ -634,13 +644,13 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     {replaced.length > 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Device {shortDevice(replaced[0])} answers as a different device</strong><span>Something else now answers at its address, so this device refuses it and cannot sync with it. If you started over as a new vault on that device, this copy was left behind: put it away to join the new vault. If you did not, change nothing here.</span></div><button className="conflict-action" onClick={() => setLeaving(true)}>Put this copy away…</button></div>}
     {devices.members.map((member) => <div key={member.id} className="peer-row">
       <div className="device-icon"><Fingerprint size={18} /></div>
-      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}</span></div>
+      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}{member.votes ? "" : " · does not vote"}</span></div>
       {!member.thisDevice && !pending && (removing === member.id
         ? <div className="form-actions"><button className="secondary" onClick={() => setRemoving(null)}>Keep</button><button className="generate-button" onClick={() => { setRemoving(null); onRemove(member.id); }}>Remove</button></div>
         : <button className="secondary" disabled={locked} onClick={() => setRemoving(member.id)}>Remove…</button>)}
     </div>)}
     {removing && <p className="review-hint">Removing a device moves the others to a new key that it never receives. It keeps what it already had, so change any passwords it could have seen. This cannot be undone.</p>}
-    {pending && pending.kind === "enroll" && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>{pending.cancelled ? "Cancelling an enrollment" : `Device ${shortDevice(pending.device)} is joining`}</strong><span>{pending.cancelled ? "Your devices are undoing it." : "It becomes a member once it has caught up. Until then no other device can be added or removed. If it never finishes, cancel it; it has received no key."}</span></div>{!pending.cancelled && <button className="conflict-action" disabled={locked} onClick={onCancelEnrollment}>Cancel enrollment</button>}</div>}
+    {pending && pending.kind === "enroll" && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>{pending.cancelled ? "Cancelling an enrollment" : `Device ${shortDevice(pending.device)} is joining`}</strong><span>{pending.cancelled ? "Your devices are undoing it." : `It becomes a member${pending.votes ? "" : " without a vote"} once it has caught up. Until then no other device can be added or removed. If it never finishes, cancel it; it has received no key.`}</span></div>{!pending.cancelled && <button className="conflict-action" disabled={locked} onClick={onCancelEnrollment}>Cancel enrollment</button>}</div>}
     {pending && pending.kind === "remove" && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Removing device {shortDevice(pending.device)}</strong><span>Waiting for the remaining devices. The new key takes effect only when they have all agreed; bring them online to finish.</span></div></div>}
     <p className="review-hint">{syncDetail(sync)}{sync.pending > 0 ? ` · ${sync.pending} waiting for unlock` : ""}</p>
     <p className="review-hint">{quorumHint(devices)}</p>
@@ -649,7 +659,7 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
       {others.length > 0 && <button className="secondary" onClick={onSync} disabled={sync.state === "syncing"}>Sync now</button>}
       {locked
         ? <button className="generate-button" onClick={onUnlock}>Unlock to invite a device</button>
-        : <button className="generate-button" onClick={onInvite} disabled={Boolean(pending)}>Invite a device</button>}
+        : <button className="generate-button" onClick={() => setChoosing(true)} disabled={Boolean(pending)}>Invite a device</button>}
     </div>
     {others.length > 0 && <button className="link-button" onClick={() => setRecovering(true)}>Lost devices and cannot remove them? Start over as a new vault…</button>}
     {others.length > 0 && <button className="link-button" onClick={() => setLeaving(true)}>Another device started over? Put this copy away to join it…</button>}
@@ -1030,8 +1040,11 @@ function LeavePanel({ onCancel, onNotice }: { onCancel: () => void; onNotice: (t
 function quorumHint(devices: DevicesInfo): string {
   const count = devices.members.length;
   if (count <= 1) return "Each device keeps a full encrypted copy and they sync directly, with no server. You will compare a six-digit code on both screens.";
-  if (count === 2) return "Adding or removing a device needs both of these devices online. With three or more, one can be away or lost and still be removed.";
-  return `Adding or removing a device needs ${devices.quorum} of these ${count} devices online. A locked device still counts while its app is open.`;
+  const voting = devices.members.filter((member) => member.votes).length;
+  const others = voting < count ? " Devices that do not vote never count toward this." : "";
+  if (voting === 1) return `Adding or removing a device needs only the device that votes to be online.${others}`;
+  if (voting === 2) return `Adding or removing a device needs both devices that vote online. With three that vote, one can be away or lost and still be removed.${others}`;
+  return `Adding or removing a device needs ${devices.quorum} of the ${voting} devices that vote online. A locked device still counts while its app is open.${others}`;
 }
 
 /** A device that joined from another one has its own root key, so the

@@ -275,7 +275,8 @@ async fn advance(raft: &Raft<ControlConfig>, state: &ControlState) -> Result<()>
     // explicitly on every attempt rather than trusted to a blocking call: a
     // learner entry can commit while its device is unreachable, and a
     // configuration that includes it would still reach a majority without it.
-    if let (MembershipChange::Enroll { device, node }, false) = (&pending.change, pending.cancelled)
+    if let (MembershipChange::Enroll { device, node, .. }, false) =
+        (&pending.change, pending.cancelled)
     {
         let known = raft
             .metrics()
@@ -303,6 +304,24 @@ async fn advance(raft: &Raft<ControlConfig>, state: &ControlState) -> Result<()>
             return Ok(());
         }
     }
+    // A member without a vote leaves as the learner it is. One that an
+    // unsigned membership entry made a voter leaves as voters do, below.
+    if let MembershipChange::Remove { device, .. } = &pending.change {
+        let present = raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .get_node(device)
+            .is_some();
+        let learner = state.without_vote.contains(device) && !state.voters().contains(device);
+        if learner && present && state.is_uniform() {
+            raft.change_membership(ChangeMembers::RemoveNodes([*device].into()), false)
+                .await
+                .map_err(|error| Error::Raft(error.to_string()))?;
+            return Ok(());
+        }
+    }
     if !(state.is_uniform() && state.voters() == pending.target_voters) {
         // Commits the joint configuration and then the uniform one; from a
         // joint configuration left by a crash, it finishes the change. A
@@ -322,9 +341,10 @@ async fn advance(raft: &Raft<ControlConfig>, state: &ControlState) -> Result<()>
     Ok(())
 }
 
-/// Removes learners that no pending enrollment is waiting for, such as the
-/// device of a cancelled enrollment. Only from a committed, uniform
-/// configuration, which is the only one a new change may start from.
+/// Removes learners that are not members without a vote and that no pending
+/// enrollment is waiting for, such as the device of a cancelled enrollment.
+/// Only from a committed, uniform configuration, which is the only one a new
+/// change may start from.
 async fn remove_stale_learners(
     raft: &Raft<ControlConfig>,
     state: &ControlState,
@@ -345,7 +365,11 @@ async fn remove_stale_learners(
         .membership()
         .nodes()
         .map(|(device, _)| *device)
-        .filter(|device| !voters.contains(device) && Some(*device) != enrolling)
+        .filter(|device| {
+            !voters.contains(device)
+                && Some(*device) != enrolling
+                && !state.without_vote.contains(device)
+        })
         .collect();
     if stale.is_empty() {
         return Ok(());

@@ -114,12 +114,16 @@ export type MemberInfo = {
   thisDevice: boolean;
   address?: string;
   leader: boolean;
+  /** Counts toward the majority a change needs. A member without a vote, such as a phone, holds the keys and syncs. */
+  votes: boolean;
 };
 
 /** A membership change the vault's devices have accepted but not finished. */
 export type PendingChange = {
   kind: "enroll" | "remove";
   device: string;
+  /** Whether the device being enrolled or removed votes. */
+  votes: boolean;
   cancelled: boolean;
 };
 
@@ -130,7 +134,7 @@ export type DevicesInfo = {
   members: MemberInfo[];
   pending?: PendingChange;
   epoch: number;
-  /** How many devices must be reachable for any change. */
+  /** How many of the devices that vote must be reachable for any change. */
   quorum: number;
   /** Set on a device without a vault whose copy of one was put away: the folder it was moved to. */
   resetArchive?: string;
@@ -291,7 +295,8 @@ export type DesktopBridge = {
   closeArchive: () => Promise<void>;
   /** Deletes the folder and everything in it. */
   deleteArchive: (name: string) => Promise<void>;
-  startInvite: () => Promise<{ code: string; expiresAt: number }>;
+  /** Invites a device; `votes` says whether it will count toward the majority a change needs. */
+  startInvite: (votes: boolean) => Promise<{ code: string; expiresAt: number }>;
   confirmInvite: (accept: boolean) => Promise<void>;
   cancelInvite: () => Promise<void>;
   joinStart: (code: string) => Promise<{ sas: string; keepsVault: boolean }>;

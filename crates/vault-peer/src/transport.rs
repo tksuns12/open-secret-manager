@@ -40,6 +40,7 @@ use osm_vault_membership::SignedRequest;
 
 use crate::{
     approve_enrollment,
+    control::Voting,
     members::MemberContact,
     pairing::JoinReview,
     peers::{pin_of, TransportIdentity},
@@ -180,11 +181,19 @@ impl PendingJoin {
         vault: &Vault,
         invitations: &mut InvitationStore,
         members: Vec<MemberContact>,
+        voting: Voting,
         listen_port: Option<u16>,
         now: u64,
     ) -> Result<(SignedRequest, ApprovedEnrollment)> {
-        let (request, grant) =
-            approve_enrollment(vault, invitations, self.review, members, listen_port, now)?;
+        let (request, grant) = approve_enrollment(
+            vault,
+            invitations,
+            self.review,
+            members,
+            voting,
+            listen_port,
+            now,
+        )?;
         Ok((
             request,
             ApprovedEnrollment {
