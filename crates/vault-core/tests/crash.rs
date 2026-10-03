@@ -259,7 +259,10 @@ const START_PATIENCE: Duration = Duration::from_secs(90);
 /// no other revision of the item names, every parent is stored, and no
 /// revision is in two places at once.
 fn assert_consistent(path: &Path) {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    // Opened for writing, as anything that uses the vault opens it: a kill
+    // during a commit leaves its journal behind, which SQLite rolls back
+    // before the first read, and a read-only connection cannot.
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
     let check: String = connection
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();

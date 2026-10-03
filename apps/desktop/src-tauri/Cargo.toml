@@ -25,6 +25,7 @@ osm-vault-sync = { path = "../../../crates/vault-sync" }
 tokio = { version = "1.53.1", features = ["macros", "net", "sync", "time"] }
 zeroize = "1.8"
 arboard = "3.4"
+osm-desktop-session = { path = "session" }
 
 # Browsers reach the app over a Unix socket.
 [target.'cfg(unix)'.dependencies]
@@ -43,5 +44,7 @@ custom-protocol = ["tauri/custom-protocol"]
 unsafe_code = "forbid"
 
 # Tauri bundles platform-specific dependencies and is checked separately from
-# the UI-independent Rust workspace.
+# the UI-independent Rust workspace. The session crate holds what the app
+# needs from macOS directly, and the one `unsafe` call that takes.
 [workspace]
+members = ["session"]

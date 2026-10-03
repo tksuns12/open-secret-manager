@@ -6,6 +6,14 @@ import type { ArchiveInfo, ArchivedItem, BrowserInfo, BrowserStatus, DevicesInfo
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
 /** The vault locks after this long without input in the window. */
 const IDLE_LOCK_MS = 5 * 60 * 1000;
+/** Why the system said the owner's session went away from the app. */
+const AWAY: Record<string, string> = {
+  sleep: "the computer went to sleep",
+  screens_sleep: "the displays went to sleep",
+  screen_locked: "the screen locked",
+  screen_saver: "the screen saver started",
+  switched_out: "another user took the screen",
+};
 type Filter = (typeof filters)[number];
 type EditorState = { mode: "create" } | { mode: "edit"; detail: EntryDetail };
 type ReviewState = { id: string; title: string; versions: VersionSummary[] };
@@ -95,6 +103,13 @@ function App() {
       bridge.listen("vault-changed", () => {
         void bridge.status().then(async (status) => { if (status === "unlocked") setEntries(await bridge.listEntries()); });
       }),
+      // The system said the owner's session went away, and the app locked.
+      // A pairing needs the owner here, so it ends too.
+      bridge.listen<string>("vault-locked", (reason) => {
+        showLocked();
+        const cancelled = endPairing();
+        setNotice(`Vault locked because ${AWAY[reason] ?? "the session went away"}${cancelled ? " · the pairing was cancelled" : ""}`);
+      }),
       bridge.listen<string>("pairing-code", (sas) => setInvite((current) => current && { ...current, sas })),
       bridge.listen<{ paired: boolean; code?: string; message?: string }>("pairing-finished", (result) => {
         setInvite(null);
@@ -123,8 +138,11 @@ function App() {
     setRejoining(false);
     return true;
   }
+  function showLocked() {
+    setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false); setArchivesOpen(false);
+  }
   function lockQuietly() {
-    void bridge.lock(); setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false); setArchivesOpen(false);
+    void bridge.lock(); showLocked();
     if (endPairing()) setNotice("Vault locked after five minutes without activity · the pairing was cancelled");
   }
   useEffect(() => {

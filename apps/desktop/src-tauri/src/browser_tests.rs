@@ -197,6 +197,14 @@ fn a_request_from_the_browser_waits_in_the_app_for_the_owners_choice() {
         assert_eq!(shown.origin, "https://example.com");
         assert_eq!(shown.session, None);
         assert!(shown.logins.is_empty() && shown.not_offered.is_empty());
+        // The window is told by a task of its own, which may run after the
+        // request is already there to be read.
+        for _ in 0..300 {
+            if *told.lock().unwrap() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(*told.lock().unwrap() >= 2, "the window was told");
         // Nothing can be chosen while it is locked.
         assert_eq!(

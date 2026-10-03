@@ -39,7 +39,10 @@ The repository is deliberately split at the security boundary:
   route from the interface to the Rust core. While it is open it also
   listens for the native messaging host, shows each request from a browser
   for the owner to decide, and connects a browser by writing the host's
-  manifest into that browser's folder.
+  manifest into that browser's folder. Its `session` crate is what it needs
+  from macOS directly: notice of sleep, a screen lock, or a user switch, on
+  which the app locks, and a clipboard entry that stays on this Mac and out
+  of clipboard history.
 - `apps/native-host` is the process a browser starts for the extension. It
   holds no vault and no key: it checks each request and passes it to the
   desktop session over a socket only the owner's account can reach.

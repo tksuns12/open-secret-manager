@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod archive;
+mod away;
 #[cfg(unix)]
 mod browser;
 #[cfg(not(unix))]
@@ -73,14 +74,21 @@ async fn vault_status(state: tauri::State<'_, AppState>) -> Result<&'static str,
     )
 }
 
-#[tauri::command]
-async fn lock_vault(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+/// Locks the vault and closes an opened archived copy, which is unlocked
+/// too. Says whether either was open.
+async fn lock_everything(state: &AppState) -> bool {
     let mut vault = state.vault.lock().await;
+    let unlocked = vault.as_ref().is_some_and(Vault::is_unlocked);
     if let Some(vault) = vault.as_mut() {
         vault.lock();
     }
-    // An opened archived copy is unlocked too: locking closes it.
-    *state.archive.lock().await = None;
+    let archive = state.archive.lock().await.take();
+    unlocked || archive.is_some()
+}
+
+#[tauri::command]
+async fn lock_vault(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+    lock_everything(&state).await;
     Ok(())
 }
 
@@ -125,19 +133,31 @@ async fn copy_totp(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
             .item_totp_code(&id, unix_time)
             .map_err(CommandError::from)?,
     );
-    let mut clipboard = arboard::Clipboard::new().map_err(|_| CommandError {
+    copy_for_a_while(&code)
+}
+
+/// Puts a secret on the clipboard and takes it off 30 seconds later, unless
+/// something else was put there since. On macOS the entry stays on this Mac
+/// and asks clipboard history apps to leave it out; locking takes it off too.
+fn copy_for_a_while(secret: &str) -> Result<(), CommandError> {
+    let unavailable = || CommandError {
         code: "clipboard",
         message: "operating-system clipboard is unavailable".into(),
-    })?;
-    clipboard
-        .set_text(code.as_str())
-        .map_err(|_| CommandError {
-            code: "clipboard",
-            message: "operating-system clipboard is unavailable".into(),
-        })?;
-    let expected = Zeroizing::new(code.to_string());
+    };
+    const WHILE: std::time::Duration = std::time::Duration::from_secs(30);
+    if cfg!(target_os = "macos") {
+        let copied = osm_desktop_session::copy_secret(secret).ok_or_else(unavailable)?;
+        std::thread::spawn(move || {
+            std::thread::sleep(WHILE);
+            osm_desktop_session::clear_if_unchanged(copied);
+        });
+        return Ok(());
+    }
+    let mut clipboard = arboard::Clipboard::new().map_err(|_| unavailable())?;
+    clipboard.set_text(secret).map_err(|_| unavailable())?;
+    let expected = Zeroizing::new(secret.to_owned());
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::thread::sleep(WHILE);
         let Ok(mut clipboard) = arboard::Clipboard::new() else {
             return;
         };
@@ -620,6 +640,7 @@ pub fn run() {
         .setup(|app| {
             network::start(app.handle());
             browser::start(app.handle());
+            away::start(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

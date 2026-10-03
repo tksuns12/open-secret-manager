@@ -3000,6 +3000,7 @@ dependencies = [
  "arboard",
  "dirs",
  "osm-browser-link",
+ "osm-desktop-session",
  "osm-vault-browser",
  "osm-vault-core",
  "osm-vault-membership",
@@ -3066,6 +3067,16 @@ dependencies = [
  "serde",
  "serde_json",
  "zeroize",
+]
+
+[[package]]
+name = "osm-desktop-session"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
 ]
 
 [[package]]

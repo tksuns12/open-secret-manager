@@ -1,0 +1,19 @@
+[package]
+name = "osm-desktop-session"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "What the desktop app needs from macOS that Tauri does not give it"
+
+# This crate holds the desktop app's only `unsafe` call: registering for
+# the system's notifications. Everything else here is safe Rust.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSDistributedNotificationCenter", "NSOperation", "NSString", "NSArray", "NSRunLoop", "NSDate"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard"] }
+
+[[test]]
+name = "system_notifications"
+harness = false

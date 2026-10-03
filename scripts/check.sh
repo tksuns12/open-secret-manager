@@ -25,15 +25,15 @@ step() { printf '\n== %s\n' "$*"; }
 
 step "Formatting"
 cargo fmt --all -- --check
-cargo fmt --manifest-path "$desktop" -- --check
+cargo fmt --manifest-path "$desktop" --all -- --check
 
 step "Lints, with warnings as errors"
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo clippy --manifest-path "$desktop" --all-targets --locked -- -D warnings
+cargo clippy --manifest-path "$desktop" --workspace --all-targets --locked -- -D warnings
 
 step "Rust tests"
 cargo test --workspace --all-targets --locked
-cargo test --manifest-path "$desktop" --locked
+cargo test --manifest-path "$desktop" --workspace --locked
 
 step "Desktop interface"
 (cd apps/desktop && npm run --silent typecheck && npm run --silent build)
