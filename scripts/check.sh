@@ -7,15 +7,20 @@
 #                                 the licenses only the npm registry knows
 #   scripts/check.sh --browsers   also the extension in headless Chromium
 #                                 and Firefox (see its README)
+#   scripts/check.sh --mobile     also the phone interface's bindings in an
+#                                 iOS simulator and on a running Android
+#                                 emulator or device
 set -eu
 cd "$(dirname "$0")/.."
 
 network=no
 browsers=no
+mobile=no
 for argument in "$@"; do
     case "$argument" in
         --network) network=yes ;;
         --browsers) browsers=yes ;;
+        --mobile) mobile=yes ;;
         *) echo "unknown option: $argument" >&2; exit 2 ;;
     esac
 done
@@ -58,6 +63,11 @@ if [ "$browsers" = yes ]; then
     step "Extension in headless browsers"
     cargo build --locked -p osm-native-host -p osm-vault-browser
     (cd apps/browser-extension && npm run test:e2e && npm run test:e2e:firefox)
+fi
+
+if [ "$mobile" = yes ]; then
+    step "Phone interface on a simulator and an emulator"
+    scripts/test-mobile-bindings.sh
 fi
 
 step "All checks passed"

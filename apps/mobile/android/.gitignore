@@ -1,0 +1,8 @@
+# Made by prepare.sh from the shared code.
+/vault/src/main/jniLibs/
+/vault/src/main/java/org/opensecretmanager/vault/osm_mobile.kt
+/vault/src/androidTest/assets/
+# Gradle's own.
+.gradle/
+build/
+local.properties

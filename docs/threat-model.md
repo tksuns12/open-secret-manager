@@ -116,6 +116,10 @@ The app tells a browser where the native host is only when the owner connects th
 
 A packaged app has the host inside it, beside its own program, and the manifest names that file. The host is therefore as trustworthy as the app's own files: whoever can replace a file inside the app can replace the host, and equally the app. Packages built here are not signed with a developer's identity, so nothing but the file system's permissions guards either; signing is release work that has not been done. The app refuses to point a browser at a host in a place that is gone when the app quits (a downloaded Mac app run before it was moved, an AppImage), so that a manifest is not left naming a path that something else could later occupy.
 
+## Phones
+
+A phone is a device of the vault like any other, with its own password and root key, enrolled by the owner's comparison of codes, and, as the desktop app invites it by default for a phone, without a vote. The shared code runs on it as it does on a computer. While the app is in front it accepts the vault's members on a port of the network it is on, and nothing else gets past the handshake; in the background nothing runs, and the other devices keep what they have for it. A password or one-time code that the app asks for, to copy or fill, crosses into Kotlin or Swift as a string, which the shared code cannot wipe there, as with the desktop app's window. A lost phone is removed like any device, and keeps what it already held. The apps themselves, their autofill, and how they keep keys are later stops; until then this describes the interface they will use (Phase 6b, stop 2).
+
 ## Recovery and imports
 
 Generate recovery material from operating-system randomness and display it deliberately. An encrypted backup must carry enough versioned metadata and wrapped keys to restore without a provider. Restoration authenticates the whole archive before replacing anything and creates a separate destination by default. A recovery secret is as sensitive as the vault it can unlock.

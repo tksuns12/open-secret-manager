@@ -1,0 +1,38 @@
+[package]
+name = "osm-mobile"
+description = "The interface the phone apps use: one device of a vault, through UniFFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Not `lints.workspace`: the workspace forbids `unsafe`, and the foreign
+# function interface UniFFI generates is made of it. This crate's own code
+# has none (see lib.rs).
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "osm_mobile"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# The generator of the Kotlin and Swift bindings, run on the development
+# machine only.
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+osm-vault-core = { path = "../vault-core" }
+osm-vault-membership = { path = "../vault-membership" }
+osm-vault-peer = { path = "../vault-peer" }
+thiserror = "2.0.17"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+uniffi = "0.32"
+zeroize = "1.8.2"
+
+[dev-dependencies]
+osm-vault-sync = { path = "../vault-sync" }
+tempfile = "3.24.0"

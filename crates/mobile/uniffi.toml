@@ -1,0 +1,9 @@
+# How the generated bindings are named in the apps.
+[bindings.kotlin]
+package_name = "org.opensecretmanager.vault"
+cdylib_name = "osm_mobile"
+
+[bindings.swift]
+module_name = "OSMVault"
+ffi_module_name = "OSMVaultFFI"
+ffi_module_filename = "OSMVaultFFI"
