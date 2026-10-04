@@ -42,5 +42,40 @@ for review; no other build does.
 
 ## iOS
 
-`ios/Tests/main.swift` checks the Swift bindings in a simulator
-(`scripts/test-mobile.sh ios`). The iOS app is a later stop.
+`ios/` is an Xcode project (`OpenSecretManager.xcodeproj`, its folders
+synchronized with these):
+
+- `App`: the app, in SwiftUI. It joins a vault from a computer by
+  invitation and comparison of codes, unlocks with its own password or,
+  once turned on, Face ID or Touch ID, lists and searches the items, and
+  copies a username, password, or one-time code. It locks, stops taking
+  part, and closes the vault's files when it leaves the screen, and hides
+  the vault in the app switcher.
+- `AutoFill`: the AutoFill extension. Once turned on (the app asks iOS
+  from "Fill logins in other apps…"), it fills a login into another app or
+  a page after the owner unlocks and chooses it on its own screen.
+- `Shared`: what both use: the vault's folder in the container they share,
+  Face ID and Touch ID, who asks for a login, and the generated bindings.
+- `LoginFixture` and `UITests`: a stand-in for another app with a login
+  form, and the UI tests.
+
+`ios/prepare.sh <scratch folder>` puts in place what the project is built
+from: the shared code's static library for the simulator and for iPhones as
+`build/OSMVaultFFI.xcframework`, the Swift bindings in `Shared/Generated`,
+and a copy of the frozen vault for the tests. None of it is committed.
+
+```text
+ios/prepare.sh "$(mktemp -d)"
+open ios/OpenSecretManager.xcodeproj
+```
+
+`scripts/test-mobile-ios.sh` builds the project and runs the UI tests in a
+simulator of its own; `scripts/test-mobile-join.sh ios` has the app join a
+desktop-side device on the same machine. xcodebuild runs UI tests only on
+simulators of the default device set, so the script installs the apps and
+starts XCTest's runner itself, with the configuration Xcode would write
+(`ios/Tests/configure-ui-tests.swift`); a later Xcode may change what that
+needs. `ios/Tests/main.swift` checks the Swift bindings alone
+(`scripts/test-mobile.sh ios` runs both). A debug build reads
+`OSM_TEST_VAULT` and `OSM_TEST_BIOMETRICS` at launch, for the tests; a
+release build has neither.

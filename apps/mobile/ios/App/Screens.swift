@@ -1,0 +1,275 @@
+import AuthenticationServices
+import SwiftUI
+
+struct RootView: View {
+    @ObservedObject var model: VaultModel
+
+    var body: some View {
+        NavigationStack {
+            content
+                .navigationTitle("Open Secret Manager")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    if model.screen == .unlocked {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button("Lock", action: model.lock).accessibilityIdentifier("lock")
+                        }
+                    }
+                }
+        }
+        .overlay { if let busy = model.busy { BusyCover(what: busy) } }
+        .overlay(alignment: .bottom) { NoticeBanner(notice: $model.notice) }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch model.screen {
+        case .opening:
+            Message(title: "Opening…")
+        case .noVault:
+            JoinStart(model: model)
+        case .joining:
+            JoinConfirm(model: model)
+        case .locked:
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    UnlockFields(
+                        biometric: model.biometric,
+                        busy: model.busy != nil,
+                        onUnlock: model.unlock,
+                        onBiometrics: model.unlockWithBiometrics
+                    )
+                    SyncLine(model: model)
+                }
+                .padding(24)
+            }
+        case .unlocked:
+            if let detail = model.detail { Detail(model: model, detail: detail) } else { Items(model: model) }
+        case .removed:
+            Message(
+                title: "This phone was removed from the vault",
+                detail: "Your other devices moved to a new key that this phone never received. What it already held stays readable here."
+            )
+        case .unreadable:
+            Message(title: "The vault on this phone cannot be opened", detail: model.unreadable)
+        }
+    }
+}
+
+private struct Message: View {
+    let title: String
+    var detail: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.title2).accessibilityIdentifier("message")
+            if let detail { Text(detail) }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+}
+
+private struct JoinStart: View {
+    @ObservedObject var model: VaultModel
+    @State private var invitation = ""
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Join your vault").font(.title2)
+                Text("On your computer, open Devices, choose Invite a device, and pick a phone. Paste the invitation here.")
+                TextField("Invitation", text: $invitation, axis: .vertical)
+                    .lineLimit(3...6)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .accessibilityIdentifier("invitation")
+                Button("Continue") { model.joinStart(invitation) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy != nil)
+                    .accessibilityIdentifier("join-continue")
+            }
+            .padding(24)
+        }
+    }
+}
+
+private struct JoinConfirm: View {
+    @ObservedObject var model: VaultModel
+    @State private var password = ""
+    @State private var again = ""
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Compare the codes").font(.title2)
+                Text("Your computer shows a code too. Continue only if they are identical.")
+                Text(model.joinCode ?? "")
+                    .font(.system(size: 34, design: .monospaced))
+                    .accessibilityIdentifier("join-code")
+                Text("This phone's password: at least 12 characters. Your other devices keep their own.")
+                SecureField("New password for this phone", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("new-password")
+                SecureField("The same again", text: $again)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("new-password-again")
+                HStack(spacing: 12) {
+                    Button("They differ", action: model.cancelJoin)
+                        .buttonStyle(.bordered)
+                        .disabled(model.busy != nil)
+                    Button("Codes match · join") { model.joinFinish(password) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(password.count < 12 || password != again || model.busy != nil)
+                        .accessibilityIdentifier("join-finish")
+                }
+            }
+            .padding(24)
+        }
+    }
+}
+
+private struct Items: View {
+    @ObservedObject var model: VaultModel
+    @State private var query = ""
+    /// Whether this app fills logins in other apps: unknown until the system says.
+    @State private var autofill: Bool?
+    @Environment(\.scenePhase) private var scenePhase
+
+    private var shown: [ItemSummary] {
+        guard !query.isEmpty else { return model.items }
+        return model.items.filter {
+            $0.title.localizedCaseInsensitiveContains(query) || $0.username.localizedCaseInsensitiveContains(query)
+                || $0.url.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var body: some View {
+        List {
+            ForEach(shown, id: \.id) { item in
+                Button { model.open(item.id) } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.title + (item.conflict ? " · needs a decision on your computer" : ""))
+                        if !item.username.isEmpty {
+                            Text(item.username).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("item:\(item.title)")
+            }
+            Section {
+                if autofill == false { AutofillOffer(enabled: $autofill) }
+                SyncLine(model: model)
+            }
+        }
+        .searchable(text: $query)
+        .task(id: scenePhase) {
+            if scenePhase == .active { autofill = await ASCredentialIdentityStore.shared.state().isEnabled }
+        }
+    }
+}
+
+/// Until the owner turns on filling with this app: the way to the setting.
+private struct AutofillOffer: View {
+    @Binding var enabled: Bool?
+
+    var body: some View {
+        Button("Fill logins in other apps…", action: turnOn).accessibilityIdentifier("turn-on-autofill")
+    }
+
+    private func turnOn() {
+        if #available(iOS 18, *) {
+            ASSettingsHelper.requestToTurnOnCredentialProviderExtension { on in
+                Task { @MainActor in enabled = on }
+            }
+        } else {
+            ASSettingsHelper.openCredentialProviderAppSettings { _ in }
+        }
+    }
+}
+
+private struct Detail: View {
+    @ObservedObject var model: VaultModel
+    let detail: ItemDetail
+
+    var body: some View {
+        List {
+            Section {
+                Button("‹ All items", action: model.close).accessibilityIdentifier("back")
+            }
+            Section {
+                Text(detail.title).font(.title2)
+                if detail.conflict {
+                    Text("Two devices changed this at once. Choose which version to keep on your computer.")
+                        .foregroundStyle(.red)
+                }
+                if !detail.username.isEmpty {
+                    Field(label: "Username", value: detail.username, identifier: "detail-username") {
+                        Button("Copy") { model.copyUsername(detail) }
+                    }
+                }
+                if detail.hasPassword {
+                    Field(label: "Password", value: "••••••••••") {
+                        Button("Copy") { model.copyPassword(detail.id) }.accessibilityIdentifier("copy-password")
+                    }
+                }
+                if detail.hasOneTimeCode {
+                    Field(label: "One-time code", value: "••• •••") {
+                        Button("Copy") { model.copyOneTimeCode(detail.id) }.accessibilityIdentifier("copy-code")
+                    }
+                }
+                if !detail.url.isEmpty { Field(label: "Website", value: detail.url) {} }
+                if !detail.notes.isEmpty { Field(label: "Notes", value: detail.notes) {} }
+            }
+        }
+    }
+}
+
+/// A labelled value, with an action beside it.
+private struct Field<Action: View>: View {
+    let label: String
+    let value: String
+    var identifier: String?
+    @ViewBuilder let action: () -> Action
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+                Text(value).accessibilityIdentifier(identifier ?? "")
+            }
+            Spacer()
+            action().buttonStyle(.borderless)
+        }
+    }
+}
+
+private struct SyncLine: View {
+    @ObservedObject var model: VaultModel
+
+    private var text: String {
+        guard let sync = model.sync else { return "Offline" }
+        let state: String = switch sync.state {
+        case .offline: "Offline"
+        case .syncing: "Syncing…"
+        case .removed: "Removed from the vault"
+        case .error: "Last sync failed" + (sync.message.map { " · \($0)" } ?? "")
+        default: sync.lastSyncedAt.map {
+                "Synced " + RelativeDateTimeFormatter().localizedString(for: Date(timeIntervalSince1970: TimeInterval($0)), relativeTo: Date())
+            } ?? "Not synced yet"
+        }
+        let members = Int(sync.members)
+        return state + (members > 0 ? " · \(members) other \(members == 1 ? "device" : "devices")" : "")
+    }
+
+    var body: some View {
+        HStack {
+            Text(text).font(.caption).accessibilityIdentifier("sync")
+            Spacer()
+            Button("Sync now", action: model.syncNow).buttonStyle(.borderless)
+        }
+    }
+}

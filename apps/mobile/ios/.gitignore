@@ -1,0 +1,6 @@
+# Made by prepare.sh from the shared code.
+/build/
+/Shared/Generated/
+/UITests/Fixtures/
+# Xcode's own.
+xcuserdata/

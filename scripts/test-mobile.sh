@@ -1,21 +1,23 @@
 #!/bin/sh
 # Runs the phone tests on a simulator and an emulator.
 #
-#   scripts/test-mobile.sh [ios] [android] [join]
+#   scripts/test-mobile.sh [ios] [android] [join] [join-ios]
 #
 # ios      the phone interface through its Swift bindings, in an iOS
 #          simulator, on a copy of the frozen format 7 vault: what
-#          crates/mobile/tests/frozen_vault.rs checks in Rust.
+#          crates/mobile/tests/frozen_vault.rs checks in Rust; then the
+#          iOS app's UI tests in a simulator (scripts/test-mobile-ios.sh).
 # android  the same through the Kotlin bindings, then the Android app's
 #          screens, on a running emulator or attached device (adb). On an
 #          emulator with a fingerprint enrolled, its sensor is touched
 #          throughout, so that unlocking with a fingerprint is tested too.
 # join     the Android app joining a desktop-side device on this machine
 #          over the network (scripts/test-mobile-join.sh).
+# join-ios the same with the iOS app.
 #
 # Without arguments: ios and android. iOS needs `rustup target add
-# aarch64-apple-ios-sim` and Xcode; the simulator is made for the run in a
-# device set of its own and deleted. Android needs `rustup target add
+# aarch64-apple-ios-sim aarch64-apple-ios` and Xcode; each simulator is made
+# for the run in a device set of its own and deleted. Android needs `rustup target add
 # aarch64-linux-android` and the Android SDK and NDK. OSM_DEVICE_PIN
 # unlocks a device or emulator that has a screen lock.
 set -eu
@@ -70,6 +72,8 @@ ios)
     xcrun simctl --set "$set_dir" shutdown "$device" >/dev/null 2>&1 || true
     xcrun simctl --set "$set_dir" delete "$device" >/dev/null 2>&1 || true
     [ "$status" = 0 ] || exit "$status"
+    echo "== iOS app"
+    scripts/test-mobile-ios.sh
     ;;
 android)
     echo "== Android"
@@ -97,7 +101,11 @@ android)
     ;;
 join)
     echo "== Android app joins a desktop-side device"
-    scripts/test-mobile-join.sh
+    scripts/test-mobile-join.sh android
+    ;;
+join-ios)
+    echo "== iOS app joins a desktop-side device"
+    scripts/test-mobile-join.sh ios
     ;;
 *)
     echo "unknown platform: $platform" >&2

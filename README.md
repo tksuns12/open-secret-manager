@@ -55,12 +55,12 @@ The repository is deliberately split at the security boundary:
   Swift bindings that UniFFI generates: one device of a vault, which joins
   from another device without a vote, unlocks, shows and copies what the
   vault holds, fills logins, and syncs while the app is open.
-- `apps/mobile` holds the Android app, which joins a vault from a computer,
-  unlocks with its password or a fingerprint, shows and copies what the
-  vault holds, fills logins into other apps and into trusted browsers'
-  pages once the owner unlocks and chooses one, and syncs while open, and
-  the Swift test program of the bindings. `scripts/test-mobile.sh` runs their tests on an emulator and a
-  simulator; see `apps/mobile/README.md`.
+- `apps/mobile` holds the Android and iOS apps, which join a vault from a
+  computer, unlock with their password or a fingerprint or face, show and
+  copy what the vault holds, fill logins into other apps and into pages
+  once the owner unlocks and chooses one, and sync while open.
+  `scripts/test-mobile.sh` runs their tests on an emulator and in
+  simulators; see `apps/mobile/README.md`.
 
 The prototype is intentionally offline-first. Local vault use does not depend
 on a peer or a network. Devices pair by invitation and a six-digit code the
