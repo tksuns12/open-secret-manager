@@ -21,7 +21,7 @@ has not been reviewed by anyone outside the project; this is the request.
 
 ## The code
 
-About 39,000 lines of Rust and TypeScript, tests included.
+About 46,000 lines of Rust, TypeScript, Kotlin, and Swift, tests included.
 
 | Part | Lines | What it does | Look at |
 | --- | --- | --- | --- |
@@ -34,6 +34,9 @@ About 39,000 lines of Rust and TypeScript, tests included.
 | `apps/desktop/src-tauri` | 6,700 | The desktop app's native side: commands, devices and sync, the browser socket, archives, backups | `src/lib.rs` (which secrets cross to the window: the stored password and one-time secret never do), `src/browser.rs` (`approve_fill`), `src/network.rs` (`recover_vault`, `restore`) |
 | `apps/desktop/src-tauri/session` | 400 | The only `unsafe` code in the project: registering for macOS notifications, to lock on sleep and screen lock | `src/macos.rs` |
 | `apps/desktop/src`, `apps/browser-extension/src` | 2,300 | The window, and the extension | `apps/browser-extension/src/background.ts` (what a reply must match before it is filled) |
+| `crates/mobile` | 1,500 | The phone apps' one interface to the shared code (UniFFI bindings for Kotlin and Swift): a device of a vault that joins without a vote, unlocks, reads, fills, and syncs while the app is open | `src/runtime.rs`: `logins_for_web`, `fill_for_web`, `fill_for_app`; `src/lib.rs`: what crosses into Kotlin and Swift |
+| `apps/mobile/android` | 2,300 | The Android app and its autofill service | `app/.../autofill/Requester.kt` (when a page's domain is believed), `FillActivity.kt`, `BiometricUnlock.kt`, `VaultApp.kt` (locking when the app is left) |
+| `apps/mobile/ios` | 1,900 | The iOS app and its AutoFill extension | `Shared/FillRequester.swift` (who asks, from what iOS says), `AutoFill/FillModel.swift` (`fill`), `Shared/BiometricUnlock.swift`, `App/VaultModel.swift` (`wentToBackground`) |
 
 Everything else in the Rust workspaces forbids `unsafe`. Nothing writes a
 log.
@@ -61,13 +64,25 @@ host relays and checks; the desktop app releases a login only when the
 owner picks it in the app, for the page's exact origin, and only under the
 unlock the choice was made in.
 
+**Phones.** A phone runs the same shared code as a member without a vote,
+locks when its app leaves the screen, and can keep its password behind the
+phone's biometrics. Its autofill fills only after the owner unlocks and
+chooses on the app's own screen. On Android a page's domain is believed
+only from a browser on Google's published list, checked by its signing
+certificate, and Android does not say the page's port; any other app is
+offered only logins the owner chose for it. On iOS the system says who
+asks; an app it names by nothing gets a choice the owner makes after a
+warning.
+
 ## The evidence
 
 - `scripts/check.sh --network --browsers` runs every check: formatting,
-  lints with warnings as errors, 242 Rust tests (the vault, membership,
+  lints with warnings as errors, 255 Rust tests (the vault, membership,
   pairing and sync in process, between processes, and in desktop shells),
   the extension's 19 tests in headless Chromium and Firefox, and the
-  dependency policy and advisory audits.
+  dependency policy and advisory audits. With `--mobile` it also runs the
+  phone tests: the bindings in an iOS simulator and on an Android emulator,
+  and the two apps' UI and autofill tests through the real shared code.
 - Frozen formats: files every build reads, in each crate's `fixtures/`.
 - Property tests on every parser that takes outside input, and crash tests
   that kill a process writing to a vault (Phase 6a stop 2).
@@ -88,6 +103,9 @@ unlock the choice was made in.
 4. Is the pairing transcript and its six-digit code a sound way to bind the
    two devices, given that the owner compares it by eye?
 5. Is anything in the frozen formats a mistake that will be costly to keep?
+6. On the phones, is it sound to believe a page's domain from the browsers
+   on Google's list, and to let the owner pick a login for an app that
+   cannot be checked against its address?
 
 ## What is known to be missing
 
@@ -96,4 +114,5 @@ The full list is the right-hand column of the delivery matrix in
 review until this one; packages signed with a developer identity and
 notarized are waiting on that identity; coverage-guided fuzzing was not run;
 the native lifecycle locks and the new backup screens were checked through
-the code, not in a running window; mobile apps do not exist yet.
+the code, not in a running window; the phone apps have run only on an
+emulator and in a simulator, and are not signed for distribution.

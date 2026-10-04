@@ -142,9 +142,16 @@ asks whether the app uses encryption that is not exempt, which is a legal
 answer about export rules, not a technical one. And the app's privacy
 manifests (`PrivacyInfo.xcprivacy`) declare reading files' metadata and the
 app group's user defaults, but not the "disk space" category: the bundled
-SQLite calls `statfs` to choose how to lock files, and none of Apple's
-listed reasons for that category describes this. Either SQLite is built
-without that detection (`SQLITE_ENABLE_LOCKING_STYLE=0`) or Apple is asked.
+SQLite calls `statfs` to choose how to lock a file and, on Apple systems
+whatever it is built with, `fstatfs` on every file it opens to recognize
+FAT volumes, and none of Apple's listed reasons for that category describes
+either. Building SQLite without its locking-style detection
+(`SQLITE_ENABLE_LOCKING_STYLE=0`) removes only the first. What would remove
+both is linking iOS's own SQLite instead of the bundled one, since calls
+inside Apple's library need no declaration: iOS 17 has SQLite 3.39, which
+has everything the vault uses (strict tables from 3.37, dropping columns
+from 3.35); the vault's tests would then have to run against it. The other
+way is to ask Apple for a reason that fits.
 
 ## How a release is built
 
