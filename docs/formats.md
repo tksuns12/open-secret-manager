@@ -325,7 +325,7 @@ The app (`apps/mobile/ios`, bundle `org.opensecretmanager.app`, iOS 17 and later
 
 The extension declares the extension point `com.apple.authentication-services-credential-provider-ui` with `ProvidesPasswords` only, registers no credential identities with the system, and returns an `ASPasswordCredential`. Who asks is read from the service identifiers the system gives (`Shared/FillRequester.swift`): a URL with the scheme https gives `https://host`, or `https://host:port` for a port other than 443; a domain gives `https://domain`; when any origin results, those origins are offered their logins by the exact-origin rule. Otherwise an App ID (from iOS 26.2) is used for the logins chosen for that app; otherwise an http URL fills nothing; and with no identifier at all the owner chooses among every login, warned, and the choice is not remembered. The extension opens the device on the shared folder, never goes online, and locks and lets go of it when the request ends.
 
-A debug build reads two variables at launch, for the UI tests (`App/TestSupport.swift`): `OSM_TEST_VAULT` empties the device's folder and puts the named vault file there (`none` for no vault), and `OSM_TEST_BIOMETRICS=off` forgets a kept password. A release build has neither.
+A debug build reads three variables at launch, for the UI tests (`App/TestSupport.swift`): `OSM_TEST_VAULT` empties the device's folder and puts the named vault file there (`none` for no vault), `OSM_TEST_BIOMETRICS=off` forgets a kept password, and `OSM_TEST_CHANGE_WHILE_EDITING` (`<item id>|<username>|<password>`) changes that item through a second device object on the folder when the editor opens for it. A release build has none of them.
 
 ## Frozen formats (Phase 6, stop 1)
 

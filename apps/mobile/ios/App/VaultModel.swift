@@ -4,6 +4,12 @@ import UIKit
 /// What the app shows.
 enum Screen: Equatable { case opening, noVault, joining, locked, unlocked, removed, unreadable }
 
+/// An item being written: a new one when `detail` is nil, otherwise that
+/// item as it was read.
+struct Editor: Equatable {
+    let detail: ItemDetail?
+}
+
 /// The device of the vault, as the screens use it. Every call to it runs off
 /// the main thread, one at a time; the screens follow what is published.
 @MainActor
@@ -19,6 +25,8 @@ final class VaultModel: ObservableObject {
     /// The outcome of the last thing the owner did, to show once.
     @Published var notice: String?
     @Published private(set) var unreadable: String?
+    /// While the editor is open.
+    @Published private(set) var editor: Editor?
     let biometric = BiometricUnlock()
 
     private let queue = DispatchQueue(label: "org.opensecretmanager.device")
@@ -76,6 +84,7 @@ final class VaultModel: ObservableObject {
         // A detail stays open only while its item does.
         if let detail, !(screen == .unlocked && items.contains { $0.id == detail.id }) { self.detail = nil }
         if screen != .joining { joinCode = nil }
+        if screen != .unlocked { editor = nil }
     }
 
     private func openDevice() async {
@@ -127,6 +136,7 @@ final class VaultModel: ObservableObject {
     func lock() {
         Task {
             detail = nil
+            editor = nil
             await call { $0.lock() }
         }
     }
@@ -168,6 +178,68 @@ final class VaultModel: ObservableObject {
 
     func close() {
         detail = nil
+    }
+
+    func startNew() {
+        editor = Editor(detail: nil)
+    }
+
+    func startEdit(_ detail: ItemDetail) {
+        editor = Editor(detail: detail)
+        #if DEBUG
+        TestSupport.changeWhileEditing(detail.id)
+        #endif
+    }
+
+    func closeEditor() {
+        editor = nil
+    }
+
+    /// Saves the editor's draft: a new item, or an edit of the item as it was read.
+    func save(_ draft: ItemDraft) {
+        guard let device else { return }
+        let editing = editor?.detail
+        Task {
+            busy = "Saving…"
+            notice = nil
+            defer { busy = nil }
+            do {
+                let saved = try await onQueue { () -> ItemDetail in
+                    if let editing {
+                        try device.updateItem(id: editing.id, revision: editing.revision, draft: draft)
+                        return try device.item(id: editing.id)
+                    }
+                    return try device.item(id: try device.createItem(draft: draft))
+                }
+                editor = nil
+                detail = saved
+                notice = editing == nil ? "Item created" : "Changes saved"
+            } catch MobileError.ChangedElsewhere {
+                // What was read is out of date: show the item as it is now.
+                let current = try? await onQueue { try device.item(id: editing?.id ?? "") }
+                editor = nil
+                detail = current
+                notice = describe(MobileError.ChangedElsewhere)
+            } catch {
+                notice = describe(error)
+            }
+            await refresh()
+        }
+    }
+
+    /// Deletes the item as it was read, on every device.
+    func delete(_ item: ItemDetail) {
+        Task {
+            if await call(nil, { try $0.deleteItem(id: item.id, revision: item.revision) }) != nil {
+                detail = nil
+                notice = "Item deleted"
+            }
+        }
+    }
+
+    /// A new password from the shared generator.
+    func generatePassword() -> String {
+        (try? OpenSecretManager.generatePassword(length: 20)) ?? ""
     }
 
     func copyUsername(_ detail: ItemDetail) {
@@ -215,6 +287,7 @@ final class VaultModel: ObservableObject {
         guard let device else { return }
         self.device = nil
         detail = nil
+        editor = nil
         if joinCode != nil {
             joinCode = nil
             notice = "The join stopped when the app left the screen · start again from your computer"

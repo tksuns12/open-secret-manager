@@ -5,8 +5,8 @@
 # app's test pastes the invitation into the app's join screen and shows the
 # code, the script answers for the owner on the desktop side only if the two
 # codes match, the test sets the phone's password, and the app shows the
-# item once it has synced. With the debug build on Android, a login then
-# made on the phone must reach the desktop.
+# item once it has synced. With the debug builds, a login then made on the
+# phone must reach the desktop.
 #
 #   scripts/test-mobile-join.sh [android|android-release|ios]
 #
@@ -200,6 +200,23 @@ elif [ "$platform" = ios ]; then
     phone_code=$(cat "$work/join/phone-code" 2>/dev/null || true)
     echo "desktop shows $desktop_code, phone shows $phone_code"
     if [ "$phone_code" = "$desktop_code" ]; then echo y >&3; else echo n >&3; fi
+    # Then the phone makes a login, which must reach the desktop.
+    for _ in $(seq 1 600); do
+        [ -e "$work/join/phone-made" ] && break
+        kill -0 "$phone" 2>/dev/null || break
+        sleep 0.5
+    done
+    if [ -e "$work/join/phone-made" ]; then
+        for _ in $(seq 1 120); do
+            echo list >&3
+            sleep 0.5
+            if grep -q "^ITEM From the phone" "$work/out"; then
+                touch "$work/join/desktop-has"
+                echo "the desktop has the phone's login"
+                break
+            fi
+        done
+    fi
     status=0
     wait "$phone" || status=$?
     cat "$work/ios.log"

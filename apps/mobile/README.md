@@ -52,8 +52,9 @@ synchronized with these):
 
 - `App`: the app, in SwiftUI. It joins a vault from a computer by
   invitation and comparison of codes, unlocks with its own password or,
-  once turned on, Face ID or Touch ID, lists and searches the items, and
-  copies a username, password, or one-time code. It locks, stops taking
+  once turned on, Face ID or Touch ID, lists and searches the items,
+  copies a username, password, or one-time code, and creates, edits, and
+  deletes logins and secure notes. It locks, stops taking
   part, and closes the vault's files when it leaves the screen, and hides
   the vault in the app switcher.
 - `AutoFill`: the AutoFill extension. Once turned on (the app asks iOS
@@ -82,8 +83,8 @@ starts XCTest's runner itself, with the configuration Xcode would write
 (`ios/Tests/configure-ui-tests.swift`); a later Xcode may change what that
 needs. `ios/Tests/main.swift` checks the Swift bindings alone
 (`scripts/test-mobile.sh ios` runs both). A debug build reads
-`OSM_TEST_VAULT` and `OSM_TEST_BIOMETRICS` at launch, for the tests; a
-release build has neither. `scripts/release-ios.sh` builds the release
+`OSM_TEST_VAULT`, `OSM_TEST_BIOMETRICS`, and `OSM_TEST_CHANGE_WHILE_EDITING`
+at launch, for the tests; a release build has none of them. `scripts/release-ios.sh` builds the release
 (signed with `OSM_APPLE_TEAM`, otherwise unsigned to check it builds), and
 `scripts/measure-ios-memory.sh` measures the app and the extension
 unlocking a vault at the real cost. What is left to try on real phones is

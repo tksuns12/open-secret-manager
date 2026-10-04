@@ -10,7 +10,12 @@ struct RootView: View {
                 .navigationTitle("Open Secret Manager")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    if model.screen == .unlocked {
+                    if model.screen == .unlocked && model.editor == nil {
+                        if model.detail == nil {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button("New", action: model.startNew).accessibilityIdentifier("new-item")
+                            }
+                        }
                         ToolbarItem(placement: .primaryAction) {
                             Button("Lock", action: model.lock).accessibilityIdentifier("lock")
                         }
@@ -43,7 +48,13 @@ struct RootView: View {
                 .padding(24)
             }
         case .unlocked:
-            if let detail = model.detail { Detail(model: model, detail: detail) } else { Items(model: model) }
+            if let editor = model.editor {
+                ItemEditor(model: model, detail: editor.detail)
+            } else if let detail = model.detail {
+                Detail(model: model, detail: detail)
+            } else {
+                Items(model: model)
+            }
         case .removed:
             Message(
                 title: "This phone was removed from the vault",
@@ -194,6 +205,11 @@ private struct AutofillOffer: View {
 private struct Detail: View {
     @ObservedObject var model: VaultModel
     let detail: ItemDetail
+    @State private var confirmingDelete = false
+
+    private var editable: Bool {
+        (detail.kind == .login || detail.kind == .secureNote) && !detail.conflict
+    }
 
     var body: some View {
         List {
@@ -205,6 +221,15 @@ private struct Detail: View {
                 if detail.conflict {
                     Text("Two devices changed this at once. Choose which version to keep on your computer.")
                         .foregroundStyle(.red)
+                }
+                if editable {
+                    HStack(spacing: 12) {
+                        Button("Edit") { model.startEdit(detail) }.accessibilityIdentifier("edit")
+                        Button("Delete…") { confirmingDelete = true }.accessibilityIdentifier("delete")
+                    }
+                    .buttonStyle(.bordered)
+                } else if !detail.conflict {
+                    Text("Identities and cards are edited on your computer.").accessibilityIdentifier("edit-elsewhere")
                 }
                 if !detail.username.isEmpty {
                     Field(label: "Username", value: detail.username, identifier: "detail-username") {
@@ -222,7 +247,145 @@ private struct Detail: View {
                     }
                 }
                 if !detail.url.isEmpty { Field(label: "Website", value: detail.url) {} }
-                if !detail.notes.isEmpty { Field(label: "Notes", value: detail.notes) {} }
+                if !detail.notes.isEmpty { Field(label: "Notes", value: detail.notes, identifier: "detail-notes") {} }
+            }
+        }
+        .alert("Delete \(detail.title)?", isPresented: $confirmingDelete) {
+            Button("Delete", role: .destructive) { model.delete(detail) }.accessibilityIdentifier("confirm-delete")
+            Button("Keep", role: .cancel) {}.accessibilityIdentifier("keep")
+        } message: {
+            Text("It is deleted on all your devices. Its earlier versions stay in the vault's history and in backups.")
+        }
+    }
+}
+
+/// Writing a login or a secure note: a new one, or `detail` as it was read.
+/// A blank password or one-time code secret keeps what the item has.
+private struct ItemEditor: View {
+    @ObservedObject var model: VaultModel
+    let detail: ItemDetail?
+    @State private var kind: ItemKind
+    @State private var title: String
+    @State private var username: String
+    @State private var url: String
+    @State private var password = ""
+    @State private var showPassword = false
+    @State private var code = ""
+    @State private var removeCode = false
+    @State private var notes: String
+    @State private var favorite: Bool
+
+    init(model: VaultModel, detail: ItemDetail?) {
+        self.model = model
+        self.detail = detail
+        _kind = State(initialValue: detail?.kind ?? .login)
+        _title = State(initialValue: detail?.title ?? "")
+        _username = State(initialValue: detail?.username ?? "")
+        _url = State(initialValue: detail?.url ?? "")
+        _notes = State(initialValue: detail?.notes ?? "")
+        _favorite = State(initialValue: detail?.favorite ?? false)
+    }
+
+    private var draft: ItemDraft {
+        let login = kind == .login
+        return ItemDraft(
+            title: title,
+            kind: kind,
+            username: login ? username : "",
+            url: login ? url : "",
+            notes: notes,
+            favorite: favorite,
+            password: login && !password.isEmpty ? password : nil,
+            oneTimeCodeSecret: !login ? nil : removeCode ? "" : code.trimmingCharacters(in: .whitespaces).isEmpty ? nil : code
+        )
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Kind", selection: $kind) {
+                    Text("Login").tag(ItemKind.login)
+                    Text("Secure note").tag(ItemKind.secureNote)
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("edit-kind")
+                LabeledContent("Title") {
+                    TextField("Title", text: $title).accessibilityIdentifier("edit-title")
+                }
+            }
+            if kind == .login {
+                Section {
+                    LabeledContent("Username") {
+                        TextField("Username", text: $username)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("edit-username")
+                    }
+                    LabeledContent("Website") {
+                        TextField("https://", text: $url)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("edit-url")
+                    }
+                }
+                Section {
+                    // Marked as codes, these fields are left alone by iOS's
+                    // Automatic Strong Passwords, which otherwise takes this
+                    // form for a sign-up and fills them with a password of
+                    // its own.
+                    Group {
+                        if showPassword {
+                            TextField("Password", text: $password)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        } else {
+                            SecureField(detail?.hasPassword == true ? "Unchanged" : "Password", text: $password)
+                        }
+                    }
+                    .textContentType(.oneTimeCode)
+                    .accessibilityIdentifier("edit-password")
+                    HStack {
+                        Button(showPassword ? "Hide" : "Show") { showPassword.toggle() }.accessibilityIdentifier("show-password")
+                        Spacer()
+                        Button("Generate") {
+                            password = model.generatePassword()
+                            showPassword = true
+                        }
+                        .accessibilityIdentifier("generate")
+                    }
+                    .buttonStyle(.borderless)
+                } footer: {
+                    if detail?.hasPassword == true { Text("Left blank, the password stays as it is.") }
+                }
+                Section {
+                    SecureField(detail?.hasOneTimeCode == true ? "Unchanged" : "One-time code secret (optional)", text: $code)
+                        .textContentType(.oneTimeCode)
+                        .disabled(removeCode)
+                        .accessibilityIdentifier("edit-code")
+                    if detail?.hasOneTimeCode == true {
+                        Toggle("Remove the one-time code", isOn: $removeCode).accessibilityIdentifier("remove-code")
+                    }
+                } footer: {
+                    if detail?.hasOneTimeCode == true { Text("Left blank, the one-time code stays as it is.") }
+                }
+            }
+            Section {
+                TextField("Notes", text: $notes, axis: .vertical)
+                    .lineLimit(kind == .secureNote ? 6...12 : 3...8)
+                    .accessibilityIdentifier("edit-notes")
+                Toggle("Favorite", isOn: $favorite).accessibilityIdentifier("edit-favorite")
+            }
+        }
+        .navigationTitle(detail == nil ? "New item" : "Edit item")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel", action: model.closeEditor).accessibilityIdentifier("cancel-edit")
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save") { model.save(draft) }
+                    .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty || model.busy != nil)
+                    .accessibilityIdentifier("save")
             }
         }
     }

@@ -7,7 +7,9 @@ import XCTest
 /// the test pastes it into the join screen and writes the `phone-code` the
 /// app shows, which the script compares with the desktop's before it answers
 /// for the owner there; then the test sets the phone's password, and the
-/// desktop's item shows once it synced. Skipped without OSM_TEST_JOIN.
+/// desktop's item shows once it synced. Last, the test makes a login and
+/// writes `phone-made`, and the script writes `desktop-has` once the desktop
+/// lists it. Skipped without OSM_TEST_JOIN.
 final class JoinTests: UITestCase {
     func testJoinsTheDesktopAndShowsItsVault() throws {
         let environment = ProcessInfo.processInfo.environment
@@ -39,5 +41,24 @@ final class JoinTests: UITestCase {
         }
         app.buttons["join-finish"].tap()
         XCTAssert(app.buttons["item:Mail"].waitForExistence(timeout: 180), "the desktop's item never arrived")
+
+        // A login made on the phone goes the other way; the script says when
+        // the desktop has it.
+        app.buttons["new-item"].waitAndTap()
+        let title = app.descendants(matching: .any)["edit-title"].firstMatch
+        title.waitAndTap()
+        title.typeText("From the phone")
+        let secret = app.descendants(matching: .any)["edit-password"].firstMatch
+        secret.waitAndTap()
+        secret.typeText("phone-made password")
+        app.buttons["save"].tap()
+        XCTAssert(app.buttons["copy-password"].waitForExistence(timeout: 30))
+        try "".write(toFile: folder + "/phone-made", atomically: true, encoding: .utf8)
+        var arrived = false
+        for _ in 0..<240 where !arrived {
+            arrived = FileManager.default.fileExists(atPath: folder + "/desktop-has")
+            if !arrived { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssert(arrived, "the desktop never had the phone's login")
     }
 }

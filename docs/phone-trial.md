@@ -53,7 +53,7 @@ phone sold since 2019 is):
 
 ## Writing on the phone
 
-- Make a login on the phone (New, on Android so far). Within a minute,
+- Make a login on the phone (New, in the list). Within a minute,
   with the computer's app open, it appears there with its password.
 - Edit it on the phone, leaving the password blank: on the computer the
   username changes and the password stays.
