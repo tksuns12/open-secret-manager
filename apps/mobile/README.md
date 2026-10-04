@@ -40,6 +40,10 @@ has the app join a desktop-side device on the same machine. A debug
 build made with `-Posm.screenshots=true` lets its screens be captured
 for review; no other build does.
 
+`scripts/release-android.sh` builds the release, shrunk and signed with the
+owner's key when one is given, and `scripts/test-mobile-join.sh
+android-release` tries it on an emulator; see `docs/release.md`.
+
 ## iOS
 
 `ios/` is an Xcode project (`OpenSecretManager.xcodeproj`, its folders
@@ -78,4 +82,8 @@ starts XCTest's runner itself, with the configuration Xcode would write
 needs. `ios/Tests/main.swift` checks the Swift bindings alone
 (`scripts/test-mobile.sh ios` runs both). A debug build reads
 `OSM_TEST_VAULT` and `OSM_TEST_BIOMETRICS` at launch, for the tests; a
-release build has neither.
+release build has neither. `scripts/release-ios.sh` builds the release
+(signed with `OSM_APPLE_TEAM`, otherwise unsigned to check it builds), and
+`scripts/measure-ios-memory.sh` measures the app and the extension
+unlocking a vault at the real cost. What is left to try on real phones is
+in `docs/phone-trial.md`.

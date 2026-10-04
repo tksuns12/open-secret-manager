@@ -28,6 +28,8 @@ before the release are upgraded when opened.
 | Linux, x86_64 (`.deb`) | **Built, not verified.** Made in a container from Ubuntu 22.04, so it needs no newer system libraries than 22.04 has. No Linux desktop has run it. Locking when the computer sleeps or the screen locks, and keeping copied codes out of clipboard history, exist only on macOS. |
 | Linux, arm64 | The packaging script builds it on request; not built for the release. |
 | Windows | **Not supported.** The app was never built for Windows, and its browser fill does not exist there. |
+| Android (9 and later, 64-bit ARM) | **Not yet a release.** The release build, shrunk and signed as it ships, joined a desktop-side device and synced on an Android 16 emulator; no real phone has run it ([phone-trial.md](phone-trial.md) is what is left). Other kinds of phone refuse to install it. |
+| iOS (17 and later, iPhone) | **Not yet a release.** Built for iPhones unsigned; tested only in an iOS 26.3 simulator. Running it on any iPhone needs an Apple developer team, which the project does not have yet. |
 | Browsers | Chromium-based browsers and Firefox, tested headless (Chrome for Testing 153, Firefox 157). The extension is not published in either store: in Chromium it loads unpacked under its development ID, and in Firefox only as a temporary add-on. |
 | Networks | Devices reach each other directly by address on a network they share. There is no relay and no discovery beyond the address in an invitation. |
 | Devices in a vault | Tested with up to four. With two, both must be online to add or remove a device; with three or more, one can be away. |
@@ -107,6 +109,42 @@ Each release folder has `SHA256SUMS`, `app-contents.sha256`, and
    disk image itself differs between builds (it records when it was made);
    the app inside it must not. The tools must be the versions in
    `build-info.txt`.
+
+## How a phone release is built
+
+Neither phone app is released yet; these build what a release would be.
+
+- `scripts/release-android.sh` builds the APK and the bundle for Google Play
+  from an export of the commit at `/private/tmp/open-secret-manager-android-release`,
+  shrunk with R8 (the rules that keep what JNA calls by name are in
+  `apps/mobile/android/vault/consumer-rules.pro`), into `dist/android/<commit>/`
+  with their SHA-256, the list of the APK's files without its signature
+  (`apk-contents.sha256`), and `build-info.txt`. With `OSM_ANDROID_KEYSTORE`,
+  `OSM_ANDROID_KEYSTORE_PASSWORD`, `OSM_ANDROID_KEY_ALIAS`, and
+  `OSM_ANDROID_KEY_PASSWORD` both are signed with that key; without them
+  they are unsigned. An update must be signed with the same key, so the
+  keystore is kept as carefully as a Developer ID.
+  `scripts/reproduce-android.sh` builds twice and compares the file lists.
+  `scripts/test-mobile-join.sh android-release` signs the release with a key
+  made for the run and has it join a desktop-side device on an emulator.
+- `scripts/release-ios.sh` builds from an export at
+  `/private/tmp/open-secret-manager-ios-release`. With `OSM_APPLE_TEAM` (a
+  team whose account is signed in to Xcode) it makes a signed archive and an
+  IPA for App Store Connect; without it, the app built for iPhones unsigned,
+  which installs nowhere and only shows that the release builds. Xcode's
+  asset compiler needs a simulator runtime of the SDK's exact version even
+  to build for iPhones; without it the unsigned build leaves out the app
+  icon and the signed one refuses to start (`xcodebuild -downloadPlatform
+  iOS` installs it).
+
+Before an iOS app is submitted, two things wait for the owner. Each upload
+asks whether the app uses encryption that is not exempt, which is a legal
+answer about export rules, not a technical one. And the app's privacy
+manifests (`PrivacyInfo.xcprivacy`) declare reading files' metadata and the
+app group's user defaults, but not the "disk space" category: the bundled
+SQLite calls `statfs` to choose how to lock files, and none of Apple's
+listed reasons for that category describes this. Either SQLite is built
+without that detection (`SQLITE_ENABLE_LOCKING_STYLE=0`) or Apple is asked.
 
 ## How a release is built
 

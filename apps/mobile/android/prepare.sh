@@ -3,25 +3,35 @@
 # shared code's library for arm64 Android, its Kotlin bindings, and a copy
 # of the frozen format 7 vault for the tests. None of it is committed.
 #
-#   apps/mobile/android/prepare.sh <scratch folder>
+#   apps/mobile/android/prepare.sh <scratch folder> [release]
+#
+# release  the library built optimized, as a release has it.
 set -eu
 cd "$(dirname "$0")"
 android=$PWD
 cd ../../..
 work=$1
+profile=debug
+[ "${2:-}" = release ] && profile=release
 
 ndk=${ANDROID_NDK_HOME:-$(ls -d "${ANDROID_HOME:-$HOME/Library/Android/sdk}"/ndk/* | tail -1)}
 tools="$ndk/toolchains/llvm/prebuilt/$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64/bin"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tools/aarch64-linux-android28-clang"
 export CC_aarch64_linux_android="$tools/aarch64-linux-android28-clang"
 export AR_aarch64_linux_android="$tools/llvm-ar"
-cargo build --locked -q -p osm-mobile --target aarch64-linux-android
+# For this machine too: the bindings are generated from that library.
+cargo build --locked -q -p osm-mobile
+if [ "$profile" = release ]; then
+    cargo build --locked -q --release -p osm-mobile --target aarch64-linux-android
+else
+    cargo build --locked -q -p osm-mobile --target aarch64-linux-android
+fi
 
 libs="$android/vault/src/main/jniLibs/arm64-v8a"
 mkdir -p "$libs"
 # Without debug information, which makes it several times smaller.
 "$tools/llvm-strip" --strip-debug -o "$libs/libosm_mobile.so" \
-    target/aarch64-linux-android/debug/libosm_mobile.so
+    "target/aarch64-linux-android/$profile/libosm_mobile.so"
 
 library=target/debug/libosm_mobile.dylib
 [ -f "$library" ] || library=target/debug/libosm_mobile.so

@@ -9,8 +9,10 @@
 # the script builds the targets, installs them, and starts XCTest's runner
 # itself, with the configuration Xcode would give it
 # (apps/mobile/ios/Tests/configure-ui-tests.swift). Variables named
-# OSM_TEST_* are passed on to the tests. Needs Xcode, an iOS simulator
-# runtime, and `rustup target add aarch64-apple-ios-sim aarch64-apple-ios`.
+# OSM_TEST_* are passed on to the tests. OSM_IOS_OPTIMIZED=1 builds the apps
+# and the shared code optimized, as a release, keeping only the debug
+# build's hooks for the tests. Needs Xcode, an iOS simulator runtime, and
+# `rustup target add aarch64-apple-ios-sim aarch64-apple-ios`.
 set -eu
 cd "$(dirname "$0")/.."
 work=$(mktemp -d)
@@ -25,16 +27,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-apps/mobile/ios/prepare.sh "$work/prepare"
-# Without the app icon: this Xcode's asset compiler needs a simulator runtime
-# of its SDK's exact version, which tests in a simulator do not otherwise.
+configuration=Debug
+profile=debug
+optimized=""
+if [ "${OSM_IOS_OPTIMIZED:-}" = 1 ]; then
+    configuration=Release
+    profile=release
+    optimized=SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG
+fi
+apps/mobile/ios/prepare.sh "$work/prepare" "$profile"
+# Without the app icon if this Mac lacks the simulator runtime Xcode's asset
+# compiler needs (see icon-flags.sh); the tests do not need it.
+# shellcheck disable=SC2046
 (cd apps/mobile/ios && xcodebuild -project OpenSecretManager.xcodeproj \
     -target UITests -target OpenSecretManager -target LoginFixture \
-    -sdk iphonesimulator -configuration Debug \
-    SYMROOT="$work/build" OBJROOT="$work/obj" \
-    EXCLUDED_SOURCE_FILE_NAMES=Assets.xcassets ASSETCATALOG_COMPILER_APPICON_NAME= \
+    -sdk iphonesimulator -configuration "$configuration" \
+    SYMROOT="$work/build" OBJROOT="$work/obj" $(./icon-flags.sh) $optimized \
     -quiet build 2>&1 | grep -v appintentsmetadataprocessor) || true
-products="$work/build/Debug-iphonesimulator"
+products="$work/build/$configuration-iphonesimulator"
 [ -d "$products/UITests-Runner.app" ] || { echo "the iOS project did not build" >&2; exit 1; }
 xcrun --sdk iphonesimulator swiftc -target arm64-apple-ios17.0-simulator \
     apps/mobile/ios/Tests/configure-ui-tests.swift -o "$work/configure-ui-tests"

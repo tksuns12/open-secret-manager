@@ -18,11 +18,30 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // The shared code is built for arm64 only: a phone of another kind
+        // refuses to install the app rather than failing to open the vault.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    // A release is signed with the owner's key when OSM_ANDROID_KEYSTORE
+    // names its keystore (with OSM_ANDROID_KEYSTORE_PASSWORD,
+    // OSM_ANDROID_KEY_ALIAS, and OSM_ANDROID_KEY_PASSWORD); without it the
+    // release is left unsigned. See docs/release.md.
+    val keystore = System.getenv("OSM_ANDROID_KEYSTORE")
+    if (keystore != null) {
+        signingConfigs.create("release") {
+            storeFile = file(keystore)
+            storePassword = System.getenv("OSM_ANDROID_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("OSM_ANDROID_KEY_ALIAS")
+            keyPassword = System.getenv("OSM_ANDROID_KEY_PASSWORD")
+        }
     }
 
     buildTypes {
@@ -34,6 +53,10 @@ android {
         }
         release {
             buildConfigField("boolean", "ALLOW_SCREENSHOTS", "false")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

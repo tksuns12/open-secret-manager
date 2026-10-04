@@ -4,18 +4,27 @@
 # build/OSMVaultFFI.xcframework, its Swift bindings, and a copy of the
 # frozen format 7 vault for the UI tests. None of it is committed.
 #
-#   apps/mobile/ios/prepare.sh <scratch folder>
+#   apps/mobile/ios/prepare.sh <scratch folder> [release]
+#
+# release  the libraries built optimized, as a release has them.
 set -eu
 cd "$(dirname "$0")"
 ios=$PWD
 cd ../../..
 work=$1
+profile=debug
+[ "${2:-}" = release ] && profile=release
 
 # The oldest iOS the app is meant for, for the C code built with it too.
 export IPHONEOS_DEPLOYMENT_TARGET=17.0
 cargo build --locked -q -p osm-mobile
-cargo build --locked -q -p osm-mobile --target aarch64-apple-ios-sim
-cargo build --locked -q -p osm-mobile --target aarch64-apple-ios
+for target in aarch64-apple-ios-sim aarch64-apple-ios; do
+    if [ "$profile" = release ]; then
+        cargo build --locked -q --release -p osm-mobile --target "$target"
+    else
+        cargo build --locked -q -p osm-mobile --target "$target"
+    fi
+done
 
 library=target/debug/libosm_mobile.dylib
 cargo run --locked -q -p osm-mobile --features bindgen --bin uniffi-bindgen -- \
@@ -28,7 +37,7 @@ cp "$work/swift/OSMVault.swift" "$ios/Shared/Generated/"
 # Without debug information, which makes the libraries several times larger.
 for target in aarch64-apple-ios-sim aarch64-apple-ios; do
     mkdir -p "$work/$target"
-    strip -S -o "$work/$target/libosm_mobile.a" "target/$target/debug/libosm_mobile.a" 2>/dev/null
+    strip -S -o "$work/$target/libosm_mobile.a" "target/$target/$profile/libosm_mobile.a" 2>/dev/null
 done
 rm -rf "$ios/build/OSMVaultFFI.xcframework"
 xcodebuild -create-xcframework \
