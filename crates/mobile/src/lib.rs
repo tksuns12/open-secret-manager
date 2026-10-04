@@ -9,7 +9,13 @@
 //! can take seconds.
 //!
 //! Secrets cross into the app only where it needs them: a password or a
-//! one-time code to copy or fill. What crosses cannot be wiped there.
+//! one-time code to copy or fill. What crosses cannot be wiped there. The
+//! owner's edits cross the other way, into the shared code, which keeps
+//! them only in the vault.
+//!
+//! On a phone the owner creates, edits, and deletes logins and secure
+//! notes; identities and cards are read there and edited on a computer, as
+//! are conflicts between devices.
 //!
 //! This crate's own code has no `unsafe`; the foreign function interface
 //! that UniFFI generates around it is made of it.
@@ -61,6 +67,17 @@ pub enum MobileError {
     NotForThisPage,
     #[error("that item is not a login")]
     NotALogin,
+    #[error("{reason}")]
+    InvalidItem { reason: String },
+    /// The item changed since it was read, here or on another device.
+    #[error("the item changed since it was opened")]
+    ChangedElsewhere,
+    /// Two devices changed the item at once; a computer resolves that.
+    #[error("two devices changed the item at once")]
+    InConflict,
+    /// Identities and cards are edited on a computer.
+    #[error("that kind of item is edited on a computer")]
+    NotEditableHere,
     // Not `message`: in Kotlin every exception has one already.
     #[error("{reason}")]
     Network { reason: String },
@@ -76,6 +93,9 @@ impl From<osm_vault_core::Error> for MobileError {
             Error::InvalidCredentials => Self::InvalidCredentials,
             Error::NotFound => Self::NotFound,
             Error::OriginMismatch => Self::NotForThisPage,
+            Error::InvalidItem(reason) => Self::InvalidItem { reason },
+            Error::Conflict { .. } => Self::ChangedElsewhere,
+            Error::Unresolved => Self::InConflict,
             error => Self::Storage {
                 reason: error.to_string(),
             },
@@ -166,6 +186,86 @@ pub struct ItemDetail {
     pub has_password: bool,
     pub has_one_time_code: bool,
     pub conflict: bool,
+    /// The revision it was read at, which an edit names: an edit of an item
+    /// that changed since is refused.
+    pub revision: String,
+}
+
+/// What the owner writes into a login or a secure note. A password or a
+/// one-time code secret of `None` keeps what the item has; an empty one
+/// removes it.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ItemDraft {
+    pub title: String,
+    pub kind: ItemKind,
+    pub username: String,
+    pub url: String,
+    pub notes: String,
+    pub favorite: bool,
+    pub password: Option<String>,
+    pub one_time_code_secret: Option<String>,
+}
+
+impl std::fmt::Debug for ItemDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ItemDraft")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ItemDraft {
+    /// Writes the draft over `item`, keeping what the draft leaves alone.
+    /// Its values move into the item, which wipes them when it goes; what
+    /// is left over is wiped here. (A record cannot wipe itself: the
+    /// bindings move its fields out.)
+    fn apply_to(self, item: &mut osm_vault_core::Item) {
+        let title = Zeroizing::new(self.title);
+        let url = Zeroizing::new(self.url);
+        item.title = title.trim().to_owned();
+        item.kind = self.kind.into();
+        item.username = self.username;
+        item.url = url.trim().to_owned();
+        item.notes = self.notes;
+        item.favorite = self.favorite;
+        if let Some(password) = self.password {
+            item.password = password;
+        }
+        if let Some(secret) = self.one_time_code_secret {
+            let secret = Zeroizing::new(secret);
+            item.totp_secret = (!secret.trim().is_empty()).then(|| secret.trim().to_owned());
+        }
+    }
+}
+
+impl ItemKind {
+    /// Whether a phone edits items of this kind.
+    fn editable_here(self) -> bool {
+        matches!(self, Self::Login | Self::SecureNote)
+    }
+}
+
+impl From<ItemKind> for osm_vault_core::ItemKind {
+    fn from(kind: ItemKind) -> Self {
+        match kind {
+            ItemKind::Login => Self::Login,
+            ItemKind::SecureNote => Self::SecureNote,
+            ItemKind::Identity => Self::Identity,
+            ItemKind::Card => Self::Card,
+        }
+    }
+}
+
+/// A new password of `length` characters with letters, digits, and
+/// symbols, from the shared code's generator, as the desktop app makes
+/// them; a length it does not allow is refused.
+#[uniffi::export]
+pub fn generate_password(length: u32) -> Result<String, MobileError> {
+    let policy = osm_vault_core::PasswordPolicy {
+        length: length as usize,
+        ..osm_vault_core::PasswordPolicy::default()
+    };
+    osm_vault_core::generate_password(&policy).map_err(Into::into)
 }
 
 /// What fills a login form: given only when the owner chose the login, and
@@ -275,6 +375,30 @@ impl Device {
     /// that app.
     pub fn fill_for_app(&self, id: String) -> Result<FillCredentials, MobileError> {
         self.tokio.block_on(self.inner.fill_for_app(&id))
+    }
+
+    /// Makes a login or a secure note from `draft`, and returns its ID.
+    /// Online, it syncs at once.
+    pub fn create_item(&self, draft: ItemDraft) -> Result<String, MobileError> {
+        self.tokio.block_on(self.inner.create_item(draft))
+    }
+
+    /// Writes `draft` over the login or secure note `id`, as read at
+    /// `revision`; refused if it changed since, or is in conflict.
+    pub fn update_item(
+        &self,
+        id: String,
+        revision: String,
+        draft: ItemDraft,
+    ) -> Result<(), MobileError> {
+        self.tokio
+            .block_on(self.inner.update_item(&id, &revision, draft))
+    }
+
+    /// Deletes the login or secure note `id`, as read at `revision`, on
+    /// every device. Its earlier versions stay in the vault's history.
+    pub fn delete_item(&self, id: String, revision: String) -> Result<(), MobileError> {
+        self.tokio.block_on(self.inner.delete_item(&id, &revision))
     }
 
     /// Connects to the inviting device from an invitation and returns the

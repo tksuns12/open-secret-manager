@@ -1,17 +1,19 @@
 //! A phone, through the interface the apps use, joins a vault from a
 //! desktop without a vote, reads and copies what it holds, stays in sync,
-//! survives a restart, and learns when it is removed. The desktop runs in
-//! this process on the shared code's public interface, as the desktop app
-//! does; the two talk over pinned TLS on localhost.
+//! survives a restart, and learns when it is removed; and what it writes
+//! reaches the desktop, while a change made on both at once waits for the
+//! desktop to resolve it. The desktop runs in this process on the shared
+//! code's public interface, as the desktop app does; the two talk over
+//! pinned TLS on localhost.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{mpsc as std_mpsc, Arc},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use osm_mobile::{Device, DeviceState, ItemKind, MobileError, SyncState};
-use osm_vault_core::{Item, Vault};
+use osm_mobile::{Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncState};
+use osm_vault_core::{Item, ItemKind as CoreKind, Vault};
 use osm_vault_membership::{device_id_from_bytes, ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
     control, invite, serve_members, start_node, AddressBook, MemberEndpoint, PairingListener,
@@ -333,4 +335,175 @@ fn a_phone_joins_without_a_vote_reads_copies_stays_in_sync_and_learns_its_remova
     let phone = Device::open_listening_on(folder, 0).unwrap();
     assert_eq!(phone.state(), DeviceState::Removed);
     assert!(matches!(phone.go_online(), Err(MobileError::Removed)));
+}
+
+/// Joins a phone in `folder` to `desktop`, the codes compared and
+/// confirmed, without checking each step on the way as the first test does.
+fn joined_phone(
+    desktop_runtime: &tokio::runtime::Runtime,
+    desktop: &Arc<Desktop>,
+    folder: PathBuf,
+) -> Device {
+    let phone = Device::open_listening_on(folder, 0).unwrap();
+    let (code, codes, answer) = desktop_runtime.block_on(desktop.invite());
+    let shown = phone.join_start(code).unwrap();
+    assert_eq!(codes.recv_timeout(Duration::from_secs(30)).unwrap(), shown);
+    answer.send(true).unwrap();
+    phone.join_finish(PHONE_PASSWORD.into()).unwrap();
+    phone
+}
+
+fn draft(title: &str, username: &str, password: Option<&str>) -> ItemDraft {
+    ItemDraft {
+        title: title.into(),
+        kind: ItemKind::Login,
+        username: username.into(),
+        url: format!("https://{}.example.test", title.to_lowercase()),
+        notes: String::new(),
+        favorite: false,
+        password: password.map(Into::into),
+        one_time_code_secret: None,
+    }
+}
+
+#[test]
+fn what_a_phone_writes_reaches_the_desktop_and_a_change_made_on_both_waits_for_the_desktop() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop_runtime = tokio::runtime::Runtime::new().unwrap();
+    let desktop = desktop_runtime.block_on(Desktop::found(dir.path()));
+    let mail = login("Mail", "mail password");
+    let mail_id = mail.id.clone();
+    desktop_runtime.block_on(desktop.put(mail));
+    let mut passport = Item::new("Passport");
+    passport.kind = CoreKind::Identity;
+    let passport_id = passport.id.clone();
+    desktop_runtime.block_on(desktop.put(passport));
+    let on_desktop =
+        |id: &str| desktop_runtime.block_on(async { desktop.vault.lock().await.get(id).ok() });
+
+    let phone = joined_phone(&desktop_runtime, &desktop, dir.path().join("phone"));
+    eventually("the vault reaches the phone", || {
+        let _ = phone.sync_now();
+        phone.items().is_ok_and(|items| items.len() == 2)
+    });
+
+    // A login made on the phone reaches the desktop, password and all: the
+    // phone syncs at once, without being asked.
+    let forum = phone
+        .create_item(draft(
+            "Forum",
+            "me@forum.example.test",
+            Some("forum password"),
+        ))
+        .unwrap();
+    eventually("the phone's new login reaches the desktop", || {
+        on_desktop(&forum).is_some()
+    });
+    let item = on_desktop(&forum).unwrap().item;
+    assert_eq!(
+        (item.username.as_str(), item.password.as_str()),
+        ("me@forum.example.test", "forum password")
+    );
+
+    // So does an edit, which keeps the password it does not name.
+    let read = phone.item(mail_id.clone()).unwrap();
+    phone
+        .update_item(
+            mail_id.clone(),
+            read.revision.clone(),
+            draft("Mail", "new name", None),
+        )
+        .unwrap();
+    eventually("the phone's edit reaches the desktop", || {
+        let _ = phone.sync_now();
+        on_desktop(&mail_id).is_some_and(|found| found.item.username == "new name")
+    });
+    assert_eq!(on_desktop(&mail_id).unwrap().item.password, "mail password");
+
+    // Changed on the desktop and on the phone while the phone was offline,
+    // it is in conflict on both, and only the desktop resolves it.
+    phone.go_offline();
+    let current = on_desktop(&mail_id).unwrap();
+    let mut on_the_desktop = current.item.clone();
+    on_the_desktop.title = "Mail, renamed on the desktop".into();
+    desktop_runtime.block_on(async {
+        desktop
+            .vault
+            .lock()
+            .await
+            .update(on_the_desktop, &current.revision)
+            .unwrap();
+    });
+    let read = phone.item(mail_id.clone()).unwrap();
+    phone
+        .update_item(
+            mail_id.clone(),
+            read.revision.clone(),
+            draft("Mail", "renamed on the phone", None),
+        )
+        .unwrap();
+    phone.go_online().unwrap();
+    eventually("both see the conflict", || {
+        let _ = phone.sync_now();
+        phone.item(mail_id.clone()).is_ok_and(|item| item.conflict)
+            && on_desktop(&mail_id).is_some_and(|found| found.conflict)
+    });
+    let conflicted = phone.item(mail_id.clone()).unwrap();
+    assert!(matches!(
+        phone.update_item(
+            mail_id.clone(),
+            conflicted.revision.clone(),
+            draft("Mail", "again", None)
+        ),
+        Err(MobileError::InConflict)
+    ));
+    assert!(matches!(
+        phone.delete_item(mail_id.clone(), conflicted.revision),
+        Err(MobileError::InConflict)
+    ));
+    desktop_runtime.block_on(async {
+        let mut vault = desktop.vault.lock().await;
+        let versions = vault.versions(&mail_id).unwrap();
+        let heads: Vec<String> = versions.iter().map(|v| v.revision.clone()).collect();
+        let kept = versions
+            .iter()
+            .find_map(|version| {
+                version
+                    .item
+                    .clone()
+                    .filter(|item| item.username == "renamed on the phone")
+            })
+            .unwrap();
+        vault.resolve(&mail_id, Some(kept), &heads).unwrap();
+    });
+    eventually("the desktop's resolution reaches the phone", || {
+        let _ = phone.sync_now();
+        phone
+            .item(mail_id.clone())
+            .is_ok_and(|item| !item.conflict && item.username == "renamed on the phone")
+    });
+
+    // An identity is read on the phone, and edited on a computer.
+    let identity = phone.item(passport_id.clone()).unwrap();
+    assert_eq!(identity.kind, ItemKind::Identity);
+    assert!(matches!(
+        phone.update_item(
+            passport_id.clone(),
+            identity.revision.clone(),
+            draft("Passport", "", None)
+        ),
+        Err(MobileError::NotEditableHere)
+    ));
+    assert!(matches!(
+        phone.delete_item(passport_id, identity.revision),
+        Err(MobileError::NotEditableHere)
+    ));
+
+    // Deleted on the phone, it is gone from the desktop.
+    let read = phone.item(forum.clone()).unwrap();
+    phone.delete_item(forum.clone(), read.revision).unwrap();
+    eventually("the phone's deletion reaches the desktop", || {
+        let _ = phone.sync_now();
+        on_desktop(&forum).is_none()
+    });
 }

@@ -16,7 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use osm_vault_core::{ItemKind, Origin, Vault};
+use osm_vault_core::{Item, ItemKind, Origin, Vault, VaultItem};
 use osm_vault_membership::{ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
     control, serve_members, start_node, AddressBook, Invitation, MemberEndpoint, MemberSync,
@@ -29,7 +29,8 @@ use tokio::{
 };
 
 use crate::{
-    DeviceState, FillCredentials, ItemDetail, ItemSummary, MobileError, SyncState, SyncStatus,
+    DeviceState, FillCredentials, ItemDetail, ItemDraft, ItemSummary, MobileError, SyncState,
+    SyncStatus,
 };
 
 /// The files of one device, as the desktop app names them.
@@ -208,7 +209,88 @@ impl Runtime {
             has_password: !item.password.is_empty(),
             has_one_time_code: item.totp_secret.is_some(),
             conflict: found.conflict,
+            revision: found.revision.clone(),
         })
+    }
+
+    pub(crate) async fn create_item(
+        self: &Arc<Self>,
+        draft: ItemDraft,
+    ) -> Result<String, MobileError> {
+        if !draft.kind.editable_here() {
+            return Err(MobileError::NotEditableHere);
+        }
+        let id = {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            let mut item = Item::default();
+            draft.apply_to(&mut item);
+            let id = item.id.clone();
+            vault.put(item)?;
+            id
+        };
+        self.sync_soon();
+        Ok(id)
+    }
+
+    pub(crate) async fn update_item(
+        self: &Arc<Self>,
+        id: &str,
+        revision: &str,
+        draft: ItemDraft,
+    ) -> Result<(), MobileError> {
+        if !draft.kind.editable_here() {
+            return Err(MobileError::NotEditableHere);
+        }
+        {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            // From the stored item, so that what the draft does not carry
+            // (custom fields, tags) stays.
+            let VaultItem {
+                mut item, conflict, ..
+            } = vault.get(id)?;
+            if conflict {
+                return Err(MobileError::InConflict);
+            }
+            if !crate::ItemKind::from(item.kind).editable_here() {
+                return Err(MobileError::NotEditableHere);
+            }
+            draft.apply_to(&mut item);
+            vault.update(item, revision)?;
+        }
+        self.sync_soon();
+        Ok(())
+    }
+
+    pub(crate) async fn delete_item(
+        self: &Arc<Self>,
+        id: &str,
+        revision: &str,
+    ) -> Result<(), MobileError> {
+        {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            let found = vault.get(id)?;
+            if found.conflict {
+                return Err(MobileError::InConflict);
+            }
+            if !crate::ItemKind::from(found.item.kind).editable_here() {
+                return Err(MobileError::NotEditableHere);
+            }
+            vault.delete(id, revision)?;
+        }
+        self.sync_soon();
+        Ok(())
+    }
+
+    /// After a change here, online: syncs at once rather than at the next
+    /// interval, without making the caller wait.
+    fn sync_soon(self: &Arc<Self>) {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = runtime.sync_with_members().await;
+        });
     }
 
     pub(crate) async fn password(&self, id: &str) -> Result<String, MobileError> {

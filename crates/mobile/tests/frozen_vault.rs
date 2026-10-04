@@ -5,9 +5,24 @@
 
 use std::path::PathBuf;
 
-use osm_mobile::{Device, DeviceState, ItemKind, MobileError, SyncState};
+use osm_mobile::{Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncState};
 
 const PASSWORD: &str = "fixture password, not a secret";
+/// The test vector of RFC 6238 as a base32 secret.
+const TOTP: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+fn draft(title: &str, kind: ItemKind) -> ItemDraft {
+    ItemDraft {
+        title: title.into(),
+        kind,
+        username: "me@example.test".into(),
+        url: " https://forum.example.test ".into(),
+        notes: String::new(),
+        favorite: false,
+        password: Some("first password".into()),
+        one_time_code_secret: None,
+    }
+}
 
 fn copy_of_the_frozen_vault() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -132,4 +147,121 @@ fn a_folder_without_a_vault_and_one_with_a_damaged_vault_are_told_apart() {
         Device::open_listening_on(damaged, 0),
         Err(MobileError::UnreadableVault { .. })
     ));
+}
+
+#[test]
+fn logins_and_notes_are_created_edited_and_deleted_and_the_rest_is_left_to_a_computer() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    assert!(matches!(
+        device.create_item(draft("Forum", ItemKind::Login)),
+        Err(MobileError::Locked)
+    ));
+    device.unlock(PASSWORD.into()).unwrap();
+
+    let id = device
+        .create_item(draft("  Forum  ", ItemKind::Login))
+        .unwrap();
+    let forum = device.item(id.clone()).unwrap();
+    assert_eq!(
+        (forum.title.as_str(), forum.url.as_str(), forum.kind),
+        ("Forum", "https://forum.example.test", ItemKind::Login)
+    );
+    assert_eq!(device.password(id.clone()).unwrap(), "first password");
+    assert_eq!(
+        device
+            .logins_for_web("https://forum.example.test".into())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // An edit keeps the password unless it names one; a one-time code
+    // secret is added, and an empty one removes it.
+    let mut edit = draft("Forum", ItemKind::Login);
+    edit.username = "someone else".into();
+    edit.password = None;
+    edit.one_time_code_secret = Some(TOTP.into());
+    device
+        .update_item(id.clone(), forum.revision.clone(), edit)
+        .unwrap();
+    let edited = device.item(id.clone()).unwrap();
+    assert_eq!(edited.username, "someone else");
+    assert!(edited.has_one_time_code);
+    assert_eq!(device.password(id.clone()).unwrap(), "first password");
+    // An edit of what was read before the last one is refused.
+    assert!(matches!(
+        device.update_item(
+            id.clone(),
+            forum.revision.clone(),
+            draft("Forum", ItemKind::Login)
+        ),
+        Err(MobileError::ChangedElsewhere)
+    ));
+    let mut without_code = draft("Forum", ItemKind::Login);
+    without_code.password = None;
+    without_code.one_time_code_secret = Some(" ".into());
+    device
+        .update_item(id.clone(), edited.revision.clone(), without_code)
+        .unwrap();
+    assert!(!device.item(id.clone()).unwrap().has_one_time_code);
+
+    // A secure note; a title is needed.
+    let mut note = draft("Recovery codes", ItemKind::SecureNote);
+    note.notes = "one\ntwo".into();
+    let note = device.create_item(note).unwrap();
+    assert_eq!(device.item(note).unwrap().kind, ItemKind::SecureNote);
+    assert!(matches!(
+        device.create_item(draft("  ", ItemKind::Login)),
+        Err(MobileError::InvalidItem { .. })
+    ));
+
+    // Identities, cards, and conflicts are for a computer.
+    for kind in [ItemKind::Identity, ItemKind::Card] {
+        assert!(matches!(
+            device.create_item(draft("Passport", kind)),
+            Err(MobileError::NotEditableHere)
+        ));
+    }
+    let conflicted = device
+        .items()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.conflict)
+        .unwrap();
+    let conflicted = device.item(conflicted.id).unwrap();
+    assert!(matches!(
+        device.update_item(
+            conflicted.id.clone(),
+            conflicted.revision.clone(),
+            draft("Mine", ItemKind::Login)
+        ),
+        Err(MobileError::InConflict)
+    ));
+    assert!(matches!(
+        device.delete_item(conflicted.id.clone(), conflicted.revision.clone()),
+        Err(MobileError::InConflict)
+    ));
+
+    // Deleted at its current revision, and not at an old one, it is gone.
+    let current = device.item(id.clone()).unwrap();
+    assert!(matches!(
+        device.delete_item(id.clone(), forum.revision),
+        Err(MobileError::ChangedElsewhere)
+    ));
+    device.delete_item(id.clone(), current.revision).unwrap();
+    assert!(matches!(device.item(id), Err(MobileError::NotFound)));
+
+    // New passwords come from the shared generator.
+    let generated = osm_mobile::generate_password(24).unwrap();
+    assert_eq!(generated.chars().count(), 24);
+    assert!(matches!(
+        osm_mobile::generate_password(2),
+        Err(MobileError::InvalidItem { .. })
+    ));
+    // A draft prints none of what it holds.
+    assert_eq!(
+        format!("{:?}", draft("Forum", ItemKind::Login)),
+        "ItemDraft { kind: Login, .. }"
+    );
 }

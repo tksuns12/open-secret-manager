@@ -67,6 +67,24 @@ class DeviceTest {
             fails<MobileException.NoOneTimeCode> { device.oneTimeCode("fixture-mail") }
             fails<MobileException.NotFound> { device.item("no such item") }
 
+            // The owner's edits cross the other way, unicode and all.
+            val draft = ItemDraft(
+                title = "Forum", kind = ItemKind.LOGIN, username = "me", url = "https://forum.example.test",
+                notes = "", favorite = false, password = "新しい 🔑 \"pass\"", oneTimeCodeSecret = null,
+            )
+            val created = device.createItem(draft)
+            assertEquals("新しい 🔑 \"pass\"", device.password(created))
+            val read = device.item(created)
+            val renamed = draft.copy(username = "someone else", password = null)
+            device.updateItem(created, read.revision, renamed)
+            assertEquals("someone else", device.item(created).username)
+            assertEquals("新しい 🔑 \"pass\"", device.password(created))
+            fails<MobileException.ChangedElsewhere> { device.updateItem(created, read.revision, renamed) }
+            fails<MobileException.NotEditableHere> { device.createItem(draft.copy(kind = ItemKind.IDENTITY)) }
+            device.deleteItem(created, device.item(created).revision)
+            fails<MobileException.NotFound> { device.item(created) }
+            assertEquals(24, generatePassword(24u).length)
+
             // A copy of a vault is not a device of its vault's devices.
             fails<MobileException.Network> { device.goOnline() }
             assertEquals(SyncState.OFFLINE, device.syncStatus().state)

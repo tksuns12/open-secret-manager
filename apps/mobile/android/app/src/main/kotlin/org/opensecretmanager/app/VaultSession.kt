@@ -263,6 +263,10 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.InvalidOrigin -> "Logins are filled only into https pages"
         is MobileException.NotForThisPage -> "That login is not saved for this page"
         is MobileException.NotALogin -> "Only a login can be filled"
+        is MobileException.InvalidItem -> error.reason
+        is MobileException.ChangedElsewhere -> "This item changed since you opened it · open it again"
+        is MobileException.InConflict -> "Two devices changed this item at once · choose a version on your computer"
+        is MobileException.NotEditableHere -> "Identities and cards are edited on your computer"
         is MobileException.Network -> "Could not reach your other devices · ${error.reason}"
         is MobileException.Storage -> "Something went wrong on this phone · ${error.reason}"
     }

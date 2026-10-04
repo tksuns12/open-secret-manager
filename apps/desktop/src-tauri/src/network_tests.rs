@@ -1232,3 +1232,60 @@ fn a_device_without_a_vote_syncs_and_when_lost_is_removed_by_the_other_alone() {
         assert_eq!(current_epoch(&a).await, 2);
     });
 }
+
+#[test]
+fn an_item_deleted_on_one_device_is_gone_from_the_other() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let apps: Vec<_> = dirs.iter().map(|dir| shell(dir.path())).collect();
+    let codes = record(&apps[0], "pairing-code");
+    let finished = record(&apps[0], "pairing-finished");
+    let (a, b) = (apps[0].handle().clone(), apps[1].handle().clone());
+
+    tauri::async_runtime::block_on(async move {
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "Kept").await;
+        put(&a, "Old account").await;
+        pair(&a, &codes, &finished, 0, &b, Some("second password")).await;
+        eventually(&b, &["Kept", "Old account"]).await;
+
+        let (id, read) = {
+            let state = a.state::<AppState>();
+            let vault = state.vault.lock().await;
+            let vault = vault.as_ref().unwrap();
+            let summary = vault
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.title == "Old account")
+                .unwrap();
+            (summary.id.clone(), summary.revision.clone())
+        };
+        // Renamed since it was read, it is not deleted from what was read.
+        crate::update_entry(
+            id.clone(),
+            read.clone(),
+            serde_json::from_value(serde_json::json!({
+                "title": "Old account, renamed", "kind": "login", "username": "",
+                "url": "", "notes": "", "favorite": false,
+            }))
+            .unwrap(),
+            a.state(),
+            a.clone(),
+        )
+        .await
+        .unwrap();
+        let stale = crate::delete_entry(id.clone(), read, a.state(), a.clone()).await;
+        assert_eq!(stale.unwrap_err().code, "conflict");
+        let current = crate::get_entry(id.clone(), a.state())
+            .await
+            .unwrap()
+            .revision;
+        crate::delete_entry(id, current, a.state(), a.clone())
+            .await
+            .unwrap();
+        eventually(&a, &["Kept"]).await;
+        eventually(&b, &["Kept"]).await;
+    });
+}

@@ -290,12 +290,12 @@ async fn create_entry(
 }
 
 #[tauri::command]
-async fn update_entry(
+async fn update_entry<R: tauri::Runtime>(
     id: String,
     expected_revision: String,
     mut input: EntryInput,
     state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
 ) -> Result<ItemSummary, CommandError> {
     let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
@@ -309,6 +309,25 @@ async fn update_entry(
     vault.update(item, &expected_revision)?;
     network::schedule_sync(&app);
     Ok(vault.get(&id)?.into())
+}
+
+/// Deletes an item on every device, as read at `expected_revision`. Its
+/// earlier versions stay in the vault's history and in backups.
+#[tauri::command]
+async fn delete_entry<R: tauri::Runtime>(
+    id: String,
+    expected_revision: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle<R>,
+) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().await;
+    let vault = vault.as_mut().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    vault.delete(&id, &expected_revision)?;
+    network::schedule_sync(&app);
+    Ok(())
 }
 
 /// One side of a conflict as shown to the owner. Secrets stay in Rust; the
@@ -675,6 +694,7 @@ pub fn run() {
             get_entry,
             create_entry,
             update_entry,
+            delete_entry,
             list_versions,
             resolve_entry,
             list_held,

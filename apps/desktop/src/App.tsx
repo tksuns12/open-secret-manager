@@ -285,6 +285,19 @@ function App() {
     }
   }
 
+  async function deleteEntry() {
+    if (editor?.mode !== "edit") return;
+    try {
+      await bridge.deleteEntry(editor.detail.id, editor.detail.revision);
+      setEntries(await bridge.listEntries());
+      setSelected("");
+      setEditor(null);
+      setNotice("Item deleted");
+    } catch (error) {
+      setNotice(commandMessage(error, "The item could not be deleted"));
+    }
+  }
+
   async function startInvite(votes: boolean) {
     try {
       const created = await bridge.startInvite(votes);
@@ -525,7 +538,7 @@ function App() {
         <footer className="footer-bar"><div><Wifi size={14} /><span>{previewMode ? "Development preview" : "Local vault"}</span><span className="footer-separator">•</span><span>{previewMode ? "No native sync session" : syncDetail(sync)}</span></div><button onClick={() => previewMode ? setNotice("Sync is unavailable in the browser preview") : setDevicesOpen(true)}>Devices <ChevronRight size={14} /></button></footer>
       </section>
       {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
-      {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} /></div></div>}
+      {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} onDelete={editor.mode === "edit" ? deleteEntry : undefined} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
       {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
       {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onNotice={setNotice} /></div></div>}
@@ -1151,7 +1164,8 @@ const entryKinds: { value: EntryKind; label: string }[] = [
   { value: "identity", label: "Identity" },
 ];
 
-function EntryEditor({ detail, onCancel, onSave }: { detail?: EntryDetail; onCancel: () => void; onSave: (input: EntryInput) => Promise<void> }) {
+function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDetail; onCancel: () => void; onSave: (input: EntryInput) => Promise<void>; onDelete?: () => Promise<void> }) {
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [title, setTitle] = useState(detail?.title ?? "");
   const [kind, setKind] = useState<EntryKind>(detail?.kind ?? "login");
   const [username, setUsername] = useState(detail?.username ?? "");
@@ -1190,7 +1204,9 @@ function EntryEditor({ detail, onCancel, onSave }: { detail?: EntryDetail; onCan
     </>}
     <label>Notes<textarea rows={kind === "secure_note" ? 7 : 3} value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
     <label className="check-row"><input type="checkbox" checked={favorite} onChange={(event) => setFavorite(event.target.checked)} /> Favorite</label>
-    <div className="form-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button type="submit" className="generate-button" disabled={!title.trim() || saving}>{detail ? "Save changes" : "Create item"}</button></div>
+    {confirmingDelete
+      ? <div className="delete-confirm"><span>Delete this item on all your devices? Its earlier versions stay in the vault's history and in backups.</span><div className="form-actions"><button type="button" className="secondary" onClick={() => setConfirmingDelete(false)}>Keep</button><button type="button" className="generate-button" onClick={() => void onDelete?.()}>Delete</button></div></div>
+      : <div className="form-actions">{onDelete && <button type="button" className="secondary" onClick={() => setConfirmingDelete(true)}>Delete…</button>}<button type="button" className="secondary" onClick={onCancel}>Cancel</button><button type="submit" className="generate-button" disabled={!title.trim() || saving}>{detail ? "Save changes" : "Create item"}</button></div>}
   </form>;
 }
 

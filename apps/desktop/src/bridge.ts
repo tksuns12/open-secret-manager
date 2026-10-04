@@ -107,6 +107,13 @@ export const bridge: DesktopBridge = {
     if (!entry) throw new Error("not_found");
     return savePreview(id, input, previewDetail(entry));
   },
+  async deleteEntry(id, expectedRevision) {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) { await invoke("delete_entry", { id, expectedRevision }); return; }
+    if (!previewEntries.some((existing) => existing.id === id)) throw new Error("not_found");
+    previewEntries = previewEntries.filter((existing) => existing.id !== id);
+    previewDetails.delete(id);
+  },
   // Conflicts only arise from revisions received from another device, so
   // the browser preview has none to review.
   async listVersions(id) {

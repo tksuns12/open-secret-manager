@@ -63,6 +63,24 @@ do {
     check(filled.username == "owner@example.test" && filled.password == "third password, with ünïcödé", "a login fills its page")
     check(fails({ try device.fillForWeb(id: "fixture-bank", origin: "https://mail.example.test") }) { if case .NotForThisPage = $0 { true } else { false } }, "a login fills no other page")
     check(try device.fillForApp(id: "fixture-bank").username == "account 42", "a login fills the app it was chosen for")
+    // The owner's edits cross the other way, unicode and all.
+    let draft = ItemDraft(title: "Forum", kind: .login, username: "me", url: "https://forum.example.test", notes: "", favorite: false, password: "新しい 🔑 \"pass\"", oneTimeCodeSecret: nil)
+    let created = try device.createItem(draft: draft)
+    check(try device.password(id: created) == "新しい 🔑 \"pass\"", "a new login keeps its password intact")
+    let read = try device.item(id: created)
+    var renamed = draft
+    renamed.username = "someone else"
+    renamed.password = nil
+    try device.updateItem(id: created, revision: read.revision, draft: renamed)
+    check(try device.item(id: created).username == "someone else", "an edit is kept")
+    check(try device.password(id: created) == "新しい 🔑 \"pass\"", "an edit keeps the password it does not name")
+    check(fails({ try device.updateItem(id: created, revision: read.revision, draft: renamed) }) { if case .ChangedElsewhere = $0 { true } else { false } }, "an edit of an older reading is refused")
+    var passport = draft
+    passport.kind = .identity
+    check(fails({ try device.createItem(draft: passport) }) { if case .NotEditableHere = $0 { true } else { false } }, "an identity is made on a computer")
+    try device.deleteItem(id: created, revision: try device.item(id: created).revision)
+    check(fails({ try device.item(id: created) }) { if case .NotFound = $0 { true } else { false } }, "a deleted item is gone")
+    check(try generatePassword(length: 24).count == 24, "the generator makes the length asked for")
     check(fails({ try device.goOnline() }) { if case .Network = $0 { true } else { false } }, "a copy of a vault does not go online")
     check(device.syncStatus().state == .offline, "it reports being offline")
     device.lock()

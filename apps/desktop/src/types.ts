@@ -247,6 +247,7 @@ export type DesktopBridge = {
   getEntry: (id: string) => Promise<EntryDetail>;
   createEntry: (input: EntryInput) => Promise<VaultEntry>;
   updateEntry: (id: string, expectedRevision: string, input: EntryInput) => Promise<VaultEntry>;
+  deleteEntry: (id: string, expectedRevision: string) => Promise<void>;
   listVersions: (id: string) => Promise<VersionSummary[]>;
   resolveEntry: (id: string, keepRevision: string, heads: string[]) => Promise<void>;
   /** Changes held for the owner's review; needs the vault unlocked. */
