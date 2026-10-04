@@ -18,6 +18,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.DeviceState
+import org.opensecretmanager.vault.FillCredentials
 import org.opensecretmanager.vault.ItemDetail
 import org.opensecretmanager.vault.ItemSummary
 import org.opensecretmanager.vault.MobileException
@@ -184,6 +185,22 @@ class VaultSession(private val context: Context, private val folder: File) {
         _state.update { it.copy(notice = "Code copied · cleared in 30 seconds") }
     }
 
+    /** The logins saved for [origin]'s pages; then, on the main thread, [done]. */
+    fun loginsForWeb(origin: String, done: (List<ItemSummary>) -> Unit) = run(null) {
+        val logins = device!!.loginsForWeb(origin).sortedBy { it.title.lowercase() }
+        withContext(Dispatchers.Main) { done(logins) }
+    }
+
+    /**
+     * A login's username and password to fill: into a page of [origin], which
+     * the login must be saved for, or, without an origin, into an app the
+     * owner chose the login for. Then, on the main thread, [done].
+     */
+    fun fill(id: String, origin: String?, done: (FillCredentials) -> Unit) = run(null) {
+        val credentials = if (origin != null) device!!.fillForWeb(id, origin) else device!!.fillForApp(id)
+        withContext(Dispatchers.Main) { done(credentials) }
+    }
+
     fun notify(text: String) {
         _state.update { it.copy(notice = text) }
     }
@@ -243,6 +260,9 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.Removed -> "This phone was removed from the vault"
         is MobileException.InvalidInvitation -> "That is not an invitation · copy it again from your computer"
         is MobileException.NoOneTimeCode -> "This item has no one-time code"
+        is MobileException.InvalidOrigin -> "Logins are filled only into https pages"
+        is MobileException.NotForThisPage -> "That login is not saved for this page"
+        is MobileException.NotALogin -> "Only a login can be filled"
         is MobileException.Network -> "Could not reach your other devices · ${error.reason}"
         is MobileException.Storage -> "Something went wrong on this phone · ${error.reason}"
     }

@@ -54,11 +54,12 @@ The repository is deliberately split at the security boundary:
 - `crates/mobile` is the interface the phone apps use, through Kotlin and
   Swift bindings that UniFFI generates: one device of a vault, which joins
   from another device without a vote, unlocks, shows and copies what the
-  vault holds, and syncs while the app is open.
+  vault holds, fills logins, and syncs while the app is open.
 - `apps/mobile` holds the Android app, which joins a vault from a computer,
   unlocks with its password or a fingerprint, shows and copies what the
-  vault holds, and syncs while open, and the Swift test program of the
-  bindings. `scripts/test-mobile.sh` runs their tests on an emulator and a
+  vault holds, fills logins into other apps and into trusted browsers'
+  pages once the owner unlocks and chooses one, and syncs while open, and
+  the Swift test program of the bindings. `scripts/test-mobile.sh` runs their tests on an emulator and a
   simulator; see `apps/mobile/README.md`.
 
 The prototype is intentionally offline-first. Local vault use does not depend

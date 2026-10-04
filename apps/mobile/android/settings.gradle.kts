@@ -1,5 +1,6 @@
 // The Android app: `app`, its screens, and `vault`, the module that wraps
-// the shared code's interface. See apps/mobile/README.md.
+// the shared code's interface; `loginfixture` is a stand-in for another app,
+// for the autofill tests. See apps/mobile/README.md.
 pluginManagement {
     repositories {
         google()
@@ -19,3 +20,4 @@ dependencyResolutionManagement {
 rootProject.name = "open-secret-manager"
 include(":vault")
 include(":app")
+include(":loginfixture")

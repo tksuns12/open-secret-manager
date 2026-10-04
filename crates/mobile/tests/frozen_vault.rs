@@ -66,6 +66,41 @@ fn the_frozen_vault_reads_through_the_interface() {
         Err(MobileError::NotFound)
     ));
 
+    // Filling: a page gets only the logins for exactly its origin.
+    let titles = |origin: &str| -> Vec<String> {
+        device
+            .logins_for_web(origin.into())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.title)
+            .collect()
+    };
+    assert_eq!(titles("https://mail.example.test"), ["Mail"]);
+    assert_eq!(titles("https://bank.example.test:8443"), ["Bank"]);
+    assert!(titles("https://bank.example.test").is_empty());
+    assert!(titles("https://login.mail.example.test").is_empty());
+    assert!(matches!(
+        device.logins_for_web("http://mail.example.test".into()),
+        Err(MobileError::InvalidOrigin)
+    ));
+    let filled = device
+        .fill_for_web("fixture-mail".into(), "https://mail.example.test".into())
+        .unwrap();
+    assert_eq!(
+        (filled.username.as_str(), filled.password.as_str()),
+        ("owner@example.test", "third password, with ünïcödé")
+    );
+    assert!(matches!(
+        device.fill_for_web("fixture-bank".into(), "https://mail.example.test".into()),
+        Err(MobileError::NotForThisPage)
+    ));
+    assert_eq!(format!("{filled:?}"), "FillCredentials { .. }");
+    // An app has no origin: the login the owner chose for it.
+    assert_eq!(
+        device.fill_for_app("fixture-bank".into()).unwrap().username,
+        "account 42"
+    );
+
     // A copy of a vault is not a device of its vault's devices.
     assert!(matches!(
         device.go_online(),

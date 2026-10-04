@@ -16,7 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use osm_vault_core::Vault;
+use osm_vault_core::{ItemKind, Origin, Vault};
 use osm_vault_membership::{ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
     control, serve_members, start_node, AddressBook, Invitation, MemberEndpoint, MemberSync,
@@ -28,7 +28,9 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{DeviceState, ItemDetail, ItemSummary, MobileError, SyncState, SyncStatus};
+use crate::{
+    DeviceState, FillCredentials, ItemDetail, ItemSummary, MobileError, SyncState, SyncStatus,
+};
 
 /// The files of one device, as the desktop app names them.
 const VAULT_FILE: &str = "vault.sqlite3";
@@ -222,6 +224,56 @@ impl Runtime {
             return Err(MobileError::NoOneTimeCode);
         }
         Ok(vault.item_totp_code(id, now())?)
+    }
+
+    pub(crate) async fn logins_for_web(
+        &self,
+        origin: &str,
+    ) -> Result<Vec<ItemSummary>, MobileError> {
+        let origin = Origin::parse(origin).ok_or(MobileError::InvalidOrigin)?;
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        Ok(vault
+            .logins_for_origin(&origin)?
+            .into_iter()
+            .map(|item| ItemSummary {
+                id: item.id.clone(),
+                title: item.title.clone(),
+                kind: item.kind.into(),
+                username: item.username.clone(),
+                url: item.url.clone(),
+                favorite: item.favorite,
+                conflict: item.conflict,
+            })
+            .collect())
+    }
+
+    pub(crate) async fn fill_for_web(
+        &self,
+        id: &str,
+        origin: &str,
+    ) -> Result<FillCredentials, MobileError> {
+        let origin = Origin::parse(origin).ok_or(MobileError::InvalidOrigin)?;
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let found = vault.credentials_for_origin(id, &origin)?;
+        Ok(FillCredentials {
+            username: found.username.clone(),
+            password: found.password.clone(),
+        })
+    }
+
+    pub(crate) async fn fill_for_app(&self, id: &str) -> Result<FillCredentials, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let found = vault.get(id)?;
+        if found.item.kind != ItemKind::Login {
+            return Err(MobileError::NotALogin);
+        }
+        Ok(FillCredentials {
+            username: found.item.username.clone(),
+            password: found.item.password.clone(),
+        })
     }
 
     pub(crate) async fn join_start(self: &Arc<Self>, code: &str) -> Result<String, MobileError> {

@@ -1,11 +1,13 @@
 package org.opensecretmanager.app
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.text.format.DateUtils
 import android.view.WindowManager
+import android.view.autofill.AutofillManager
 import androidx.activity.compose.setContent
-import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
-import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -44,14 +46,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.opensecretmanager.vault.ItemDetail
 import org.opensecretmanager.vault.ItemSummary
@@ -71,62 +74,19 @@ class MainActivity : FragmentActivity() {
         }
         val session = (application as VaultApp).session
         biometric = BiometricUnlock(this)
+        val prompts = FingerprintPrompts(this, biometric, session)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 VaultScreen(
                     session = session,
                     biometric = biometric,
-                    onUnlockWithBiometric = { unlockWithBiometric(session) },
-                    onRememberWithBiometric = ::rememberWithBiometric,
+                    onUnlockWithBiometric = prompts::unlock,
+                    onRememberWithBiometric = prompts::keep,
                 )
             }
         }
     }
 
-    private fun unlockWithBiometric(session: VaultSession) {
-        val cipher = biometric.cipherToRead() ?: run {
-            session.notify("Unlock with the password once: the fingerprints on this phone changed")
-            return
-        }
-        BiometricPrompt(
-            this,
-            ContextCompat.getMainExecutor(this),
-            object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    val unlocked = result.cryptoObject?.cipher ?: return
-                    session.unlock(biometric.read(unlocked))
-                }
-            },
-        ).authenticate(
-            BiometricPrompt.PromptInfo.Builder()
-                .setTitle("Unlock the vault")
-                .setAllowedAuthenticators(BIOMETRIC_STRONG)
-                .setNegativeButtonText("Use the password")
-                .build(),
-            BiometricPrompt.CryptoObject(cipher),
-        )
-    }
-
-    /** After an unlock with [password]: keeps it for the next unlock, once a biometric check allows. */
-    private fun rememberWithBiometric(password: String) {
-        val cipher = biometric.cipherToStore()
-        BiometricPrompt(
-            this,
-            ContextCompat.getMainExecutor(this),
-            object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    result.cryptoObject?.cipher?.let { biometric.store(it, password) }
-                }
-            },
-        ).authenticate(
-            BiometricPrompt.PromptInfo.Builder()
-                .setTitle("Unlock with a fingerprint next time")
-                .setAllowedAuthenticators(BIOMETRIC_STRONG)
-                .setNegativeButtonText("Not now")
-                .build(),
-            BiometricPrompt.CryptoObject(cipher),
-        )
-    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -177,7 +137,7 @@ fun VaultScreen(
 }
 
 @Composable
-private fun Message(title: String, detail: String? = null) {
+internal fun Message(title: String, detail: String? = null) {
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
         Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.testTag("message"))
         detail?.let {
@@ -188,7 +148,7 @@ private fun Message(title: String, detail: String? = null) {
 }
 
 @Composable
-private fun Busy(what: String) {
+internal fun Busy(what: String) {
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
@@ -265,7 +225,7 @@ private fun SecretField(value: String, onChange: (String) -> Unit, label: String
 }
 
 @Composable
-private fun Unlock(
+internal fun Unlock(
     state: UiState,
     session: VaultSession,
     biometric: BiometricUnlock,
@@ -325,8 +285,28 @@ private fun Items(state: UiState, session: VaultSession) {
         LazyColumn(Modifier.weight(1f)) {
             items(shown, key = { it.id }) { item -> ItemRow(item) { session.open(item.id) } }
         }
+        AutofillOffer()
         SyncLine(state.sync, session)
     }
+}
+
+/** Until the owner picks this app to fill logins in other apps: the way to the setting. */
+@Composable
+private fun AutofillOffer() {
+    val context = LocalContext.current
+    val manager = context.getSystemService(AutofillManager::class.java) ?: return
+    var enabled by remember { mutableStateOf(manager.hasEnabledAutofillServices()) }
+    LifecycleResumeEffect(manager) {
+        enabled = manager.hasEnabledAutofillServices()
+        onPauseOrDispose { }
+    }
+    if (enabled || !manager.isAutofillSupported) return
+    TextButton(
+        onClick = {
+            context.startActivity(Intent(Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE, Uri.parse("package:${context.packageName}")))
+        },
+        modifier = Modifier.testTag("turn-on-autofill"),
+    ) { Text("Fill logins in other apps…") }
 }
 
 @Composable

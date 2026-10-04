@@ -55,6 +55,12 @@ pub enum MobileError {
     InvalidInvitation,
     #[error("the item has no one-time code")]
     NoOneTimeCode,
+    #[error("that is not an https origin")]
+    InvalidOrigin,
+    #[error("that login is not for this page")]
+    NotForThisPage,
+    #[error("that item is not a login")]
+    NotALogin,
     // Not `message`: in Kotlin every exception has one already.
     #[error("{reason}")]
     Network { reason: String },
@@ -69,6 +75,7 @@ impl From<osm_vault_core::Error> for MobileError {
             Error::Locked => Self::Locked,
             Error::InvalidCredentials => Self::InvalidCredentials,
             Error::NotFound => Self::NotFound,
+            Error::OriginMismatch => Self::NotForThisPage,
             error => Self::Storage {
                 reason: error.to_string(),
             },
@@ -161,6 +168,20 @@ pub struct ItemDetail {
     pub conflict: bool,
 }
 
+/// What fills a login form: given only when the owner chose the login, and
+/// for a page only when the login is for exactly its origin.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FillCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for FillCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FillCredentials { .. }")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum SyncState {
     /// Not taking part: the app is in the background, or never went online.
@@ -234,6 +255,26 @@ impl Device {
     /// The item's current one-time code.
     pub fn one_time_code(&self, id: String) -> Result<String, MobileError> {
         self.tokio.block_on(self.inner.one_time_code(&id))
+    }
+
+    /// The logins for a page of `origin` (`https://host` or
+    /// `https://host:port`), by the one rule the desktop's browser fill
+    /// uses: HTTPS, the exact host, and the exact port.
+    pub fn logins_for_web(&self, origin: String) -> Result<Vec<ItemSummary>, MobileError> {
+        self.tokio.block_on(self.inner.logins_for_web(&origin))
+    }
+
+    /// The user name and password of the login the owner chose for a page
+    /// of `origin`; refused unless the login is for exactly that origin.
+    pub fn fill_for_web(&self, id: String, origin: String) -> Result<FillCredentials, MobileError> {
+        self.tokio.block_on(self.inner.fill_for_web(&id, &origin))
+    }
+
+    /// The user name and password of the login the owner chose for an app,
+    /// which has no origin to check: only after the owner picked it for
+    /// that app.
+    pub fn fill_for_app(&self, id: String) -> Result<FillCredentials, MobileError> {
+        self.tokio.block_on(self.inner.fill_for_app(&id))
     }
 
     /// Connects to the inviting device from an invitation and returns the
