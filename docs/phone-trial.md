@@ -51,6 +51,18 @@ phone sold since 2019 is):
    the computer reaches the phone while the app is open (within a minute, or
    at once with Sync now).
 
+## Writing on the phone
+
+- Make a login on the phone (New, on Android so far). Within a minute,
+  with the computer's app open, it appears there with its password.
+- Edit it on the phone, leaving the password blank: on the computer the
+  username changes and the password stays.
+- Change the same item on the computer and on the phone while the phone's
+  app is closed, then open it: both show the item as needing a decision,
+  the phone offers no Edit, and choosing a version on the computer clears
+  it on the phone.
+- Delete it on the phone: it goes from the computer too.
+
 ## Leaving and coming back
 
 - Switch to another app and back: the vault is locked.

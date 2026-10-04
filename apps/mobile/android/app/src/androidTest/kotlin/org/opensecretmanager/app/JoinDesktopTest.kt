@@ -17,10 +17,11 @@ import org.junit.runner.RunWith
 
 /**
  * The app joins a desktop-side device running on the machine the emulator
- * runs on, through its screens and over the network, and shows the vault it
- * receives: run by scripts/test-mobile-join.sh, which passes the invitation
- * and answers for the owner on the desktop side once the two codes match.
- * Skipped without an invitation.
+ * runs on, through its screens and over the network, shows the vault it
+ * receives, and sends back a login made on the phone: run by
+ * scripts/test-mobile-join.sh, which passes the invitation, answers for the
+ * owner on the desktop side once the two codes match, and then looks for
+ * the phone's login there. Skipped without an invitation.
  */
 @OptIn(ExperimentalTestApi::class)
 @RunWith(AndroidJUnit4::class)
@@ -48,5 +49,16 @@ class JoinDesktopTest {
         // Joined, unlocked, and the desktop's item arrives as it syncs.
         compose.waitUntilAtLeastOneExists(hasTestTag("item:Mail"), 120_000)
         Log.i("OSMJoin", "PHONE-HAS Mail")
+
+        // A login made on the phone goes the other way; the script then
+        // looks for it on the desktop.
+        val made = System.currentTimeMillis() / 1000
+        compose.onNodeWithTag("new-item").performClick()
+        compose.waitUntilAtLeastOneExists(hasTestTag("edit-title"), 10_000)
+        compose.onNodeWithTag("edit-title").performTextInput("From the phone")
+        compose.onNodeWithTag("edit-password").performTextInput("phone-made password")
+        compose.onNodeWithTag("save").performClick()
+        compose.waitUntil(60_000) { (session.state.value.sync?.lastSyncedAt?.toLong() ?: 0) >= made }
+        Log.i("OSMJoin", "PHONE-MADE From the phone")
     }
 }

@@ -5,7 +5,8 @@
 # app's test pastes the invitation into the app's join screen and shows the
 # code, the script answers for the owner on the desktop side only if the two
 # codes match, the test sets the phone's password, and the app shows the
-# item once it has synced.
+# item once it has synced. With the debug build on Android, a login then
+# made on the phone must reach the desktop.
 #
 #   scripts/test-mobile-join.sh [android|android-release|ios]
 #
@@ -237,6 +238,10 @@ else
         tail -30 "$work/gradle.log" >&2
         exit "$status"
     fi
+    # What the phone wrote reached the desktop.
+    echo list >&3
+    expect "ITEM From the phone" >/dev/null
+    echo "the desktop has the phone's login"
 fi
 
 # The desktop has the phone as its second member, without a vote.

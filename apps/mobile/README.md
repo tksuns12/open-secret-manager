@@ -12,8 +12,9 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   build. Neither is committed.
 - `app`: the app. It joins a vault from a computer by invitation and
   comparison of codes, unlocks with its own password or, once turned on,
-  a fingerprint, lists and searches the items, and copies a username,
-  password, or one-time code. It locks and stops taking part when it
+  a fingerprint, lists and searches the items, copies a username,
+  password, or one-time code, and creates, edits, and deletes logins and
+  secure notes. It locks and stops taking part when it
   leaves the screen, and keeps the vault out of screenshots. Once picked
   as the phone's autofill service, it fills logins into other apps and
   into pages of the browsers it trusts (`res/raw/trusted_browsers.json`,

@@ -20,6 +20,7 @@ import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.DeviceState
 import org.opensecretmanager.vault.FillCredentials
 import org.opensecretmanager.vault.ItemDetail
+import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemSummary
 import org.opensecretmanager.vault.MobileException
 import org.opensecretmanager.vault.SyncStatus
@@ -39,7 +40,12 @@ data class UiState(
     /** The outcome of the last thing the owner did, to show once. */
     val notice: String? = null,
     val unreadable: String? = null,
+    /** An item being written, while the editor is open. */
+    val editor: Editor? = null,
 )
+
+/** A new item when [detail] is null, otherwise that item as it was read. */
+data class Editor(val detail: ItemDetail?)
 
 /**
  * The device of the vault, as the screens use it. Every call to it runs off
@@ -120,6 +126,7 @@ class VaultSession(private val context: Context, private val folder: File) {
                 detail = current.detail?.takeIf { detail -> screen == Screen.UNLOCKED && items.any { it.id == detail.id } },
                 sync = device.syncStatus(),
                 joinCode = current.joinCode.takeIf { screen == Screen.JOINING },
+                editor = current.editor.takeIf { screen == Screen.UNLOCKED },
             )
         }
     }
@@ -134,7 +141,7 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     fun lock() = run(null) {
         device?.lock()
-        _state.update { it.copy(detail = null) }
+        _state.update { it.copy(detail = null, editor = null) }
         refresh()
     }
 
@@ -169,6 +176,51 @@ class VaultSession(private val context: Context, private val folder: File) {
     fun close() {
         _state.update { it.copy(detail = null) }
     }
+
+    fun startNew() {
+        _state.update { it.copy(editor = Editor(null)) }
+    }
+
+    fun startEdit(detail: ItemDetail) {
+        _state.update { it.copy(editor = Editor(detail)) }
+    }
+
+    fun closeEditor() {
+        _state.update { it.copy(editor = null) }
+    }
+
+    /** Saves the editor's draft: a new item, or an edit of the item as it was read. */
+    fun save(draft: ItemDraft) = run("Saving…") {
+        val device = device!!
+        val editing = _state.value.editor?.detail
+        try {
+            val id = if (editing == null) {
+                device.createItem(draft)
+            } else {
+                device.updateItem(editing.id, editing.revision, draft)
+                editing.id
+            }
+            val saved = device.item(id)
+            _state.update {
+                it.copy(editor = null, detail = saved, notice = if (editing == null) "Item created" else "Changes saved")
+            }
+        } catch (error: MobileException.ChangedElsewhere) {
+            // What was read is out of date: show the item as it is now.
+            val current = editing?.let { runCatching { device.item(it.id) }.getOrNull() }
+            _state.update { it.copy(editor = null, detail = current, notice = describe(error)) }
+        }
+        refresh()
+    }
+
+    /** Deletes the item as it was read, on every device. */
+    fun delete(detail: ItemDetail) = run(null) {
+        device!!.deleteItem(detail.id, detail.revision)
+        _state.update { it.copy(detail = null, notice = "Item deleted") }
+        refresh()
+    }
+
+    /** A new password from the shared generator. */
+    fun generatePassword(): String = org.opensecretmanager.vault.generatePassword(20u)
 
     fun copyUsername(detail: ItemDetail) {
         SecretClipboard.copy(context, "Username", detail.username, secret = false)
@@ -241,7 +293,7 @@ class VaultSession(private val context: Context, private val folder: File) {
             if (device.state() == DeviceState.JOINING) return@run
             device.lock()
             device.goOffline()
-            _state.update { it.copy(detail = null) }
+            _state.update { it.copy(detail = null, editor = null) }
             refresh()
         }
     }

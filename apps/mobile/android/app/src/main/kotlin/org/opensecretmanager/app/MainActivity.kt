@@ -7,6 +7,7 @@ import android.provider.Settings
 import android.text.format.DateUtils
 import android.view.WindowManager
 import android.view.autofill.AutofillManager
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -21,11 +22,15 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -51,12 +56,15 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.opensecretmanager.vault.ItemDetail
+import org.opensecretmanager.vault.ItemDraft
+import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
 import org.opensecretmanager.vault.SyncState
 import org.opensecretmanager.vault.SyncStatus
@@ -105,12 +113,34 @@ fun VaultScreen(
             session.dismissNotice()
         }
     }
+    val fields = state.editor?.takeIf { state.screen == Screen.UNLOCKED }?.let { editor ->
+        remember(editor) { EditorFields(editor.detail) }
+    }
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Open Secret Manager") },
+                title = {
+                    Text(
+                        when {
+                            fields == null -> "Open Secret Manager"
+                            state.editor?.detail == null -> "New item"
+                            else -> "Edit item"
+                        },
+                    )
+                },
                 actions = {
-                    if (state.screen == Screen.UNLOCKED) {
+                    if (fields != null) {
+                        // Up here, where no notice covers them.
+                        TextButton(onClick = session::closeEditor, modifier = Modifier.testTag("cancel-edit")) { Text("Cancel") }
+                        TextButton(
+                            onClick = { session.save(fields.draft()) },
+                            enabled = fields.title.isNotBlank() && state.busy == null,
+                            modifier = Modifier.testTag("save"),
+                        ) { Text("Save") }
+                    } else if (state.screen == Screen.UNLOCKED) {
+                        if (state.detail == null) {
+                            TextButton(onClick = session::startNew, modifier = Modifier.testTag("new-item")) { Text("New") }
+                        }
                         TextButton(onClick = session::lock, modifier = Modifier.testTag("lock")) { Text("Lock") }
                     }
                 },
@@ -124,7 +154,9 @@ fun VaultScreen(
                 Screen.NO_VAULT -> JoinStart(state, session)
                 Screen.JOINING -> JoinConfirm(state, session)
                 Screen.LOCKED -> Unlock(state, session, biometric, onUnlockWithBiometric, onRememberWithBiometric)
-                Screen.UNLOCKED -> state.detail?.let { Detail(it, session) } ?: Items(state, session)
+                Screen.UNLOCKED -> fields?.let { ItemEditor(it, state.editor?.detail, session) }
+                    ?: state.detail?.let { Detail(it, session) }
+                    ?: Items(state, session)
                 Screen.REMOVED -> Message(
                     "This phone was removed from the vault",
                     "Your other devices moved to a new key that this phone never received. What it already held stays readable here.",
@@ -322,7 +354,12 @@ private fun ItemRow(item: ItemSummary, onClick: () -> Unit) {
 
 @Composable
 private fun Detail(detail: ItemDetail, session: VaultSession) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    var confirmingDelete by remember(detail.id) { mutableStateOf(false) }
+    val editable = (detail.kind == ItemKind.LOGIN || detail.kind == ItemKind.SECURE_NOTE) && !detail.conflict
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
         TextButton(onClick = session::close, modifier = Modifier.testTag("back")) { Text("‹ All items") }
         Text(detail.title, style = MaterialTheme.typography.headlineSmall)
         if (detail.conflict) {
@@ -330,6 +367,18 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
                 "Two devices changed this at once. Choose which version to keep on your computer.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.error,
+            )
+        }
+        if (editable) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(onClick = { session.startEdit(detail) }, modifier = Modifier.testTag("edit")) { Text("Edit") }
+                OutlinedButton(onClick = { confirmingDelete = true }, modifier = Modifier.testTag("delete")) { Text("Delete…") }
+            }
+        } else if (!detail.conflict) {
+            Text(
+                "Identities and cards are edited on your computer.",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.testTag("edit-elsewhere"),
             )
         }
         if (detail.username.isNotEmpty()) {
@@ -348,8 +397,161 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
             }
         }
         if (detail.url.isNotEmpty()) Field("Website", detail.url)
-        if (detail.notes.isNotEmpty()) Field("Notes", detail.notes)
+        if (detail.notes.isNotEmpty()) Field("Notes", detail.notes, "detail-notes")
     }
+    if (confirmingDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmingDelete = false },
+            title = { Text("Delete ${detail.title}?") },
+            text = { Text("It is deleted on all your devices. Its earlier versions stay in the vault's history and in backups.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmingDelete = false
+                        session.delete(detail)
+                    },
+                    modifier = Modifier.testTag("confirm-delete"),
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmingDelete = false }, modifier = Modifier.testTag("keep")) { Text("Keep") }
+            },
+        )
+    }
+}
+
+/**
+ * What the editor holds while it is open: a new login or secure note, or
+ * [detail] as it was read. A blank password or one-time code secret keeps
+ * what the item has.
+ */
+class EditorFields(detail: ItemDetail?) {
+    var kind by mutableStateOf(detail?.kind ?: ItemKind.LOGIN)
+    var title by mutableStateOf(detail?.title ?: "")
+    var username by mutableStateOf(detail?.username ?: "")
+    var url by mutableStateOf(detail?.url ?: "")
+    var password by mutableStateOf("")
+    var showPassword by mutableStateOf(false)
+    var code by mutableStateOf("")
+    var removeCode by mutableStateOf(false)
+    var notes by mutableStateOf(detail?.notes ?: "")
+    var favorite by mutableStateOf(detail?.favorite ?: false)
+
+    fun draft(): ItemDraft {
+        val login = kind == ItemKind.LOGIN
+        return ItemDraft(
+            title = title,
+            kind = kind,
+            username = if (login) username else "",
+            url = if (login) url else "",
+            notes = notes,
+            favorite = favorite,
+            password = if (login) password.ifEmpty { null } else null,
+            oneTimeCodeSecret = when {
+                !login -> null
+                removeCode -> ""
+                code.isNotBlank() -> code
+                else -> null
+            },
+        )
+    }
+}
+
+@Composable
+private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, session: VaultSession) {
+    BackHandler(onBack = session::closeEditor)
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (detail != null) Text(detail.title, style = MaterialTheme.typography.titleLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = fields.kind == ItemKind.LOGIN,
+                onClick = { fields.kind = ItemKind.LOGIN },
+                label = { Text("Login") },
+                modifier = Modifier.testTag("kind-login"),
+            )
+            FilterChip(
+                selected = fields.kind == ItemKind.SECURE_NOTE,
+                onClick = { fields.kind = ItemKind.SECURE_NOTE },
+                label = { Text("Secure note") },
+                modifier = Modifier.testTag("kind-note"),
+            )
+        }
+        EditField(fields.title, { fields.title = it }, "Title", "edit-title")
+        if (fields.kind == ItemKind.LOGIN) {
+            EditField(fields.username, { fields.username = it }, "Username", "edit-username")
+            EditField(fields.url, { fields.url = it }, "Website", "edit-url", keyboard = KeyboardType.Uri)
+            OutlinedTextField(
+                value = fields.password,
+                onValueChange = { fields.password = it },
+                label = { Text("Password") },
+                placeholder = { if (detail?.hasPassword == true) Text("Unchanged") },
+                supportingText = { if (detail?.hasPassword == true) Text("Left blank, the password stays as it is") },
+                singleLine = true,
+                visualTransformation = if (fields.showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth().testTag("edit-password"),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { fields.showPassword = !fields.showPassword }, modifier = Modifier.testTag("show-password")) {
+                    Text(if (fields.showPassword) "Hide" else "Show")
+                }
+                TextButton(
+                    onClick = {
+                        fields.password = session.generatePassword()
+                        fields.showPassword = true
+                    },
+                    modifier = Modifier.testTag("generate"),
+                ) { Text("Generate") }
+            }
+            OutlinedTextField(
+                value = fields.code,
+                onValueChange = { fields.code = it },
+                label = { Text("One-time code secret") },
+                placeholder = { Text(if (detail?.hasOneTimeCode == true) "Unchanged" else "Base32 secret (optional)") },
+                supportingText = { if (detail?.hasOneTimeCode == true) Text("Left blank, the one-time code stays as it is") },
+                singleLine = true,
+                enabled = !fields.removeCode,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth().testTag("edit-code"),
+            )
+            if (detail?.hasOneTimeCode == true) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = fields.removeCode,
+                        onCheckedChange = { fields.removeCode = it },
+                        modifier = Modifier.testTag("remove-code"),
+                    )
+                    Text("Remove the one-time code")
+                }
+            }
+        }
+        OutlinedTextField(
+            value = fields.notes,
+            onValueChange = { fields.notes = it },
+            label = { Text("Notes") },
+            minLines = if (fields.kind == ItemKind.SECURE_NOTE) 6 else 3,
+            modifier = Modifier.fillMaxWidth().testTag("edit-notes"),
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(checked = fields.favorite, onCheckedChange = { fields.favorite = it }, modifier = Modifier.testTag("edit-favorite"))
+            Text("Favorite")
+        }
+    }
+}
+
+@Composable
+private fun EditField(value: String, onChange: (String) -> Unit, label: String, tag: String, keyboard: KeyboardType = KeyboardType.Text) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onChange,
+        label = { Text(label) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = keyboard),
+        modifier = Modifier.fillMaxWidth().testTag(tag),
+    )
 }
 
 /** A labelled value, with an action beside it. */
