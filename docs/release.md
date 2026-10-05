@@ -137,21 +137,19 @@ Neither phone app is released yet; these build what a release would be.
   icon and the signed one refuses to start (`xcodebuild -downloadPlatform
   iOS` installs it).
 
-Before an iOS app is submitted, two things wait for the owner. Each upload
+Before an iOS app is submitted, the owner answers one question: each upload
 asks whether the app uses encryption that is not exempt, which is a legal
-answer about export rules, not a technical one. And the app's privacy
-manifests (`PrivacyInfo.xcprivacy`) declare reading files' metadata and the
-app group's user defaults, but not the "disk space" category: the bundled
-SQLite calls `statfs` to choose how to lock a file and, on Apple systems
-whatever it is built with, `fstatfs` on every file it opens to recognize
-FAT volumes, and none of Apple's listed reasons for that category describes
-either. Building SQLite without its locking-style detection
-(`SQLITE_ENABLE_LOCKING_STYLE=0`) removes only the first. What would remove
-both is linking iOS's own SQLite instead of the bundled one, since calls
-inside Apple's library need no declaration: iOS 17 has SQLite 3.39, which
+answer about export rules, not a technical one. The app's privacy manifests
+(`PrivacyInfo.xcprivacy`) declare reading files' metadata and the app
+group's user defaults. On iOS the shared code uses iOS's own SQLite, linked
+with `-lsqlite3`, rather than the copy it builds in elsewhere (Phase 7,
+stop 6): SQLite calls `statfs` and `fstatfs` on the files it opens, which
+fall under the "disk space" category of declared reasons, and none of
+Apple's reasons for that category describes them, but calls made inside
+Apple's own library need no declaration. The iOS libraries refer to SQLite
+without containing it, and to neither call. iOS 17 has SQLite 3.39, which
 has everything the vault uses (strict tables from 3.37, dropping columns
-from 3.35); the vault's tests would then have to run against it. The other
-way is to ask Apple for a reason that fits.
+from 3.35); the shared code's tests ran against the simulator's.
 
 ## How a release is built
 

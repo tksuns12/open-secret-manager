@@ -12,10 +12,16 @@ workspace = true
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
 getrandom = "0.3.4"
 hpke = { version = "0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "aes"] }
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40.2", default-features = false }
 sha2 = "0.10.9"
 thiserror = "2.0.18"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
+
+# SQLite is built in, except on iOS, which has its own: an app there links
+# it (`-lsqlite3`), so that its calls need no privacy declaration (see
+# docs/release.md).
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }

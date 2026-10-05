@@ -51,11 +51,12 @@ ios)
     cp "$work/swift/OSMVaultFFI.modulemap" "$work/include/module.modulemap"
     sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
     # The static library, linked in: the program must load nothing from
-    # this disk when it starts.
+    # this disk when it starts. On iOS the shared code uses the system's
+    # SQLite.
     xcrun --sdk iphonesimulator swiftc -target arm64-apple-ios17.0-simulator -sdk "$sdk" \
         -I "$work/include" -module-name OSMVaultTests \
         "$work/swift/OSMVault.swift" apps/mobile/ios/Tests/main.swift \
-        target/aarch64-apple-ios-sim/debug/libosm_mobile.a -framework Security \
+        target/aarch64-apple-ios-sim/debug/libosm_mobile.a -framework Security -lsqlite3 \
         -o "$work/osm-vault-tests"
     cp "$frozen" "$work/device/vault.sqlite3"
     # A simulator of the run's own, on the internal disk: one may wait
