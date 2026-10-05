@@ -244,14 +244,37 @@ class VaultSession(private val context: Context, private val folder: File) {
         withContext(Dispatchers.Main) { done(logins) }
     }
 
+    /** Of [logins], those with a one-time code, in their order; then, on the main thread, [done]. */
+    fun withOneTimeCodes(logins: List<ItemSummary>, done: (List<ItemSummary>) -> Unit) = run(null) {
+        val found = device!!.withOneTimeCodes(logins.map { it.id })
+        withContext(Dispatchers.Main) { done(found) }
+    }
+
     /**
-     * A login's username and password to fill: into a page of [origin], which
+     * What fills a form from a login: its username and password if [login],
+     * and its current one-time code if [code]. Into a page of [origin], which
      * the login must be saved for, or, without an origin, into an app the
-     * owner chose the login for. Then, on the main thread, [done].
+     * owner chose the login for. A form that asks for the password too is
+     * filled without a code when the login has none. Then, on the main
+     * thread, [done].
      */
-    fun fill(id: String, origin: String?, done: (FillCredentials) -> Unit) = run(null) {
-        val credentials = if (origin != null) device!!.fillForWeb(id, origin) else device!!.fillForApp(id)
-        withContext(Dispatchers.Main) { done(credentials) }
+    fun fill(id: String, origin: String?, login: Boolean, code: Boolean, done: (FillCredentials?, String?) -> Unit) = run(null) {
+        val device = device!!
+        val credentials = when {
+            !login -> null
+            origin != null -> device.fillForWeb(id, origin)
+            else -> device.fillForApp(id)
+        }
+        val oneTimeCode = if (!code) {
+            null
+        } else {
+            try {
+                if (origin != null) device.oneTimeCodeForWeb(id, origin) else device.oneTimeCode(id)
+            } catch (error: MobileException.NoOneTimeCode) {
+                if (login) null else throw error
+            }
+        }
+        withContext(Dispatchers.Main) { done(credentials, oneTimeCode) }
     }
 
     /**

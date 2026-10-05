@@ -102,6 +102,11 @@ phone sold since 2019 is):
 4. In another app's login screen, the same entry appears; the first time the
    owner chooses a login for that app, after a warning, and it is offered
    there again afterwards.
+5. On a site or app that asks for a code from an authenticator app after
+   the password, tap the code field: the same entry appears, and the fill
+   screen lists the logins with a one-time code; the chosen one's code
+   fills the field. Note fields where nothing is offered (a field must say
+   it takes a one-time code).
 
 **iOS:**
 

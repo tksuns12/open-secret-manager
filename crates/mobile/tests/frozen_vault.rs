@@ -150,6 +150,58 @@ fn a_folder_without_a_vault_and_one_with_a_damaged_vault_are_told_apart() {
 }
 
 #[test]
+fn a_one_time_code_goes_only_where_its_login_would() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    let ids: Vec<String> = device
+        .items()
+        .unwrap()
+        .into_iter()
+        .map(|item| item.id)
+        .chain(["no such item".to_owned()])
+        .collect();
+    let with_codes: Vec<String> = device
+        .with_one_time_codes(ids)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.title)
+        .collect();
+    assert_eq!(with_codes, ["Bank"]);
+
+    let code = device
+        .one_time_code_for_web(
+            "fixture-bank".into(),
+            "https://bank.example.test:8443".into(),
+        )
+        .unwrap();
+    assert!(code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(matches!(
+        device.one_time_code_for_web("fixture-bank".into(), "https://bank.example.test".into()),
+        Err(MobileError::NotForThisPage)
+    ));
+    assert!(matches!(
+        device.one_time_code_for_web(
+            "fixture-bank".into(),
+            "http://bank.example.test:8443".into()
+        ),
+        Err(MobileError::InvalidOrigin)
+    ));
+    assert!(matches!(
+        device.one_time_code_for_web("fixture-mail".into(), "https://mail.example.test".into()),
+        Err(MobileError::NoOneTimeCode)
+    ));
+    device.lock();
+    assert!(matches!(
+        device.one_time_code_for_web(
+            "fixture-bank".into(),
+            "https://bank.example.test:8443".into()
+        ),
+        Err(MobileError::Locked)
+    ));
+}
+
+#[test]
 fn what_a_form_submitted_goes_only_into_a_login_it_could_be_filled_with() {
     let (_dir, folder) = copy_of_the_frozen_vault();
     let device = Device::open_listening_on(folder, 0).unwrap();

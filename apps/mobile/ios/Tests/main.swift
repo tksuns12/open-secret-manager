@@ -63,6 +63,11 @@ do {
     check(filled.username == "owner@example.test" && filled.password == "third password, with ünïcödé", "a login fills its page")
     check(fails({ try device.fillForWeb(id: "fixture-bank", origin: "https://mail.example.test") }) { if case .NotForThisPage = $0 { true } else { false } }, "a login fills no other page")
     check(try device.fillForApp(id: "fixture-bank").username == "account 42", "a login fills the app it was chosen for")
+    // A one-time code goes only where its login would.
+    check(try device.withOneTimeCodes(ids: try device.items().map { $0.id }).map { $0.title } == ["Bank"], "only Bank has a one-time code")
+    check(try device.oneTimeCodeForWeb(id: "fixture-bank", origin: "https://bank.example.test:8443").count == 6, "a code fills its login's page")
+    check(fails({ try device.oneTimeCodeForWeb(id: "fixture-bank", origin: "https://bank.example.test") }) { if case .NotForThisPage = $0 { true } else { false } }, "a code fills no other page")
+    check(fails({ try device.oneTimeCodeForWeb(id: "fixture-mail", origin: "https://mail.example.test") }) { if case .NoOneTimeCode = $0 { true } else { false } }, "a login without a code fills none")
     // The owner's edits cross the other way, unicode and all.
     let draft = ItemDraft(title: "Forum", kind: .login, username: "me", url: "https://forum.example.test", notes: "", favorite: false, password: "新しい 🔑 \"pass\"", oneTimeCodeSecret: nil)
     let created = try device.createItem(draft: draft)

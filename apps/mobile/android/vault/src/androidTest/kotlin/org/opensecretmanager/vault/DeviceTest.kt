@@ -67,6 +67,12 @@ class DeviceTest {
             fails<MobileException.NoOneTimeCode> { device.oneTimeCode("fixture-mail") }
             fails<MobileException.NotFound> { device.item("no such item") }
 
+            // A one-time code goes only where its login would.
+            assertEquals(listOf("Bank"), device.withOneTimeCodes(device.items().map { it.id }).map { it.title })
+            assertEquals(6, device.oneTimeCodeForWeb("fixture-bank", "https://bank.example.test:8443").length)
+            fails<MobileException.NotForThisPage> { device.oneTimeCodeForWeb("fixture-bank", "https://bank.example.test") }
+            fails<MobileException.NoOneTimeCode> { device.oneTimeCodeForWeb("fixture-mail", "https://mail.example.test") }
+
             // The owner's edits cross the other way, unicode and all.
             val draft = ItemDraft(
                 title = "Forum", kind = ItemKind.LOGIN, username = "me", url = "https://forum.example.test",

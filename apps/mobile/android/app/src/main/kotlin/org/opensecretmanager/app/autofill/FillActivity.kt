@@ -60,8 +60,10 @@ import org.opensecretmanager.vault.ItemSummary
  * "unlock to fill" in it: unlock, see who asks, choose the login. A page of
  * a trusted browser is offered the logins saved for its origin and nothing
  * else; an app is offered the logins the owner chose for it before, or the
- * owner chooses one, warned. The vault locks again once this screen goes,
- * as it does when the app is left.
+ * owner chooses one, warned. A form that asks for a one-time code is offered
+ * only logins that have one, and gets the login's current code; a form with
+ * a password field and a code field gets both. The vault locks again once
+ * this screen goes, as it does when the app is left.
  */
 class FillActivity : FragmentActivity() {
     private lateinit var form: Form
@@ -81,6 +83,8 @@ class FillActivity : FragmentActivity() {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 FillScreen(
                     requester = requester,
+                    codeOnly = form.password == null,
+                    withCode = form.oneTimeCode != null,
                     session = session,
                     appLogins = AppLogins(this),
                     biometric = biometric,
@@ -92,16 +96,19 @@ class FillActivity : FragmentActivity() {
         }
     }
 
-    /** Hands the login to the form that asked, which fills it at once. */
-    private fun finishWith(credentials: FillCredentials) {
+    /** Hands what was chosen to the form that asked, which fills it at once. */
+    private fun finishWith(credentials: FillCredentials?, code: String?) {
         val presentation = RemoteViews(packageName, android.R.layout.simple_list_item_1).apply {
             setTextViewText(android.R.id.text1, getString(org.opensecretmanager.app.R.string.app_name))
         }
         @Suppress("DEPRECATION")
         val dataset = Dataset.Builder(presentation).apply {
-            // An empty username leaves what the owner typed there alone.
-            form.username?.takeIf { credentials.username.isNotEmpty() }?.let { setValue(it, AutofillValue.forText(credentials.username)) }
-            form.password?.let { setValue(it, AutofillValue.forText(credentials.password)) }
+            credentials?.let { login ->
+                // An empty username leaves what the owner typed there alone.
+                form.username?.takeIf { login.username.isNotEmpty() }?.let { setValue(it, AutofillValue.forText(login.username)) }
+                form.password?.let { setValue(it, AutofillValue.forText(login.password)) }
+            }
+            code?.let { value -> form.oneTimeCode?.let { setValue(it, AutofillValue.forText(value)) } }
         }.build()
         setResult(RESULT_OK, Intent().putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, dataset))
         finish()
@@ -112,11 +119,13 @@ class FillActivity : FragmentActivity() {
 @Composable
 private fun FillScreen(
     requester: Requester?,
+    codeOnly: Boolean,
+    withCode: Boolean,
     session: VaultSession,
     appLogins: AppLogins,
     biometric: BiometricUnlock,
     prompts: FingerprintPrompts,
-    onFill: (FillCredentials) -> Unit,
+    onFill: (FillCredentials?, String?) -> Unit,
     onCancel: () -> Unit,
 ) {
     val state by session.state.collectAsStateWithLifecycle()
@@ -127,13 +136,21 @@ private fun FillScreen(
             session.dismissNotice()
         }
     }
+    // Fills what the form asks for from a login; one chosen for an app from
+    // every login is remembered for it.
+    val fill: (ItemSummary, String?, Boolean) -> Unit = { item, origin, chosenNow ->
+        session.fill(item.id, origin, login = !codeOnly, code = withCode) { credentials, code ->
+            if (chosenNow && requester is Requester.App) appLogins.remember(requester, item.id)
+            onFill(credentials, code)
+        }
+    }
     Scaffold(
         // Tags as resource ids: the tests drive this screen from outside the
         // app, as the system shows it over another one.
         modifier = Modifier.semantics { testTagsAsResourceId = true },
         topBar = {
             TopAppBar(
-                title = { Text("Fill a login") },
+                title = { Text(if (codeOnly) "Fill a one-time code" else "Fill a login") },
                 actions = { TextButton(onClick = onCancel, modifier = Modifier.testTag("cancel")) { Text("Cancel") } },
             )
         },
@@ -153,8 +170,8 @@ private fun FillScreen(
                 state.screen == Screen.UNLOCKED -> Column {
                     Asker(requester)
                     when (requester) {
-                        is Requester.Web -> WebLogins(requester, session, onFill)
-                        is Requester.App -> AppLoginsList(requester, state.items, appLogins, session, onFill)
+                        is Requester.Web -> WebLogins(requester, codeOnly, session) { fill(it, requester.origin, false) }
+                        is Requester.App -> AppLoginsList(requester, state.items, codeOnly, appLogins, session, fill)
                     }
                 }
                 state.screen == Screen.REMOVED -> Message("This phone was removed from the vault")
@@ -196,13 +213,21 @@ internal fun Asker(requester: Requester) {
 }
 
 @Composable
-private fun WebLogins(requester: Requester.Web, session: VaultSession, onFill: (FillCredentials) -> Unit) {
+private fun WebLogins(requester: Requester.Web, codeOnly: Boolean, session: VaultSession, onChoose: (ItemSummary) -> Unit) {
     var logins by remember(requester) { mutableStateOf<List<ItemSummary>?>(null) }
-    LaunchedEffect(requester) { session.loginsForWeb(requester.origin) { logins = it } }
+    LaunchedEffect(requester) {
+        session.loginsForWeb(requester.origin) { found ->
+            if (codeOnly) session.withOneTimeCodes(found) { logins = it } else logins = found
+        }
+    }
     val shown = logins ?: return
     if (shown.isEmpty()) {
         Column(Modifier.padding(24.dp)) {
-            Text("No login for this site", style = MaterialTheme.typography.titleMedium, modifier = Modifier.testTag("no-logins"))
+            Text(
+                if (codeOnly) "No login with a one-time code for this site" else "No login for this site",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.testTag("no-logins"),
+            )
             Text(
                 "A login is offered only on the site it was saved for: over https, on the same host and port. " +
                     "Browsers on Android do not say which port a page uses, so a login saved for an unusual port is not offered here.",
@@ -211,24 +236,30 @@ private fun WebLogins(requester: Requester.Web, session: VaultSession, onFill: (
         }
         return
     }
-    LoginRows(shown) { item -> session.fill(item.id, requester.origin, onFill) }
+    LoginRows(shown, onChoose = onChoose)
 }
 
 @Composable
 private fun AppLoginsList(
     requester: Requester.App,
     items: List<ItemSummary>,
+    codeOnly: Boolean,
     appLogins: AppLogins,
     session: VaultSession,
-    onFill: (FillCredentials) -> Unit,
+    fill: (ItemSummary, String?, Boolean) -> Unit,
 ) {
-    val logins = items.filter { it.kind == ItemKind.LOGIN }
+    var logins by remember(requester) { mutableStateOf<List<ItemSummary>?>(null) }
+    LaunchedEffect(items, codeOnly) {
+        val all = items.filter { it.kind == ItemKind.LOGIN }
+        if (codeOnly) session.withOneTimeCodes(all) { logins = it } else logins = all
+    }
+    val offered = logins ?: return
     val chosen = appLogins.chosen(requester)
-    val remembered = logins.filter { it.id in chosen }
+    val remembered = offered.filter { it.id in chosen }
     var choosing by remember(requester) { mutableStateOf(false) }
     if (!choosing) {
         Column {
-            LoginRows(remembered, Modifier.weight(1f, fill = false)) { item -> session.fill(item.id, null, onFill) }
+            LoginRows(remembered, Modifier.weight(1f, fill = false)) { item -> fill(item, null, false) }
             TextButton(
                 onClick = { choosing = true },
                 modifier = Modifier.padding(horizontal = 12.dp).testTag("choose-another"),
@@ -244,12 +275,7 @@ private fun AppLoginsList(
             color = MaterialTheme.colorScheme.error,
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp).testTag("warning"),
         )
-        LoginRows(logins) { item ->
-            session.fill(item.id, null) { credentials ->
-                appLogins.remember(requester, item.id)
-                onFill(credentials)
-            }
-        }
+        LoginRows(offered) { item -> fill(item, null, true) }
     }
 }
 

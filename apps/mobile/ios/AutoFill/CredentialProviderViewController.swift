@@ -2,7 +2,7 @@ import AuthenticationServices
 import SwiftUI
 
 /// What the system opens when the owner chooses this app to fill a login
-/// form in another app or a page, or, from iOS 26.2, to save what such a
+/// form in another app or a page, or, from iOS 26.2, to save what a login
 /// form submitted. It registers no logins with the system, so the system
 /// knows nothing of the vault, and every fill and save starts here.
 final class CredentialProviderViewController: ASCredentialProviderViewController {
@@ -30,6 +30,25 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
                     withSelectedCredential: ASPasswordCredential(user: credentials.username, password: credentials.password),
                     completionHandler: nil
                 )
+            },
+            onCancel: { [weak self] in
+                guard let self else { return }
+                extensionContext.cancelRequest(withError: userCanceled)
+            }
+        ))
+    }
+
+    /// A one-time code for a field that asks for one. Not reached yet: the
+    /// extension does not declare `ProvidesOneTimeCodes`, since iOS offers a
+    /// provider's codes only for the sites it registered with the system,
+    /// and it registers none.
+    @available(iOS 18.0, *)
+    override func prepareOneTimeCodeCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier]) {
+        show(FillModel(
+            requester: FillRequester(serviceIdentifiers),
+            oneTimeCode: true,
+            onCode: { [weak self] code in
+                self?.extensionContext.completeOneTimeCodeRequest(using: ASOneTimeCodeCredential(code: code), completionHandler: nil)
             },
             onCancel: { [weak self] in
                 guard let self else { return }

@@ -148,6 +148,20 @@ pub enum ItemKind {
     Card,
 }
 
+impl From<osm_vault_core::ItemSummary> for ItemSummary {
+    fn from(item: osm_vault_core::ItemSummary) -> Self {
+        Self {
+            id: item.id,
+            title: item.title,
+            kind: item.kind.into(),
+            username: item.username,
+            url: item.url,
+            favorite: item.favorite,
+            conflict: item.conflict,
+        }
+    }
+}
+
 impl From<osm_vault_core::ItemKind> for ItemKind {
     fn from(kind: osm_vault_core::ItemKind) -> Self {
         use osm_vault_core::ItemKind as Kind;
@@ -389,6 +403,21 @@ impl Device {
     /// that app.
     pub fn fill_for_app(&self, id: String) -> Result<FillCredentials, MobileError> {
         self.tokio.block_on(self.inner.fill_for_app(&id))
+    }
+
+    /// For a form that asks for a one-time code: of the logins in `ids`,
+    /// which are those the form could be filled with, the ones that have a
+    /// one-time code. Unknown IDs are skipped.
+    pub fn with_one_time_codes(&self, ids: Vec<String>) -> Result<Vec<ItemSummary>, MobileError> {
+        self.tokio.block_on(self.inner.with_one_time_codes(&ids))
+    }
+
+    /// The current one-time code of the login the owner chose for a page of
+    /// `origin`; refused unless the login is for exactly that origin. For
+    /// an app, [`Device::one_time_code`] gives it.
+    pub fn one_time_code_for_web(&self, id: String, origin: String) -> Result<String, MobileError> {
+        self.tokio
+            .block_on(self.inner.one_time_code_for_web(&id, &origin))
     }
 
     /// Makes a login or a secure note from `draft`, and returns its ID.

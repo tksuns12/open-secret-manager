@@ -12,7 +12,8 @@ import android.widget.TextView
 
 /**
  * A login page of `origin` (an extra, `https://mail.example.test` if none)
- * in a web view. The page is served from here, so no network is needed;
+ * in a web view, or, with the extra `page` set to `code`, a page that asks
+ * for a one-time code. The page is served from here, so no network is needed;
  * the web view still navigates to the address and reports its domain.
  * Signing in posts the form and shows the page again.
  */
@@ -22,6 +23,7 @@ class WebLoginActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.web_login)
         val origin = intent.getStringExtra("origin") ?: "https://mail.example.test"
+        val html = if (intent.getStringExtra("page") == "code") CODE_PAGE else PAGE
         val filled = findViewById<TextView>(R.id.filled)
         val page = findViewById<WebView>(R.id.page)
         page.settings.javaScriptEnabled = true
@@ -29,13 +31,16 @@ class WebLoginActivity : Activity() {
             object {
                 @JavascriptInterface
                 fun report(username: String, password: String) = runOnUiThread { filled.text = "$username|$password" }
+
+                @JavascriptInterface
+                fun reportCode(code: String) = runOnUiThread { filled.text = code }
             },
             "fixture",
         )
         page.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse =
                 if (request.url.path == "/login") {
-                    WebResourceResponse("text/html", "utf-8", PAGE.byteInputStream())
+                    WebResourceResponse("text/html", "utf-8", html.byteInputStream())
                 } else {
                     WebResourceResponse("text/plain", "utf-8", 404, "Not Found", emptyMap(), "".byteInputStream())
                 }
@@ -55,6 +60,18 @@ class WebLoginActivity : Activity() {
             </form>
             <script>
               setInterval(() => fixture.report(username.value, password.value), 200);
+            </script>
+        """.trimIndent()
+
+        val CODE_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>input { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
+            <form method="post" action="/login">
+              <input id="code" type="text" name="code" autocomplete="one-time-code" inputmode="numeric" placeholder="Code">
+            </form>
+            <script>
+              setInterval(() => fixture.reportCode(code.value), 200);
             </script>
         """.trimIndent()
     }

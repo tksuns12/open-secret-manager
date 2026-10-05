@@ -9,9 +9,10 @@ import android.view.autofill.AutofillId
 
 /**
  * What a fill request found on the screen that asks: the fields a login
- * goes into, the app that shows them, and the web page's domain and scheme
- * if the app said it shows a page. Whether to believe the domain is
- * decided elsewhere ([Requester]).
+ * goes into (a username and a password, or a one-time code, or all three),
+ * the app that shows them, and the web page's domain and scheme if the app
+ * said it shows a page. Whether to believe the domain is decided elsewhere
+ * ([Requester]).
  */
 data class Form(
     val packageName: String,
@@ -19,6 +20,7 @@ data class Form(
     val webScheme: String?,
     val username: AutofillId?,
     val password: AutofillId?,
+    val oneTimeCode: AutofillId?,
 ) {
     fun toBundle() = Bundle().apply {
         putString(PACKAGE, packageName)
@@ -26,6 +28,7 @@ data class Form(
         putString(WEB_SCHEME, webScheme)
         putParcelable(USERNAME, username)
         putParcelable(PASSWORD, password)
+        putParcelable(ONE_TIME_CODE, oneTimeCode)
     }
 
     companion object {
@@ -34,6 +37,7 @@ data class Form(
         private const val WEB_SCHEME = "form.webScheme"
         private const val USERNAME = "form.username"
         private const val PASSWORD = "form.password"
+        private const val ONE_TIME_CODE = "form.oneTimeCode"
 
         @Suppress("DEPRECATION")
         fun fromBundle(extras: Bundle): Form? {
@@ -44,6 +48,7 @@ data class Form(
                 extras.getString(WEB_SCHEME),
                 extras.getParcelable(USERNAME),
                 extras.getParcelable(PASSWORD),
+                extras.getParcelable(ONE_TIME_CODE),
             )
         }
 
@@ -60,7 +65,7 @@ data class Form(
             return found
         }
 
-        /** Finds the login fields, or null if the screen has no password field. */
+        /** Finds the login fields, or null if the screen has neither a password field nor a one-time code field. */
         fun parse(structure: AssistStructure): Form? {
             val fields = mutableListOf<AssistStructure.ViewNode>()
             var webDomain: String? = null
@@ -77,18 +82,25 @@ data class Form(
             }
             for (index in 0 until structure.windowNodeCount) visit(structure.getWindowNodeAt(index).rootViewNode)
 
-            val passwordIndex = fields.indexOfFirst(::isPassword)
-            if (passwordIndex < 0) return null
+            val code = fields.firstOrNull(::isOneTimeCode)
+            val passwordIndex = fields.indexOfFirst { isPassword(it) && !isOneTimeCode(it) }
+            if (passwordIndex < 0 && code == null) return null
             // The username is the field that says it is one, or else the
-            // text field just before the password.
-            val username = fields.firstOrNull(::isUsername)
-                ?: fields.take(passwordIndex).lastOrNull { !isPassword(it) }
+            // text field just before the password. A screen that asks only
+            // for a code has none.
+            val username = if (passwordIndex < 0) {
+                null
+            } else {
+                fields.firstOrNull(::isUsername)
+                    ?: fields.take(passwordIndex).lastOrNull { !isPassword(it) && !isOneTimeCode(it) }
+            }
             return Form(
                 packageName = structure.activityComponent.packageName,
                 webDomain = webDomain,
                 webScheme = webScheme,
                 username = username?.autofillId,
-                password = fields[passwordIndex].autofillId,
+                password = fields.getOrNull(passwordIndex)?.autofillId,
+                oneTimeCode = code?.autofillId,
             )
         }
 
@@ -117,8 +129,17 @@ data class Form(
             }
         }
 
+        /**
+         * A field for a code from an authenticator app, as the vault has:
+         * one that says so in an app's autofill hints or a page's
+         * `autocomplete`. A field for a code sent by text message or email
+         * is not one.
+         */
+        fun isOneTimeCode(node: AssistStructure.ViewNode): Boolean =
+            hints(node).any { it == "2faappotpcode" || it == "one-time-code" }
+
         fun isUsername(node: AssistStructure.ViewNode): Boolean {
-            if (isPassword(node)) return false
+            if (isPassword(node) || isOneTimeCode(node)) return false
             val hints = hints(node)
             if (hints.any {
                     it == View.AUTOFILL_HINT_USERNAME.lowercase() || it == View.AUTOFILL_HINT_EMAIL_ADDRESS.lowercase() ||

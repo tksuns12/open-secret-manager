@@ -11,7 +11,11 @@ import androidx.test.uiautomator.StaleObjectException
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.UiObject2
 import androidx.test.uiautomator.Until
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.ByteBuffer
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -20,6 +24,9 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.opensecretmanager.app.autofill.Requester
+import org.opensecretmanager.vault.Device
+import org.opensecretmanager.vault.ItemDraft
+import org.opensecretmanager.vault.ItemKind
 
 /**
  * Filling another app's forms through the system's autofill, end to end:
@@ -86,12 +93,15 @@ class AutofillTest {
 
     private fun mine(tag: String) = By.res(tag).pkg(context.packageName)
 
-    /** Opens a form of the stand-in app, chooses "unlock to fill" in it, and unlocks. */
-    private fun askToFill(activity: String, origin: String? = null, name: String? = null) {
+    /**
+     * Opens a form of the stand-in app (with [extras] for `am start`), chooses
+     * "unlock to fill" in it, and unlocks.
+     */
+    private fun askToFill(activity: String, origin: String? = null, name: String? = null, field: String = "username", extras: String = "") {
         device.wakeUp()
-        shell("am start -W -S -n $FIXTURE/.$activity" + (origin?.let { " --es origin $it" } ?: ""))
+        shell("am start -W -S -n $FIXTURE/.$activity" + (origin?.let { " --es origin $it" } ?: "") + extras)
         val field = if (origin == null) {
-            find(By.res(FIXTURE, "username"))
+            find(By.res(FIXTURE, field))
         } else {
             find(By.clazz("android.widget.EditText").pkg(FIXTURE), 30_000)
         }
@@ -313,7 +323,97 @@ class AutofillTest {
         assertLockedAgain()
     }
 
+    /** The code of RFC 6238 for a base32 [secret] at [unixTime], as the shared code makes it. */
+    private fun totp(secret: String, unixTime: Long): String {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        val key = ByteArrayOutputStream()
+        var buffer = 0
+        var bits = 0
+        for (char in secret) {
+            buffer = (buffer shl 5) or alphabet.indexOf(char)
+            bits += 5
+            if (bits >= 8) {
+                bits -= 8
+                key.write((buffer shr bits) and 0xff)
+            }
+        }
+        val mac = Mac.getInstance("HmacSHA1")
+        mac.init(SecretKeySpec(key.toByteArray(), "HmacSHA1"))
+        val hash = mac.doFinal(ByteBuffer.allocate(8).putLong(unixTime / 30).array())
+        val offset = hash.last().toInt() and 0x0f
+        val value = ((hash[offset].toInt() and 0x7f) shl 24) or ((hash[offset + 1].toInt() and 0xff) shl 16) or
+            ((hash[offset + 2].toInt() and 0xff) shl 8) or (hash[offset + 3].toInt() and 0xff)
+        return "%06d".format(value % 1_000_000)
+    }
+
+    /** The stand-in shows the current code of [secret] (or the one before, as the step may just have turned). */
+    private fun assertFilledWithCodeOf(secret: String) {
+        val filled = find(By.res(FIXTURE, "filled"))
+        assertTrue("filled: ${filled.text}", filled.wait(Until.textMatches("[0-9]{6}"), 15_000) == true)
+        val now = System.currentTimeMillis() / 1000
+        assertTrue("filled: ${filled.text}", filled.text in setOf(totp(secret, now), totp(secret, now - 30)))
+    }
+
+    @Test
+    fun anAppsCodeFieldIsFilledWithTheCurrentCodeOfTheLoginChosenForIt() {
+        askToFill("CodeActivity", field = "code", name = "code")
+        find(mine("choose-another")).click()
+        find(mine("warning"))
+        // Only the logins that have a code: Bank, not Mail.
+        find(mine("fill:Bank"))
+        assertNull(device.findObject(mine("fill:Mail")))
+        capture("code-choose")
+        find(mine("fill:Bank")).click()
+        assertFilledWithCodeOf(BANK_CODE_SECRET)
+        assertLockedAgain()
+
+        // Chosen for this app, it is offered there again.
+        askToFill("CodeActivity", field = "code")
+        find(mine("fill:Bank")).click()
+        assertFilledWithCodeOf(BANK_CODE_SECRET)
+        assertLockedAgain()
+    }
+
+    @Test
+    fun aTrustedBrowsersCodeFieldIsFilledFromTheLoginsForItsOrigin() {
+        // A login with a code for an origin without a port, which a page on
+        // Android can be offered.
+        session.reopenForTests { folder ->
+            BiometricUnlock(context).disable()
+            instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
+                File(folder, "vault.sqlite3").outputStream().use { output -> input.copyTo(output) }
+            }
+            Device.open(folder.path).use { other ->
+                other.unlock(password)
+                other.createItem(
+                    ItemDraft(
+                        title = "Codes", kind = ItemKind.LOGIN, username = "code user",
+                        url = "https://codes.example.test", notes = "", favorite = false, password = "x",
+                        oneTimeCodeSecret = BANK_CODE_SECRET,
+                    ),
+                )
+            }
+        }
+        Requester.trustedForTests += FIXTURE
+        askToFill("WebLoginActivity", "https://codes.example.test", name = "web-code", extras = " --es page code")
+        find(mine("fill:Codes"))
+        capture("web-code-logins")
+        find(mine("fill:Codes")).click()
+        assertFilledWithCodeOf(BANK_CODE_SECRET)
+        assertLockedAgain()
+
+        // Mail is for its page but has no code: nothing is offered.
+        askToFill("WebLoginActivity", "https://mail.example.test", extras = " --es page code")
+        find(mine("no-logins"))
+        assertNull(device.findObject(mine("fill:Mail")))
+        find(mine("cancel")).click()
+        assertLockedAgain()
+    }
+
     private companion object {
         const val FIXTURE = "org.opensecretmanager.loginfixture"
+
+        /** Bank's one-time code secret in the frozen vault (`crates/vault-core/examples/make_fixture.rs`). */
+        const val BANK_CODE_SECRET = "JBSWY3DPEHPK3PXP"
     }
 }

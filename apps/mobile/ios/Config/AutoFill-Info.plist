@@ -5,7 +5,8 @@
 	<!-- The AutoFill extension: it provides passwords, chosen in its own
 	     screen, and from iOS 26.2 saves what a login form submitted, where
 	     the owner chooses in its screen; it registers none with the system
-	     and makes no passkeys. -->
+	     and makes no passkeys. It does not declare ProvidesOneTimeCodes:
+	     iOS offers a provider's codes only for the sites it registered. -->
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>

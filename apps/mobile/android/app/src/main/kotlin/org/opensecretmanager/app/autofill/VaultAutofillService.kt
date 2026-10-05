@@ -15,8 +15,8 @@ import android.widget.RemoteViews
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Offers to fill a login form in another app or a browser, and to save what
- * the form submitted. It never says what the vault holds: the only offer is
+ * Offers to fill a login form or a one-time code field in another app or a
+ * browser, and to save what a login form submitted. It never says what the vault holds: the only offer is
  * "unlock to fill", which opens [FillActivity], where the owner unlocks and
  * chooses the login. A save opens [SaveActivity], where the owner unlocks
  * and chooses where it goes.
@@ -27,7 +27,8 @@ class VaultAutofillService : AutofillService() {
     override fun onFillRequest(request: FillRequest, cancellationSignal: CancellationSignal, callback: FillCallback) {
         val structure = request.fillContexts.lastOrNull()?.structure
         val form = structure?.let(Form::parse)
-        // Not this app's own screens, and not a screen without a login form.
+        // Not this app's own screens, and not a screen without a login form
+        // or a one-time code field.
         if (form == null || form.packageName == packageName) {
             callback.onSuccess(null)
             return
@@ -47,7 +48,7 @@ class VaultAutofillService : AutofillService() {
         // screen, whose result fills the form at once.
         @Suppress("DEPRECATION")
         val dataset = Dataset.Builder(offer).apply {
-            listOfNotNull(form.username, form.password).forEach { setValue(it, null) }
+            listOfNotNull(form.username, form.password, form.oneTimeCode).forEach { setValue(it, null) }
             setAuthentication(sender)
         }.build()
         val response = FillResponse.Builder().addDataset(dataset)

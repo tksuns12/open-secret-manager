@@ -10,7 +10,8 @@ struct Saving {
 
 /// The fill or save screen's state: the device opened on the vault the app
 /// shares, never online, unlocked for this one fill or save and dropped when
-/// it ends.
+/// it ends. A fill is of a login's username and password or, for a field
+/// that asks for one, of its current one-time code.
 @MainActor
 final class FillModel: ObservableObject {
     enum Stage: Equatable { case opening, locked, unlocked, noVault, removed, unreadable(String), nothingToFill }
@@ -18,6 +19,8 @@ final class FillModel: ObservableObject {
     let requester: FillRequester
     /// Set when the screen saves rather than fills.
     let saving: Saving?
+    /// Set when the screen fills a one-time code.
+    let oneTimeCode: Bool
     @Published private(set) var stage: Stage = .opening
     /// What may be filled: the logins for the origins, or those chosen for the app.
     @Published private(set) var offered: [ItemSummary] = []
@@ -36,19 +39,24 @@ final class FillModel: ObservableObject {
     /// For each offered login, the origin it is filled for.
     private var originOf: [String: String] = [:]
     private let onFill: (FillCredentials) -> Void
+    private let onCode: (String) -> Void
     private let onSaved: () -> Void
     private let onCancel: () -> Void
 
     init(
         requester: FillRequester,
         saving: Saving? = nil,
+        oneTimeCode: Bool = false,
         onFill: @escaping (FillCredentials) -> Void = { _ in },
+        onCode: @escaping (String) -> Void = { _ in },
         onSaved: @escaping () -> Void = {},
         onCancel: @escaping () -> Void
     ) {
         self.requester = requester
         self.saving = saving
+        self.oneTimeCode = oneTimeCode
         self.onFill = onFill
+        self.onCode = onCode
         self.onSaved = onSaved
         self.onCancel = onCancel
         if case .notHTTPS = requester {
@@ -125,13 +133,16 @@ final class FillModel: ObservableObject {
 
     private func listOffered() async {
         let requester = requester
+        let oneTimeCode = oneTimeCode
         let found: ([ItemSummary], [String: String])? = await call { device in
             switch requester {
             case let .origins(origins):
                 var logins: [ItemSummary] = []
                 var originOf: [String: String] = [:]
                 for origin in origins {
-                    for login in try device.loginsForWeb(origin: origin) where originOf[login.id] == nil {
+                    var forOrigin = try device.loginsForWeb(origin: origin)
+                    if oneTimeCode { forOrigin = try device.withOneTimeCodes(ids: forOrigin.map(\.id)) }
+                    for login in forOrigin where originOf[login.id] == nil {
                         logins.append(login)
                         originOf[login.id] = origin
                     }
@@ -139,7 +150,8 @@ final class FillModel: ObservableObject {
                 return (logins, originOf)
             case let .app(id, _):
                 let chosen = AppLogins().chosen(id)
-                return (try device.items().filter { $0.kind == .login && chosen.contains($0.id) }, [:])
+                let logins = try device.items().filter { $0.kind == .login && chosen.contains($0.id) }
+                return (oneTimeCode ? try device.withOneTimeCodes(ids: logins.map(\.id)) : logins, [:])
             case .unnamed, .notHTTPS:
                 return ([], [:])
             }
@@ -163,10 +175,13 @@ final class FillModel: ObservableObject {
         }?.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending } ?? []
     }
 
-    /// Every login, for an app the owner chooses one for.
+    /// Every login (with a one-time code, for a code), for an app the owner
+    /// chooses one for.
     func chooseAny() async {
+        let oneTimeCode = oneTimeCode
         all = await call { device in
-            try device.items().filter { $0.kind == .login }
+            let logins = try device.items().filter { $0.kind == .login }
+            return try (oneTimeCode ? device.withOneTimeCodes(ids: logins.map(\.id)) : logins)
                 .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         }
     }
@@ -177,6 +192,18 @@ final class FillModel: ObservableObject {
         // A page or an app of an origin gets only a login offered for it.
         if case .origins = requester, origin == nil {
             notice = describe(MobileError.NotForThisPage)
+            return
+        }
+        if oneTimeCode {
+            Task {
+                guard let code = await call(nil, { device -> String in
+                    if let origin { return try device.oneTimeCodeForWeb(id: login.id, origin: origin) }
+                    return try device.oneTimeCode(id: login.id)
+                }) else { return }
+                if case let .app(id, _) = requester { AppLogins().remember(id, login.id) }
+                close()
+                onCode(code)
+            }
             return
         }
         Task {

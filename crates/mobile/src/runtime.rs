@@ -180,19 +180,7 @@ impl Runtime {
     pub(crate) async fn items(&self) -> Result<Vec<ItemSummary>, MobileError> {
         let vault = self.vault.lock().await;
         let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        Ok(vault
-            .list()?
-            .into_iter()
-            .map(|item| ItemSummary {
-                id: item.id.clone(),
-                title: item.title.clone(),
-                kind: item.kind.into(),
-                username: item.username.clone(),
-                url: item.url.clone(),
-                favorite: item.favorite,
-                conflict: item.conflict,
-            })
-            .collect())
+        Ok(vault.list()?.into_iter().map(ItemSummary::from).collect())
     }
 
     pub(crate) async fn item(&self, id: &str) -> Result<ItemDetail, MobileError> {
@@ -386,15 +374,7 @@ impl Runtime {
         Ok(vault
             .logins_for_origin(&origin)?
             .into_iter()
-            .map(|item| ItemSummary {
-                id: item.id.clone(),
-                title: item.title.clone(),
-                kind: item.kind.into(),
-                username: item.username.clone(),
-                url: item.url.clone(),
-                favorite: item.favorite,
-                conflict: item.conflict,
-            })
+            .map(ItemSummary::from)
             .collect())
     }
 
@@ -411,6 +391,42 @@ impl Runtime {
             username: found.username.clone(),
             password: found.password.clone(),
         })
+    }
+
+    pub(crate) async fn with_one_time_codes(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<ItemSummary>, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let mut found = Vec::new();
+        for id in ids {
+            let item = match vault.get(id) {
+                Ok(item) => item,
+                Err(osm_vault_core::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if item.item.kind == ItemKind::Login && item.item.totp_secret.is_some() {
+                found.push(osm_vault_core::ItemSummary::from(item).into());
+            }
+        }
+        Ok(found)
+    }
+
+    pub(crate) async fn one_time_code_for_web(
+        &self,
+        id: &str,
+        origin: &str,
+    ) -> Result<String, MobileError> {
+        let origin = Origin::parse(origin).ok_or(MobileError::InvalidOrigin)?;
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        // The one rule for what goes into a page, as for its password.
+        drop(vault.credentials_for_origin(id, &origin)?);
+        if vault.get(id)?.item.totp_secret.is_none() {
+            return Err(MobileError::NoOneTimeCode);
+        }
+        Ok(vault.item_totp_code(id, now())?)
     }
 
     pub(crate) async fn fill_for_app(&self, id: &str) -> Result<FillCredentials, MobileError> {

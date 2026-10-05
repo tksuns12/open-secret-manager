@@ -15,7 +15,7 @@ struct FillView: View {
                 }
                 .padding()
             }
-            .navigationTitle(model.saving == nil ? "Fill a login" : "Save a login")
+            .navigationTitle(model.saving != nil ? "Save a login" : model.oneTimeCode ? "Fill a one-time code" : "Fill a login")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -89,7 +89,7 @@ private struct Logins: View {
         VStack(alignment: .leading, spacing: 16) {
             if case .origins = model.requester, model.offered.isEmpty {
                 Explanation(
-                    title: "No login for this site",
+                    title: model.oneTimeCode ? "No login with a one-time code for this site" : "No login for this site",
                     detail: "A login is offered only on the site it was saved for: over https, on the same host and port."
                 )
                 .accessibilityIdentifier("no-logins")

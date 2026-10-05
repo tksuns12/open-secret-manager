@@ -19,8 +19,9 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   as the phone's autofill service, it fills logins into other apps and
   into pages of the browsers it trusts (`res/raw/trusted_browsers.json`,
   made by `android/trusted-browsers.mjs`), after the owner unlocks and
-  chooses the login on its fill screen, and offers to save a login those
-  apps and pages send, where the owner chooses on its save screen.
+  chooses the login on its fill screen (and its one-time code into a field
+  that asks for one), and offers to save a login those apps and pages
+  send, where the owner chooses on its save screen.
 - `loginfixture`: a stand-in for another app with login forms, which the
   autofill tests fill and sign in to. Never shipped.
 
