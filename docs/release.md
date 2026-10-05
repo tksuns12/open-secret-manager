@@ -146,8 +146,9 @@ with `-lsqlite3`, rather than the copy it builds in elsewhere (Phase 7,
 stop 6): SQLite calls `statfs` and `fstatfs` on the files it opens, which
 fall under the "disk space" category of declared reasons, and none of
 Apple's reasons for that category describes them, but calls made inside
-Apple's own library need no declaration. The iOS libraries refer to SQLite
-without containing it, and to neither call. iOS 17 has SQLite 3.39, which
+Apple's own library need no declaration. The app and the extension built for
+iPhones link `/usr/lib/libsqlite3.dylib`, contain no SQLite of their own,
+and call neither function. iOS 17 has SQLite 3.39, which
 has everything the vault uses (strict tables from 3.37, dropping columns
 from 3.35); the shared code's tests ran against the simulator's.
 
