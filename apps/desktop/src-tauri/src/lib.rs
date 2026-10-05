@@ -12,9 +12,13 @@ mod browser;
 mod browser;
 #[cfg(all(test, unix))]
 mod browser_tests;
+mod import;
+#[cfg(test)]
+mod import_tests;
 mod network;
 #[cfg(test)]
 mod network_tests;
+mod settings;
 
 use std::path::PathBuf;
 
@@ -38,6 +42,9 @@ struct AppState {
     browser: browser::Browser,
     /// The backup the owner picked to restore, until it is restored.
     chosen_backup: std::sync::Mutex<Option<PathBuf>>,
+    /// What an export the owner chose would add, until the import is
+    /// confirmed or dropped. Locking drops it.
+    import: Mutex<Option<osm_vault_core::ImportPreview>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +66,7 @@ impl From<osm_vault_core::Error> for CommandError {
             osm_vault_core::Error::InvalidRecoveryKey => "invalid_recovery_key",
             osm_vault_core::Error::RecoveryNotEnabled => "recovery_not_enabled",
             osm_vault_core::Error::UpgradeRequiresPassword => "upgrade_requires_password",
+            osm_vault_core::Error::InvalidImport(_) => "invalid_import",
             _ => "vault_error",
         };
         Self {
@@ -88,6 +96,7 @@ async fn lock_everything(state: &AppState) -> bool {
         vault.lock();
     }
     let archive = state.archive.lock().await.take();
+    state.import.lock().await.take();
     unlocked || archive.is_some()
 }
 
@@ -154,6 +163,44 @@ async fn copy_totp(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
     copy_for_a_while(&code)
 }
 
+/// Copies an item's password, for 30 seconds.
+#[tauri::command]
+async fn copy_password(id: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+    let vault = state.vault.lock().await;
+    let vault = vault.as_ref().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    let item = vault.get(&id)?.item;
+    if item.password.is_empty() {
+        return Err(CommandError {
+            code: "no_password",
+            message: "the item has no password".into(),
+        });
+    }
+    copy_for_a_while(&item.password)
+}
+
+/// Copies the value of one of an item's other fields, for 30 seconds.
+#[tauri::command]
+async fn copy_field(
+    id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let vault = state.vault.lock().await;
+    let vault = vault.as_ref().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    let item = vault.get(&id)?.item;
+    let value = item.custom_fields.get(&name).ok_or_else(|| CommandError {
+        code: "not_found",
+        message: "the item has no such field".into(),
+    })?;
+    copy_for_a_while(value)
+}
+
 /// Puts a secret on the clipboard and takes it off 30 seconds later, unless
 /// something else was put there since. On macOS the entry stays on this Mac
 /// and asks clipboard history apps to leave it out; locking takes it off too.
@@ -200,6 +247,9 @@ struct EntryDetail {
     favorite: bool,
     has_password: bool,
     has_totp: bool,
+    /// The names of the item's other fields, such as an imported card's
+    /// number; their values are copied, never sent to the window.
+    fields: Vec<String>,
     revision: String,
 }
 
@@ -266,6 +316,7 @@ async fn get_entry(
         favorite: item.favorite,
         has_password: !item.password.is_empty(),
         has_totp: item.totp_secret.is_some(),
+        fields: item.custom_fields.keys().cloned().collect(),
         revision,
     })
 }
@@ -674,6 +725,7 @@ pub fn run() {
             network,
             browser,
             chosen_backup: std::sync::Mutex::new(None),
+            import: Mutex::new(None),
         })
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -689,6 +741,8 @@ pub fn run() {
             list_entries,
             generate_password,
             copy_totp,
+            copy_password,
+            copy_field,
             create_vault,
             unlock_vault,
             get_entry,
@@ -734,7 +788,12 @@ pub fn run() {
             browser::deny_fill,
             browser::browser_status,
             browser::connect_browser,
-            browser::disconnect_browser
+            browser::disconnect_browser,
+            import::choose_import,
+            import::confirm_import,
+            import::cancel_import,
+            settings::settings,
+            settings::set_auto_lock
         ])
         .run(tauri::generate_context!())
         .expect("error while running Open Secret Manager");

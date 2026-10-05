@@ -56,6 +56,7 @@ mod tests {
                 path,
                 network,
                 chosen_backup: std::sync::Mutex::new(None),
+                import: Mutex::new(None),
             })
             .build(mock_context(noop_assets()))
             .unwrap();

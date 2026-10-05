@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, MoreHorizontal, Plus, Search, ShieldCheck, Sparkles, UnlockKeyhole, Wifi, X } from "lucide-react";
+import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, Sparkles, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge } from "./bridge";
-import type { ArchiveInfo, ArchivedItem, BrowserInfo, BrowserStatus, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, ArchivedItem, BrowserInfo, BrowserStatus, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, ImportFormat, ImportSummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
-/** The vault locks after this long without input in the window. */
-const IDLE_LOCK_MS = 5 * 60 * 1000;
+/** How long without input in the window locks the vault, as the owner may set it. */
+const AUTO_LOCK_CHOICES = [1, 5, 15, 60];
+function minutesText(minutes: number): string {
+  return minutes === 60 ? "an hour" : minutes === 1 ? "a minute" : `${minutes} minutes`;
+}
+/** What an item of a kind is called where it has no username to show. */
+function kindLabel(kind: EntryKind): string {
+  return kind === "secure_note" ? "Secure note" : kind === "identity" ? "Identity" : kind === "card" ? "Card" : "Login";
+}
 /** Why the system said the owner's session went away from the app. */
 const AWAY: Record<string, string> = {
   sleep: "the computer went to sleep",
@@ -64,6 +71,13 @@ function App() {
   const [heldOpen, setHeldOpen] = useState(false);
   const [archivesOpen, setArchivesOpen] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  // The owner's auto-lock setting, in minutes.
+  const [autoLockMinutes, setAutoLockMinutes] = useState(5);
+  const autoLockRef = useRef(autoLockMinutes);
+  // The open item's details: its notes and which secrets it has.
+  const [shown, setShown] = useState<EntryDetail | null>(null);
   // A request from a browser extension that waits for a decision here.
   const [fill, setFill] = useState<FillAsked | null>(null);
   // The request last seen waiting, and the one decided in this window, so
@@ -77,6 +91,7 @@ function App() {
   // still does, so the vault stays open at most that long unattended.
   const pairing = Boolean(invite) || rejoining;
   const pairingRef = useRef(pairing);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     void bridge.vaultProblem().then(setVaultProblem).catch(() => {});
@@ -147,15 +162,20 @@ function App() {
     return true;
   }
   function showLocked() {
-    setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false); setArchivesOpen(false);
+    setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false); setArchivesOpen(false); setImportOpen(false); setShown(null);
   }
   function lockQuietly() {
     void bridge.lock(); showLocked();
-    if (endPairing()) setNotice("Vault locked after five minutes without activity · the pairing was cancelled");
+    if (endPairing()) setNotice(`Vault locked after ${minutesText(autoLockRef.current)} without activity · the pairing was cancelled`);
   }
   useEffect(() => {
-    let timer = window.setTimeout(lockQuietly, IDLE_LOCK_MS);
-    const reset = () => { window.clearTimeout(timer); timer = window.setTimeout(lockQuietly, IDLE_LOCK_MS); };
+    void bridge.settings().then((settings) => setAutoLockMinutes(settings.autoLockMinutes)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    autoLockRef.current = autoLockMinutes;
+    const wait = autoLockMinutes * 60 * 1000;
+    let timer = window.setTimeout(lockQuietly, wait);
+    const reset = () => { window.clearTimeout(timer); timer = window.setTimeout(lockQuietly, wait); };
     const onVisibility = () => {
       if (document.visibilityState !== "hidden") reset();
       else if (!pairingRef.current) lockQuietly();
@@ -163,7 +183,7 @@ function App() {
     for (const event of ["pointerdown", "keydown", "touchstart"]) window.addEventListener(event, reset, { passive: true });
     document.addEventListener("visibilitychange", onVisibility);
     return () => { window.clearTimeout(timer); for (const event of ["pointerdown", "keydown", "touchstart"]) window.removeEventListener(event, reset); document.removeEventListener("visibilitychange", onVisibility); };
-  }, []);
+  }, [autoLockMinutes]);
   useEffect(() => {
     pairingRef.current = pairing;
     // Pairing ended while the window was covered: lock now, as covering it
@@ -173,6 +193,7 @@ function App() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n" && !locked) { event.preventDefault(); setEditor({ mode: "create" }); }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k" && !locked) { event.preventDefault(); searchRef.current?.focus(); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -207,19 +228,50 @@ function App() {
     return matchesQuery && matchesFilter;
   }), [entries, filter, query]);
   const active = entries.find((entry) => entry.id === selected) ?? visible[0];
+  // The open item's details, read again when it changes.
+  useEffect(() => {
+    if (!active || locked) { setShown(null); return; }
+    let current = true;
+    void bridge.getEntry(active.id).then((detail) => { if (current) setShown(detail); }).catch(() => { if (current) setShown(null); });
+    return () => { current = false; };
+  }, [active?.id, active?.revision, locked]);
 
-  async function copyTotp() {
+  /** Copies a secret of the open item through the shell, which clears it after 30 seconds. */
+  async function copySecret(what: "password" | "code" | "field", name = "") {
     if (!active) return;
     if (previewMode) {
-      setNotice("TOTP copy is unavailable in the browser preview");
+      setNotice("Copying is not available in the browser preview");
       return;
     }
     try {
-      await bridge.copyTotp(active.id);
-      setNotice("One-time code copied · clears in 30 seconds");
-    } catch {
-      setNotice("TOTP clipboard is unavailable while the native adapter is not installed");
+      if (what === "password") await bridge.copyPassword(active.id);
+      else if (what === "code") await bridge.copyTotp(active.id);
+      else await bridge.copyField(active.id, name);
+      setNotice(`${what === "password" ? "Password" : what === "code" ? "One-time code" : name} copied · cleared in 30 seconds`);
+    } catch (error) {
+      setNotice(commandMessage(error, "Nothing was copied"));
     }
+  }
+
+  async function changeAutoLock(minutes: number) {
+    try {
+      const settings = await bridge.setAutoLock(minutes);
+      setAutoLockMinutes(settings.autoLockMinutes);
+      setNotice(`The vault locks after ${minutesText(settings.autoLockMinutes)} without activity`);
+    } catch (error) {
+      setNotice(commandMessage(error, "The setting was not saved"));
+    }
+  }
+
+  async function imported(added: number) {
+    setImportOpen(false);
+    setEntries(await bridge.listEntries().catch(() => entries));
+    setNotice(`${added} ${added === 1 ? "item" : "items"} imported`);
+  }
+
+  function closeImport() {
+    setImportOpen(false);
+    void bridge.cancelImport().catch(() => {});
   }
 
   async function openReview() {
@@ -514,25 +566,25 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark"><KeyRound size={17} strokeWidth={2.5} /></div><span>open secret</span><span className="brand-dot">·</span></div>
-        <div className="vault-chip"><div className="vault-emblem"><ShieldCheck size={16} /></div><div><strong>Personal vault</strong><span>{previewMode ? "Development preview · local only" : sync.state === "removed" ? "Removed from this vault" : sync.devices > 0 ? `Owner device · ${sync.devices + 1} devices` : "Owner device · local only"}</span></div><ChevronRight size={15} className="muted" /></div>
+        <div className="vault-chip"><div className="vault-emblem"><ShieldCheck size={16} /></div><div><strong>Personal vault</strong><span>{previewMode ? "Development preview · local only" : sync.state === "removed" ? "Removed from this vault" : sync.devices > 0 ? `Owner device · ${sync.devices + 1} devices` : "Owner device · local only"}</span></div></div>
         <button className="new-item" onClick={() => { if (!locked) setEditor({ mode: "create" }); }} disabled={locked}><Plus size={17} /> New item <span>⌘ N</span></button>
         <nav className="nav-list" aria-label="Vault filters">
           <p className="nav-caption">YOUR VAULT <span>{entries.length}</span></p>
           {filters.map((item) => <button key={item} className={`nav-item ${filter === item ? "active" : ""}`} onClick={() => setFilter(item)}><span className={`nav-icon ${item === "Favorites" ? "star" : ""}`}>{item === "All items" ? "⌂" : item === "Favorites" ? "★" : item === "Logins" ? "↗" : "▤"}</span>{item}<span className="nav-count">{item === "All items" ? entries.length : item === "Favorites" ? entries.filter((e) => e.favorite).length : item === "Logins" ? entries.filter((e) => e.kind === "login").length : entries.filter((e) => e.kind === "secure_note").length}</span></button>)}
         </nav>
-        <div className="sidebar-bottom"><button className="utility" onClick={() => setGeneratorOpen(true)}><Sparkles size={16} /> Generator</button><button className="utility" onClick={() => setArchivesOpen(true)} disabled={previewMode}><Archive size={16} /> Archive</button><button className="utility" onClick={() => setBackupOpen(true)} disabled={previewMode || locked}><HardDriveDownload size={16} /> Back up</button><button className="utility" onClick={() => setBrowserOpen(true)} disabled={previewMode}><Globe size={16} /> Browser</button><button className="utility"><Clock3 size={16} /> Activity</button><button className="utility"><MoreHorizontal size={16} /> Settings</button><button className="device-card" onClick={() => setDevicesOpen(true)} disabled={previewMode}><div className="device-icon"><Fingerprint size={18} /></div><div><strong>This device</strong><span>{previewMode ? "Preview data only" : sync.state === "removed" ? "Removed · tap for details" : sync.devices > 0 ? `Syncs with ${sync.devices} other ${sync.devices === 1 ? "device" : "devices"}` : "Only device · tap to add one"}</span></div><span className={`online-dot ${sync.state === "synced" || sync.state === "idle" ? "" : "offline-dot"}`} /></button></div>
+        <div className="sidebar-bottom"><button className="utility" onClick={() => setGeneratorOpen(true)}><Sparkles size={16} /> Generator</button><button className="utility" onClick={() => setArchivesOpen(true)} disabled={previewMode}><Archive size={16} /> Archive</button><button className="utility" onClick={() => setBackupOpen(true)} disabled={previewMode || locked}><HardDriveDownload size={16} /> Back up</button><button className="utility" onClick={() => setBrowserOpen(true)} disabled={previewMode}><Globe size={16} /> Browser</button><button className="utility" onClick={() => setSettingsOpen(true)}><SettingsIcon size={16} /> Settings</button><button className="device-card" onClick={() => setDevicesOpen(true)} disabled={previewMode}><div className="device-icon"><Fingerprint size={18} /></div><div><strong>This device</strong><span>{previewMode ? "Preview data only" : sync.state === "removed" ? "Removed · tap for details" : sync.devices > 0 ? `Syncs with ${sync.devices} other ${sync.devices === 1 ? "device" : "devices"}` : "Only device · tap to add one"}</span></div><span className={`online-dot ${sync.state === "synced" || sync.state === "idle" ? "" : "offline-dot"}`} /></button></div>
       </aside>
 
       <section className="content-pane">
-        <header className="topbar"><div className="breadcrumbs"><span>Personal vault</span><ChevronRight size={15} /><strong>{filter}</strong></div><div className="top-actions"><button className={`sync-status ${syncLabel(sync).tone}`} onClick={() => setDevicesOpen(true)} disabled={previewMode} title={sync.message ?? undefined}><span className="status-dot" />{syncLabel(sync).text}</button><button className="icon-button" title="Lock vault" onClick={lock}><LockKeyhole size={18} /></button><div className="avatar">YK</div></div></header>
+        <header className="topbar"><div className="breadcrumbs"><span>Personal vault</span><ChevronRight size={15} /><strong>{filter}</strong></div><div className="top-actions"><button className={`sync-status ${syncLabel(sync).tone}`} onClick={() => setDevicesOpen(true)} disabled={previewMode} title={sync.message ?? undefined}><span className="status-dot" />{syncLabel(sync).text}</button><button className="icon-button" title="Lock vault" onClick={lock}><LockKeyhole size={18} /></button></div></header>
         <div className="workspace">
           <div className="list-column">
-            <div className="list-heading"><div><p className="eyebrow">{filter.toUpperCase()}</p><h1>{visible.length} <span>items</span></h1></div><button className="icon-button bordered" title="Import"><ArrowDownToLine size={17} /></button></div>
+            <div className="list-heading"><div><p className="eyebrow">{filter.toUpperCase()}</p><h1>{visible.length} <span>items</span></h1></div><button className="icon-button bordered" title="Import" onClick={() => setImportOpen(true)} disabled={locked}><ArrowDownToLine size={17} /></button></div>
             {!locked && held.length > 0 && <div className="conflict-banner held-banner"><CircleAlert size={16} /><div><strong>{held.length} {held.length === 1 ? "change is" : "changes are"} held for review</strong><span>Written by a device that is not one of this vault's devices. Not part of your vault until you decide.</span></div><button className="conflict-action" onClick={() => setHeldOpen(true)}>Review</button></div>}
-            <label className="search-box"><Search size={17} /><input aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
-            <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{entry.username ?? "Secure note"}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}<small>{entry.updatedAt}</small></div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
+            <label className="search-box"><Search size={17} /><input ref={searchRef} aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
+            <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{entry.username || kindLabel(entry.kind)}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}</div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
           </div>
-          <div className="detail-column">{locked && vaultStatus === "missing" && vaultProblem ? <UnreadablePanel problem={vaultProblem} onPutAway={() => void putUnreadableAway()} /> : locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked && vaultStatus === "missing" && restoring ? <RestorePanel onCancel={() => setRestoring(false)} onRestored={(result) => void restored(result)} onNotice={setNotice} /> : locked && vaultStatus === "locked" && resetting ? <ResetPasswordPanel onCancel={() => setResetting(false)} onReset={() => void passwordReset()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{fill && <div className="conflict-banner fill-banner"><CircleAlert size={16} /><div><strong>{fill.browser} asks to fill a login into {fill.origin}</strong><span>{vaultStatus === "missing" ? "This device has no vault to fill from." : "Unlock to choose a login. Nothing is sent until you choose."}</span></div><button className="conflict-action" onClick={() => void denyFill()}>Deny</button></div>}{vaultStatus === "missing" ? devices.resetArchive ? devices.resetReason === "left" ? <><CircleAlert size={25} /><h2>This device's copy was put away</h2><span>You had it moved to {devices.resetArchive}. Nothing was deleted. Join the new vault with an invitation from the device that started it, or create a new vault here.</span></> : <><CircleAlert size={25} /><h2>This device was removed from its vault</h2><span>Your other devices removed it, so its copy was moved to {devices.resetArchive}. Nothing was deleted. Join again with an invitation from one of your other devices, or create a new vault here.</span></> : <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setRestoring(true)}>Restore from a backup instead</button>}{vaultStatus === "locked" && !previewMode && <button className="link-button" onClick={() => setResetting(true)}>Forgot the password? Use the recovery key</button>}{vaultStatus === "missing" && devices.resetArchive && <button className="link-button" onClick={() => setArchivesOpen(true)}>Look into the copy that was put away</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div><button className="icon-button"><MoreHorizontal size={19} /></button></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button><button onClick={copyTotp}><Copy size={15} /> Copy TOTP</button><button onClick={() => setNotice("Item link copied")}>Share <span className="action-arrow">↗</span></button></div><div className="record-card"><RecordField label="Username" value={active.username ?? "—"} /><RecordField label="Password" value="••••••••••••••" secret /><RecordField label="Website" value={active.url ?? "—"} link /></div><div className="history-note"><Clock3 size={15} /><div><strong>Revision history is retained</strong><span>Every edit keeps its signed parent revision.</span></div><ChevronRight size={15} /></div>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
+          <div className="detail-column">{locked && vaultStatus === "missing" && vaultProblem ? <UnreadablePanel problem={vaultProblem} onPutAway={() => void putUnreadableAway()} /> : locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked && vaultStatus === "missing" && restoring ? <RestorePanel onCancel={() => setRestoring(false)} onRestored={(result) => void restored(result)} onNotice={setNotice} /> : locked && vaultStatus === "locked" && resetting ? <ResetPasswordPanel onCancel={() => setResetting(false)} onReset={() => void passwordReset()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{fill && <div className="conflict-banner fill-banner"><CircleAlert size={16} /><div><strong>{fill.browser} asks to fill a login into {fill.origin}</strong><span>{vaultStatus === "missing" ? "This device has no vault to fill from." : "Unlock to choose a login. Nothing is sent until you choose."}</span></div><button className="conflict-action" onClick={() => void denyFill()}>Deny</button></div>}{vaultStatus === "missing" ? devices.resetArchive ? devices.resetReason === "left" ? <><CircleAlert size={25} /><h2>This device's copy was put away</h2><span>You had it moved to {devices.resetArchive}. Nothing was deleted. Join the new vault with an invitation from the device that started it, or create a new vault here.</span></> : <><CircleAlert size={25} /><h2>This device was removed from its vault</h2><span>Your other devices removed it, so its copy was moved to {devices.resetArchive}. Nothing was deleted. Join again with an invitation from one of your other devices, or create a new vault here.</span></> : <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setRestoring(true)}>Restore from a backup instead</button>}{vaultStatus === "locked" && !previewMode && <button className="link-button" onClick={() => setResetting(true)}>Forgot the password? Use the recovery key</button>}{vaultStatus === "missing" && devices.resetArchive && <button className="link-button" onClick={() => setArchivesOpen(true)}>Look into the copy that was put away</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button>{shown?.hasPassword && <button onClick={() => void copySecret("password")}><Copy size={15} /> Copy password</button>}{shown?.hasTotp && <button onClick={() => void copySecret("code")}><Copy size={15} /> Copy one-time code</button>}</div><ItemRecord entry={active} detail={shown?.id === active.id ? shown : null} onCopyUsername={() => { void navigator.clipboard?.writeText(active.username ?? ""); setNotice("Username copied"); }} onCopy={(what, name) => void copySecret(what, name)} /><div className="history-note"><Clock3 size={15} /><div><strong>Revision history is retained</strong><span>Every edit keeps its signed parent revision.</span></div></div>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
         </div>
         {recoveryKey && !locked && <div className="recovery-overlay"><div className="recovery-card"><strong>Recovery key · store this offline</strong><code>{recoveryKey}</code><span>It is shown after every unlock until you confirm here that you stored it.</span><button onClick={() => { setRecoveryKey(null); void bridge.confirmRecoveryKey().catch(() => {}); }}>I stored it</button></div></div>}
         <footer className="footer-bar"><div><Wifi size={14} /><span>{previewMode ? "Development preview" : "Local vault"}</span><span className="footer-separator">•</span><span>{previewMode ? "No native sync session" : syncDetail(sync)}</span></div><button onClick={() => previewMode ? setNotice("Sync is unavailable in the browser preview") : setDevicesOpen(true)}>Devices <ChevronRight size={14} /></button></footer>
@@ -545,6 +597,8 @@ function App() {
       {archivesOpen && <div className="modal-backdrop" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">ARCHIVE</p><h2>Copies put away on this device</h2></div><button className="icon-button" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><X size={18} /></button></div><ArchivesPanel canCopy={!locked} onCopied={() => { void bridge.listEntries().then(setEntries).catch(() => {}); }} onNotice={setNotice} /></div></div>}
       {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes) => void startInvite(votes)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
+      {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">SETTINGS</p><h2>On this computer</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div><SettingsPanel minutes={autoLockMinutes} onChange={(minutes) => void changeAutoLock(minutes)} /></div></div>}
+      {importOpen && !locked && <div className="modal-backdrop" onClick={closeImport}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">IMPORT</p><h2>Bring in logins from another app</h2></div><button className="icon-button" onClick={closeImport}><X size={18} /></button></div><ImportPanel onImported={(added) => void imported(added)} onNotice={setNotice} /></div></div>}
       {fill && !locked && <div className="modal-backdrop"><div className="generator-modal entry-editor" role="dialog" aria-label="Fill a login"><div className="modal-head"><div><p className="eyebrow">ASKED BY {fill.browser.toUpperCase()}</p><h2 className="fill-origin">Fill a login into {fill.origin}</h2></div></div><FillPanel key={`${fill.requestId} ${fill.session}`} asked={fill} onFill={(login) => void sendFill(login)} onDeny={() => void denyFill()} /></div></div>}
       {notice && <div className={recoveryKey && !locked ? "toast toast-raised" : "toast"}><ShieldCheck size={15} />{notice}</div>}
     </main>
@@ -1124,8 +1178,84 @@ function JoinPanel({ keepsVault, onCancel, onJoined, onNotice }: { keepsVault?: 
   </div>;
 }
 
-function RecordField({ label, value, secret, link }: { label: string; value: string; secret?: boolean; link?: boolean }) {
-  return <div className="record-field"><label>{label}</label><div><span className={secret ? "masked" : link ? "record-link" : ""}>{value}</span>{secret ? <button className="field-action" onClick={() => navigator.clipboard?.writeText(value)}> <Copy size={14} /> </button> : link ? <span className="external">↗</span> : null}</div></div>;
+/**
+ * What an item holds, as the item's page shows it: its username and website,
+ * that it has a password, its other fields by name, and its notes. A secret
+ * is copied by the shell and never shown here.
+ */
+function ItemRecord({ entry, detail, onCopyUsername, onCopy }: { entry: VaultEntry; detail: EntryDetail | null; onCopyUsername: () => void; onCopy: (what: "password" | "field", name?: string) => void }) {
+  const fields = [
+    entry.username ? <RecordField key="username" label="Username" value={entry.username} onCopy={onCopyUsername} /> : null,
+    detail?.hasPassword ? <RecordField key="password" label="Password" value="••••••••••••" masked onCopy={() => onCopy("password")} /> : null,
+    entry.url ? <RecordField key="url" label="Website" value={entry.url} /> : null,
+    ...(detail?.fields ?? []).map((name) => <RecordField key={`field:${name}`} label={name} value="••••••••" masked onCopy={() => onCopy("field", name)} />),
+  ].filter(Boolean);
+  return <>{fields.length > 0 && <div className="record-card">{fields}</div>}{detail?.notes && <div className="record-card record-notes"><div className="record-field"><label>Notes</label><p>{detail.notes}</p></div></div>}</>;
+}
+
+function RecordField({ label, value, masked, onCopy }: { label: string; value: string; masked?: boolean; onCopy?: () => void }) {
+  return <div className="record-field"><label>{label}</label><div><span className={masked ? "masked" : ""}>{value}</span>{onCopy && <button className="field-action" title={`Copy ${label.toLowerCase()}`} aria-label={`Copy ${label}`} onClick={onCopy}><Copy size={14} /></button>}</div></div>;
+}
+
+/** What the owner sets on this computer. */
+function SettingsPanel({ minutes, onChange }: { minutes: number; onChange: (minutes: number) => void }) {
+  return <div className="entry-form">
+    <label>Lock the vault after<select aria-label="Lock the vault after" value={minutes} onChange={(event) => onChange(Number(event.target.value))}>{AUTO_LOCK_CHOICES.map((choice) => <option key={choice} value={choice}>{minutesText(choice)} without activity</option>)}</select></label>
+    <p className="review-hint">Hiding or covering the window, the computer going to sleep, and the screen locking lock the vault at once, whatever this says. This setting stays on this computer; your other devices keep their own.</p>
+  </div>;
+}
+
+const importSources: { format: ImportFormat; name: string; detail: string }[] = [
+  { format: "bitwarden", name: "Bitwarden", detail: "An unencrypted JSON export" },
+  { format: "chrome", name: "Chrome", detail: "Passwords exported as CSV" },
+  { format: "firefox", name: "Firefox", detail: "Logins exported as CSV" },
+];
+
+/**
+ * Brings in another app's export: the owner picks the file in the system's
+ * dialog, which the shell reads, sees what it would add, and confirms.
+ */
+function ImportPanel({ onImported, onNotice }: { onImported: (added: number) => void; onNotice: (text: string) => void }) {
+  const [summary, setSummary] = useState<ImportSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function choose(format: ImportFormat) {
+    setBusy(true);
+    try {
+      const read = await bridge.chooseImport(format);
+      if (read) setSummary(read);
+    } catch (error) {
+      onNotice(commandMessage(error, "That file could not be read"));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function confirm() {
+    setBusy(true);
+    try {
+      onImported(await bridge.confirmImport());
+    } catch (error) {
+      onNotice(commandMessage(error, "Nothing was imported"));
+      setBusy(false);
+    }
+  }
+  if (!summary) {
+    return <div className="entry-form">
+      <p className="review-hint">Export your logins from the other app first, then choose the export here. It is read on this computer, and nothing is added until you confirm.</p>
+      <div className="import-sources">{importSources.map((source) => <button key={source.format} className="version-card import-source" disabled={busy} onClick={() => void choose(source.format)}><strong>{source.name}</strong><span>{source.detail}</span></button>)}</div>
+    </div>;
+  }
+  const kinds = [[summary.logins, "login"], [summary.notes, "secure note"], [summary.cards, "card"], [summary.identities, "identity"]] as const;
+  const described = kinds.filter(([count]) => count > 0).map(([count, kind]) => `${count} ${kind === "identity" && count !== 1 ? "identities" : count === 1 ? kind : `${kind}s`}`).join(", ");
+  return <div className="entry-form" aria-label="What the import adds">
+    <div className="version-card">
+      <div className="version-meta"><strong>{summary.file}</strong></div>
+      <span className="import-count">{summary.items} {summary.items === 1 ? "item" : "items"} to add: {described}</span>
+      {summary.already > 0 && <span className="review-hint">{summary.already} of them {summary.already === 1 ? "looks like an item" : "look like items"} you already have (the same website and username). {summary.already === 1 ? "It is" : "They are"} added all the same; delete what you do not need.</span>}
+      {summary.warnings.length > 0 && <details className="import-skipped"><summary>{summary.warnings.length} {summary.warnings.length === 1 ? "entry was" : "entries were"} skipped</summary><ul>{summary.warnings.slice(0, 50).map((warning, index) => <li key={index}>Entry {warning.row}: {warning.message}</li>)}{summary.warnings.length > 50 && <li>and {summary.warnings.length - 50} more</li>}</ul></details>}
+    </div>
+    <p className="review-hint">The export holds your passwords unencrypted. Once they are here, delete it and empty the trash.</p>
+    <div className="form-actions"><button className="generate-button" disabled={busy} onClick={() => void confirm()}>Add {summary.items} {summary.items === 1 ? "item" : "items"}</button><button className="secondary" disabled={busy} onClick={() => { setSummary(null); void bridge.cancelImport().catch(() => {}); }}>Choose another</button></div>
+  </div>;
 }
 
 function commandMessage(error: unknown, fallback: string): string {
@@ -1155,6 +1285,11 @@ function commandMessage(error: unknown, fallback: string): string {
   if (code === "network" || code === "timeout") return `${fallback} · ${(error as { message?: string }).message ?? "network error"}`;
   if (code === "invalid_item") return (error as { message?: string }).message ?? fallback;
   if (code === "locked") return "Unlock the vault first";
+  if (code === "invalid_import") return `That is not such an export · ${(error as { message?: string }).message ?? "it could not be read"}`;
+  if (code === "no_import") return "Choose an export first";
+  if (code === "no_password") return "This item has no password";
+  if (code === "clipboard") return "The clipboard is not available · nothing was copied";
+  if (code === "invalid_setting") return "That is not one of the choices";
   return fallback;
 }
 
@@ -1162,6 +1297,7 @@ const entryKinds: { value: EntryKind; label: string }[] = [
   { value: "login", label: "Login" },
   { value: "secure_note", label: "Secure note" },
   { value: "identity", label: "Identity" },
+  { value: "card", label: "Card" },
 ];
 
 function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDetail; onCancel: () => void; onSave: (input: EntryInput) => Promise<void>; onDelete?: () => Promise<void> }) {

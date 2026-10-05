@@ -45,3 +45,4 @@ button { color: inherit; border: 0; cursor: pointer; }
 .saved-banner { color: #86b768; background: #1b2318; }
 .saved-banner strong { color: #a9cc8f; }
 .saved-banner span { color: #8aa478; overflow-wrap: anywhere; }
+.record-notes { margin-top: 12px; }.record-notes p { margin: 0; color: #d8d0c3; font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }.import-sources { display: grid; gap: 8px; }.import-source { text-align: left; cursor: pointer; }.import-source strong { color: #e0d6c7; font-size: 11px; }.import-source span { color: #857d71; font-size: 10px; }.import-source:hover:not(:disabled) { border-color: #8d673a; }.import-source:disabled { opacity: .5; }.import-count { color: #d8d0c3; font-size: 11px; }.import-skipped { color: #94897a; font-size: 10px; }.import-skipped ul { margin: 6px 0 0; padding-left: 16px; display: grid; gap: 3px; }

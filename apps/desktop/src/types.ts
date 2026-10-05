@@ -1,4 +1,4 @@
-export type EntryKind = "login" | "secure_note" | "identity";
+export type EntryKind = "login" | "secure_note" | "identity" | "card";
 
 export type VaultEntry = {
   id: string;
@@ -6,7 +6,6 @@ export type VaultEntry = {
   kind: EntryKind;
   username?: string;
   url?: string;
-  updatedAt: string;
   favorite?: boolean;
   conflict?: boolean;
   revision?: string;
@@ -23,7 +22,32 @@ export type EntryDetail = {
   favorite: boolean;
   hasPassword: boolean;
   hasTotp: boolean;
+  /** The names of the item's other fields, such as an imported card's number; their values are copied, never sent here. */
+  fields: string[];
   revision: string;
+};
+
+/** The exports the app imports. */
+export type ImportFormat = "bitwarden" | "chrome" | "firefox";
+
+/** What an import would add, shown before the owner confirms. No secret. */
+export type ImportSummary = {
+  file: string;
+  items: number;
+  logins: number;
+  notes: number;
+  cards: number;
+  identities: number;
+  /** Items with the same kind, website, and username as one the vault has; added as items of their own all the same. */
+  already: number;
+  /** Entries of the file that were skipped, with why. */
+  warnings: { row: number; message: string }[];
+};
+
+/** What the owner sets on this device. */
+export type Settings = {
+  /** Minutes without activity before the window locks the vault: 1, 5, 15, or 60. */
+  autoLockMinutes: number;
 };
 
 /** `password` and `totpSecret` are omitted to keep the stored value; an empty `totpSecret` removes it. */
@@ -244,6 +268,10 @@ export type DesktopBridge = {
   lock: () => Promise<void>;
   generatePassword: (length: number) => Promise<string>;
   copyTotp: (id: string) => Promise<void>;
+  /** Copies an item's password for 30 seconds; the password never reaches the window. */
+  copyPassword: (id: string) => Promise<void>;
+  /** Copies the value of one of an item's other fields for 30 seconds. */
+  copyField: (id: string, name: string) => Promise<void>;
   getEntry: (id: string) => Promise<EntryDetail>;
   createEntry: (input: EntryInput) => Promise<VaultEntry>;
   updateEntry: (id: string, expectedRevision: string, input: EntryInput) => Promise<VaultEntry>;
@@ -313,6 +341,14 @@ export type DesktopBridge = {
   /** Tells a browser where to find this app; resolves to the new status. */
   connectBrowser: (browser: string) => Promise<BrowserStatus>;
   disconnectBrowser: (browser: string) => Promise<BrowserStatus>;
+  /** Asks for an export of `format` and reads it; resolves to what it would add, or `null` if the owner closed the dialog. The file stays with the shell. */
+  chooseImport: (format: ImportFormat) => Promise<ImportSummary | null>;
+  /** Adds what the chosen export holds as new items; resolves to how many. */
+  confirmImport: () => Promise<number>;
+  /** Drops the export read for an import not confirmed. */
+  cancelImport: () => Promise<void>;
+  settings: () => Promise<Settings>;
+  setAutoLock: (minutes: number) => Promise<Settings>;
   /** Subscribes to a shell event; resolves to an unsubscribe function. */
   listen: <T>(event: string, handler: (payload: T) => void) => Promise<() => void>;
 };

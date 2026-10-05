@@ -50,6 +50,7 @@ fn shell(dir: &Path, home: &Path, host: Option<PathBuf>) -> App<MockRuntime> {
             path,
             network,
             chosen_backup: std::sync::Mutex::new(None),
+            import: Mutex::new(None),
         })
         .build(mock_context(noop_assets()))
         .unwrap()
@@ -111,14 +112,40 @@ impl Host {
         .expect("the app answers or closes")
     }
 
+    /// The next response besides the app's reminders that the request
+    /// still waits; `None` once the app closed the connection.
+    async fn answer(&mut self) -> Option<Response> {
+        loop {
+            match self.next().await {
+                Some(Response::Waiting(_)) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// The app sends nothing for a while but its reminders, every 20
+    /// seconds, that the request still waits.
     async fn is_quiet(&mut self) {
-        let mut byte = [0_u8; 1];
-        assert!(
-            timeout(Duration::from_millis(200), self.0.read(&mut byte))
-                .await
-                .is_err(),
-            "the app said something"
-        );
+        let until = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            let mut prefix = [0_u8; 4];
+            let Ok(read) = tokio::time::timeout_at(until, self.0.read_exact(&mut prefix)).await
+            else {
+                return;
+            };
+            let said = match read {
+                Ok(_) => {
+                    let mut body = vec![0_u8; Prefix::Socket.length(prefix).unwrap_or(0)];
+                    let _ = self.0.read_exact(&mut body).await;
+                    match serde_json::from_slice::<Response>(&body) {
+                        Ok(Response::Waiting(_)) => continue,
+                        _ => String::from_utf8_lossy(&body).into_owned(),
+                    }
+                }
+                Err(error) => format!("(the connection ended: {error})"),
+            };
+            panic!("the app said something: {said}");
+        }
     }
 }
 
@@ -286,7 +313,7 @@ fn a_request_from_the_browser_waits_in_the_app_for_the_owners_choice() {
         let second_unlock = shown.session.unwrap();
         assert_ne!(second_unlock, first_unlock);
         choose(second_unlock.clone()).await.unwrap();
-        let Some(Response::FillReply(reply)) = host.next().await else {
+        let Some(Response::FillReply(reply)) = host.answer().await else {
             panic!("a reply")
         };
         assert!(reply.answers(&wanted.request));
@@ -306,7 +333,7 @@ fn a_request_from_the_browser_waits_in_the_app_for_the_owners_choice() {
             .await
             .unwrap();
         assert_eq!(
-            host.next().await,
+            host.answer().await,
             Some(Response::refusal("second", Refusal::Denied))
         );
         assert_eq!(
@@ -377,7 +404,7 @@ fn a_device_without_a_vault_shows_the_request_and_can_only_deny_it() {
             .await
             .unwrap();
         assert_eq!(
-            host.next().await,
+            host.answer().await,
             Some(Response::refusal("first", Refusal::Denied))
         );
     });

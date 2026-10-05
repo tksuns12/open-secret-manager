@@ -7,7 +7,8 @@ account, hosted synchronisation service, relay, or telemetry.
 The repository is deliberately split at the security boundary:
 
 - `crates/vault-core` owns the encrypted local vault, unlock state, revisions,
-  imports, backups, recovery, password generation, and TOTP.
+  imports (which the desktop app offers for Bitwarden, Chrome, and Firefox
+  exports), backups, recovery, password generation, and TOTP.
 - `crates/vault-sync` owns authenticated ciphertext transport primitives,
   invitations, locked receipt, and epoch key envelopes. It never receives a
   plaintext record. Direct TLS sockets and the OpenRaft adapter are explicit

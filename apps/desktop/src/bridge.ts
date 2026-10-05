@@ -1,4 +1,4 @@
-import type { ArchiveInfo, BrowserStatus, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, BrowserStatus, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -16,17 +16,22 @@ async function nativeOnly<T>(cmd: string, args?: unknown): Promise<T> {
 }
 
 let previewEntries: VaultEntry[] = [
-  { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", updatedAt: "Today, 09:42", favorite: true },
-  { id: "2", title: "GitHub", kind: "login", username: "northstar-labs", url: "github.com", updatedAt: "Yesterday, 18:10", favorite: true },
-  { id: "3", title: "Banking — checking", kind: "login", username: "•••• 4821", url: "secure.bank.example", updatedAt: "Sep 18", favorite: false },
-  { id: "4", title: "Recovery codes", kind: "secure_note", updatedAt: "Sep 12", favorite: false },
-  { id: "5", title: "Studio Wi-Fi", kind: "login", username: "studio", url: "network", updatedAt: "Aug 27", favorite: false },
+  { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", favorite: true },
+  { id: "2", title: "GitHub", kind: "login", username: "northstar-labs", url: "github.com", favorite: true },
+  { id: "3", title: "Banking — checking", kind: "login", username: "•••• 4821", url: "secure.bank.example", favorite: false },
+  { id: "4", title: "Recovery codes", kind: "secure_note", favorite: false },
+  { id: "5", title: "Studio Wi-Fi", kind: "login", username: "studio", url: "network", favorite: false },
 ];
+
+/** What the preview's import would add: sample data, no secret. */
+const previewImport: ImportSummary = { file: "sample-export.csv", items: 2, logins: 2, notes: 0, cards: 0, identities: 0, already: 1, warnings: [{ row: 4, message: "entry has no password" }] };
+let previewImportChosen = false;
+let previewSettings: Settings = { autoLockMinutes: 5 };
 
 const previewDetails = new Map<string, EntryDetail>();
 
 function previewDetail(entry: VaultEntry): EntryDetail {
-  return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, revision: entry.revision ?? "preview" };
+  return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, fields: [], revision: entry.revision ?? "preview" };
 }
 
 /** Preview writes stay in memory and never retain the password or TOTP secret. */
@@ -36,10 +41,11 @@ function savePreview(id: string, input: EntryInput, previous?: EntryDetail): Vau
     id, title: input.title, kind: input.kind, username: input.username, url: input.url, notes: input.notes, favorite: input.favorite,
     hasPassword: input.password !== undefined ? input.password.length > 0 : Boolean(previous?.hasPassword),
     hasTotp: input.totpSecret !== undefined ? input.totpSecret.trim().length > 0 : Boolean(previous?.hasTotp),
+    fields: previous?.fields ?? [],
     revision,
   };
   previewDetails.set(id, detail);
-  const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, updatedAt: "Just now", favorite: input.favorite, revision };
+  const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, favorite: input.favorite, revision };
   previewEntries = [entry, ...previewEntries.filter((existing) => existing.id !== id)];
   return entry;
 }
@@ -88,6 +94,8 @@ export const bridge: DesktopBridge = {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) await invoke("copy_totp", { id });
   },
+  copyPassword: (id) => nativeOnly("copy_password", { id }),
+  copyField: (id, name) => nativeOnly("copy_field", { id, name }),
   async getEntry(id) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) return (await invoke("get_entry", { id })) as EntryDetail;
@@ -199,6 +207,36 @@ export const bridge: DesktopBridge = {
   joinStart: (code) => nativeOnly("join_start", { code }),
   joinFinish: (password) => nativeOnly("join_finish", { password: password ?? null }),
   cancelJoin: () => nativeOnly("cancel_join"),
+  // The preview's import is sample data: no file is read.
+  async chooseImport(format) {
+    const invoke = native();
+    if (invoke) return (await invoke("choose_import", { format })) as ImportSummary | null;
+    previewImportChosen = true;
+    return previewImport;
+  },
+  async confirmImport() {
+    const invoke = native();
+    if (invoke) return (await invoke("confirm_import")) as number;
+    if (!previewImportChosen) throw new Error("no_import");
+    previewImportChosen = false;
+    previewEntries = [...previewEntries, { id: crypto.randomUUID(), title: "Sample import one", kind: "login", username: "sample", url: "one.example", favorite: false }, { id: crypto.randomUUID(), title: "Sample import two", kind: "login", username: "sample", url: "two.example", favorite: false }];
+    return previewImport.items;
+  },
+  async cancelImport() {
+    const invoke = native();
+    if (invoke) await invoke("cancel_import");
+    previewImportChosen = false;
+  },
+  async settings() {
+    const invoke = native();
+    return invoke ? ((await invoke("settings")) as Settings) : previewSettings;
+  },
+  async setAutoLock(minutes) {
+    const invoke = native();
+    if (invoke) return (await invoke("set_auto_lock", { minutes })) as Settings;
+    previewSettings = { autoLockMinutes: minutes };
+    return previewSettings;
+  },
   async listen(event, handler) {
     const listen = (globalThis as TauriGlobal).__TAURI__?.event?.listen;
     if (!listen) return () => {};

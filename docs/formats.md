@@ -68,6 +68,8 @@ The unlocked key bundle contains the current epoch key and any retained historic
 
 Recommended logical tables are vault metadata, encrypted revisions, parent edges, materialized heads, pending ingress, committed public membership, recipient key envelopes, rotation progress, and sync cursors. Persistent Raft storage additionally needs votes, logs, applied state, and snapshots. These are logical requirements; exact SQL names remain implementation details.
 
+The desktop app keeps the owner's settings in `settings.json` beside the vault in its data folder (since Phase 8): a JSON object with `autoLockMinutes`, the minutes without activity that lock the vault, one of 1, 5, 15, and 60. A missing file, or one with anything else, means 5. It is written whole (to `settings.json.partial`, then renamed), is not synced, and stays when the device is reset.
+
 ## Immutable record revisions
 
 The target authenticated revision header contains:
