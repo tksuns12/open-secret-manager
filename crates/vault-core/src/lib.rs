@@ -11,9 +11,9 @@ pub use crypto::{epoch_key_check, RecoveryKey};
 pub use error::{Error, Result};
 pub use import::preview_import;
 pub use model::{
-    BackupCheck, FillCredentials, ForkReport, ImportFormat, ImportPreview, ImportWarning,
-    IngressReport, Item, ItemKind, ItemSummary, ItemVersion, PasswordPolicy, QuarantinedRevision,
-    RevisionInfo, StageOutcome, UnlockSession, VaultItem,
+    BackupCheck, DeletedItem, FillCredentials, ForkReport, HistoryVersion, ImportFormat,
+    ImportPreview, ImportWarning, IngressReport, Item, ItemKind, ItemSummary, ItemVersion,
+    PasswordPolicy, QuarantinedRevision, RevisionInfo, StageOutcome, UnlockSession, VaultItem,
 };
 pub use osm_origin::Origin;
 pub use storage::{

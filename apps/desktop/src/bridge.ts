@@ -1,4 +1,4 @@
-import type { ArchiveInfo, BrowserStatus, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, BrowserStatus, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -29,6 +29,29 @@ let previewImportChosen = false;
 let previewSettings: Settings = { autoLockMinutes: 5 };
 
 const previewDetails = new Map<string, EntryDetail>();
+/** Items deleted in the preview, which it can bring back. */
+let previewDeleted: VaultEntry[] = [];
+/** The versions the preview's own edits made, newest first, with what each held: sample data, no secret. */
+const previewHistory = new Map<string, { version: HistoryEntry; entry: VaultEntry }[]>();
+
+function previewVersions(entry: VaultEntry): { version: HistoryEntry; entry: VaultEntry }[] {
+  return previewHistory.get(entry.id) ?? [{ version: { revision: entry.revision ?? "preview", deleted: false, current: true, first: true, merged: false, title: entry.title, username: entry.username ?? "", url: entry.url ?? "", changed: [], device: "preview", thisDevice: true }, entry }];
+}
+
+/** Records the version an edit in the preview made, with the fields it changed. */
+function recordPreviewVersion(entry: VaultEntry, input: EntryInput, previous?: EntryDetail) {
+  const before = previewEntries.find((existing) => existing.id === entry.id);
+  const versions = before ? previewVersions(before) : [];
+  const changed = previous ? [
+    previous.title !== input.title ? "title" : "",
+    previous.username !== input.username ? "username" : "",
+    input.password !== undefined ? "password" : "",
+    previous.url !== input.url ? "website" : "",
+    previous.notes !== input.notes ? "notes" : "",
+  ].filter(Boolean) : [];
+  const version: HistoryEntry = { revision: entry.revision ?? crypto.randomUUID(), deleted: false, current: true, first: !previous, merged: false, title: entry.title, username: entry.username ?? "", url: entry.url ?? "", changed, device: "preview", thisDevice: true };
+  previewHistory.set(entry.id, [{ version, entry }, ...versions.map((older) => ({ ...older, version: { ...older.version, current: false } }))]);
+}
 
 function previewDetail(entry: VaultEntry): EntryDetail {
   return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, fields: [], revision: entry.revision ?? "preview" };
@@ -46,6 +69,7 @@ function savePreview(id: string, input: EntryInput, previous?: EntryDetail): Vau
   };
   previewDetails.set(id, detail);
   const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, favorite: input.favorite, revision };
+  recordPreviewVersion(entry, input, previous);
   previewEntries = [entry, ...previewEntries.filter((existing) => existing.id !== id)];
   return entry;
 }
@@ -118,9 +142,10 @@ export const bridge: DesktopBridge = {
   async deleteEntry(id, expectedRevision) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) { await invoke("delete_entry", { id, expectedRevision }); return; }
-    if (!previewEntries.some((existing) => existing.id === id)) throw new Error("not_found");
+    const gone = previewEntries.find((existing) => existing.id === id);
+    if (!gone) throw new Error("not_found");
     previewEntries = previewEntries.filter((existing) => existing.id !== id);
-    previewDetails.delete(id);
+    previewDeleted = [gone, ...previewDeleted];
   },
   // Conflicts only arise from revisions received from another device, so
   // the browser preview has none to review.
@@ -207,6 +232,37 @@ export const bridge: DesktopBridge = {
   joinStart: (code) => nativeOnly("join_start", { code }),
   joinFinish: (password) => nativeOnly("join_finish", { password: password ?? null }),
   cancelJoin: () => nativeOnly("cancel_join"),
+  // The preview keeps no history but the item as it is now.
+  async itemHistory(id) {
+    const invoke = native();
+    if (invoke) return (await invoke("item_history", { id })) as HistoryEntry[];
+    const entry = previewEntries.find((existing) => existing.id === id);
+    if (!entry) throw new Error("not_found");
+    return previewVersions(entry).map((saved) => saved.version);
+  },
+  async deletedEntries() {
+    const invoke = native();
+    if (invoke) return (await invoke("deleted_entries")) as DeletedEntry[];
+    return previewDeleted.map((entry) => ({ id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", last: entry.revision ?? "preview", heads: ["preview-deletion"], device: "preview", thisDevice: true }));
+  },
+  async restoreEntry(id, revision, heads) {
+    const invoke = native();
+    if (invoke) return (await invoke("restore_entry", { id, revision, heads })) as VaultEntry;
+    const deleted = previewDeleted.find((gone) => gone.id === id);
+    const current = deleted ?? previewEntries.find((existing) => existing.id === id);
+    if (!current) throw new Error("not_found");
+    const earlier = previewVersions(current).find((saved) => saved.version.revision === revision);
+    const restored = deleted ?? { ...(earlier?.entry ?? current), revision: crypto.randomUUID() };
+    if (!deleted && earlier) {
+      const versions = previewVersions(current).map((saved) => ({ ...saved, version: { ...saved.version, current: false } }));
+      const changed = [current.title !== restored.title ? "title" : "", current.username !== restored.username ? "username" : "", current.url !== restored.url ? "website" : ""].filter(Boolean);
+      previewHistory.set(id, [{ version: { ...earlier.version, revision: restored.revision ?? "", current: true, first: false, changed }, entry: restored }, ...versions]);
+      previewDetails.delete(id);
+    }
+    previewDeleted = previewDeleted.filter((gone) => gone.id !== id);
+    previewEntries = [restored, ...previewEntries.filter((existing) => existing.id !== id)];
+    return restored;
+  },
   // The preview's import is sample data: no file is read.
   async chooseImport(format) {
     const invoke = native();

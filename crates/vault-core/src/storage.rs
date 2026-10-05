@@ -20,9 +20,9 @@ use crate::{
         verify_recovery_check, KdfConfig, SecretKey, DEVICE_ID_LEN, KEY_LEN, NONCE_LEN,
         PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    BackupCheck, Error, FillCredentials, ForkReport, IngressReport, Item, ItemKind, ItemSummary,
-    ItemVersion, Origin, QuarantinedRevision, RecoveryKey, Result, RevisionInfo, StageOutcome,
-    UnlockSession, VaultItem,
+    BackupCheck, DeletedItem, Error, FillCredentials, ForkReport, HistoryVersion, IngressReport,
+    Item, ItemKind, ItemSummary, ItemVersion, Origin, QuarantinedRevision, RecoveryKey, Result,
+    RevisionInfo, StageOutcome, UnlockSession, VaultItem,
 };
 
 /// Storage layout: a per-device root key wraps the device key, the HPKE
@@ -1118,6 +1118,128 @@ impl Vault {
                 })
             })
             .collect()
+    }
+
+    /// Every stored version of an item, newest first: each verified and
+    /// decrypted, with the versions it followed and whether it is current.
+    /// The order is the order this device stored them in, in which a
+    /// version always comes after those it followed.
+    pub fn history(&self, item_id: &str) -> Result<Vec<HistoryVersion>> {
+        self.key()?;
+        let heads = head_ids(&self.connection, item_id)?;
+        if heads.is_empty() {
+            return Err(Error::NotFound);
+        }
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {REVISION_COLUMNS} FROM revisions r WHERE r.item_id=? ORDER BY r.rowid DESC"
+        ))?;
+        let revisions = statement
+            .query_map([item_id], row_to_revision)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        revisions
+            .iter()
+            .map(|revision| {
+                let item = if revision.tombstone {
+                    self.open_revision(revision)?;
+                    None
+                } else {
+                    Some(self.open_item(revision)?)
+                };
+                let id = revision.revision_id();
+                Ok(HistoryVersion {
+                    current: heads.contains(&id),
+                    revision: id,
+                    parents: revision.parents.clone(),
+                    author_device_id: revision.author_device_id,
+                    item,
+                })
+            })
+            .collect()
+    }
+
+    /// The items that every one of their current versions deletes, most
+    /// recently deleted first, each with the version before its deletion.
+    pub fn deleted_items(&self) -> Result<Vec<DeletedItem>> {
+        self.key()?;
+        let mut statement = self.connection.prepare(
+            "SELECT h.item_id FROM heads h JOIN revisions r ON r.revision=h.revision \
+             GROUP BY h.item_id HAVING MIN(h.tombstone)=1 ORDER BY MAX(r.rowid) DESC",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut deleted = Vec::with_capacity(ids.len());
+        for item_id in ids {
+            let heads = item_heads(&self.connection, &item_id)?;
+            // The deletion stored last, then back through the versions the
+            // deletions followed to the nearest that held the item.
+            let newest = self.connection.query_row(
+                &format!(
+                    "SELECT {REVISION_COLUMNS} FROM heads h JOIN revisions r ON r.revision=h.revision \
+                     WHERE h.item_id=? ORDER BY r.rowid DESC LIMIT 1"
+                ),
+                [&item_id],
+                row_to_revision,
+            )?;
+            let mut waiting: Vec<String> = heads
+                .iter()
+                .flat_map(|head| head.parents.iter().cloned())
+                .collect();
+            let mut seen = BTreeSet::new();
+            let mut last = None;
+            while let Some(id) = waiting.pop() {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let Some(revision) = revision_by_id(&self.connection, &id)? else {
+                    continue;
+                };
+                if revision.tombstone {
+                    waiting.extend(revision.parents.iter().cloned());
+                    continue;
+                }
+                last = Some(revision);
+                break;
+            }
+            // A deletion with nothing before it here cannot be brought back.
+            let Some(last) = last else { continue };
+            deleted.push(DeletedItem {
+                last: ItemVersion {
+                    revision: last.revision_id(),
+                    author_device_id: last.author_device_id,
+                    item: Some(self.open_item(&last)?),
+                },
+                heads: heads.iter().map(EncryptedRevision::revision_id).collect(),
+                deleted_by: newest.author_device_id,
+                item_id,
+            });
+        }
+        Ok(deleted)
+    }
+
+    /// Brings back what the version `revision` of an item held as its
+    /// newest version, following the current versions named in `heads`: an
+    /// earlier version of an item, or an item as it was before it was
+    /// deleted. A current version not named stays, as in a resolution.
+    pub fn restore(
+        &mut self,
+        item_id: &str,
+        revision: &str,
+        heads: &[String],
+    ) -> Result<RevisionInfo> {
+        self.key()?;
+        let stored = revision_by_id(&self.connection, revision)?.ok_or(Error::NotFound)?;
+        if stored.item_id != item_id {
+            return Err(Error::InvalidItem("that version is of another item".into()));
+        }
+        if stored.tombstone {
+            return Err(Error::InvalidItem(
+                "that version deletes the item: choose one before it".into(),
+            ));
+        }
+        let item = self.open_item(&stored)?;
+        self.resolve(item_id, Some(item), heads)
     }
 
     pub fn list(&self) -> Result<Vec<ItemSummary>> {

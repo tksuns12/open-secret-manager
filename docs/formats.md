@@ -92,6 +92,8 @@ Signature validation uses a public key already authorized by membership. An atta
 
 The materialized head set is derived, repairable state. A new revision supersedes only its named ancestors. An explicit conflict resolution names every head the owner resolved. A new concurrent head arriving later remains visible. Deletion is an encrypted tombstone with the same validation rules as an edit.
 
+An item's history (since Phase 8) is every stored revision of it, read newest first in the order the device stored them, in which a revision always follows its parents; a revision carries no time, so the history has none. An item is deleted when every one of its heads is a tombstone; the version before is the nearest of the tombstones' ancestors that is not one. A restore writes no new kind of revision: it is a resolution, with the content of the chosen earlier revision of the same item (never a tombstone), whose parents are the heads the owner was shown; a head that arrived since stays, as in any resolution.
+
 ## HPKE key envelopes
 
 Use an RFC 9180 implementation rather than a custom X25519 construction. The sync primitive currently uses DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, and AES-256-GCM; record XChaCha20-Poly1305 and HPKE AES-256-GCM are different uses and have different nonce handling. The suite and the envelope's layout are frozen in a fixture. HPKE's suite identifiers and context handling follow [RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html).

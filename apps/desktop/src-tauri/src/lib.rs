@@ -12,6 +12,7 @@ mod browser;
 mod browser;
 #[cfg(all(test, unix))]
 mod browser_tests;
+mod history;
 mod import;
 #[cfg(test)]
 mod import_tests;
@@ -427,10 +428,7 @@ async fn list_versions(
                 .as_ref()
                 .map(|item| item.url.clone())
                 .unwrap_or_default(),
-            device: version.author_device_id[..4]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
+            device: history::short_device(&version.author_device_id),
             this_device: Some(version.author_device_id) == this_device,
             revision: version.revision,
         })
@@ -789,6 +787,9 @@ pub fn run() {
             browser::browser_status,
             browser::connect_browser,
             browser::disconnect_browser,
+            history::item_history,
+            history::deleted_entries,
+            history::restore_entry,
             import::choose_import,
             import::confirm_import,
             import::cancel_import,

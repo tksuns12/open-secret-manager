@@ -64,6 +64,112 @@ fn locked_lifecycle_and_revision_conflicts() {
 }
 
 #[test]
+fn an_items_history_lists_every_version_and_an_earlier_version_or_a_deleted_item_comes_back() {
+    let dir = tempdir().unwrap();
+    let (mut vault, _) = Vault::create(dir.path().join("vault.db"), "initial password").unwrap();
+    let device = vault.device_id().unwrap();
+    let mut item = login("Mail");
+    let id = item.id.clone();
+    item.password = "first password".into();
+    let first = vault.put(item.clone()).unwrap();
+    item.password = "second password".into();
+    item.username = "someone else".into();
+    let second = vault.update(item.clone(), &first.revision).unwrap();
+    vault.put(login("Another")).unwrap();
+
+    // Newest first, each with what it followed and who wrote it.
+    let history = vault.history(&id).unwrap();
+    let seen: Vec<(&str, bool, &[String])> = history
+        .iter()
+        .map(|version| {
+            (
+                version.revision.as_str(),
+                version.current,
+                version.parents.as_slice(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (
+                second.revision.as_str(),
+                true,
+                std::slice::from_ref(&first.revision)
+            ),
+            (first.revision.as_str(), false, &[][..]),
+        ]
+    );
+    assert!(history
+        .iter()
+        .all(|version| version.author_device_id == device));
+    assert_eq!(history[1].item.as_ref().unwrap().password, "first password");
+    assert!(!format!("{history:?}").contains("first password"));
+
+    // An earlier version comes back as the newest, after the current one.
+    let restored = vault
+        .restore(&id, &first.revision, std::slice::from_ref(&second.revision))
+        .unwrap();
+    assert_eq!(restored.parents, std::slice::from_ref(&second.revision));
+    let now = vault.get(&id).unwrap();
+    assert_eq!(
+        (now.item.password.as_str(), now.item.username.as_str()),
+        ("first password", "alice@example.test")
+    );
+    assert_eq!(vault.history(&id).unwrap().len(), 3);
+    // Not from an older reading.
+    assert!(matches!(
+        vault.restore(&id, &first.revision, std::slice::from_ref(&second.revision)),
+        Err(Error::Conflict { .. })
+    ));
+
+    // A deleted item is listed with the version before its deletion.
+    let gone = vault.delete(&id, &restored.revision).unwrap();
+    assert!(matches!(vault.get(&id), Err(Error::NotFound)));
+    let deleted = vault.deleted_items().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].item_id, id);
+    assert_eq!(deleted[0].last.revision, restored.revision);
+    assert_eq!(
+        deleted[0].last.item.as_ref().unwrap().password,
+        "first password"
+    );
+    assert_eq!(deleted[0].heads, std::slice::from_ref(&gone.revision));
+    assert_eq!(deleted[0].deleted_by, device);
+    let history = vault.history(&id).unwrap();
+    assert!(history[0].item.is_none() && history[0].current);
+    // A deletion is no version to bring back; another item's version is
+    // not this item's; an unknown one is not found.
+    assert!(matches!(
+        vault.restore(&id, &gone.revision, std::slice::from_ref(&gone.revision)),
+        Err(Error::InvalidItem(_))
+    ));
+    let other = vault.list().unwrap().remove(0);
+    assert!(matches!(
+        vault.restore(&id, &other.revision, std::slice::from_ref(&gone.revision)),
+        Err(Error::InvalidItem(_))
+    ));
+    assert!(matches!(
+        vault.restore(&id, &"0".repeat(64), std::slice::from_ref(&gone.revision)),
+        Err(Error::NotFound)
+    ));
+
+    // Brought back, it is an item again and no longer deleted.
+    vault
+        .restore(&id, &deleted[0].last.revision, &deleted[0].heads)
+        .unwrap();
+    assert_eq!(vault.get(&id).unwrap().item.password, "first password");
+    assert!(vault.deleted_items().unwrap().is_empty());
+    assert!(matches!(
+        vault.history("no such item"),
+        Err(Error::NotFound)
+    ));
+    vault.lock();
+    assert!(matches!(vault.history(&id), Err(Error::Locked)));
+    assert!(matches!(vault.deleted_items(), Err(Error::Locked)));
+}
+
+#[test]
 fn concurrent_connections_cannot_overwrite_one_head() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.db");

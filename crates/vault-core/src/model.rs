@@ -234,6 +234,55 @@ impl fmt::Debug for ItemVersion {
     }
 }
 
+/// One stored version of an item, for its history.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HistoryVersion {
+    pub revision: String,
+    /// The versions it followed: none for the first, one for an edit,
+    /// several where it settled a conflict.
+    pub parents: Vec<String>,
+    pub author_device_id: [u8; 16],
+    /// `None` when this version deletes the item.
+    pub item: Option<Item>,
+    /// It is one of the item's current versions.
+    pub current: bool,
+}
+
+impl fmt::Debug for HistoryVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoryVersion")
+            .field("revision", &self.revision)
+            .field("parents", &self.parents)
+            .field("author_device_id", &self.author_device_id)
+            .field("deleted", &self.item.is_none())
+            .field("current", &self.current)
+            .finish()
+    }
+}
+
+/// An item that every one of its current versions deletes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeletedItem {
+    pub item_id: String,
+    /// The version the deletion followed, which a restore brings back.
+    pub last: ItemVersion,
+    /// The deletions that are its current versions, which a restore names.
+    pub heads: Vec<String>,
+    /// Who deleted it: the author of its newest deletion.
+    pub deleted_by: [u8; 16],
+}
+
+impl fmt::Debug for DeletedItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeletedItem")
+            .field("item_id", &self.item_id)
+            .field("last", &self.last)
+            .field("heads", &self.heads)
+            .field("deleted_by", &self.deleted_by)
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemSummary {
     pub id: String,

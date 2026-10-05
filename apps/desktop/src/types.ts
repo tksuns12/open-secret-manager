@@ -27,6 +27,41 @@ export type EntryDetail = {
   revision: string;
 };
 
+/** One version of an item, as its history shows it. No secret. */
+export type HistoryEntry = {
+  revision: string;
+  /** It deleted the item. */
+  deleted: boolean;
+  /** It is one of the item's current versions. */
+  current: boolean;
+  /** It made the item. */
+  first: boolean;
+  /** It settled a conflict between versions. */
+  merged: boolean;
+  title: string;
+  username: string;
+  url: string;
+  /** The fields it changed from the version it followed. */
+  changed: string[];
+  device: string;
+  thisDevice: boolean;
+};
+
+/** An item deleted on every device, as it was before. No secret. */
+export type DeletedEntry = {
+  id: string;
+  title: string;
+  kind: EntryKind;
+  username: string;
+  url: string;
+  /** The version before the deletion, which a restore brings back. */
+  last: string;
+  /** The deletions, which a restore follows. */
+  heads: string[];
+  device: string;
+  thisDevice: boolean;
+};
+
 /** The exports the app imports. */
 export type ImportFormat = "bitwarden" | "chrome" | "firefox";
 
@@ -341,6 +376,12 @@ export type DesktopBridge = {
   /** Tells a browser where to find this app; resolves to the new status. */
   connectBrowser: (browser: string) => Promise<BrowserStatus>;
   disconnectBrowser: (browser: string) => Promise<BrowserStatus>;
+  /** Every version of an item, newest first. */
+  itemHistory: (id: string) => Promise<HistoryEntry[]>;
+  /** The items deleted, most recently first. */
+  deletedEntries: () => Promise<DeletedEntry[]>;
+  /** Brings back what version `revision` of an item held, following its current versions `heads`; resolves to the item. */
+  restoreEntry: (id: string, revision: string, heads: string[]) => Promise<VaultEntry>;
   /** Asks for an export of `format` and reads it; resolves to what it would add, or `null` if the owner closed the dialog. The file stays with the shell. */
   chooseImport: (format: ImportFormat) => Promise<ImportSummary | null>;
   /** Adds what the chosen export holds as new items; resolves to how many. */

@@ -1235,7 +1235,7 @@ fn a_device_without_a_vote_syncs_and_when_lost_is_removed_by_the_other_alone() {
 }
 
 #[test]
-fn an_item_deleted_on_one_device_is_gone_from_the_other() {
+fn an_item_deleted_on_one_device_is_gone_from_the_other_until_either_restores_it() {
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let apps: Vec<_> = dirs.iter().map(|dir| shell(dir.path())).collect();
     let codes = record(&apps[0], "pairing-code");
@@ -1283,10 +1283,62 @@ fn an_item_deleted_on_one_device_is_gone_from_the_other() {
             .await
             .unwrap()
             .revision;
-        crate::delete_entry(id, current, a.state(), a.clone())
+        crate::delete_entry(id.clone(), current, a.state(), a.clone())
             .await
             .unwrap();
         eventually(&a, &["Kept"]).await;
         eventually(&b, &["Kept"]).await;
+
+        // The other device lists it as deleted, by the first, with its
+        // history, and brings it back: it returns on both.
+        let deleted = crate::history::deleted_entries(b.state()).await.unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(
+            (
+                deleted[0].id.as_str(),
+                deleted[0].title.as_str(),
+                deleted[0].this_device
+            ),
+            (id.as_str(), "Old account, renamed", false)
+        );
+        let history = crate::history::item_history(id.clone(), b.state())
+            .await
+            .unwrap();
+        let seen: Vec<(bool, bool, bool)> = history
+            .iter()
+            .map(|version| (version.deleted, version.first, version.this_device))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (true, false, false),
+                (false, false, false),
+                (false, true, false)
+            ]
+        );
+        assert!(
+            history[1].changed.contains(&"title"),
+            "{:?}",
+            history[1].changed
+        );
+        assert_eq!(history[2].title, "Old account");
+        crate::history::restore_entry(
+            id.clone(),
+            deleted[0].last.clone(),
+            deleted[0].heads.clone(),
+            b.state(),
+            b.clone(),
+        )
+        .await
+        .unwrap();
+        eventually(&b, &["Kept", "Old account, renamed"]).await;
+        eventually(&a, &["Kept", "Old account, renamed"]).await;
+        assert!(crate::history::deleted_entries(a.state())
+            .await
+            .unwrap()
+            .is_empty());
+        let history = crate::history::item_history(id, a.state()).await.unwrap();
+        assert_eq!(history.len(), 4);
+        assert!(history[0].current && !history[0].this_device && !history[0].deleted);
     });
 }
