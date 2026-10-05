@@ -4,10 +4,14 @@ import android.app.Activity
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
+import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 
-/** A login form of the app's own. It shows what was filled, for the tests to read. */
+/**
+ * A login form of the app's own. It shows what was filled, for the tests to
+ * read; signing in closes it.
+ */
 class NativeLoginActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -24,5 +28,6 @@ class NativeLoginActivity : Activity() {
         }
         username.addTextChangedListener(show)
         password.addTextChangedListener(show)
+        findViewById<Button>(R.id.sign_in).setOnClickListener { finish() }
     }
 }

@@ -25,6 +25,9 @@ final class FillRequestTests: XCTestCase {
         if #available(iOS 26.2, *) {
             let app = ASCredentialServiceIdentifier(identifier: "ABCDE12345.org.example.app", type: .app, displayName: "Example")
             XCTAssertEqual(FillRequester([app]), .app(id: "ABCDE12345.org.example.app", name: "Example"))
+            // As a save request names it.
+            let saving = ASCredentialServiceIdentifier(identifier: "app://ABCDE12345.org.example.app", type: .app, displayName: "Example")
+            XCTAssertEqual(FillRequester([saving]), .app(id: "ABCDE12345.org.example.app", name: "Example"))
         }
     }
 

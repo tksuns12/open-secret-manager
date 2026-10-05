@@ -28,9 +28,11 @@ use tokio::{
     task::JoinHandle,
 };
 
+use zeroize::Zeroizing;
+
 use crate::{
-    DeviceState, FillCredentials, ItemDetail, ItemDraft, ItemSummary, MobileError, SyncState,
-    SyncStatus,
+    DeviceState, FillCredentials, ItemDetail, ItemDraft, ItemSummary, MobileError, SaveCandidate,
+    SyncState, SyncStatus,
 };
 
 /// The files of one device, as the desktop app names them.
@@ -279,6 +281,72 @@ impl Runtime {
                 return Err(MobileError::NotEditableHere);
             }
             vault.delete(id, revision)?;
+        }
+        self.sync_soon();
+        Ok(())
+    }
+
+    pub(crate) async fn save_candidates(
+        &self,
+        ids: &[String],
+        username: &str,
+        password: &str,
+    ) -> Result<Vec<SaveCandidate>, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let username = username.trim();
+        let mut candidates = Vec::new();
+        for id in ids {
+            let found = match vault.get(id) {
+                Ok(found) => found,
+                Err(osm_vault_core::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let item = &found.item;
+            if found.conflict || item.kind != ItemKind::Login {
+                continue;
+            }
+            if !username.is_empty() && item.username.trim() != username {
+                continue;
+            }
+            candidates.push(SaveCandidate {
+                id: item.id.clone(),
+                title: item.title.clone(),
+                username: item.username.clone(),
+                revision: found.revision.clone(),
+                has_this_password: item.password == password,
+            });
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) async fn update_password(
+        self: &Arc<Self>,
+        id: &str,
+        revision: &str,
+        password: String,
+    ) -> Result<(), MobileError> {
+        let mut password = Zeroizing::new(password);
+        if password.is_empty() {
+            return Err(MobileError::InvalidItem {
+                reason: "there is no password to save".into(),
+            });
+        }
+        {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            let VaultItem {
+                mut item, conflict, ..
+            } = vault.get(id)?;
+            if conflict {
+                return Err(MobileError::InConflict);
+            }
+            if item.kind != ItemKind::Login {
+                return Err(MobileError::NotALogin);
+            }
+            // Into the item, which wipes it when it goes.
+            item.password = std::mem::take(&mut *password);
+            vault.update(item, revision)?;
         }
         self.sync_soon();
         Ok(())

@@ -23,6 +23,7 @@ import org.opensecretmanager.vault.ItemDetail
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemSummary
 import org.opensecretmanager.vault.MobileException
+import org.opensecretmanager.vault.SaveCandidate
 import org.opensecretmanager.vault.SyncStatus
 
 /** What the app shows. */
@@ -251,6 +252,47 @@ class VaultSession(private val context: Context, private val folder: File) {
     fun fill(id: String, origin: String?, done: (FillCredentials) -> Unit) = run(null) {
         val credentials = if (origin != null) device!!.fillForWeb(id, origin) else device!!.fillForApp(id)
         withContext(Dispatchers.Main) { done(credentials) }
+    }
+
+    /**
+     * For saving what a form submitted: the logins it could go into, among
+     * those saved for [origin]'s pages or, without an origin, those in
+     * [chosen] (the logins the owner chose for an app). Then, on the main
+     * thread, [done].
+     */
+    fun saveCandidates(
+        origin: String?,
+        chosen: Set<String>,
+        username: String,
+        password: String,
+        done: (List<SaveCandidate>) -> Unit,
+    ) = run(null) {
+        val device = device!!
+        val ids = if (origin != null) device.loginsForWeb(origin).map { it.id } else chosen.toList()
+        val candidates = device.saveCandidates(ids, username, password).sortedBy { it.title.lowercase() }
+        withContext(Dispatchers.Main) { done(candidates) }
+    }
+
+    /** Saves a new login from [draft]; then, on the main thread, [done] with its ID. */
+    fun saveNew(draft: ItemDraft, done: (String) -> Unit) = run("Saving…") {
+        val id = device!!.createItem(draft)
+        withContext(Dispatchers.Main) { done(id) }
+    }
+
+    /**
+     * Changes the password of the login [candidate] as it was read; then, on
+     * the main thread, [done] with whether it did. A login that changed
+     * since is left alone.
+     */
+    fun updatePassword(candidate: SaveCandidate, password: String, done: (Boolean) -> Unit) = run("Saving…") {
+        val saved = try {
+            device!!.updatePassword(candidate.id, candidate.revision, password)
+            true
+        } catch (error: MobileException.ChangedElsewhere) {
+            _state.update { it.copy(notice = "That login changed since this screen read it · choose again") }
+            false
+        }
+        withContext(Dispatchers.Main) { done(saved) }
     }
 
     fun notify(text: String) {

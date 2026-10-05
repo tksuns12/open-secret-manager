@@ -3,7 +3,9 @@
 <plist version="1.0">
 <dict>
 	<!-- The AutoFill extension: it provides passwords, chosen in its own
-	     screen; it registers none with the system and makes no passkeys. -->
+	     screen, and from iOS 26.2 saves what a login form submitted, where
+	     the owner chooses in its screen; it registers none with the system
+	     and makes no passkeys. -->
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>
@@ -11,6 +13,8 @@
 			<key>ASCredentialProviderExtensionCapabilities</key>
 			<dict>
 				<key>ProvidesPasswords</key>
+				<true/>
+				<key>SupportsSavePasswordCredentials</key>
 				<true/>
 			</dict>
 		</dict>

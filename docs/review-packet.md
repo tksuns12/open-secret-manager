@@ -21,7 +21,7 @@ has not been reviewed by anyone outside the project; this is the request.
 
 ## The code
 
-About 46,000 lines of Rust, TypeScript, Kotlin, and Swift, tests included.
+About 49,000 lines of Rust, TypeScript, Kotlin, and Swift, tests included.
 
 | Part | Lines | What it does | Look at |
 | --- | --- | --- | --- |
@@ -34,9 +34,9 @@ About 46,000 lines of Rust, TypeScript, Kotlin, and Swift, tests included.
 | `apps/desktop/src-tauri` | 6,700 | The desktop app's native side: commands, devices and sync, the browser socket, archives, backups | `src/lib.rs` (which secrets cross to the window: the stored password and one-time secret never do), `src/browser.rs` (`approve_fill`), `src/network.rs` (`recover_vault`, `restore`) |
 | `apps/desktop/src-tauri/session` | 400 | The only `unsafe` code in the project: registering for macOS notifications, to lock on sleep and screen lock | `src/macos.rs` |
 | `apps/desktop/src`, `apps/browser-extension/src` | 2,300 | The window, and the extension | `apps/browser-extension/src/background.ts` (what a reply must match before it is filled) |
-| `crates/mobile` | 1,500 | The phone apps' one interface to the shared code (UniFFI bindings for Kotlin and Swift): a device of a vault that joins without a vote, unlocks, reads, fills, and syncs while the app is open | `src/runtime.rs`: `logins_for_web`, `fill_for_web`, `fill_for_app`; `src/lib.rs`: what crosses into Kotlin and Swift |
-| `apps/mobile/android` | 2,300 | The Android app and its autofill service | `app/.../autofill/Requester.kt` (when a page's domain is believed), `FillActivity.kt`, `BiometricUnlock.kt`, `VaultApp.kt` (locking when the app is left) |
-| `apps/mobile/ios` | 1,900 | The iOS app and its AutoFill extension | `Shared/FillRequester.swift` (who asks, from what iOS says), `AutoFill/FillModel.swift` (`fill`), `Shared/BiometricUnlock.swift`, `App/VaultModel.swift` (`wentToBackground`) |
+| `crates/mobile` | 2,300 | The phone apps' one interface to the shared code (UniFFI bindings for Kotlin and Swift): a device of a vault that joins without a vote, unlocks, reads, writes, fills, saves, and syncs while the app is open | `src/runtime.rs`: `logins_for_web`, `fill_for_web`, `fill_for_app`, `save_candidates`, `update_password`; `src/lib.rs`: what crosses into Kotlin and Swift |
+| `apps/mobile/android` | 3,400 | The Android app and its autofill service | `app/.../autofill/Requester.kt` (when a page's domain is believed), `FillActivity.kt`, `SaveActivity.kt` and `PendingSave.kt` (what a save may change, and where the form's password waits), `BiometricUnlock.kt`, `VaultApp.kt` (locking when the app is left) |
+| `apps/mobile/ios` | 2,600 | The iOS app and its AutoFill extension | `Shared/FillRequester.swift` (who asks, from what iOS says), `AutoFill/FillModel.swift` (`fill`, `saveNew`, `update`), `Shared/BiometricUnlock.swift`, `App/VaultModel.swift` (`wentToBackground`) |
 
 Everything else in the Rust workspaces forbids `unsafe`. Nothing writes a
 log.
@@ -72,7 +72,9 @@ only from a browser on Google's published list, checked by its signing
 certificate, and Android does not say the page's port; any other app is
 offered only logins the owner chose for it. On iOS the system says who
 asks; an app it names by nothing gets a choice the owner makes after a
-warning.
+warning. A save of what another app's form sent can change only the
+password of a login that form could be filled with; anything else is a new
+login, and nothing is written before the owner unlocks and chooses.
 
 ## The evidence
 

@@ -78,6 +78,14 @@ do {
     var passport = draft
     passport.kind = .identity
     check(fails({ try device.createItem(draft: passport) }) { if case .NotEditableHere = $0 { true } else { false } }, "an identity is made on a computer")
+    // What a form submitted goes into a login the form could fill, as its password only.
+    let forum = try device.loginsForWeb(origin: "https://forum.example.test").map { $0.id }
+    let candidates = try device.saveCandidates(ids: forum, username: "someone else", password: "新しい 🔑 \"pass\"")
+    check(candidates.map { $0.hasThisPassword } == [true], "a save finds the login that has its password already")
+    check(try device.saveCandidates(ids: forum, username: "another", password: "x").isEmpty, "another username is another account")
+    try device.updatePassword(id: created, revision: candidates[0].revision, password: "次の 🔑")
+    check(try device.password(id: created) == "次の 🔑", "a saved password is kept")
+    check(try device.item(id: created).username == "someone else", "a saved password changes nothing else")
     try device.deleteItem(id: created, revision: try device.item(id: created).revision)
     check(fails({ try device.item(id: created) }) { if case .NotFound = $0 { true } else { false } }, "a deleted item is gone")
     check(try generatePassword(length: 24).count == 24, "the generator makes the length asked for")

@@ -81,6 +81,14 @@ class DeviceTest {
             assertEquals("新しい 🔑 \"pass\"", device.password(created))
             fails<MobileException.ChangedElsewhere> { device.updateItem(created, read.revision, renamed) }
             fails<MobileException.NotEditableHere> { device.createItem(draft.copy(kind = ItemKind.IDENTITY)) }
+            // What a form submitted goes into a login the form could fill, as its password only.
+            val forum = device.loginsForWeb("https://forum.example.test").map { it.id }
+            val candidates = device.saveCandidates(forum, "someone else", "新しい 🔑 \"pass\"")
+            assertEquals(listOf(true), candidates.map { it.hasThisPassword })
+            assertTrue(device.saveCandidates(forum, "another", "x").isEmpty())
+            device.updatePassword(created, candidates[0].revision, "次の 🔑")
+            assertEquals("次の 🔑", device.password(created))
+            assertEquals("someone else", device.item(created).username)
             device.deleteItem(created, device.item(created).revision)
             fails<MobileException.NotFound> { device.item(created) }
             assertEquals(24, generatePassword(24u).length)

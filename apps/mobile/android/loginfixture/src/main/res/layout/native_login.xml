@@ -6,6 +6,14 @@
     android:fitsSystemWindows="true"
     android:orientation="vertical"
     android:padding="24dp">
+    <!-- Closes the screen, which is when the system offers to save. Above
+         the fields, where neither the keyboard nor the offer to fill
+         covers it. -->
+    <Button
+        android:id="@+id/sign_in"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sign in" />
     <EditText
         android:id="@+id/username"
         android:layout_width="match_parent"

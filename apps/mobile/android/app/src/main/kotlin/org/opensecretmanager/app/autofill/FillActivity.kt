@@ -168,7 +168,7 @@ private fun FillScreen(
 
 /** Who the login would go to, as the owner should check it. */
 @Composable
-private fun Asker(requester: Requester) {
+internal fun Asker(requester: Requester) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp)) {
         when (requester) {
             is Requester.Web -> {

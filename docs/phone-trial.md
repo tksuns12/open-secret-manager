@@ -120,6 +120,33 @@ phone sold since 2019 is):
    unlocks, iOS likely ended it for its memory: note the phone's model and
    whether Face ID or the password was used.
 
+## Saving from autofill
+
+**Android:**
+
+1. With Open Secret Manager as the autofill service, sign in to a site in
+   Chrome (https) with an account the vault does not have, typing the
+   username and password. After the page changes, Android asks "Save …
+   to Open Secret Manager?": choose Save, unlock, and Save as a new login.
+   The next time, the login is offered on that site.
+2. Change that password on the site (or sign in with a new one): the save
+   screen offers "Update the password of" the login, and the computer gets
+   the new password within a minute.
+3. The same in an app's sign-in: the new login is offered to that app
+   afterwards, and to no other.
+4. Note any app or site where no save is offered after signing in, and
+   whether the app asked for the username and password on separate screens.
+
+**iOS** (26.2 or later):
+
+1. Sign in to a site in Safari, or to an app, with an account the vault
+   does not have. iOS asks "Save Password?": choose Open Secret Manager,
+   unlock, and Save as a new login.
+2. Sign in again with a new password: the save screen offers to update the
+   login.
+3. Let Safari suggest a strong password on a sign-up page: note what iOS
+   shows, and whether the password reaches the vault once the form is sent.
+
 ## Removing the phone
 
 On the computer, remove the phone in the Devices panel. The next time the

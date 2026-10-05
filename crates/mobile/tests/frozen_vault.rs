@@ -150,6 +150,123 @@ fn a_folder_without_a_vault_and_one_with_a_damaged_vault_are_told_apart() {
 }
 
 #[test]
+fn what_a_form_submitted_goes_only_into_a_login_it_could_be_filled_with() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    let ids = |origin: &str| -> Vec<String> {
+        device
+            .logins_for_web(origin.into())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.id)
+            .collect()
+    };
+    let candidates = |ids: Vec<String>, username: &str, password: &str| {
+        device
+            .save_candidates(ids, username.into(), password.into())
+            .unwrap()
+            .into_iter()
+            .map(|candidate| (candidate.title, candidate.has_this_password))
+            .collect::<Vec<_>>()
+    };
+    let mail = ids("https://mail.example.test");
+    assert_eq!(
+        candidates(mail.clone(), " owner@example.test ", "a new password"),
+        [("Mail".to_owned(), false)]
+    );
+    assert_eq!(
+        candidates(
+            mail.clone(),
+            "owner@example.test",
+            "third password, with ünïcödé"
+        ),
+        [("Mail".to_owned(), true)]
+    );
+    // Another username is another account; a form without one could be
+    // any of the page's.
+    assert!(candidates(mail.clone(), "someone else", "a new password").is_empty());
+    assert_eq!(
+        candidates(mail.clone(), "", "x"),
+        [("Mail".to_owned(), false)]
+    );
+    // Only logins, not in conflict, still in the vault.
+    let items = device.items().unwrap();
+    let all = device
+        .save_candidates(
+            items
+                .iter()
+                .map(|item| item.id.clone())
+                .chain(["no such item".to_owned()])
+                .collect(),
+            String::new(),
+            "x".into(),
+        )
+        .unwrap();
+    let logins = items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Login && !item.conflict);
+    assert_eq!(
+        all.iter()
+            .map(|candidate| &candidate.id)
+            .collect::<Vec<_>>(),
+        logins.map(|item| &item.id).collect::<Vec<_>>()
+    );
+    assert!(items
+        .iter()
+        .any(|item| item.conflict && item.kind == ItemKind::Login));
+
+    // The password changes, and nothing else.
+    let bank = device.item("fixture-bank".into()).unwrap();
+    device
+        .update_password(
+            "fixture-bank".into(),
+            bank.revision.clone(),
+            "a new password".into(),
+        )
+        .unwrap();
+    let updated = device.item("fixture-bank".into()).unwrap();
+    assert_eq!(
+        device.password("fixture-bank".into()).unwrap(),
+        "a new password"
+    );
+    assert_eq!(
+        (
+            updated.username.as_str(),
+            updated.notes.as_str(),
+            updated.has_one_time_code
+        ),
+        ("account 42", "line one\nline two", true)
+    );
+    assert!(matches!(
+        device.update_password("fixture-bank".into(), bank.revision, "again".into()),
+        Err(MobileError::ChangedElsewhere)
+    ));
+    assert!(matches!(
+        device.update_password("fixture-bank".into(), updated.revision.clone(), "".into()),
+        Err(MobileError::InvalidItem { .. })
+    ));
+    let mut note = draft("Recovery codes", ItemKind::SecureNote);
+    note.notes = "one".into();
+    let note = device.item(device.create_item(note).unwrap()).unwrap();
+    assert!(matches!(
+        device.update_password(note.id, note.revision, "x".into()),
+        Err(MobileError::NotALogin)
+    ));
+    let conflicted = device
+        .items()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.conflict)
+        .unwrap();
+    let conflicted = device.item(conflicted.id).unwrap();
+    assert!(matches!(
+        device.update_password(conflicted.id, conflicted.revision, "x".into()),
+        Err(MobileError::InConflict)
+    ));
+}
+
+#[test]
 fn logins_and_notes_are_created_edited_and_deleted_and_the_rest_is_left_to_a_computer() {
     let (_dir, folder) = copy_of_the_frozen_vault();
     let device = Device::open_listening_on(folder, 0).unwrap();

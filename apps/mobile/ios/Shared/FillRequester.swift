@@ -37,7 +37,11 @@ enum FillRequester: Equatable {
                 }
             default:
                 if #available(iOS 26.2, *), identifier.type == .app {
-                    app = (identifier.identifier, identifier.displayName ?? identifier.identifier)
+                    // A save request names the app `app://<App ID>`: one key
+                    // for the app, whichever request names it.
+                    var id = identifier.identifier
+                    if id.hasPrefix("app://") { id.removeFirst("app://".count) }
+                    app = (id, identifier.displayName ?? id)
                 }
             }
         }

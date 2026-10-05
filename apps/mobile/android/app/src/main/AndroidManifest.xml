@@ -3,6 +3,17 @@
     <!-- Unlocking with a fingerprint or the face, if the owner turns it on. -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
+    <!-- The apps a person can open, so that the fill and save screens can
+         tell which app asks by its signing certificate: Android hides other
+         apps from this one otherwise. An app without a launcher entry stays
+         hidden, and is filled and saved nothing. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <!-- No backup: the vault, the device's keys, and the password kept for
          biometric unlock stay on this phone. A copy elsewhere would be a
          second device under this one's identity. -->
@@ -25,8 +36,9 @@
         </activity>
 
         <!-- Filling logins into other apps and pages, once the owner picks
-             this app as the phone's autofill service. It only offers
-             "unlock to fill"; the fill screen does the rest. -->
+             this app as the phone's autofill service, and saving what their
+             forms submit. It only offers "unlock to fill" and a save; the
+             fill and save screens do the rest. -->
         <service
             android:name=".autofill.VaultAutofillService"
             android:exported="true"
@@ -44,6 +56,12 @@
              so the vault's own screens stay where they were. -->
         <activity
             android:name=".autofill.FillActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:taskAffinity=""
+            android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".autofill.SaveActivity"
             android:excludeFromRecents="true"
             android:exported="false"
             android:taskAffinity=""

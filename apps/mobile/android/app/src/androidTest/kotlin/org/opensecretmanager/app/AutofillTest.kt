@@ -2,10 +2,12 @@ package org.opensecretmanager.app
 
 import android.graphics.Bitmap
 import android.os.ParcelFileDescriptor
+import android.view.KeyEvent
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.BySelector
+import androidx.test.uiautomator.StaleObjectException
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.UiObject2
 import androidx.test.uiautomator.Until
@@ -184,6 +186,130 @@ class AutofillTest {
         find(mine("choose-another"))
         assertNull(device.findObject(mine("fill:Mail")))
         find(mine("cancel")).click()
+        assertLockedAgain()
+    }
+
+    /**
+     * Types [text] as keys into the page's focused field: one key, which
+     * closes the offer to fill under the field, and then the rest. While the
+     * offer shows, the system passes keys through it, and loses or reorders
+     * some (a space even chooses it); the on-screen keyboard's typing does
+     * not go that way.
+     */
+    private fun typeKeys(text: String) {
+        shell("input text ${text.take(1)}")
+        Thread.sleep(1_500)
+        shell("input text ${text.drop(1)}")
+    }
+
+    /**
+     * Opens a form of the stand-in app, types [username] and [password] into
+     * it, and signs in; then chooses Save in the system's offer, and unlocks
+     * the save screen. On a page, they are typed as keys, since a web view
+     * reports only what was typed: letters, digits, and dashes only.
+     */
+    private fun submitAndSave(activity: String, origin: String?, username: String, password: String, name: String? = null) {
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.$activity" + (origin?.let { " --es origin $it" } ?: ""))
+        // A tap first: the system asks this app about a form when a field
+        // takes the focus, and only then offers to save it. Not on the
+        // password field, which the offer to fill may cover by then.
+        if (origin == null) {
+            find(By.res(FIXTURE, "username")).click()
+            find(By.res(FIXTURE, "username")).text = username
+            find(By.res(FIXTURE, "password")).text = password
+            find(By.res(FIXTURE, "sign_in")).click()
+        } else {
+            // Keys typed can still be lost on the way, so the form is typed
+            // again, afresh, until the page shows it got them all.
+            for (attempt in 1..3) {
+                if (attempt > 1) shell("am start -W -S -n $FIXTURE/.$activity --es origin $origin")
+                find(By.clazz("android.widget.EditText").pkg(FIXTURE), 30_000).click()
+                Thread.sleep(1_500)
+                typeKeys(username)
+                device.pressKeyCode(KeyEvent.KEYCODE_TAB)
+                Thread.sleep(1_500)
+                typeKeys(password)
+                if (find(By.res(FIXTURE, "filled")).wait(Until.textEquals("$username|$password"), 5_000) == true) break
+                check(attempt < 3) { "the page never got all the keys typed" }
+            }
+            // The page's one button is its Sign in, uncovered now that the
+            // offer to fill is closed. The web view may redo its tree, so
+            // the button is found again until the tap reaches it.
+            for (attempt in 1..3) {
+                try {
+                    find(By.clazz("android.widget.Button").pkg(FIXTURE)).click()
+                    break
+                } catch (stale: StaleObjectException) {
+                    if (attempt == 3) throw stale
+                }
+            }
+        }
+        val save = find(By.res("android", "autofill_save_yes"))
+        name?.let { capture("$it-save-offer") }
+        save.click()
+        find(mine("password"))
+        find(mine("password")).text = this.password
+        find(mine("unlock")).click()
+        find(mine("asker"))
+    }
+
+    @Test
+    fun anAppsNewLoginIsSavedForItAndItsNextPasswordIntoThatLogin() {
+        submitAndSave("NativeLoginActivity", null, "new account", "new password", name = "app")
+        // Nothing chosen for this app: only a new login, for this app.
+        find(mine("save-new"))
+        assertNull(device.findObject(mine("update:Bank")))
+        assertEquals("Login fixture", find(mine("save-title")).text)
+        capture("save-app-new")
+        find(mine("save-new")).click()
+        assertLockedAgain()
+        askToFill("NativeLoginActivity")
+        find(mine("fill:Login fixture")).click()
+        assertFilled("new account|new password")
+        assertLockedAgain()
+
+        // The next password for that account goes into that login.
+        submitAndSave("NativeLoginActivity", null, "new account", "newer password")
+        find(mine("update:Login fixture")).click()
+        assertLockedAgain()
+        askToFill("NativeLoginActivity")
+        find(mine("fill:Login fixture")).click()
+        assertFilled("new account|newer password")
+        assertLockedAgain()
+    }
+
+    @Test
+    fun aTrustedBrowsersPageSavesIntoTheLoginsForItsOriginOnly() {
+        Requester.trustedForTests += FIXTURE
+        // A page with no login for it: a new login, for its origin.
+        submitAndSave("WebLoginActivity", "https://new.example.test", "someone", "first-password", name = "web")
+        find(mine("save-new"))
+        assertNull(device.findObject(mine("update:Mail")))
+        assertEquals("new.example.test", find(mine("save-title")).text)
+        capture("save-web-new")
+        find(mine("save-new")).click()
+        assertLockedAgain()
+        askToFill("WebLoginActivity", "https://new.example.test")
+        find(mine("fill:new.example.test")).click()
+        assertFilled("someone|first-password")
+        assertLockedAgain()
+
+        // What the vault has already is not saved again.
+        submitAndSave("WebLoginActivity", "https://new.example.test", "someone", "first-password")
+        find(mine("already-saved"))
+        find(mine("done")).click()
+        assertLockedAgain()
+
+        // A new password for that account goes into its login.
+        submitAndSave("WebLoginActivity", "https://new.example.test", "someone", "second-password")
+        find(mine("update:new.example.test"))
+        capture("save-web-update")
+        find(mine("update:new.example.test")).click()
+        assertLockedAgain()
+        askToFill("WebLoginActivity", "https://new.example.test")
+        find(mine("fill:new.example.test")).click()
+        assertFilled("someone|second-password")
         assertLockedAgain()
     }
 

@@ -1,17 +1,30 @@
 import Foundation
 
-/// The fill screen's state: the device opened on the vault the app shares,
-/// never online, unlocked for this one fill and dropped when it ends.
+/// What a login form submitted, which the system asks to save.
+struct Saving {
+    let username: String
+    let password: String
+    /// A name the system suggests for the login, if any.
+    let title: String?
+}
+
+/// The fill or save screen's state: the device opened on the vault the app
+/// shares, never online, unlocked for this one fill or save and dropped when
+/// it ends.
 @MainActor
 final class FillModel: ObservableObject {
     enum Stage: Equatable { case opening, locked, unlocked, noVault, removed, unreadable(String), nothingToFill }
 
     let requester: FillRequester
+    /// Set when the screen saves rather than fills.
+    let saving: Saving?
     @Published private(set) var stage: Stage = .opening
     /// What may be filled: the logins for the origins, or those chosen for the app.
     @Published private(set) var offered: [ItemSummary] = []
     /// Every login, once the owner asks to choose one for an app.
     @Published private(set) var all: [ItemSummary]?
+    /// For a save: the logins the form could be filled with, under its username.
+    @Published private(set) var candidates: [SaveCandidate] = []
     @Published private(set) var busy: String?
     @Published var notice: String?
     let biometric = BiometricUnlock()
@@ -23,11 +36,20 @@ final class FillModel: ObservableObject {
     /// For each offered login, the origin it is filled for.
     private var originOf: [String: String] = [:]
     private let onFill: (FillCredentials) -> Void
+    private let onSaved: () -> Void
     private let onCancel: () -> Void
 
-    init(requester: FillRequester, onFill: @escaping (FillCredentials) -> Void, onCancel: @escaping () -> Void) {
+    init(
+        requester: FillRequester,
+        saving: Saving? = nil,
+        onFill: @escaping (FillCredentials) -> Void = { _ in },
+        onSaved: @escaping () -> Void = {},
+        onCancel: @escaping () -> Void
+    ) {
         self.requester = requester
+        self.saving = saving
         self.onFill = onFill
+        self.onSaved = onSaved
         self.onCancel = onCancel
         if case .notHTTPS = requester {
             stage = .nothingToFill
@@ -84,8 +106,9 @@ final class FillModel: ObservableObject {
     func unlockWithBiometrics() {
         Task {
             let biometric = biometric
+            let reason = saving == nil ? "Unlock the vault to fill a login" : "Unlock the vault to save a login"
             let outcome = await withCheckedContinuation { continuation in
-                DispatchQueue.global().async { continuation.resume(returning: biometric.read(reason: "Unlock the vault to fill a login")) }
+                DispatchQueue.global().async { continuation.resume(returning: biometric.read(reason: reason)) }
             }
             let password: String
             switch outcome {
@@ -124,8 +147,20 @@ final class FillModel: ObservableObject {
         guard let found else { return }
         offered = found.0.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         originOf = found.1
+        if saving != nil {
+            await listCandidates()
+        }
         stage = .unlocked
-        if case .unnamed = requester { await chooseAny() }
+        if saving == nil, case .unnamed = requester { await chooseAny() }
+    }
+
+    /// Of the logins the form could be filled with, those its save could go into.
+    private func listCandidates() async {
+        guard let saving else { return }
+        let ids = offered.map(\.id)
+        candidates = await call { device in
+            try device.saveCandidates(ids: ids, username: saving.username, password: saving.password)
+        }?.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending } ?? []
     }
 
     /// Every login, for an app the owner chooses one for.
@@ -153,6 +188,66 @@ final class FillModel: ObservableObject {
             close()
             onFill(credentials)
         }
+    }
+
+    /// The title a new login from this save starts with.
+    var suggestedTitle: String {
+        if let title = saving?.title?.trimmingCharacters(in: .whitespaces), !title.isEmpty { return title }
+        switch requester {
+        case let .origins(origins): return origins.first.map { $0.replacingOccurrences(of: "https://", with: "") } ?? ""
+        case let .app(_, name): return name
+        case .notHTTPS, .unnamed: return ""
+        }
+    }
+
+    /// Saves the form's login as a new one: for the page's origin, or for
+    /// the app the system names.
+    func saveNew(title: String) {
+        guard let saving else { return }
+        let url: String
+        if case let .origins(origins) = requester { url = origins.first ?? "" } else { url = "" }
+        let draft = ItemDraft(
+            title: title, kind: .login, username: saving.username, url: url,
+            notes: "", favorite: false, password: saving.password, oneTimeCodeSecret: nil
+        )
+        let requester = requester
+        Task {
+            guard let id = await call("Saving…", { try $0.createItem(draft: draft) }) else { return }
+            if case let .app(app, _) = requester { AppLogins().remember(app, id) }
+            finishSave()
+        }
+    }
+
+    /// Puts the form's password into `candidate`, as it was read. If it
+    /// changed since, it is read again for the owner to choose again.
+    func update(_ candidate: SaveCandidate) {
+        guard let saving else { return }
+        Task {
+            do {
+                busy = "Saving…"
+                defer { busy = nil }
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    queue.async { [device] in
+                        guard let device else { return continuation.resume(throwing: MobileError.NoVault) }
+                        continuation.resume(with: Result {
+                            try device.updatePassword(id: candidate.id, revision: candidate.revision, password: saving.password)
+                        })
+                    }
+                }
+                finishSave()
+            } catch MobileError.ChangedElsewhere {
+                notice = "That login changed since this screen read it · choose again"
+                await listCandidates()
+            } catch {
+                notice = describe(error)
+            }
+        }
+    }
+
+    /// The vault has the form's login already, or has it now.
+    func finishSave() {
+        close()
+        onSaved()
     }
 
     func cancel() {

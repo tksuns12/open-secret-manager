@@ -14,6 +14,7 @@ import android.widget.TextView
  * A login page of `origin` (an extra, `https://mail.example.test` if none)
  * in a web view. The page is served from here, so no network is needed;
  * the web view still navigates to the address and reports its domain.
+ * Signing in posts the form and shows the page again.
  */
 class WebLoginActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
@@ -46,13 +47,14 @@ class WebLoginActivity : Activity() {
         val PAGE = """
             <!doctype html>
             <meta name="viewport" content="width=device-width">
-            <style>input { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
-            <form>
-              <input id="email" type="email" name="email" autocomplete="username" placeholder="Email">
+            <style>input, button { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
+            <form method="post" action="/login">
+              <button id="sign-in" type="submit">Sign in</button>
+              <input id="username" type="text" name="username" autocomplete="username" placeholder="Username">
               <input id="password" type="password" name="password" autocomplete="current-password" placeholder="Password">
             </form>
             <script>
-              setInterval(() => fixture.report(email.value, password.value), 200);
+              setInterval(() => fixture.report(username.value, password.value), 200);
             </script>
         """.trimIndent()
     }

@@ -47,6 +47,19 @@ data class Form(
             )
         }
 
+        /** What the fields [ids] held when the screen was read: their text, by field. */
+        fun values(structure: AssistStructure, ids: Set<AutofillId>): Map<AutofillId, String> {
+            val found = mutableMapOf<AutofillId, String>()
+            fun visit(node: AssistStructure.ViewNode) {
+                val id = node.autofillId
+                val value = node.autofillValue
+                if (id != null && id in ids && value != null && value.isText) found[id] = value.textValue.toString()
+                for (index in 0 until node.childCount) visit(node.getChildAt(index))
+            }
+            for (index in 0 until structure.windowNodeCount) visit(structure.getWindowNodeAt(index).rootViewNode)
+            return found
+        }
+
         /** Finds the login fields, or null if the screen has no password field. */
         fun parse(structure: AssistStructure): Form? {
             val fields = mutableListOf<AssistStructure.ViewNode>()

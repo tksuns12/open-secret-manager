@@ -14,8 +14,9 @@
 //! them only in the vault.
 //!
 //! On a phone the owner creates, edits, and deletes logins and secure
-//! notes; identities and cards are read there and edited on a computer, as
-//! are conflicts between devices.
+//! notes, and saves what another app's login form submitted; identities and
+//! cards are read there and edited on a computer, as are conflicts between
+//! devices.
 //!
 //! This crate's own code has no `unsafe`; the foreign function interface
 //! that UniFFI generates around it is made of it.
@@ -282,6 +283,19 @@ impl std::fmt::Debug for FillCredentials {
     }
 }
 
+/// A login that what a form submitted could be saved into: one that form
+/// could be filled with, under the username it had.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SaveCandidate {
+    pub id: String,
+    pub title: String,
+    pub username: String,
+    /// The revision it was read at, which the update names.
+    pub revision: String,
+    /// It has the form's password already: there is nothing to save.
+    pub has_this_password: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum SyncState {
     /// Not taking part: the app is in the background, or never went online.
@@ -399,6 +413,34 @@ impl Device {
     /// every device. Its earlier versions stay in the vault's history.
     pub fn delete_item(&self, id: String, revision: String) -> Result<(), MobileError> {
         self.tokio.block_on(self.inner.delete_item(&id, &revision))
+    }
+
+    /// For saving what a login form submitted: of the logins in `ids`,
+    /// which are those the form could be filled with, the ones with the
+    /// form's `username` (every one, if the form had none), and whether each
+    /// has the form's `password` already. Logins in conflict are left out.
+    pub fn save_candidates(
+        &self,
+        ids: Vec<String>,
+        username: String,
+        password: String,
+    ) -> Result<Vec<SaveCandidate>, MobileError> {
+        let password = Zeroizing::new(password);
+        self.tokio
+            .block_on(self.inner.save_candidates(&ids, &username, &password))
+    }
+
+    /// Changes only the password of the login `id`, as read at `revision`;
+    /// refused if it changed since, or is in conflict. Online, it syncs at
+    /// once.
+    pub fn update_password(
+        &self,
+        id: String,
+        revision: String,
+        password: String,
+    ) -> Result<(), MobileError> {
+        self.tokio
+            .block_on(self.inner.update_password(&id, &revision, password))
     }
 
     /// Connects to the inviting device from an invitation and returns the

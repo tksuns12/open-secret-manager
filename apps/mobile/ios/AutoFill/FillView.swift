@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// The fill screen: who asks, an unlock, and what may be filled.
+/// The fill or save screen: who asks, an unlock, and what may be filled, or
+/// where what the form submitted may be saved.
 struct FillView: View {
     @ObservedObject var model: FillModel
 
@@ -14,7 +15,7 @@ struct FillView: View {
                 }
                 .padding()
             }
-            .navigationTitle("Fill a login")
+            .navigationTitle(model.saving == nil ? "Fill a login" : "Save a login")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -38,7 +39,11 @@ struct FillView: View {
                 onBiometrics: model.unlockWithBiometrics
             )
         case .unlocked:
-            Logins(model: model)
+            if let saving = model.saving {
+                SaveChoices(model: model, saving: saving)
+            } else {
+                Logins(model: model)
+            }
         case .noVault:
             Explanation(title: "This phone has no vault yet", detail: "Join your vault in Open Secret Manager first.")
         case .removed:
@@ -46,7 +51,11 @@ struct FillView: View {
         case let .unreadable(reason):
             Explanation(title: "The vault on this phone cannot be opened", detail: reason)
         case .nothingToFill:
-            Explanation(title: "Nothing to fill", detail: "Logins are filled only into pages over https.")
+            if model.saving == nil {
+                Explanation(title: "Nothing to fill", detail: "Logins are filled only into pages over https.")
+            } else {
+                Explanation(title: "Nothing to save", detail: "Logins are saved only for pages over https.")
+            }
         }
     }
 }
@@ -106,6 +115,67 @@ private struct Logins: View {
             "An app cannot be checked against a login's address. Choose only a login meant for \(name): it is offered to this app again, and to no other."
         default:
             "This app cannot be checked against a login's address, and it does not say which app it is. Choose only a login meant for it."
+        }
+    }
+}
+
+/// Where what the form submitted goes: into a login the same form could be
+/// filled with, under the username it sent, or into a new login.
+private struct SaveChoices: View {
+    @ObservedObject var model: FillModel
+    let saving: Saving
+    @State private var title: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Username").font(.caption).foregroundStyle(.secondary)
+                Text(saving.username.isEmpty ? "None" : saving.username).accessibilityIdentifier("save-username")
+                Text("The password the form sent is not shown.").font(.caption).foregroundStyle(.secondary)
+            }
+            if let already = model.candidates.first(where: \.hasThisPassword) {
+                Text("Already saved, in \(already.title)").font(.headline).accessibilityIdentifier("already-saved")
+                Button("Done", action: model.finishSave)
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("done")
+            } else {
+                if !model.candidates.isEmpty {
+                    Divider()
+                    Text("Update a login").font(.headline)
+                    ForEach(model.candidates, id: \.id) { candidate in
+                        Button("Update the password of \(candidate.title)") { model.update(candidate) }
+                            .buttonStyle(.bordered)
+                            .disabled(model.busy != nil)
+                            .accessibilityIdentifier("update:\(candidate.title)")
+                    }
+                }
+                Divider()
+                Text(model.candidates.isEmpty ? "Save a new login" : "Or save a new login").font(.headline)
+                TextField("Title", text: titleBinding)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("save-title")
+                Text(whereOffered).font(.caption).foregroundStyle(.secondary)
+                Button("Save as a new login") { model.saveNew(title: titleBinding.wrappedValue) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(titleBinding.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty || model.busy != nil)
+                    .accessibilityIdentifier("save-new")
+            }
+        }
+    }
+
+    /// The title field, starting from what the model suggests.
+    private var titleBinding: Binding<String> {
+        Binding(get: { title ?? model.suggestedTitle }, set: { title = $0 })
+    }
+
+    private var whereOffered: String {
+        switch model.requester {
+        case let .origins(origins):
+            "It is offered on \(origins.first.map { $0.replacingOccurrences(of: "https://", with: "") } ?? "this site") only."
+        case let .app(_, name):
+            "It is offered to \(name) again, and to no other app."
+        case .notHTTPS, .unnamed:
+            "This app does not say which site it belongs to: to fill the login into it, you choose it, warned."
         }
     }
 }

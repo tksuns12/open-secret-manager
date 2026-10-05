@@ -3,7 +3,14 @@
     <application
         android:label="Login fixture"
         android:theme="@android:style/Theme.Material.Light">
-        <activity android:name=".NativeLoginActivity" android:exported="true" />
+        <!-- In the launcher, as the apps people sign in to are: the app
+             under test sees only those. -->
+        <activity android:name=".NativeLoginActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
         <activity android:name=".WebLoginActivity" android:exported="true" />
     </application>
 </manifest>

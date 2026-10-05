@@ -19,9 +19,10 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   as the phone's autofill service, it fills logins into other apps and
   into pages of the browsers it trusts (`res/raw/trusted_browsers.json`,
   made by `android/trusted-browsers.mjs`), after the owner unlocks and
-  chooses the login on its fill screen.
+  chooses the login on its fill screen, and offers to save a login those
+  apps and pages send, where the owner chooses on its save screen.
 - `loginfixture`: a stand-in for another app with login forms, which the
-  autofill tests fill. Never shipped.
+  autofill tests fill and sign in to. Never shipped.
 
 To fill with it, pick Open Secret Manager in the phone's settings (or
 from "Fill logins in other apps…" in the app). Chrome 135 and later uses
@@ -59,7 +60,9 @@ synchronized with these):
   the vault in the app switcher.
 - `AutoFill`: the AutoFill extension. Once turned on (the app asks iOS
   from "Fill logins in other apps…"), it fills a login into another app or
-  a page after the owner unlocks and chooses it on its own screen.
+  a page after the owner unlocks and chooses it on its own screen, and,
+  from iOS 26.2, saves a login another app or a page sent, where the owner
+  chooses.
 - `Shared`: what both use: the vault's folder in the container they share,
   Face ID and Touch ID, who asks for a login, and the generated bindings.
 - `LoginFixture` and `UITests`: a stand-in for another app with a login
