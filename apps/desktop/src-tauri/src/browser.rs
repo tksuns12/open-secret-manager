@@ -31,9 +31,9 @@ struct Known {
     id: &'static str,
     name: &'static str,
     firefox: bool,
-    /// The browser's own folder, relative to the home folder: it is there
-    /// if the browser has been used on this account.
-    profile: &'static str,
+    /// The browser's own folders, relative to the home folder: it is there
+    /// if it has been used on this account, and one of them is.
+    profiles: &'static [&'static str],
     /// Where the browser looks for host manifests, relative to the home
     /// folder.
     hosts: &'static str,
@@ -45,35 +45,35 @@ const BROWSERS: [Known; 5] = [
         id: "chrome",
         name: "Google Chrome",
         firefox: false,
-        profile: "Library/Application Support/Google/Chrome",
+        profiles: &["Library/Application Support/Google/Chrome"],
         hosts: "Library/Application Support/Google/Chrome/NativeMessagingHosts",
     },
     Known {
         id: "chromium",
         name: "Chromium",
         firefox: false,
-        profile: "Library/Application Support/Chromium",
+        profiles: &["Library/Application Support/Chromium"],
         hosts: "Library/Application Support/Chromium/NativeMessagingHosts",
     },
     Known {
         id: "brave",
         name: "Brave",
         firefox: false,
-        profile: "Library/Application Support/BraveSoftware/Brave-Browser",
+        profiles: &["Library/Application Support/BraveSoftware/Brave-Browser"],
         hosts: "Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts",
     },
     Known {
         id: "edge",
         name: "Microsoft Edge",
         firefox: false,
-        profile: "Library/Application Support/Microsoft Edge",
+        profiles: &["Library/Application Support/Microsoft Edge"],
         hosts: "Library/Application Support/Microsoft Edge/NativeMessagingHosts",
     },
     Known {
         id: "firefox",
         name: "Firefox",
         firefox: true,
-        profile: "Library/Application Support/Firefox",
+        profiles: &["Library/Application Support/Firefox"],
         hosts: "Library/Application Support/Mozilla/NativeMessagingHosts",
     },
 ];
@@ -84,40 +84,50 @@ const BROWSERS: [Known; 5] = [
         id: "chrome",
         name: "Google Chrome",
         firefox: false,
-        profile: ".config/google-chrome",
+        profiles: &[".config/google-chrome"],
         hosts: ".config/google-chrome/NativeMessagingHosts",
     },
     Known {
         id: "chromium",
         name: "Chromium",
         firefox: false,
-        profile: ".config/chromium",
+        profiles: &[".config/chromium"],
         hosts: ".config/chromium/NativeMessagingHosts",
     },
     Known {
         id: "brave",
         name: "Brave",
         firefox: false,
-        profile: ".config/BraveSoftware/Brave-Browser",
+        profiles: &[".config/BraveSoftware/Brave-Browser"],
         hosts: ".config/BraveSoftware/Brave-Browser/NativeMessagingHosts",
     },
     Known {
         id: "edge",
         name: "Microsoft Edge",
         firefox: false,
-        profile: ".config/microsoft-edge",
+        profiles: &[".config/microsoft-edge"],
         hosts: ".config/microsoft-edge/NativeMessagingHosts",
     },
     Known {
         id: "firefox",
         name: "Firefox",
         firefox: true,
-        profile: ".mozilla/firefox",
+        // A new Firefox profile goes in the XDG folder (seen with Firefox
+        // 157), and an earlier one stays where it was; Firefox still looks
+        // for host manifests in ~/.mozilla only (tried with 157).
+        profiles: &[".mozilla/firefox", ".config/mozilla/firefox"],
         hosts: ".mozilla/native-messaging-hosts",
     },
 ];
 
 impl Known {
+    /// Whether the browser has been used on this account.
+    fn used(&self, home: &Path) -> bool {
+        self.profiles
+            .iter()
+            .any(|profile| home.join(profile).is_dir())
+    }
+
     fn manifest_path(&self, home: &Path) -> PathBuf {
         home.join(self.hosts).join(format!("{HOST_NAME}.json"))
     }
@@ -182,7 +192,7 @@ impl Browser {
         let home = self.home.as_deref().ok_or_else(unknown)?;
         let known = BROWSERS
             .iter()
-            .find(|known| known.id == id && home.join(known.profile).is_dir())
+            .find(|known| known.id == id && known.used(home))
             .ok_or_else(unknown)?;
         Ok((known, home))
     }
@@ -195,7 +205,7 @@ impl Browser {
             .flat_map(|home| {
                 BROWSERS
                     .iter()
-                    .filter(move |known| home.join(known.profile).is_dir())
+                    .filter(move |known| known.used(home))
                     .map(move |known| self.browser(known, home))
             })
             .collect();
@@ -647,4 +657,32 @@ pub async fn disconnect_browser(
         Err(error) => return Err(storage(error)),
     }
     Ok(state.browser.status())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_browser_is_there_when_any_of_its_folders_is() {
+        let firefox = Known {
+            id: "firefox",
+            name: "Firefox",
+            firefox: true,
+            profiles: &[".mozilla/firefox", ".config/mozilla/firefox"],
+            hosts: ".mozilla/native-messaging-hosts",
+        };
+        let home = tempfile::tempdir().unwrap();
+        assert!(!firefox.used(home.path()));
+        // Only the folder a new Firefox makes on Linux.
+        std::fs::create_dir_all(home.path().join(".config/mozilla/firefox")).unwrap();
+        assert!(firefox.used(home.path()));
+        // Linux's own list has both, and the manifests where Firefox reads them.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let known = BROWSERS.iter().find(|known| known.id == "firefox").unwrap();
+            assert_eq!(known.profiles, firefox.profiles);
+            assert_eq!(known.hosts, firefox.hosts);
+        }
+    }
 }

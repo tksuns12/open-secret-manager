@@ -26,7 +26,7 @@ before the release are upgraded when opened.
 | macOS 14 and 15 on Apple Silicon | The app installs (its minimum is macOS 14), but it was not run on them. |
 | macOS on Intel | Not built. |
 | Linux, x86_64 (`.deb`) | **Built, not verified.** Made in a container from Ubuntu 22.04, so it needs no newer system libraries than 22.04 has. No Linux desktop has run it. Locking when the computer sleeps or the screen locks, and keeping copied codes out of clipboard history, exist only on macOS. |
-| Linux, arm64 | The packaging script builds it on request; not built for the release. |
+| Linux, arm64 | The packaging script builds it on request; not built for the release. A build of the Phase 9 code ran in an Ubuntu 22.04 container under a virtual display with a window manager: a vault made, a login added, Firefox 157 connected and filled through its extension. Not a desktop session (no GNOME or KDE), and the same limits as x86_64. |
 | Windows | **Not supported.** The app was never built for Windows, and its browser fill does not exist there. |
 | Android (9 and later, 64-bit ARM) | **Not yet a release.** The release build, shrunk and signed as it ships, joined a desktop-side device and synced on an Android 16 emulator; no real phone has run it ([phone-trial.md](phone-trial.md) is what is left). Other kinds of phone refuse to install it. |
 | iOS (17 and later, iPhone) | **Not yet a release.** Built for iPhones unsigned; tested only in an iOS 26.3 simulator. Running it on any iPhone needs an Apple developer team, which the project does not have yet. |
