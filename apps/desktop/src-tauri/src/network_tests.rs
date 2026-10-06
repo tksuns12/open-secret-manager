@@ -1058,6 +1058,95 @@ fn a_removed_device_is_reset_and_joins_again() {
     });
 }
 
+/// Marks a device store as a later version's, as `claim_store_version`
+/// reads it.
+fn mark_later(store: &Path) {
+    rusqlite::Connection::open(store)
+        .unwrap()
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+}
+
+#[test]
+fn a_device_store_of_a_later_version_is_refused_by_name_and_left_as_it_is() {
+    for store in ["peers.sqlite3", "invitations.sqlite3"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.sqlite3");
+        drop(network::Network::open(&path).unwrap());
+        mark_later(&dir.path().join(store));
+        let before = std::fs::read(dir.path().join(store)).unwrap();
+
+        let Err(refused) = network::Network::open(&path) else {
+            panic!("{store} of a later version was opened");
+        };
+        assert_eq!(refused.code, "later_version");
+        assert_eq!(
+            refused.message,
+            format!("{store} was written by a later version of Open Secret Manager")
+        );
+        assert_eq!(std::fs::read(dir.path().join(store)).unwrap(), before);
+    }
+}
+
+#[test]
+fn a_vault_file_this_build_cannot_open_keeps_what_is_beside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.sqlite3");
+    drop(Vault::create(&path, PASSWORD).unwrap());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE vault_meta SET format_version = 8", [])
+        .unwrap();
+    // Its control-plane database, which a launch without a vault would
+    // take for what an abandoned join left.
+    std::fs::write(dir.path().join("control.sqlite3"), b"a later control plane").unwrap();
+
+    let app = shell(dir.path());
+    let handle = app.handle().clone();
+    tauri::async_runtime::block_on(async move {
+        assert!(crate::vault_problem(handle.state())
+            .await
+            .unwrap()
+            .is_some());
+        network::start(&handle);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    assert_eq!(
+        std::fs::read(dir.path().join("control.sqlite3")).unwrap(),
+        b"a later control plane"
+    );
+}
+
+#[test]
+fn a_control_plane_database_of_a_later_version_is_left_as_it_is_and_said_to_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.sqlite3");
+    drop(Vault::create(&path, PASSWORD).unwrap());
+    let control = dir.path().join("control.sqlite3");
+    mark_later(&control);
+    let before = std::fs::read(&control).unwrap();
+
+    let app = shell(dir.path());
+    let handle = app.handle().clone();
+    let status = tauri::async_runtime::block_on(async move {
+        network::start(&handle);
+        for _ in 0..100 {
+            let status = network::sync_status(handle.state()).await.unwrap();
+            if status.state == "error" {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the failure was never said");
+    });
+    let message = status.message.unwrap();
+    assert!(
+        message.starts_with("control.sqlite3 cannot be opened: "),
+        "{message}"
+    );
+    assert_eq!(std::fs::read(&control).unwrap(), before);
+}
+
 #[test]
 fn a_reset_interrupted_after_removal_is_finished_at_launch() {
     let dir = tempfile::tempdir().unwrap();

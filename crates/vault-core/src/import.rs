@@ -213,6 +213,7 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
             custom_fields,
             tags: Vec::new(),
             favorite: source.favorite,
+            unknown_fields: BTreeMap::new(),
         });
     }
     Ok((items, warnings))
@@ -327,6 +328,7 @@ fn parse_csv(bytes: &[u8], flavor: CsvFlavor) -> Result<(Vec<Item>, Vec<ImportWa
             custom_fields: BTreeMap::new(),
             tags: Vec::new(),
             favorite: false,
+            unknown_fields: BTreeMap::new(),
         });
     }
     Ok((items, warnings))

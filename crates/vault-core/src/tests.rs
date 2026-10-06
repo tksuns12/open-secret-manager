@@ -63,6 +63,75 @@ fn locked_lifecycle_and_revision_conflicts() {
     assert!(matches!(vault.get(&item_id), Err(Error::NotFound)));
 }
 
+/// An item as a later build would write it: this build's fields, and two
+/// it does not know, one holding a secret.
+const LATER_ITEM: &str = r#"{"id":"later","title":"Mail","kind":"login","username":"me","password":"old","url":"https://mail.example.test","notes":"","totp_secret":null,"custom_fields":{},"tags":[],"favorite":false,"passkey":{"credential":"secret key","counter":3},"colour":"blue"}"#;
+
+#[test]
+fn fields_of_a_later_build_stay_through_an_edit_a_reopen_and_a_backup() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, recovery) = Vault::create(&path, "initial password").unwrap();
+    let item: Item = serde_json::from_str(LATER_ITEM).unwrap();
+    assert_eq!(item.unknown_fields.len(), 2);
+    let first = vault.put(item).unwrap();
+
+    // An edit as the apps make one: from the stored item, changing a field
+    // this build shows.
+    let mut edited = vault.get("later").unwrap().item;
+    edited.password = "new".into();
+    vault.update(edited, &first.revision).unwrap();
+    let later = |item: &Item| {
+        (
+            item.unknown_fields["colour"].clone(),
+            item.unknown_fields["passkey"]["credential"].clone(),
+        )
+    };
+    let expected = (serde_json::json!("blue"), serde_json::json!("secret key"));
+    let now = vault.get("later").unwrap().item;
+    assert_eq!(now.password, "new");
+    assert_eq!(later(&now), expected);
+    assert_eq!(vault.history("later").unwrap()[0].changed, ["password"]);
+
+    // Written into the revision, so another reading of the file has them.
+    drop(vault);
+    let mut vault = Vault::open(&path).unwrap();
+    vault.unlock("initial password").unwrap();
+    assert_eq!(later(&vault.get("later").unwrap().item), expected);
+
+    // And a backup carries them.
+    let backup = dir.path().join("vault.osmbackup");
+    vault.export_backup(&backup).unwrap();
+    let restored = dir.path().join("restored.db");
+    let restored =
+        Vault::restore_backup(&backup, &restored, &recovery, "new device password").unwrap();
+    assert_eq!(later(&restored.get("later").unwrap().item), expected);
+}
+
+#[test]
+fn an_items_fields_come_once_each_and_an_unknown_one_never_takes_a_known_name() {
+    let twice = |field: &str| {
+        let with = LATER_ITEM.replacen("\"title\"", &format!("{field},\"title\""), 1);
+        serde_json::from_str::<Item>(&with).is_err()
+    };
+    assert!(twice(r#""username":"again""#));
+    assert!(twice(r#""colour":"red""#));
+
+    // This build's own items gain nothing when written.
+    let mut mine = login("Mine");
+    mine.id = "mine".into();
+    let written = serde_json::to_value(&mine).unwrap();
+    assert_eq!(written.as_object().unwrap().len(), 11);
+    assert_eq!(serde_json::from_value::<Item>(written).unwrap(), mine);
+
+    let dir = tempdir().unwrap();
+    let (mut vault, _) = Vault::create(dir.path().join("vault.db"), "initial password").unwrap();
+    let mut item = login("Taken");
+    item.unknown_fields
+        .insert("password".into(), serde_json::json!("other"));
+    assert!(matches!(vault.put(item), Err(Error::InvalidItem(_))));
+}
+
 #[test]
 fn an_items_history_lists_every_version_and_an_earlier_version_or_a_deleted_item_comes_back() {
     let dir = tempdir().unwrap();

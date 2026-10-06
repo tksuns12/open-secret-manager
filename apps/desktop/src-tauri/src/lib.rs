@@ -21,7 +21,7 @@ mod network;
 mod network_tests;
 mod settings;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use osm_vault_core::{Item, ItemKind, ItemSummary, PasswordPolicy, Vault, VaultItem};
 use serde::{Deserialize, Serialize};
@@ -710,12 +710,41 @@ async fn enable_recovery(
     vault.enable_recovery(&recovery).map_err(Into::into)
 }
 
+/// Why the app could not start on this computer's files, if it could not.
+struct StartupProblem(Option<String>);
+
+/// For the window, before anything else: why the app could not start, in
+/// place of the vault, or nothing when it started.
+#[tauri::command]
+fn startup_problem(state: tauri::State<'_, StartupProblem>) -> Option<String> {
+    state.0.clone()
+}
+
+/// The window alone, saying why the app cannot start on the files beside
+/// the vault: nothing else runs, and nothing is written.
+fn run_refused(context: tauri::Context<tauri::Wry>, vault_path: &Path, problem: String) {
+    let folder = vault_path.parent().unwrap_or(Path::new("."));
+    tauri::Builder::default()
+        .manage(StartupProblem(Some(format!(
+            "{problem}. The files are in {}.",
+            folder.display()
+        ))))
+        .invoke_handler(tauri::generate_handler![startup_problem])
+        .run(context)
+        .expect("error while running Open Secret Manager");
+}
+
 pub fn run() {
+    let context = tauri::generate_context!();
     let path = default_vault_path();
     network::finish_interrupted_recovery(&path);
-    let network = network::Network::open(&path).expect("could not open the peer store");
+    let network = match network::Network::open(&path) {
+        Ok(network) => network,
+        Err(problem) => return run_refused(context, &path, problem.message),
+    };
     let browser = browser::Browser::open(&path);
     tauri::Builder::default()
+        .manage(StartupProblem(None))
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
             archive: Mutex::new(None),
@@ -733,6 +762,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            startup_problem,
             vault_status,
             vault_problem,
             lock_vault,
@@ -796,7 +826,7 @@ pub fn run() {
             settings::settings,
             settings::set_auto_lock
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running Open Secret Manager");
 }
 
@@ -830,6 +860,11 @@ mod tests {
         item.totp_secret = Some("JBSWY3DPEHPK3PXP".into());
         item.custom_fields.insert("pin".into(), "1234".into());
         item.tags.push("work".into());
+        // A field of a later build's, which this one does not know.
+        item.unknown_fields.insert(
+            "passkey".into(),
+            serde_json::json!({ "credential": "secret" }),
+        );
         item
     }
 
@@ -846,6 +881,7 @@ mod tests {
             Some("1234")
         );
         assert_eq!(item.tags, ["work"]);
+        assert_eq!(item.unknown_fields, stored().unknown_fields);
     }
 
     #[test]

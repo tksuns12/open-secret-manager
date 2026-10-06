@@ -246,6 +246,7 @@ pub async fn copy_from_archive<R: Runtime>(
     copy.custom_fields = source.custom_fields.clone();
     copy.tags = source.tags.clone();
     copy.favorite = source.favorite;
+    copy.unknown_fields = source.unknown_fields.clone();
     vault.put(copy)?;
     network::schedule_sync(&app);
     items(opened, Some(vault))

@@ -101,6 +101,21 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A device store that would not open: the device cannot be used, as with a
+/// vault file it cannot open, and the store is named, and said to be a later
+/// version's when it is. It is left as it is.
+fn store_problem(file: &str, error: osm_vault_peer::Error) -> MobileError {
+    let reason = if matches!(
+        error,
+        osm_vault_peer::Error::Sync(osm_vault_sync::Error::UnsupportedVersion)
+    ) {
+        format!("{file} was written by a later version of Open Secret Manager")
+    } else {
+        format!("{file} cannot be opened: {error}")
+    };
+    MobileError::UnreadableVault { reason }
+}
+
 impl Runtime {
     pub(crate) async fn open(directory: PathBuf, port: u16) -> Result<Self, MobileError> {
         std::fs::create_dir_all(&directory)?;
@@ -120,8 +135,10 @@ impl Runtime {
             None
         };
         let peers_path = directory.join(PEERS_FILE);
-        let peers = PeerStore::open(&peers_path)?;
-        let addresses = AddressBook::open(&peers_path)?;
+        let peers =
+            PeerStore::open(&peers_path).map_err(|error| store_problem(PEERS_FILE, error))?;
+        let addresses =
+            AddressBook::open(&peers_path).map_err(|error| store_problem(PEERS_FILE, error))?;
         let removed = directory.join(REMOVED_MARKER).exists();
         Ok(Self {
             port,

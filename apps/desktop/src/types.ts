@@ -332,6 +332,8 @@ export type DesktopBridge = {
   foundControlPlane: () => Promise<void>;
   removeDevice: (device: string) => Promise<void>;
   cancelEnrollment: () => Promise<void>;
+  /** Why the app could not start on this computer's files, or `null` when it started; asked before anything else. */
+  startupProblem: () => Promise<string | null>;
   /** Why the vault file on this device cannot be opened, or `null` if there is none or it opens. */
   vaultProblem: () => Promise<string | null>;
   /** Moves a vault file that cannot be opened to an archive folder; resolves to that folder. */

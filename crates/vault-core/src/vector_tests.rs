@@ -473,19 +473,20 @@ fn the_frozen_vault_is_laid_out_as_the_encodings_say() {
     assert_eq!(read, 11 + 2 + 1);
 }
 
-/// The fields of an item are part of record format 2. A build that adds
-/// one must write a later record format, because a build that does not know
-/// the field reads the item without it and would drop it on the next edit.
+/// The fields of an item are part of record format 2. Since Phase 8 a
+/// build keeps a field it does not know and writes it back after its own,
+/// so that an edit here does not drop a later build's field; builds from
+/// before drop it.
 #[test]
-fn an_items_fields_are_fixed_and_one_it_does_not_know_is_not_kept() {
+fn an_items_fields_are_fixed_and_one_it_does_not_know_is_kept_after_them() {
     let item: Item = serde_json::from_str(
         r#"{"id":"i","title":"t","kind":"card","username":"","password":"","url":"","notes":"",
-            "totp_secret":null,"custom_fields":{},"tags":[],"favorite":false,"added_later":"x"}"#,
+            "added_later":"x","totp_secret":null,"custom_fields":{},"tags":[],"favorite":false}"#,
     )
     .unwrap();
     assert_eq!(
         serde_json::to_string(&item).unwrap(),
-        r#"{"id":"i","title":"t","kind":"card","username":"","password":"","url":"","notes":"","totp_secret":null,"custom_fields":{},"tags":[],"favorite":false}"#
+        r#"{"id":"i","title":"t","kind":"card","username":"","password":"","url":"","notes":"","totp_secret":null,"custom_fields":{},"tags":[],"favorite":false,"added_later":"x"}"#
     );
     // Every field has to be there, a kind has to be one of the four, and a
     // field given twice is refused.

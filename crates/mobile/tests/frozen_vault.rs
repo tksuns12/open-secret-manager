@@ -532,3 +532,73 @@ fn logins_and_notes_are_created_edited_and_deleted_and_the_rest_is_left_to_a_com
         "ItemDraft { kind: Login, .. }"
     );
 }
+
+#[test]
+fn an_edit_or_a_saved_password_keeps_the_fields_of_a_later_build() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    // A login a later build wrote, with a field this one does not know.
+    {
+        let mut vault = osm_vault_core::Vault::open(folder.join("vault.sqlite3")).unwrap();
+        vault.unlock(PASSWORD).unwrap();
+        let item: osm_vault_core::Item = serde_json::from_str(
+            r#"{"id":"later","title":"Later","kind":"login","username":"me","password":"old","url":"https://later.example.test","notes":"","totp_secret":null,"custom_fields":{},"tags":[],"favorite":false,"passkey":{"credential":"secret key"}}"#,
+        )
+        .unwrap();
+        vault.put(item).unwrap();
+    }
+    let kept = |folder: &std::path::Path| {
+        let mut vault = osm_vault_core::Vault::open(folder.join("vault.sqlite3")).unwrap();
+        vault.unlock(PASSWORD).unwrap();
+        let item = vault.get("later").unwrap().item;
+        (
+            item.username.clone(),
+            item.password.clone(),
+            item.unknown_fields["passkey"]["credential"].clone(),
+        )
+    };
+
+    let device = Device::open_listening_on(folder.clone(), 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    let later = device.item("later".into()).unwrap();
+    let mut edit = draft("Later", ItemKind::Login);
+    edit.username = "someone else".into();
+    edit.password = None;
+    device
+        .update_item("later".into(), later.revision, edit)
+        .unwrap();
+    let later = device.item("later".into()).unwrap();
+    device
+        .update_password("later".into(), later.revision, "saved password".into())
+        .unwrap();
+    drop(device);
+
+    assert_eq!(
+        kept(&folder),
+        (
+            "someone else".to_owned(),
+            "saved password".to_owned(),
+            serde_json::json!("secret key")
+        )
+    );
+}
+
+#[test]
+fn a_peer_store_of_a_later_version_makes_the_device_unreadable_and_is_left_as_it_is() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    drop(Device::open_listening_on(folder.clone(), 0).unwrap());
+    let store = folder.join("peers.sqlite3");
+    rusqlite::Connection::open(&store)
+        .unwrap()
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+    let before = std::fs::read(&store).unwrap();
+
+    let Err(MobileError::UnreadableVault { reason }) = Device::open_listening_on(folder, 0) else {
+        panic!("a peer store of a later version was opened");
+    };
+    assert_eq!(
+        reason,
+        "peers.sqlite3 was written by a later version of Open Secret Manager"
+    );
+    assert_eq!(std::fs::read(&store).unwrap(), before);
+}

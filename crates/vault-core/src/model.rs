@@ -1,6 +1,10 @@
 use std::{collections::BTreeMap, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{Error as _, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use serde_json::Value;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -27,12 +31,80 @@ pub struct Item {
     pub custom_fields: BTreeMap<String, String>,
     pub tags: Vec<String>,
     pub favorite: bool,
+    /// The fields of a later build that this one does not know, as they
+    /// were read, so that an edit here writes them back rather than drops
+    /// them. Empty in an item this build made. None may have the name of a
+    /// field above.
+    #[serde(flatten, deserialize_with = "unknown_fields")]
+    pub unknown_fields: BTreeMap<String, Value>,
+}
+
+/// This build's names for an item's fields, which an unknown field may not
+/// take.
+const KNOWN_FIELDS: [&str; 11] = [
+    "id",
+    "title",
+    "kind",
+    "username",
+    "password",
+    "url",
+    "notes",
+    "totp_secret",
+    "custom_fields",
+    "tags",
+    "favorite",
+];
+
+/// The fields an item's JSON has besides this build's, each once: a field
+/// given twice is refused, as one of this build's is.
+fn unknown_fields<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Value>, D::Error> {
+    struct Fields;
+
+    impl<'de> Visitor<'de> for Fields {
+        type Value = BTreeMap<String, Value>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an item's fields")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut fields = BTreeMap::new();
+            while let Some(name) = map.next_key::<String>()? {
+                let value = map.next_value()?;
+                if let Some(mut earlier) = fields.insert(name, value) {
+                    zeroize_value(&mut earlier);
+                    return Err(A::Error::custom("an item field is given twice"));
+                }
+            }
+            Ok(fields)
+        }
+    }
+
+    deserializer.deserialize_map(Fields)
+}
+
+/// Wipes the text in a value, where whatever secret it holds would be.
+fn zeroize_value(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(values) => values.iter_mut().for_each(zeroize_value),
+        Value::Object(fields) => {
+            for (mut name, mut value) in std::mem::take(fields) {
+                name.zeroize();
+                zeroize_value(&mut value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 impl Item {
     /// The fields this item has changed from `before`, by name: `title`,
     /// `type`, `username`, `password`, `website`, `one-time code`, `notes`,
-    /// `other fields`, `tags`, `favorite`. Names only, never values.
+    /// `other fields`, `tags`, `favorite`, and `fields of a later version`
+    /// for those this build does not know. Names only, never values.
     pub fn changed_from(&self, before: &Item) -> Vec<&'static str> {
         [
             (before.title != self.title, "title"),
@@ -45,6 +117,10 @@ impl Item {
             (before.custom_fields != self.custom_fields, "other fields"),
             (before.tags != self.tags, "tags"),
             (before.favorite != self.favorite, "favorite"),
+            (
+                before.unknown_fields != self.unknown_fields,
+                "fields of a later version",
+            ),
         ]
         .into_iter()
         .filter_map(|(changed, name)| changed.then_some(name))
@@ -69,6 +145,10 @@ impl Drop for Item {
             tag.zeroize();
         }
         self.tags.clear();
+        for (mut name, mut value) in std::mem::take(&mut self.unknown_fields) {
+            name.zeroize();
+            zeroize_value(&mut value);
+        }
     }
 }
 
@@ -97,6 +177,7 @@ impl Default for Item {
             custom_fields: BTreeMap::new(),
             tags: Vec::new(),
             favorite: false,
+            unknown_fields: BTreeMap::new(),
         }
     }
 }
@@ -125,6 +206,15 @@ impl Item {
         {
             return Err(crate::Error::InvalidItem(
                 "TOTP secret must not be empty".into(),
+            ));
+        }
+        if self
+            .unknown_fields
+            .keys()
+            .any(|name| KNOWN_FIELDS.contains(&name.as_str()))
+        {
+            return Err(crate::Error::InvalidItem(
+                "an unknown field has the name of a known one".into(),
             ));
         }
         Ok(())

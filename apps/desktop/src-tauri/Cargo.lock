@@ -3007,6 +3007,7 @@ dependencies = [
  "osm-vault-membership",
  "osm-vault-peer",
  "osm-vault-sync",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

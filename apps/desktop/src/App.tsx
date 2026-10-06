@@ -1034,6 +1034,18 @@ function RestorePanel({ onCancel, onRestored, onNotice }: { onCancel: () => void
 
 /** A vault file is on this device that cannot be opened. Nothing can be
  * made over it, so the owner has it put away first. */
+/** In place of the whole window when the app could not start on this
+ * computer's files: what it found, and nothing to do here but read it. */
+export function StartupProblem({ problem }: { problem: string }) {
+  return <main className="app-shell">
+    <div className="empty-detail startup-problem">
+      <CircleAlert size={25} /><h2>Open Secret Manager cannot start on this computer's files</h2>
+      <span>{problem}</span>
+      <span>If a later version of this app wrote them, install that version again. Nothing was changed, and nothing runs until then.</span>
+    </div>
+  </main>;
+}
+
 function UnreadablePanel({ problem, onPutAway }: { problem: string; onPutAway: () => void }) {
   return <div className="empty-detail">
     <CircleAlert size={25} /><h2>This device's vault cannot be opened</h2>

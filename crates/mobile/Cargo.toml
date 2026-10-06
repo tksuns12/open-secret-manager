@@ -28,11 +28,13 @@ bindgen = ["uniffi/cli"]
 osm-vault-core = { path = "../vault-core" }
 osm-vault-membership = { path = "../vault-membership" }
 osm-vault-peer = { path = "../vault-peer" }
+osm-vault-sync = { path = "../vault-sync" }
 thiserror = "2.0.17"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 uniffi = "0.32"
 zeroize = "1.8.2"
 
 [dev-dependencies]
-osm-vault-sync = { path = "../vault-sync" }
+rusqlite = { version = "0.40.2", default-features = false }
+serde_json = "1.0.149"
 tempfile = "3.24.0"

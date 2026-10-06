@@ -63,9 +63,9 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 
 pub struct SyncStatus {
     /// `local` (no other device to sync with), `idle`, `syncing`, `synced`,
     /// `received`, `error`, or `removed`.
-    state: &'static str,
+    pub(crate) state: &'static str,
     last_synced_at: Option<u64>,
-    message: Option<String>,
+    pub(crate) message: Option<String>,
     /// How many other devices this one syncs with.
     devices: usize,
     /// Revisions received while locked, waiting for unlock.
@@ -136,19 +136,23 @@ struct JoinState {
 }
 
 impl Network {
+    /// Opens this device's peer and invitation stores beside the vault. A
+    /// store a later version wrote is refused, untouched, by name.
     pub fn open(vault_path: &Path) -> Result<Self, CommandError> {
         let directory = vault_path.parent().unwrap_or(Path::new(".")).to_owned();
         std::fs::create_dir_all(&directory).map_err(storage_error)?;
         let peers_path = directory.join("peers.sqlite3");
-        let peers = PeerStore::open(&peers_path).map_err(network_error)?;
-        let addresses = AddressBook::open(&peers_path).map_err(network_error)?;
+        let peers =
+            PeerStore::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
+        let addresses =
+            AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
         // One-use invitation tokens are recorded durably so a restart
         // cannot make a used token valid again.
         let invitations = InvitationStore::open(
             directory.join("invitations.sqlite3"),
             InvitationPolicy::default(),
         )
-        .map_err(|error| network_error(error.into()))?;
+        .map_err(|error| store_error("invitations.sqlite3", error.into()))?;
         let removed = directory.join(REMOVED_MARKER).exists();
         Ok(Self {
             directory,
@@ -397,16 +401,16 @@ fn with_stores_closed<T>(
         .map_err(|error| network_error(error.into()))?;
     let result = step();
     let peers_path = net.directory.join("peers.sqlite3");
-    *peers = PeerStore::open(&peers_path).map_err(network_error)?;
+    *peers = PeerStore::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
     *net.addresses
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        AddressBook::open(&peers_path).map_err(network_error)?;
+        AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
     *invitations = InvitationStore::open(
         net.directory.join("invitations.sqlite3"),
         InvitationPolicy::default(),
     )
-    .map_err(|error| network_error(error.into()))?;
+    .map_err(|error| store_error("invitations.sqlite3", error.into()))?;
     result
 }
 
@@ -560,13 +564,21 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let net = network(&app);
-        let identity = {
+        let (unreadable, identity) = {
             let app_state = app.state::<AppState>();
             let vault = app_state.vault.lock().await;
-            vault
-                .as_ref()
-                .and_then(|vault| Some((vault.vault_id(), vault.device_id()?)))
+            (
+                vault.is_none() && app_state.path.symlink_metadata().is_ok(),
+                vault
+                    .as_ref()
+                    .and_then(|vault| Some((vault.vault_id(), vault.device_id()?))),
+            )
         };
+        // A vault file this build cannot open, a later version's or a
+        // damaged one: what is beside it belongs to it, and stays as it is.
+        if unreadable {
+            return;
+        }
         let Some((vault_id, device)) = identity else {
             // Without a vault, a control database is what an unfinished
             // join left: its device identity is gone.
@@ -583,8 +595,20 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         if !net.control_path().exists() {
             return;
         }
-        let Ok(control) = start_control(&app, vault_id, device_id_from_bytes(device)).await else {
-            return;
+        let control = match start_control(&app, vault_id, device_id_from_bytes(device)).await {
+            Ok(control) => control,
+            Err(error) => {
+                // Left as it is, most likely a later version's: this
+                // device does not take part, and says why.
+                update_status(&app, |status| {
+                    status.state = "error";
+                    status.message = Some(format!(
+                        "control.sqlite3 cannot be opened: {}",
+                        error.message
+                    ));
+                });
+                return;
+            }
         };
         // A node that was never initialized and received nothing belongs
         // to no control plane: an in-place join was abandoned.
@@ -2027,6 +2051,25 @@ fn storage_error(error: std::io::Error) -> CommandError {
     CommandError {
         code: "storage",
         message: error.to_string(),
+    }
+}
+
+/// A device store that would not open, named, and said to be a later
+/// version's when it is.
+fn store_error(file: &str, error: osm_vault_peer::Error) -> CommandError {
+    if matches!(
+        error,
+        osm_vault_peer::Error::Sync(osm_vault_sync::Error::UnsupportedVersion)
+    ) {
+        CommandError {
+            code: "later_version",
+            message: format!("{file} was written by a later version of Open Secret Manager"),
+        }
+    } else {
+        CommandError {
+            code: "storage",
+            message: format!("{file} cannot be opened: {error}"),
+        }
     }
 }
 
