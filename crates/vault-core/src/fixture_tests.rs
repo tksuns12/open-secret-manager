@@ -17,8 +17,17 @@ use crate::{epoch_key_check, Error, Item, RecoveryKey, Vault};
 
 /// Every storage format there has been, and the backup format its code
 /// wrote.
-const FORMATS: [(u32, u32); 7] = [(1, 1), (2, 2), (3, 3), (4, 3), (5, 3), (6, 4), (7, 4)];
-pub(crate) const CURRENT: u32 = 7;
+const FORMATS: [(u32, u32); 8] = [
+    (1, 1),
+    (2, 2),
+    (3, 3),
+    (4, 3),
+    (5, 3),
+    (6, 4),
+    (7, 4),
+    (8, 4),
+];
+pub(crate) const CURRENT: u32 = 8;
 const CURRENT_BACKUP: u32 = 4;
 
 /// This crate's folder: where it was built, or `OSM_TEST_CRATE_DIR` when the
@@ -160,6 +169,7 @@ fn a_vault_written_by_every_earlier_format_opens_with_its_content_and_keeps_work
         vault.unlock(expected.password()).unwrap();
         assert_basic_content(&vault, &expected, format != 1);
         assert_eq!(format_in(&path), CURRENT, "format {format}");
+        assert!(!vault.rows_changed(), "format {format}");
 
         // It stays readable: locked and unlocked again, and opened again.
         vault.lock();
@@ -669,15 +679,15 @@ fn a_changed_bit_in_any_authenticated_value_of_the_vault_file_is_refused() {
     })));
 }
 
-/// The file proves that what it shows was written by an authorized device.
-/// It does not prove that nothing is missing: the set of rows is not
-/// authenticated, so whoever can write the file can hide an item or an
-/// edit, though not show anything else in its place.
+/// The file proves that what it shows was written by an authorized device,
+/// and since format 8 that nothing was taken out of it or changed: heads
+/// taken out, or set back to an earlier version, are set again from the
+/// revisions at the next unlock, and the owner is told.
 #[test]
-fn rows_taken_out_of_the_vault_file_hide_an_item_without_an_error() {
-    let hidden = |change: &'static str| {
-        let expected = Expected::of(CURRENT);
-        let (_dir, path) = copy_of(CURRENT);
+fn an_item_or_an_edit_hidden_in_the_vault_file_comes_back_and_is_said() {
+    let expected = Expected::of(CURRENT);
+    let opened = |change: &str| {
+        let (dir, path) = copy_of(CURRENT);
         let connection = Connection::open(&path).unwrap();
         for trigger in TRIGGERS {
             connection
@@ -688,29 +698,38 @@ fn rows_taken_out_of_the_vault_file_hide_an_item_without_an_error() {
         drop(connection);
         let mut vault = Vault::open(&path).unwrap();
         vault.unlock_with_recovery(&expected.recovery()).unwrap();
-        let listed: Vec<String> = vault
-            .list()
-            .unwrap()
-            .into_iter()
-            .map(|item| item.id)
-            .collect();
-        (
-            listed,
-            vault
-                .get("fixture-bank")
-                .map(|found| found.item.title.clone()),
-        )
+        (dir, vault)
     };
-    let (listed, bank) = hidden("DELETE FROM heads WHERE item_id = 'fixture-bank'");
-    assert!(!listed.contains(&"fixture-bank".to_owned()));
-    assert!(matches!(bank, Err(Error::NotFound)));
-    // An edit marked as a deletion is likewise missing, not shown.
-    let (listed, bank) = hidden(
+    let (_dir, untouched) = opened("");
+    assert!(!untouched.rows_changed());
+
+    // An item's head taken out: the item is back.
+    let (_dir, vault) = opened("DELETE FROM heads WHERE item_id = 'fixture-bank'");
+    assert!(vault.rows_changed());
+    assert_eq!(
+        vault.get("fixture-bank").unwrap().revision,
+        untouched.get("fixture-bank").unwrap().revision
+    );
+    // An edit hidden by setting the head back to an earlier version: the
+    // edit is back.
+    let (_dir, vault) = opened(
+        "UPDATE heads SET revision = (SELECT r.revision FROM revisions r \
+         WHERE r.item_id = heads.item_id AND r.revision <> heads.revision LIMIT 1) \
+         WHERE item_id = 'fixture-mail'",
+    );
+    assert!(vault.rows_changed());
+    assert_eq!(
+        vault.get("fixture-mail").unwrap().revision,
+        untouched.get("fixture-mail").unwrap().revision
+    );
+    // An edit marked as a deletion: the revision's row itself was changed,
+    // against its ID, so the item stays missing, but the owner is told.
+    let (_dir, vault) = opened(
         "UPDATE revisions SET tombstone = 1 WHERE item_id = 'fixture-bank';
          UPDATE heads SET tombstone = 1 WHERE item_id = 'fixture-bank';",
     );
-    assert!(!listed.contains(&"fixture-bank".to_owned()));
-    assert!(matches!(bank, Err(Error::NotFound)));
+    assert!(vault.rows_changed());
+    assert!(matches!(vault.get("fixture-bank"), Err(Error::NotFound)));
 }
 
 #[test]
@@ -719,12 +738,12 @@ fn a_format_from_the_future_is_refused_and_the_file_left_alone() {
     let (dir, path) = copy_of(CURRENT);
     Connection::open(&path)
         .unwrap()
-        .execute("UPDATE vault_meta SET format_version = 8", [])
+        .execute("UPDATE vault_meta SET format_version = 9", [])
         .unwrap();
     let before = std::fs::read(&path).unwrap();
     assert!(matches!(
         Vault::open(&path),
-        Err(Error::UnsupportedVersion(8))
+        Err(Error::UnsupportedVersion(9))
     ));
     assert!(std::fs::read(&path).unwrap() == before);
 
@@ -965,4 +984,89 @@ fn a_password_hashing_cost_outside_its_bounds_is_refused_before_it_is_paid() {
             "{column} = {value}"
         );
     }
+}
+
+/// Takes rows out of a closed vault's file, as anyone who can write the
+/// file can, past the triggers that stop the app itself. Returns how many
+/// rows the statement changed.
+pub(crate) fn take_out(path: &Path, statement: &str) -> usize {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER IF EXISTS revisions_no_delete;
+             DROP TRIGGER IF EXISTS epoch_keys_no_delete;
+             DROP TRIGGER IF EXISTS revoked_devices_no_delete;",
+        )
+        .unwrap();
+    connection.execute(statement, []).unwrap()
+}
+
+#[test]
+fn a_format_7_vault_is_sealed_at_its_first_unlock_and_cannot_be_set_back() {
+    let expected = Expected::of(7);
+    let (_dir, path) = copy_of(7);
+    let mut vault = Vault::open(&path).unwrap();
+    assert_eq!(format_in(&path), 7, "sealing needs the key");
+    vault.unlock(expected.password()).unwrap();
+    assert_eq!(format_in(&path), 8);
+    assert!(!vault.rows_changed());
+    drop(vault);
+    let mut vault = Vault::open(&path).unwrap();
+    vault.unlock(expected.password()).unwrap();
+    assert!(!vault.rows_changed());
+    drop(vault);
+    // Set back to format 7 by hand, so that an unlock would seal it again
+    // over whatever had been taken out: the signing key is under format
+    // 8's label now, so the vault does not unlock, and stays as it is.
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE vault_meta SET format_version = 7", [])
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut vault = Vault::open(&path).unwrap();
+    assert!(matches!(
+        vault.unlock(expected.password()),
+        Err(Error::Crypto)
+    ));
+    drop(vault);
+    assert!(std::fs::read(&path).unwrap() == before);
+}
+
+#[test]
+fn a_row_taken_out_of_a_sealed_vault_never_goes_unnoticed() {
+    let expected = Expected::of(CURRENT);
+    for (what, statement) in [
+        (
+            "an earlier version",
+            "DELETE FROM revisions WHERE revision IN \
+             (SELECT revision FROM revisions WHERE revision NOT IN (SELECT revision FROM heads) LIMIT 1)",
+        ),
+        ("a removed device's mark", "DELETE FROM revoked_devices"),
+        (
+            "an earlier epoch's key",
+            "DELETE FROM epoch_keys WHERE epoch < (SELECT current_epoch FROM vault_meta)",
+        ),
+        (
+            "another author",
+            "DELETE FROM devices WHERE device_id <> (SELECT device_id FROM vault_meta)",
+        ),
+        ("the seal itself", "UPDATE vault_meta SET row_seal = NULL"),
+        (
+            "the seal, changed",
+            "UPDATE vault_meta SET row_seal = zeroblob(72)",
+        ),
+    ] {
+        let (_dir, path) = copy_of(CURRENT);
+        assert!(take_out(&path, statement) > 0, "nothing to take: {what}");
+        // It still opens, and says so.
+        let mut vault = Vault::open(&path).unwrap();
+        vault.unlock(expected.password()).unwrap();
+        assert!(vault.rows_changed(), "{what} taken out went unnoticed");
+    }
+    // Untouched, it says nothing.
+    let (_dir, path) = copy_of(CURRENT);
+    let mut vault = Vault::open(&path).unwrap();
+    vault.unlock(expected.password()).unwrap();
+    assert!(!vault.rows_changed());
 }

@@ -84,6 +84,35 @@ class AppTest {
     }
 
     @Test
+    fun recordsTakenOutOfTheFileAreSaidAfterUnlockingUntilConfirmed() {
+        // The format 8 fixture with the first version of Mail taken out
+        // (prepare.sh makes it).
+        session.reopenForTests { folder ->
+            BiometricUnlock(instrumentation.targetContext).disable()
+            instrumentation.context.assets.open("sealed-taken-out-vault.sqlite3").use { input ->
+                File(folder, "vault.sqlite3").outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("rows-changed")
+        compose.onNodeWithTag("item:Mail").assertExists()
+        compose.onNodeWithTag("rows-changed-ok").performClick()
+        compose.waitUntil(10_000) { !session.state.value.rowsChanged }
+        compose.onNodeWithTag("rows-changed").assertDoesNotExist()
+        // Confirmed, it is not said again.
+        compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
+        compose.waitUntil(10_000) { session.state.value.screen == Screen.LOCKED }
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Bank")
+        compose.onNodeWithTag("rows-changed").assertDoesNotExist()
+    }
+
+    @Test
     fun syncingWhileClosedIsScheduledUntilTurnedOff() {
         val context = instrumentation.targetContext
         BackgroundSync.set(context, true)

@@ -602,3 +602,40 @@ fn a_peer_store_of_a_later_version_makes_the_device_unreadable_and_is_left_as_it
     );
     assert_eq!(std::fs::read(&store).unwrap(), before);
 }
+
+#[test]
+fn records_taken_out_of_the_file_are_said_after_unlocking_until_confirmed() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    // Sealed at its first unlock (format 8), then the first version of Mail
+    // taken out past the trigger the app keeps.
+    let device = Device::open_listening_on(folder.clone(), 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    assert!(!device.rows_changed());
+    drop(device);
+    let connection = rusqlite::Connection::open(folder.join("vault.sqlite3")).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER revisions_no_delete;")
+        .unwrap();
+    let taken = connection
+        .execute(
+            "DELETE FROM revisions WHERE item_id='fixture-mail' AND parents=''",
+            [],
+        )
+        .unwrap();
+    assert_eq!(taken, 1);
+    drop(connection);
+
+    let device = Device::open_listening_on(folder.clone(), 0).unwrap();
+    assert!(!device.rows_changed(), "nothing is said while locked");
+    device.unlock(PASSWORD.into()).unwrap();
+    assert!(device.rows_changed());
+    device.lock();
+    device.unlock(PASSWORD.into()).unwrap();
+    assert!(device.rows_changed(), "said again until confirmed");
+    device.confirm_rows_changed().unwrap();
+    assert!(!device.rows_changed());
+    drop(device);
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    assert!(!device.rows_changed());
+}

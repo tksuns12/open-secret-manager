@@ -315,6 +315,7 @@ private fun Items(state: UiState, session: VaultSession) {
             it.url.contains(query, ignoreCase = true)
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+        if (state.rowsChanged) RowsChanged(session)
         OutlinedTextField(
             value = query,
             onValueChange = { query = it },
@@ -367,6 +368,25 @@ private fun AutofillOffer() {
         },
         modifier = Modifier.testTag("turn-on-autofill"),
     ) { Text("Fill logins in other apps…") }
+}
+
+/** An unlock found records taken out of the vault's file or changed in it. */
+@Composable
+private fun RowsChanged(session: VaultSession) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("rows-changed")) {
+        Text(
+            "Something in this vault's file was taken out or changed",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.error,
+        )
+        Text(
+            "Since this phone last wrote to it, something outside the app removed or changed records in the vault's file: " +
+                "an item, an edit, or a device's keys. Your other devices send back what they have at the next sync.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        TextButton(onClick = session::confirmRowsChanged, modifier = Modifier.testTag("rows-changed-ok")) { Text("I understand") }
+        HorizontalDivider()
+    }
 }
 
 @Composable

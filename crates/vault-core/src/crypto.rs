@@ -127,10 +127,108 @@ pub(crate) fn device_key_aad(
     device_id: &[u8; DEVICE_ID_LEN],
     public_key: &[u8; PUBLIC_KEY_LEN],
 ) -> Vec<u8> {
-    let mut aad = b"osm-device-signing-key-v1\0".to_vec();
+    device_key_aad_labelled(
+        b"osm-device-signing-key-v1\0",
+        vault_id,
+        device_id,
+        public_key,
+    )
+}
+
+/// From format 8: the same, under a label of its own, so that a file whose
+/// header is set back to an earlier format no longer unlocks, rather than
+/// being taken for one that was never sealed.
+pub(crate) fn sealed_device_key_aad(
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    public_key: &[u8; PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    device_key_aad_labelled(
+        b"osm-device-signing-key-v2\0",
+        vault_id,
+        device_id,
+        public_key,
+    )
+}
+
+fn device_key_aad_labelled(
+    label: &[u8],
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    public_key: &[u8; PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    let mut aad = label.to_vec();
     aad.extend_from_slice(vault_id);
     aad.extend_from_slice(device_id);
     aad.extend_from_slice(public_key);
+    aad
+}
+
+/// The keys of the rows a vault never changes or removes: revision IDs,
+/// authorized and revoked device IDs, and epochs.
+pub(crate) struct RowSets {
+    pub revisions: Vec<String>,
+    pub devices: Vec<Vec<u8>>,
+    pub revoked: Vec<Vec<u8>>,
+    pub epochs: Vec<u64>,
+}
+
+/// From format 8: the key of the row seal, HMAC-SHA256 under the root key
+/// of `osm-row-seal-key-v1`.
+pub(crate) fn row_seal_key(root_key: &[u8; KEY_LEN]) -> Result<Zeroizing<[u8; 32]>> {
+    let mut derive = <Hmac<Sha256> as Mac>::new_from_slice(root_key).map_err(|_| Error::Crypto)?;
+    derive.update(b"osm-row-seal-key-v1");
+    Ok(Zeroizing::new(derive.finalize().into_bytes().into()))
+}
+
+/// One row's mark: HMAC-SHA256 under the row seal key over
+/// `osm-row-mark-v1`, NUL, the name of the row's table, NUL, and the row's
+/// key (a revision ID as its 64 characters, a device ID as its 16 bytes,
+/// an epoch as 64 bits).
+pub(crate) fn row_mark(seal_key: &[u8; 32], table: &str, key: &[u8]) -> Result<[u8; 32]> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(seal_key).map_err(|_| Error::Crypto)?;
+    mac.update(b"osm-row-mark-v1\0");
+    mac.update(table.as_bytes());
+    mac.update(&[0]);
+    mac.update(key);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// What the row seal keeps: the XOR of the marks of every row in the sets.
+/// It is kept encrypted, so a row can be added to it without reading the
+/// others, and not taken out by anyone who cannot open it.
+pub(crate) fn row_marks(seal_key: &[u8; 32], sets: &RowSets) -> Result<[u8; 32]> {
+    let mut marks = [0; 32];
+    let mut add = |table: &str, key: &[u8]| -> Result<()> {
+        xor_into(&mut marks, &row_mark(seal_key, table, key)?);
+        Ok(())
+    };
+    for revision in &sets.revisions {
+        add("revisions", revision.as_bytes())?;
+    }
+    for device in &sets.devices {
+        add("devices", device)?;
+    }
+    for device in &sets.revoked {
+        add("revoked_devices", device)?;
+    }
+    for epoch in &sets.epochs {
+        add("epoch_keys", &epoch.to_be_bytes())?;
+    }
+    Ok(marks)
+}
+
+pub(crate) fn xor_into(marks: &mut [u8; 32], mark: &[u8; 32]) {
+    for (byte, other) in marks.iter_mut().zip(mark) {
+        *byte ^= other;
+    }
+}
+
+/// The row seal is the marks encrypted by the root key under this AAD:
+/// `osm-row-seal-v1`, NUL, and the vault ID.
+pub(crate) fn row_seal_aad(vault_id: &[u8; 32]) -> Vec<u8> {
+    let mut aad = b"osm-row-seal-v1\0".to_vec();
+    aad.extend_from_slice(vault_id);
     aad
 }
 

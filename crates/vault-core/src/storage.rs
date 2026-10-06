@@ -16,9 +16,10 @@ use crate::{
         decrypt, derive_password_key, device_authorization, device_key_aad, device_revocation,
         encrypt, epoch_key_aad, key_wrap_aad, keys_equal, legacy_record_aad, legacy_revision_id,
         random_array, recipient_key_aad, record_aad, recovery_check, revision_id,
-        revision_signature_message, verify_device_authorization, verify_device_revocation,
-        verify_recovery_check, KdfConfig, SecretKey, DEVICE_ID_LEN, KEY_LEN, NONCE_LEN,
-        PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
+        revision_signature_message, row_mark, row_marks, row_seal_aad, row_seal_key,
+        sealed_device_key_aad, verify_device_authorization, verify_device_revocation,
+        verify_recovery_check, xor_into, KdfConfig, RowSets, SecretKey, DEVICE_ID_LEN, KEY_LEN,
+        NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
     BackupCheck, DeletedItem, Error, FillCredentials, ForkReport, HistoryVersion, IngressReport,
     Item, ItemKind, ItemSummary, ItemVersion, Origin, QuarantinedRevision, RecoveryKey, Result,
@@ -28,8 +29,12 @@ use crate::{
 /// Storage layout: a per-device root key wraps the device key, the HPKE
 /// recipient secret, the authorized-author and revocation MACs, and the
 /// vault's epoch keys; a write fence holds writes until a committed epoch is
-/// active.
-const VAULT_FORMAT_VERSION: u32 = 7;
+/// active; and a seal under the root key covers the rows that are never
+/// changed or removed, so that one taken out shows.
+const VAULT_FORMAT_VERSION: u32 = 8;
+/// Format 8 without the row seal; sealed at the next unlock, which needs the
+/// root key.
+const MEMBERSHIP_FORMAT_VERSION: u32 = 7;
 /// Per-device root keys without revocations, a recipient secret, or a write
 /// fence; gains them when opened, without the key.
 const ROOT_KEY_FORMAT_VERSION: u32 = 6;
@@ -95,7 +100,9 @@ CREATE TABLE vault_meta (
     recipient_nonce BLOB CHECK(recipient_nonce IS NULL OR length(recipient_nonce) = 24),
     recipient_wrapped_secret BLOB
         CHECK(recipient_wrapped_secret IS NULL OR length(recipient_wrapped_secret) = 48),
-    write_fence INTEGER NOT NULL DEFAULT 1 CHECK(write_fence >= 1)
+    write_fence INTEGER NOT NULL DEFAULT 1 CHECK(write_fence >= 1),
+    row_seal BLOB CHECK(row_seal IS NULL OR length(row_seal) = 72),
+    rows_changed INTEGER NOT NULL DEFAULT 0 CHECK(rows_changed IN (0, 1))
 ) STRICT;
 "#;
 
@@ -107,6 +114,30 @@ ALTER TABLE vault_meta ADD COLUMN recipient_nonce BLOB
 ALTER TABLE vault_meta ADD COLUMN recipient_wrapped_secret BLOB
     CHECK(recipient_wrapped_secret IS NULL OR length(recipient_wrapped_secret) = 48);
 ALTER TABLE vault_meta ADD COLUMN write_fence INTEGER NOT NULL DEFAULT 1 CHECK(write_fence >= 1);
+"#;
+
+/// The connection's own record of the sealed rows it adds, so that each
+/// write adds their marks to the seal without reading every row. These are
+/// temporary: they live in the connection's memory, never in the file, and
+/// a write that is rolled back takes its entries with it.
+const SEAL_TRACKING: &str = r#"
+CREATE TEMP TABLE IF NOT EXISTS sealed_rows_added(set_name TEXT NOT NULL, row_key ANY);
+CREATE TEMP TRIGGER IF NOT EXISTS sealed_revision_added AFTER INSERT ON main.revisions
+BEGIN INSERT INTO sealed_rows_added VALUES('revisions', CAST(NEW.revision AS BLOB)); END;
+CREATE TEMP TRIGGER IF NOT EXISTS sealed_device_added AFTER INSERT ON main.devices
+BEGIN INSERT INTO sealed_rows_added VALUES('devices', NEW.device_id); END;
+CREATE TEMP TRIGGER IF NOT EXISTS sealed_revocation_added AFTER INSERT ON main.revoked_devices
+BEGIN INSERT INTO sealed_rows_added VALUES('revoked_devices', NEW.device_id); END;
+CREATE TEMP TRIGGER IF NOT EXISTS sealed_epoch_added AFTER INSERT ON main.epoch_keys
+BEGIN INSERT INTO sealed_rows_added VALUES('epoch_keys', NEW.epoch); END;
+"#;
+
+/// Format 8 columns, added to a format 7 `vault_meta` at the unlock that
+/// seals it: the seal, and whether an unlock found it broken and the owner
+/// has not yet been told.
+const FORMAT_8_COLUMNS: &str = r#"
+ALTER TABLE vault_meta ADD COLUMN row_seal BLOB CHECK(row_seal IS NULL OR length(row_seal) = 72);
+ALTER TABLE vault_meta ADD COLUMN rows_changed INTEGER NOT NULL DEFAULT 0 CHECK(rows_changed IN (0, 1));
 "#;
 
 /// Authorized devices that committed membership has removed. Their stored
@@ -340,6 +371,9 @@ struct Header {
     /// when committed membership activates a later epoch; it works while
     /// locked, so writes stop until this device has that epoch's key.
     write_fence: u64,
+    /// An unlock or a write found rows taken out of the file or changed in
+    /// it, and the owner has not confirmed seeing it.
+    rows_changed: bool,
 }
 
 #[derive(Clone)]
@@ -507,7 +541,7 @@ impl Vault {
         let kdf = KdfConfig::default();
         let password_salt = random_array::<SALT_LEN>();
         let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &root_key)?;
-        let (device, _) = generate_device(&root_key, &vault_id)?;
+        let (device, _) = generate_device(&root_key, &vault_id, VAULT_FORMAT_VERSION)?;
         let recipient = wrap_recipient_secret(
             &root_key,
             &vault_id,
@@ -528,10 +562,12 @@ impl Vault {
             device: Some(device),
             recipient: Some(recipient),
             write_fence: FIRST_EPOCH,
+            rows_changed: false,
         };
         insert_header(&connection, &header)?;
         insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
         store_epoch_key(&connection, &root_key, &vault_id, FIRST_EPOCH, &epoch_key)?;
+        seal_rows(&connection, &root_key, &vault_id)?;
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
         vault.activate(root_key, None)?;
@@ -682,11 +718,19 @@ impl Vault {
         if self.header.format_version == ROOT_KEY_FORMAT_VERSION {
             self.migrate_add_membership()?;
         }
+        if self.header.format_version == MEMBERSHIP_FORMAT_VERSION {
+            self.migrate_seal(&root_key)?;
+        }
         let device = self.header.device.as_ref().ok_or(Error::Crypto)?;
         let seed = decrypt(
             &root_key,
             &device.key_nonce,
-            &device_key_aad(&self.header.vault_id, &device.device_id, &device.public_key),
+            &signing_key_aad(
+                self.header.format_version,
+                &self.header.vault_id,
+                &device.device_id,
+                &device.public_key,
+            ),
             &device.wrapped_signing_key,
         )
         .map_err(|_| Error::Crypto)?;
@@ -705,6 +749,7 @@ impl Vault {
         }
         let revoked = load_revocations(&self.connection, &root_key, &self.header.vault_id)?;
         let recipient_secret = self.recipient_secret_or_create(&root_key)?;
+        self.check_seal(&root_key)?;
         self.root_key = Some(root_key);
         self.epoch_keys = epoch_keys;
         self.signing_key = Some(signing_key);
@@ -712,6 +757,157 @@ impl Vault {
         self.revoked = revoked;
         self.recipient_secret = Some(recipient_secret);
         self.session = Some(UnlockSession::new(random_array()));
+        Ok(())
+    }
+
+    /// Seals a format 7 vault in one transaction: adds the format 8 columns,
+    /// rewraps this device's signing key under the format 8 label, and seals
+    /// the rows. Another connection may have done it since this one read
+    /// the header.
+    fn migrate_seal(&mut self, root_key: &SecretKey) -> Result<()> {
+        let vault_id = self.header.vault_id;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = transaction.query_row(
+            "SELECT format_version FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == MEMBERSHIP_FORMAT_VERSION {
+            let device = self.header.device.clone().ok_or(Error::Crypto)?;
+            let seed = decrypt(
+                root_key,
+                &device.key_nonce,
+                &device_key_aad(&vault_id, &device.device_id, &device.public_key),
+                &device.wrapped_signing_key,
+            )
+            .map_err(|_| Error::Crypto)?;
+            let key_nonce = random_array::<NONCE_LEN>();
+            let wrapped_signing_key = encrypt(
+                root_key,
+                &key_nonce,
+                &sealed_device_key_aad(&vault_id, &device.device_id, &device.public_key),
+                &seed,
+            )?;
+            // A file written by this build's schema has them already.
+            let has_columns: i64 = transaction.query_row(
+                "SELECT count(*) FROM pragma_table_info('vault_meta') WHERE name='row_seal'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_columns == 0 {
+                transaction.execute_batch(FORMAT_8_COLUMNS)?;
+            }
+            transaction.execute(
+                "UPDATE vault_meta SET format_version=?, device_key_nonce=?, \
+                 device_wrapped_signing_key=? WHERE singleton=1",
+                params![
+                    VAULT_FORMAT_VERSION,
+                    key_nonce.as_slice(),
+                    wrapped_signing_key
+                ],
+            )?;
+            seal_rows(&transaction, root_key, &vault_id)?;
+        }
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(())
+    }
+
+    /// Checks, as the vault unlocks, that no row was taken out of its file
+    /// or changed in it: the seal over the rows never changed or removed;
+    /// each revision's columns against its ID, which covers them; and the
+    /// heads against the revisions they follow from (an item's revisions
+    /// that none of its others name as a parent). Anything found is recorded
+    /// for the owner to be told; the heads are set again from the
+    /// revisions, and the rows left sealed again, so later writes keep the
+    /// seal. A revision that is missing comes back from the vault's other
+    /// devices at the next sync, as anything this device lacks does.
+    fn check_seal(&mut self, root_key: &SecretKey) -> Result<()> {
+        let vault_id = self.header.vault_id;
+        self.connection.execute_batch(SEAL_TRACKING)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored: Option<Vec<u8>> = transaction.query_row(
+            "SELECT row_seal FROM vault_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let marks = row_marks(&*row_seal_key(root_key)?, &row_sets(&transaction)?)?;
+        let sealed = stored
+            .and_then(|stored| open_row_seal(root_key, &vault_id, &stored))
+            .is_some_and(|stored| keys_equal(&stored, &marks));
+
+        let mut revisions_intact = true;
+        let mut named = BTreeSet::new();
+        let mut follows = BTreeMap::new();
+        {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT r.revision,{REVISION_COLUMNS} FROM revisions r"
+            ))?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let revision = row_to_revision_at(row, 1)?;
+                revisions_intact &= revision.revision_id() == id;
+                named.extend(revision.parents);
+                follows.insert(id, (revision.item_id, revision.tombstone));
+            }
+        }
+        for parent in &named {
+            follows.remove(parent);
+        }
+        let mut heads = BTreeMap::new();
+        {
+            let mut statement =
+                transaction.prepare("SELECT revision, item_id, tombstone FROM heads")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                heads.insert(row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?));
+            }
+        }
+        let heads_intact = heads == follows;
+        if !heads_intact {
+            transaction.execute("DELETE FROM heads", [])?;
+            for (revision, (item_id, tombstone)) in &follows {
+                transaction.execute(
+                    "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,?)",
+                    params![revision, item_id, tombstone],
+                )?;
+            }
+        }
+        if !(sealed && revisions_intact && heads_intact) {
+            transaction.execute("UPDATE vault_meta SET rows_changed=1 WHERE singleton=1", [])?;
+        }
+        if sealed {
+            forget_added_rows(&transaction)?;
+        } else {
+            store_row_seal(&transaction, root_key, &vault_id, &marks)?;
+            forget_added_rows(&transaction)?;
+        }
+        transaction.commit()?;
+        self.header = read_header(&self.connection)?;
+        Ok(())
+    }
+
+    /// Whether an unlock found rows taken out of the vault's file or changed
+    /// in it, and the owner has not yet confirmed seeing it. Such rows are
+    /// revisions and heads (an item, or an edit, hidden), authorized or
+    /// removed devices, and epoch keys. Heads are set right at that unlock;
+    /// what is missing comes back from the vault's other devices at the
+    /// next sync.
+    pub fn rows_changed(&self) -> bool {
+        self.header.rows_changed
+    }
+
+    /// The owner has seen that rows were taken out: stop saying so.
+    pub fn confirm_rows_changed(&mut self) -> Result<()> {
+        self.key()?;
+        self.connection
+            .execute("UPDATE vault_meta SET rows_changed=0 WHERE singleton=1", [])?;
+        self.header = read_header(&self.connection)?;
         Ok(())
     }
 
@@ -776,7 +972,8 @@ impl Vault {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 rows
             };
-            let (device, signing_key) = generate_device(master_key, &vault_id)?;
+            let (device, signing_key) =
+                generate_device(master_key, &vault_id, SHARED_KEY_FORMAT_VERSION)?;
             let mut header = self.header.clone();
             header.format_version = SHARED_KEY_FORMAT_VERSION;
             header.device = Some(device);
@@ -936,7 +1133,7 @@ impl Vault {
             transaction.execute_batch(REVOCATIONS_SCHEMA)?;
             transaction.execute(
                 "UPDATE vault_meta SET format_version=? WHERE singleton=1",
-                [VAULT_FORMAT_VERSION],
+                [MEMBERSHIP_FORMAT_VERSION],
             )?;
         }
         transaction.commit()?;
@@ -1010,8 +1207,11 @@ impl Vault {
     ) -> Result<()> {
         let key = self.key()?.clone();
         let verifying = VerifyingKey::from_bytes(&public_key).map_err(|_| Error::Crypto)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_device_authorization(
-            &self.connection,
+            &transaction,
             &key,
             &self.header,
             &DeviceRecord {
@@ -1019,6 +1219,8 @@ impl Vault {
                 public_key,
             },
         )?;
+        reseal(&transaction, &key, &self.header.vault_id)?;
+        transaction.commit()?;
         self.devices.insert(device_id, verifying);
         Ok(())
     }
@@ -1352,6 +1554,7 @@ impl Vault {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
+        let (seal_key, seal_vault) = (self.key()?.clone(), self.header.vault_id);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1369,6 +1572,7 @@ impl Vault {
                 parents: Vec::new(),
             });
         }
+        reseal(&transaction, &seal_key, &seal_vault)?;
         transaction.commit()?;
         Ok(revisions)
     }
@@ -1448,6 +1652,7 @@ impl Vault {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
+        let (seal_key, seal_vault) = (self.key()?.clone(), self.header.vault_id);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1459,6 +1664,7 @@ impl Vault {
                 params![revision_id, revision.item_id],
             )?;
         }
+        reseal(&transaction, &seal_key, &seal_vault)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1771,7 +1977,7 @@ impl Vault {
         let kdf = KdfConfig::default();
         let password_salt = random_array::<SALT_LEN>();
         let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &root_key)?;
-        let (device, _) = generate_device(&root_key, &vault_id)?;
+        let (device, _) = generate_device(&root_key, &vault_id, VAULT_FORMAT_VERSION)?;
         let recipient = wrap_recipient_secret(
             &root_key,
             &vault_id,
@@ -1792,6 +1998,7 @@ impl Vault {
             device: Some(device),
             recipient: Some(recipient),
             write_fence: FIRST_EPOCH,
+            rows_changed: false,
         };
         insert_header(&connection, &header)?;
         insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
@@ -1801,6 +2008,7 @@ impl Vault {
         for record in &payload.epoch_keys {
             store_epoch_key(&connection, &root_key, &vault_id, record.epoch, &record.key)?;
         }
+        seal_rows(&connection, &root_key, &vault_id)?;
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
         vault.activate(root_key, None)?;
@@ -2085,6 +2293,7 @@ impl Vault {
             revision: id.clone(),
             parents: revision.parents.clone(),
         };
+        let (seal_key, seal_vault) = (self.key()?.clone(), self.header.vault_id);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2128,6 +2337,7 @@ impl Vault {
         // A staged copy is consumed by the same transaction that accepts it.
         transaction.execute("DELETE FROM ingress WHERE revision=?", [&id])?;
         replace_heads(&transaction, &revision, &id)?;
+        reseal(&transaction, &seal_key, &seal_vault)?;
         transaction.commit()?;
         Ok(info)
     }
@@ -2304,6 +2514,16 @@ fn check_parents(connection: &Connection, revision: &EncryptedRevision) -> Resul
 fn replace_heads(connection: &Connection, revision: &EncryptedRevision, id: &str) -> Result<()> {
     for parent in &revision.parents {
         connection.execute("DELETE FROM heads WHERE revision=?", [parent])?;
+    }
+    // A revision that arrives after one naming it, as one taken out of the
+    // file and fetched again does, is not a head.
+    let mut statement = connection.prepare("SELECT parents FROM revisions WHERE item_id=?")?;
+    let mut rows = statement.query([&revision.item_id])?;
+    while let Some(row) = rows.next()? {
+        let parents = split_parents(&row.get::<_, String>(0)?).ok_or(Error::Crypto)?;
+        if parents.iter().any(|parent| parent == id) {
+            return Ok(());
+        }
     }
     connection.execute(
         "INSERT INTO heads(revision,item_id,tombstone) VALUES(?,?,?)",
@@ -2532,6 +2752,7 @@ fn read_header(connection: &Connection) -> Result<Header> {
             | QUARANTINE_FORMAT_VERSION
             | SHARED_KEY_FORMAT_VERSION
             | ROOT_KEY_FORMAT_VERSION
+            | MEMBERSHIP_FORMAT_VERSION
             | VAULT_FORMAT_VERSION
     ) {
         return Err(Error::UnsupportedVersion(version));
@@ -2547,16 +2768,21 @@ fn read_header(connection: &Connection) -> Result<Header> {
     } else {
         "NULL,NULL,NULL,1"
     };
-    let membership_columns = if version == VAULT_FORMAT_VERSION {
+    let membership_columns = if version >= MEMBERSHIP_FORMAT_VERSION {
         "recipient_nonce,recipient_wrapped_secret,write_fence"
     } else {
         "NULL,NULL,1"
+    };
+    let seal_columns = if version == VAULT_FORMAT_VERSION {
+        "rows_changed"
+    } else {
+        "0"
     };
     let row = connection.query_row(
         &format!(
             "SELECT vault_id,kdf_memory_kib,kdf_iterations,kdf_parallelism,password_salt,\
              password_nonce,password_wrapped_key,recovery_nonce,recovery_wrapped_key,{device_columns},\
-             {root_columns},{membership_columns} FROM vault_meta WHERE singleton=1"
+             {root_columns},{membership_columns},{seal_columns} FROM vault_meta WHERE singleton=1"
         ),
         [],
         |row| Ok((
@@ -2578,9 +2804,10 @@ fn read_header(connection: &Connection) -> Result<Header> {
                 row.get::<_, Option<Vec<u8>>>(17)?, row.get::<_, Option<Vec<u8>>>(18)?,
                 row.get::<_, i64>(19)?,
             ),
+            row.get::<_, i64>(20)?,
         )),
     )?;
-    let (base, device_row, root_row, membership_row) = row;
+    let (base, device_row, root_row, membership_row, rows_changed) = row;
     let device = match device_row {
         (Some(device_id), Some(public_key), Some(key_nonce), Some(wrapped_signing_key)) => {
             Some(DeviceHeader {
@@ -2624,6 +2851,7 @@ fn read_header(connection: &Connection) -> Result<Header> {
         device,
         recipient: key_wrapper(membership_row.0, membership_row.1)?,
         write_fence,
+        rows_changed: rows_changed != 0,
     })
 }
 
@@ -2812,11 +3040,131 @@ impl Header {
     }
 }
 
+/// The label a device signing key is wrapped under in a vault of `format`.
+fn signing_key_aad(
+    format: u32,
+    vault_id: &[u8; 32],
+    device_id: &[u8; DEVICE_ID_LEN],
+    public_key: &[u8; PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    if format >= VAULT_FORMAT_VERSION {
+        sealed_device_key_aad(vault_id, device_id, public_key)
+    } else {
+        device_key_aad(vault_id, device_id, public_key)
+    }
+}
+
+/// The keys of the rows the seal covers.
+fn row_sets(connection: &Connection) -> Result<RowSets> {
+    fn column<T: rusqlite::types::FromSql>(connection: &Connection, sql: &str) -> Result<Vec<T>> {
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+    Ok(RowSets {
+        revisions: column(
+            connection,
+            "SELECT revision FROM revisions ORDER BY revision",
+        )?,
+        devices: column(
+            connection,
+            "SELECT device_id FROM devices ORDER BY device_id",
+        )?,
+        revoked: column(
+            connection,
+            "SELECT device_id FROM revoked_devices ORDER BY device_id",
+        )?,
+        epochs: column::<i64>(connection, "SELECT epoch FROM epoch_keys ORDER BY epoch")?
+            .into_iter()
+            .map(|epoch| u64::try_from(epoch).map_err(|_| Error::Crypto))
+            .collect::<Result<_>>()?,
+    })
+}
+
+/// Seals the rows never changed or removed, from all of them: when a vault
+/// is made or reaches format 8, and when an unlock finds the seal broken.
+fn seal_rows(connection: &Connection, root_key: &SecretKey, vault_id: &[u8; 32]) -> Result<()> {
+    let marks = row_marks(&*row_seal_key(root_key)?, &row_sets(connection)?)?;
+    store_row_seal(connection, root_key, vault_id, &marks)?;
+    forget_added_rows(connection)
+}
+
+/// Adds to the seal the rows added since it was last written, which the
+/// connection's own triggers listed (`SEAL_TRACKING`). Called in the
+/// transaction that adds them, so the seal always matches what that
+/// transaction leaves, and costs the same however many rows there are. A
+/// seal that no longer opens was broken since the unlock: the owner is told
+/// at the next one, and the rows are sealed from all of them.
+fn reseal(connection: &Connection, root_key: &SecretKey, vault_id: &[u8; 32]) -> Result<()> {
+    let stored: Option<Vec<u8>> = connection.query_row(
+        "SELECT row_seal FROM vault_meta WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let Some(mut marks) = stored.and_then(|stored| open_row_seal(root_key, vault_id, &stored))
+    else {
+        connection.execute("UPDATE vault_meta SET rows_changed=1 WHERE singleton=1", [])?;
+        return seal_rows(connection, root_key, vault_id);
+    };
+    let seal_key = row_seal_key(root_key)?;
+    let mut statement =
+        connection.prepare("SELECT set_name, row_key FROM temp.sealed_rows_added")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        let key: Vec<u8> = if table == "epoch_keys" {
+            let epoch = u64::try_from(row.get::<_, i64>(1)?).map_err(|_| Error::Crypto)?;
+            epoch.to_be_bytes().to_vec()
+        } else {
+            row.get(1)?
+        };
+        xor_into(&mut marks, &row_mark(&seal_key, &table, &key)?);
+    }
+    drop(rows);
+    drop(statement);
+    store_row_seal(connection, root_key, vault_id, &marks)?;
+    forget_added_rows(connection)
+}
+
+fn store_row_seal(
+    connection: &Connection,
+    root_key: &SecretKey,
+    vault_id: &[u8; 32],
+    marks: &[u8; 32],
+) -> Result<()> {
+    let nonce = random_array::<NONCE_LEN>();
+    let mut seal = nonce.to_vec();
+    seal.extend_from_slice(&encrypt(root_key, &nonce, &row_seal_aad(vault_id), marks)?);
+    connection.execute("UPDATE vault_meta SET row_seal=? WHERE singleton=1", [seal])?;
+    Ok(())
+}
+
+/// The marks a stored seal holds, or nothing if it does not open.
+fn open_row_seal(root_key: &SecretKey, vault_id: &[u8; 32], stored: &[u8]) -> Option<[u8; 32]> {
+    let (nonce, sealed) = stored.split_first_chunk::<NONCE_LEN>()?;
+    let marks = decrypt(root_key, nonce, &row_seal_aad(vault_id), sealed).ok()?;
+    marks.as_slice().try_into().ok()
+}
+
+fn forget_added_rows(connection: &Connection) -> Result<()> {
+    let tracking: bool = connection.query_row(
+        "SELECT count(*) > 0 FROM sqlite_temp_master WHERE name='sealed_rows_added'",
+        [],
+        |row| row.get(0),
+    )?;
+    if tracking {
+        connection.execute("DELETE FROM temp.sealed_rows_added", [])?;
+    }
+    Ok(())
+}
+
 /// Creates a random device identity whose signing key is wrapped by the
-/// device's root key (the shared vault key in older formats).
+/// device's root key (the shared vault key in older formats), under the
+/// label of the vault's `format`.
 fn generate_device(
     master_key: &SecretKey,
     vault_id: &[u8; 32],
+    format: u32,
 ) -> Result<(DeviceHeader, SigningKey)> {
     let seed = Zeroizing::new(random_array::<32>());
     let signing_key = SigningKey::from_bytes(&seed);
@@ -2826,7 +3174,7 @@ fn generate_device(
     let wrapped_signing_key = encrypt(
         master_key,
         &key_nonce,
-        &device_key_aad(vault_id, &device_id, &public_key),
+        &signing_key_aad(format, vault_id, &device_id, &public_key),
         seed.as_ref(),
     )?;
     Ok((
@@ -3282,12 +3630,12 @@ impl Vault {
         if self.revoked.contains(&device_id) {
             return Ok(false);
         }
-        insert_revocation(
-            &self.connection,
-            &root_key,
-            &self.header.vault_id,
-            &device_id,
-        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_revocation(&transaction, &root_key, &self.header.vault_id, &device_id)?;
+        reseal(&transaction, &root_key, &self.header.vault_id)?;
+        transaction.commit()?;
         self.revoked.insert(device_id);
         Ok(true)
     }
@@ -3358,7 +3706,7 @@ impl Vault {
         let wrapped_signing_key = encrypt(
             &root_key,
             &key_nonce,
-            &device_key_aad(&vault_id, &device.device_id, &public_key),
+            &sealed_device_key_aad(&vault_id, &device.device_id, &public_key),
             device.seed.as_ref(),
         )?;
         let recipient =
@@ -3382,6 +3730,7 @@ impl Vault {
             }),
             recipient: Some(recipient),
             write_fence: material.current_epoch,
+            rows_changed: false,
         };
         insert_header(&connection, &header)?;
         insert_device_authorization(&connection, &root_key, &header, &header.device_record()?)?;
@@ -3415,6 +3764,7 @@ impl Vault {
             }
             insert_revocation(&connection, &root_key, &vault_id, device_id)?;
         }
+        seal_rows(&connection, &root_key, &vault_id)?;
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
         vault.activate(root_key, None)?;
@@ -3447,13 +3797,12 @@ impl Vault {
         if self.epoch_keys.len() >= MAX_EPOCHS {
             return Err(Error::Crypto);
         }
-        store_epoch_key(
-            &self.connection,
-            &root_key,
-            &self.header.vault_id,
-            epoch,
-            key,
-        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        store_epoch_key(&transaction, &root_key, &self.header.vault_id, epoch, key)?;
+        reseal(&transaction, &root_key, &self.header.vault_id)?;
+        transaction.commit()?;
         self.epoch_keys.insert(epoch, Zeroizing::new(*key));
         Ok(())
     }
@@ -3655,7 +4004,7 @@ impl Vault {
         let wrapped_signing_key = encrypt(&root_key, &key_nonce, &device_aad, &seed)?;
         let password = wrap_with(password_key, &vault_id, b"password", &root_key)?;
         let mut header = self.header.clone();
-        header.format_version = VAULT_FORMAT_VERSION;
+        header.format_version = MEMBERSHIP_FORMAT_VERSION;
         header.password_nonce = password.nonce;
         header.password_wrapped_key = password.wrapped_key;
         header.legacy_recovery = header.recovery.take();
@@ -3712,7 +4061,8 @@ impl Vault {
         let kdf = KdfConfig::default();
         let password_salt = random_array::<SALT_LEN>();
         let password = wrap_with_password(password, &password_salt, kdf, &vault_id, &shared_key)?;
-        let (device, signing_key) = generate_device(&shared_key, &vault_id)?;
+        let (device, signing_key) =
+            generate_device(&shared_key, &vault_id, SHARED_KEY_FORMAT_VERSION)?;
         let header = Header {
             format_version: SHARED_KEY_FORMAT_VERSION,
             vault_id,
@@ -3727,6 +4077,7 @@ impl Vault {
             device: Some(device),
             recipient: None,
             write_fence: FIRST_EPOCH,
+            rows_changed: false,
         };
         insert_header(&connection, &header)?;
         let record = header.device_record()?;

@@ -1095,7 +1095,7 @@ fn a_vault_file_this_build_cannot_open_keeps_what_is_beside_it() {
     drop(Vault::create(&path, PASSWORD).unwrap());
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute("UPDATE vault_meta SET format_version = 8", [])
+        .execute("UPDATE vault_meta SET format_version = 9", [])
         .unwrap();
     // Its control-plane database, which a launch without a vault would
     // take for what an abandoned join left.
@@ -1145,6 +1145,48 @@ fn a_control_plane_database_of_a_later_version_is_left_as_it_is_and_said_to_fail
         "{message}"
     );
     assert_eq!(std::fs::read(&control).unwrap(), before);
+}
+
+#[test]
+fn records_taken_out_of_the_file_are_said_after_unlocking_until_the_owner_confirms() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.sqlite3");
+    let (mut vault, _) = Vault::create(&path, PASSWORD).unwrap();
+    let mut old = Item::new("Edited");
+    let first = vault.put(old.clone()).unwrap();
+    old.notes = "second".into();
+    vault.update(old, &first.revision).unwrap();
+    drop(vault);
+    // An earlier version taken out, past the trigger the app keeps.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER revisions_no_delete;")
+        .unwrap();
+    connection
+        .execute("DELETE FROM revisions WHERE revision=?", [&first.revision])
+        .unwrap();
+    drop(connection);
+
+    let app = shell(dir.path());
+    let handle = app.handle().clone();
+    tauri::async_runtime::block_on(async move {
+        assert!(
+            !crate::rows_changed(handle.state()).await.unwrap(),
+            "locked"
+        );
+        let unlock = || crate::unlock_vault(PASSWORD.into(), handle.state(), handle.clone());
+        unlock().await.unwrap();
+        assert!(crate::rows_changed(handle.state()).await.unwrap());
+        // Said after every unlock until confirmed.
+        crate::lock_vault(handle.state()).await.unwrap();
+        unlock().await.unwrap();
+        assert!(crate::rows_changed(handle.state()).await.unwrap());
+        crate::confirm_rows_changed(handle.state()).await.unwrap();
+        assert!(!crate::rows_changed(handle.state()).await.unwrap());
+        crate::lock_vault(handle.state()).await.unwrap();
+        unlock().await.unwrap();
+        assert!(!crate::rows_changed(handle.state()).await.unwrap());
+    });
 }
 
 #[test]

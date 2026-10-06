@@ -199,6 +199,21 @@ impl Runtime {
         }
     }
 
+    pub(crate) async fn rows_changed(&self) -> bool {
+        self.vault
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|vault| vault.is_unlocked() && vault.rows_changed())
+    }
+
+    pub(crate) async fn confirm_rows_changed(&self) -> Result<(), MobileError> {
+        let mut vault = self.vault.lock().await;
+        let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+        vault.confirm_rows_changed()?;
+        Ok(())
+    }
+
     pub(crate) async fn items(&self) -> Result<Vec<ItemSummary>, MobileError> {
         let vault = self.vault.lock().await;
         let vault = vault.as_ref().ok_or(MobileError::NoVault)?;

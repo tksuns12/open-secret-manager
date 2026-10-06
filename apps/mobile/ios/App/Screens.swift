@@ -161,6 +161,18 @@ private struct Items: View {
 
     var body: some View {
         List {
+            if model.rowsChanged {
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Something in this vault's file was taken out or changed").font(.headline).foregroundStyle(.red)
+                        Text("Since this phone last wrote to it, something outside the app removed or changed records in the vault's file: an item, an edit, or a device's keys. Your other devices send back what they have at the next sync.")
+                            .font(.caption)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("rows-changed")
+                    Button("I understand", action: model.confirmRowsChanged).accessibilityIdentifier("rows-changed-ok")
+                }
+            }
             ForEach(shown, id: \.id) { item in
                 Button { model.open(item.id) } label: {
                     VStack(alignment: .leading, spacing: 2) {

@@ -383,6 +383,12 @@ fn a_vault_written_to_by_a_process_that_is_killed_opens_consistent_with_nothing_
                 .unlock(&password)
                 .expect("neither password opens the vault");
         }
+        // The seal is written in the same transaction as the rows it
+        // covers, so a kill never leaves the two apart.
+        assert!(
+            !vault.rows_changed(),
+            "a kill left the rows and their seal apart"
+        );
 
         // Everything it reported done is there.
         for line in &heard {
@@ -450,6 +456,7 @@ fn a_vault_being_made_when_its_process_is_killed_is_either_there_whole_or_not_th
         for n in &made {
             let mut vault = Vault::open(dir.path().join(format!("{n}.sqlite3"))).unwrap();
             vault.unlock(PASSWORDS[0]).unwrap();
+            assert!(!vault.rows_changed());
         }
         // The one under way when it was killed is whole or absent, and a new
         // one can be made in its place either way.
@@ -458,6 +465,7 @@ fn a_vault_being_made_when_its_process_is_killed_is_either_there_whole_or_not_th
         if path.exists() {
             let mut vault = Vault::open(&path).expect("a half-made vault was left in place");
             vault.unlock(PASSWORDS[0]).unwrap();
+            assert!(!vault.rows_changed());
         } else {
             Vault::create(&path, PASSWORDS[0])
                 .expect("what the crash left blocks making the vault");

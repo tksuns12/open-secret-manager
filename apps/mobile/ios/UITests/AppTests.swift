@@ -16,6 +16,26 @@ final class AppTests: UITestCase {
         XCTAssert(app.staticTexts["notice"].waitForLabel("That is not an invitation · copy it again from your computer"))
     }
 
+    func testRecordsTakenOutOfTheFileAreSaidAfterUnlockingUntilConfirmed() {
+        // The format 8 fixture with the first version of Mail taken out
+        // (prepare.sh makes it).
+        let takenOut = Bundle(for: AppTests.self).path(forResource: "sealed-taken-out-vault", ofType: "sqlite3")!
+        let app = launchApp(vault: takenOut)
+        unlock(in: app)
+        let said = app.descendants(matching: .any)["rows-changed"].firstMatch
+        XCTAssert(said.waitForExistence(timeout: 30), "the taking out was not said")
+        XCTAssert(app.buttons["item:Mail"].exists)
+        capture("app-rows-changed")
+        app.buttons["rows-changed-ok"].tap()
+        XCTAssert(said.waitForNonExistence(timeout: 15))
+        // Confirmed, it is not said again.
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        unlock(in: app)
+        XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
+        XCTAssertFalse(said.exists)
+    }
+
     func testAWrongPasswordIsRefused() {
         let app = launchApp(vault: frozenVault)
         unlock(in: app, password: "not the password")

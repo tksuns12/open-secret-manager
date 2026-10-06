@@ -202,6 +202,11 @@ export const bridge: DesktopBridge = {
     const invoke = native();
     if (invoke) await invoke("confirm_recovery_key");
   },
+  async rowsChanged() {
+    const invoke = native();
+    return invoke ? Boolean(await invoke("rows_changed")) : false;
+  },
+  confirmRowsChanged: () => nativeOnly("confirm_rows_changed"),
   enableRecovery: (recoveryKey) => nativeOnly("enable_recovery", { recoveryKey }),
   syncNow: () => nativeOnly("sync_now"),
   async listArchives() {

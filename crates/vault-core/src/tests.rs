@@ -1227,7 +1227,7 @@ fn single_head_vault_migrates_without_changing_signed_revisions() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
@@ -1536,7 +1536,7 @@ fn a_format_4_vault_gains_the_ingress_queue_when_opened_locked() {
     );
     // Re-rooting waits for a password unlock.
     vault.unlock("password").unwrap();
-    assert_eq!(version(&path), 7);
+    assert_eq!(version(&path), 8);
     assert_eq!(vault.get(&item.id).unwrap().item.title, "Before upgrade");
 }
 
@@ -2134,23 +2134,10 @@ fn a_write_fence_stops_writes_until_the_committed_epoch_is_active() {
 
 #[test]
 fn a_format_6_vault_gains_membership_fields_when_opened_locked() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("v6.db");
-    let (mut vault, _) = Vault::create(&path, "password").unwrap();
-    let item = login("Before upgrade");
-    vault.put(item.clone()).unwrap();
-    drop(vault);
-    let connection = Connection::open(&path).unwrap();
-    connection
-        .execute_batch(
-            "DROP TABLE revoked_devices;
-             ALTER TABLE vault_meta DROP COLUMN recipient_nonce;
-             ALTER TABLE vault_meta DROP COLUMN recipient_wrapped_secret;
-             ALTER TABLE vault_meta DROP COLUMN write_fence;
-             UPDATE vault_meta SET format_version=6;",
-        )
-        .unwrap();
-    drop(connection);
+    // The frozen format 6 file: a newer vault set back to format 6 by hand
+    // no longer unlocks, which is what format 8's signing key label is for.
+    let (_dir, path) = crate::fixture_tests::copy_of(6);
+    let password = "fixture password, not a secret";
     let version = |path: &std::path::Path| -> u32 {
         Connection::open(path)
             .unwrap()
@@ -2165,18 +2152,21 @@ fn a_format_6_vault_gains_membership_fields_when_opened_locked() {
     assert_eq!(version(&path), 7);
     vault.raise_write_fence(1).unwrap();
     // The recipient secret needs the root key, so it appears at unlock and
-    // stays the same afterwards.
-    vault.unlock("password").unwrap();
+    // stays the same afterwards; the unlock also seals the vault (format 8).
+    vault.unlock(password).unwrap();
+    assert_eq!(version(&path), 8);
+    assert!(!vault.rows_changed());
     let secret = vault.recipient_secret().unwrap();
-    assert_eq!(vault.get(&item.id).unwrap().item.title, "Before upgrade");
+    assert_eq!(vault.get("fixture-mail").unwrap().item.title, "Mail");
     vault.lock();
     assert!(matches!(vault.recipient_secret(), Err(Error::Locked)));
-    vault.unlock("password").unwrap();
+    vault.unlock(password).unwrap();
     assert_eq!(*vault.recipient_secret().unwrap(), *secret);
     drop(vault);
     let mut reopened = Vault::open(&path).unwrap();
-    reopened.unlock("password").unwrap();
+    reopened.unlock(password).unwrap();
     assert_eq!(*reopened.recipient_secret().unwrap(), *secret);
+    assert!(!reopened.rows_changed());
 }
 
 #[test]
@@ -2470,4 +2460,268 @@ fn every_unlock_has_its_own_session() {
     assert_eq!(other.unlock_session(), None);
     other.unlock("password").unwrap();
     assert_ne!(other.unlock_session(), Some(third));
+}
+
+/// Opens `path` again and unlocks it, as an app does after a restart.
+fn reopened(path: &std::path::Path, password: &str) -> Vault {
+    let mut vault = Vault::open(path).unwrap();
+    vault.unlock(password).unwrap();
+    vault
+}
+
+#[test]
+fn an_item_taken_out_of_the_file_shows_at_the_next_unlock_and_comes_back_from_another_device() {
+    let dir = tempdir().unwrap();
+    let a_path = dir.path().join("a.db");
+    let (mut a, _) = Vault::create(&a_path, "password").unwrap();
+    let mut b = Vault::join(
+        dir.path().join("b.db"),
+        "password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    authorize(&mut a, &b);
+    let hidden = a.put(login("Hidden")).unwrap();
+    a.put(login("Kept")).unwrap();
+    deliver(&mut b, &a);
+    drop(a);
+
+    // Someone who can write the file takes the item out, head and all.
+    let take = |statement: String| crate::fixture_tests::take_out(&a_path, &statement);
+    assert_eq!(
+        take(format!(
+            "DELETE FROM revisions WHERE revision='{}'",
+            hidden.revision
+        )),
+        1
+    );
+    take(format!(
+        "DELETE FROM heads WHERE revision='{}'",
+        hidden.revision
+    ));
+    let mut a = reopened(&a_path, "password");
+    assert!(a.rows_changed());
+    assert!(matches!(a.get(&hidden.item_id), Err(Error::NotFound)));
+
+    // The other device has it, and syncing brings it back. The owner is
+    // told until they confirm, and the seal holds again after.
+    deliver(&mut a, &b);
+    assert_eq!(a.get(&hidden.item_id).unwrap().item.title, "Hidden");
+    drop(a);
+    let mut a = reopened(&a_path, "password");
+    assert!(a.rows_changed());
+    a.confirm_rows_changed().unwrap();
+    drop(a);
+    assert!(!reopened(&a_path, "password").rows_changed());
+}
+
+/// A version between two others taken out: until it comes back, nothing
+/// says that the one before it was superseded, so the item shows both as
+/// a conflict. Fetched again, it is not taken for a head, though it arrives
+/// after the version that names it.
+#[test]
+fn a_middle_version_taken_out_comes_back_without_leaving_a_conflict() {
+    let dir = tempdir().unwrap();
+    let a_path = dir.path().join("a.db");
+    let (mut a, _) = Vault::create(&a_path, "password").unwrap();
+    let mut b = Vault::join(
+        dir.path().join("b.db"),
+        "password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    authorize(&mut a, &b);
+    let first = a.put(login("Edited")).unwrap();
+    let mut item = a.get(&first.item_id).unwrap().item;
+    item.notes = "second".into();
+    let middle = a.update(item.clone(), &first.revision).unwrap();
+    item.notes = "third".into();
+    let last = a.update(item, &middle.revision).unwrap();
+    deliver(&mut b, &a);
+    drop(a);
+
+    crate::fixture_tests::take_out(
+        &a_path,
+        &format!("DELETE FROM revisions WHERE revision='{}'", middle.revision),
+    );
+    let mut a = reopened(&a_path, "password");
+    assert!(a.rows_changed());
+    assert!(a.get(&first.item_id).unwrap().conflict);
+
+    deliver(&mut a, &b);
+    let shown = a.get(&first.item_id).unwrap();
+    assert!(!shown.conflict);
+    assert_eq!(shown.revision, last.revision);
+    a.confirm_rows_changed().unwrap();
+    drop(a);
+    let a = reopened(&a_path, "password");
+    assert!(
+        !a.rows_changed(),
+        "the heads it left are the ones the revisions give"
+    );
+    assert_eq!(a.get(&first.item_id).unwrap().revision, last.revision);
+}
+
+#[test]
+fn a_change_made_while_the_vault_is_unlocked_shows_at_the_next_unlock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    let (mut a, _) = Vault::create(&path, "password").unwrap();
+    let early = a.put(login("Early")).unwrap();
+    // A revision taken out while the vault is open: the next write adds to
+    // the seal without reading the rows, and the next unlock finds it.
+    crate::fixture_tests::take_out(
+        &path,
+        &format!("DELETE FROM revisions WHERE revision='{}'", early.revision),
+    );
+    a.put(login("Later")).unwrap();
+    drop(a);
+    assert!(reopened(&path, "password").rows_changed());
+
+    // A seal broken while the vault is open: the next write finds it.
+    let (mut a, _) = Vault::create(dir.path().join("b.db"), "password").unwrap();
+    rusqlite::Connection::open(dir.path().join("b.db"))
+        .unwrap()
+        .execute("UPDATE vault_meta SET row_seal = zeroblob(72)", [])
+        .unwrap();
+    a.put(login("Later")).unwrap();
+    drop(a);
+    assert!(reopened(&dir.path().join("b.db"), "password").rows_changed());
+}
+
+/// The app and its AutoFill extension on iOS are two processes with one
+/// vault file. Each write reads the seal the other left.
+#[test]
+fn two_openers_of_one_vault_file_keep_its_seal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    drop(Vault::create(&path, "password").unwrap());
+    let mut app = reopened(&path, "password");
+    let mut extension = reopened(&path, "password");
+    let first = app.put(login("From the app")).unwrap();
+    extension.put(login("From the extension")).unwrap();
+    let mut edited = app.get(&first.item_id).unwrap().item;
+    edited.notes = "edited".into();
+    app.update(edited, &first.revision).unwrap();
+    extension.put(login("Again from the extension")).unwrap();
+    drop((app, extension));
+    let vault = reopened(&path, "password");
+    assert!(!vault.rows_changed());
+    assert_eq!(vault.list().unwrap().len(), 3);
+}
+
+/// What the seal does not see: the sealed rows set back to an earlier
+/// moment together with the seal of that moment, the heads made to agree.
+/// That is an older copy of the file in part, and like a whole older copy
+/// it shows nothing; what was added since is gone from this device until
+/// a sync brings it back.
+#[test]
+fn rows_set_back_together_with_their_seal_are_not_seen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    let (mut a, _) = Vault::create(&path, "password").unwrap();
+    a.put(login("Before")).unwrap();
+    let seal_then: Vec<u8> = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT row_seal FROM vault_meta", [], |row| row.get(0))
+        .unwrap();
+    let after = a.put(login("After")).unwrap();
+    drop(a);
+    crate::fixture_tests::take_out(
+        &path,
+        &format!("DELETE FROM revisions WHERE revision='{}'", after.revision),
+    );
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute("DELETE FROM heads WHERE revision=?", [&after.revision])
+        .unwrap();
+    connection
+        .execute("UPDATE vault_meta SET row_seal=?", [seal_then])
+        .unwrap();
+    drop(connection);
+    let a = reopened(&path, "password");
+    assert!(!a.rows_changed());
+    assert!(matches!(a.get(&after.item_id), Err(Error::NotFound)));
+}
+
+#[test]
+fn everyday_use_never_breaks_the_seal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    let (mut a, recovery) = Vault::create(&path, "password").unwrap();
+    let mut password = "password";
+    let check = |vault: Vault, password: &str| {
+        drop(vault);
+        let vault = reopened(&path, password);
+        assert!(!vault.rows_changed());
+        vault
+    };
+    a = check(a, password);
+
+    // Items written, edited, deleted, and restored; an export imported.
+    let item = login("Mail");
+    let first = a.put(item.clone()).unwrap();
+    let mut edited = item.clone();
+    edited.notes = "edited".into();
+    let second = a.update(edited, &first.revision).unwrap();
+    a.delete(&item.id, &second.revision).unwrap();
+    let deleted = a.deleted_items().unwrap();
+    a.restore(
+        &deleted[0].item_id,
+        &deleted[0].last.revision,
+        &deleted[0].heads,
+    )
+    .unwrap();
+    let export = b"name,url,username,password,note\nForum,https://forum.example,me,pw,\n";
+    a.confirm_import(preview_import(ImportFormat::ChromeCsv, export).unwrap())
+        .unwrap();
+    a = check(a, password);
+
+    // Another device joins and syncs both ways, received while locked too.
+    let mut b = Vault::join(
+        dir.path().join("b.db"),
+        "password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    authorize(&mut a, &b);
+    deliver(&mut b, &a);
+    b.put(login("From b")).unwrap();
+    deliver(&mut a, &b);
+    let from_b = b.put(login("Staged")).unwrap();
+    a.lock();
+    a.stage_revision(wire(&b, &from_b.revision)).unwrap();
+    a.unlock(password).unwrap();
+    a.process_staged().unwrap();
+    a = check(a, password);
+
+    // A device the vault does not know: its revision is held, then accepted.
+    let mut stranger = Vault::join(
+        dir.path().join("c.db"),
+        "password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    deliver(&mut stranger, &a);
+    stranger.put(login("From a stranger")).unwrap();
+    assert!(deliver(&mut a, &stranger) > 0);
+    let held = a.quarantined().unwrap();
+    a.accept_quarantined(&held[0].revision).unwrap();
+    a = check(a, password);
+
+    // A device removed, a new epoch, a new password, the recovery key.
+    a.revoke_device(b.device_id().unwrap()).unwrap();
+    let (epoch, _) = a.generate_epoch_key().unwrap();
+    a.activate_epoch(epoch).unwrap();
+    a.put(login("After rotation")).unwrap();
+    a.change_password(password, "new password").unwrap();
+    password = "new password";
+    a = check(a, password);
+    a.lock();
+    a.unlock_with_recovery(&recovery).unwrap();
+    assert!(!a.rows_changed());
 }

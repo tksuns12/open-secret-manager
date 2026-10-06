@@ -324,6 +324,9 @@ export type DesktopBridge = {
   pendingRecoveryKey: () => Promise<string | null>;
   /** The owner stored the recovery key; the vault stops keeping it. */
   confirmRecoveryKey: () => Promise<void>;
+  /** Whether the last unlock found records taken out of the vault's file, which the owner has not yet confirmed seeing. */
+  rowsChanged: () => Promise<boolean>;
+  confirmRowsChanged: () => Promise<void>;
   enableRecovery: (recoveryKey: string) => Promise<void>;
   syncStatus: () => Promise<SyncStatus>;
   syncNow: () => Promise<void>;

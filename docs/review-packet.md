@@ -45,8 +45,11 @@ log.
 
 **Disk.** A vault file holds ciphertext, signed revision headers, and
 wrapped keys. The password (Argon2id) or the recovery key unwraps a
-per-device root key, which unwraps the rest. A file writer can hide rows
-and roll the whole file back without detection; both are published risks.
+per-device root key, which unwraps the rest. Since format 8 (Phase 10) a
+seal under the root key covers which rows the file holds; rows a file
+writer takes out or changes are reported at the next unlock. A file
+writer can still roll the file back, whole or the sealed rows together with
+their seal, without detection; that is a published risk.
 
 **Devices.** Every revision is signed by its device and verified against
 the vault's authorized authors before it joins the history; anything else

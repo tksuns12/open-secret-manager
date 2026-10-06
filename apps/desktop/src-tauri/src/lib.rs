@@ -683,6 +683,26 @@ async fn pending_recovery_key(
         .map(|recovery| recovery.to_string()))
 }
 
+/// Whether the last unlock found records taken out of the vault's file
+/// that the owner has not yet been told of.
+#[tauri::command]
+async fn rows_changed(state: tauri::State<'_, AppState>) -> Result<bool, CommandError> {
+    let vault = state.vault.lock().await;
+    Ok(vault
+        .as_ref()
+        .is_some_and(|vault| vault.is_unlocked() && vault.rows_changed()))
+}
+
+/// The owner has seen that records were taken out: stop saying so.
+#[tauri::command]
+async fn confirm_rows_changed(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+    let mut vault = state.vault.lock().await;
+    if let Some(vault) = vault.as_mut() {
+        vault.confirm_rows_changed()?;
+    }
+    Ok(())
+}
+
 /// The owner has stored the recovery key: the vault stops keeping it.
 #[tauri::command]
 async fn confirm_recovery_key(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
@@ -785,6 +805,8 @@ pub fn run() {
             recovery_status,
             pending_recovery_key,
             confirm_recovery_key,
+            rows_changed,
+            confirm_rows_changed,
             enable_recovery,
             backup::save_backup,
             backup::choose_backup,

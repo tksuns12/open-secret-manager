@@ -407,6 +407,19 @@ impl Device {
         self.tokio.block_on(self.inner.lock())
     }
 
+    /// Whether an unlock found records taken out of the vault's file or
+    /// changed in it (an item, an edit, or a device's keys), and the owner
+    /// has not yet confirmed seeing it. What is gone comes back from the
+    /// vault's other devices at the next sync. False while locked.
+    pub fn rows_changed(&self) -> bool {
+        self.tokio.block_on(self.inner.rows_changed())
+    }
+
+    /// The owner has seen that records were taken out: stop saying so.
+    pub fn confirm_rows_changed(&self) -> Result<(), MobileError> {
+        self.tokio.block_on(self.inner.confirm_rows_changed())
+    }
+
     pub fn items(&self) -> Result<Vec<ItemSummary>, MobileError> {
         self.tokio.block_on(self.inner.items())
     }

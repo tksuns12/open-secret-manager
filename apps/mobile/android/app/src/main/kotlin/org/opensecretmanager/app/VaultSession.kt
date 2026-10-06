@@ -49,6 +49,8 @@ data class UiState(
     val history: History? = null,
     /** The items deleted, while that list is open. */
     val deleted: List<DeletedEntry>? = null,
+    /** The last unlock found records taken out of the vault's file. */
+    val rowsChanged: Boolean = false,
 )
 
 /** The versions of [detail], newest first. */
@@ -141,8 +143,15 @@ class VaultSession(private val context: Context, private val folder: File) {
                 editor = current.editor.takeIf { screen == Screen.UNLOCKED },
                 history = current.history.takeIf { screen == Screen.UNLOCKED },
                 deleted = current.deleted.takeIf { screen == Screen.UNLOCKED },
+                rowsChanged = screen == Screen.UNLOCKED && device.rowsChanged(),
             )
         }
+    }
+
+    /** The owner has seen that records were taken out of the vault's file. */
+    fun confirmRowsChanged() = run(null) {
+        device?.confirmRowsChanged()
+        refresh()
     }
 
     /** Unlocks with [password]; then, on the main thread, [onUnlocked]. */

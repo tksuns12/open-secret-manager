@@ -37,6 +37,8 @@ final class VaultModel: ObservableObject {
     @Published private(set) var history: History?
     /// The items deleted, while that list is open.
     @Published private(set) var deleted: [DeletedEntry]?
+    /// The last unlock found records taken out of the vault's file.
+    @Published private(set) var rowsChanged = false
     let biometric = BiometricUnlock()
 
     private let queue = DispatchQueue(label: "org.opensecretmanager.device")
@@ -76,10 +78,10 @@ final class VaultModel: ObservableObject {
     /// Reads where the device stands, and what an unlocked vault holds.
     private func refresh() async {
         guard let device else { return }
-        guard let (state, items, sync) = try? await onQueue({ () -> (DeviceState, [ItemSummary], SyncStatus) in
+        guard let (state, items, sync, rowsChanged) = try? await onQueue({ () -> (DeviceState, [ItemSummary], SyncStatus, Bool) in
             let state = device.state()
             let items = state == .unlocked ? ((try? device.items()) ?? []) : []
-            return (state, items, device.syncStatus())
+            return (state, items, device.syncStatus(), state == .unlocked && device.rowsChanged())
         }) else { return }
         guard screen != .unreadable else { return }
         screen = switch state {
@@ -91,6 +93,7 @@ final class VaultModel: ObservableObject {
         }
         self.items = items.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         self.sync = sync
+        self.rowsChanged = rowsChanged
         // A detail stays open only while its item does.
         if let detail, !(screen == .unlocked && items.contains { $0.id == detail.id }) { self.detail = nil }
         if screen != .joining { joinCode = nil }
@@ -303,6 +306,11 @@ final class VaultModel: ObservableObject {
 
     func closeDeleted() {
         deleted = nil
+    }
+
+    /// The owner has seen that records were taken out of the vault's file.
+    func confirmRowsChanged() {
+        Task { _ = await call(nil, { try $0.confirmRowsChanged() }) }
     }
 
     /// Brings back a deleted item as it was before it was deleted.

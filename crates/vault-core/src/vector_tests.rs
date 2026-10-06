@@ -1,9 +1,10 @@
 //! The encodings the storage and wire formats are built from, checked
 //! against frozen values: `fixtures/vectors.json` holds the inputs and what
 //! this code made of them when the formats were frozen, for this and for
-//! any other implementation to compare with. A second test reads the frozen
-//! vault's rows with these encodings alone, so the vectors are the ones the
-//! file was written with.
+//! any other implementation to compare with, and `fixtures/vectors-8.json`
+//! adds what format 8 brought. A further test reads the frozen vault's rows
+//! with these encodings alone, so the vectors are the ones the file was
+//! written with.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::Connection;
@@ -13,8 +14,9 @@ use crate::{
     crypto::{
         decrypt, device_authorization, device_key_aad, device_revocation, encrypt, epoch_key_aad,
         key_wrap_aad, legacy_record_aad, legacy_revision_id, recipient_key_aad, record_aad,
-        recovery_check, revision_id, revision_signature_message, verify_device_authorization,
-        verify_device_revocation,
+        recovery_check, revision_id, revision_signature_message, row_mark, row_marks, row_seal_aad,
+        row_seal_key, sealed_device_key_aad, verify_device_authorization, verify_device_revocation,
+        xor_into, RowSets,
     },
     epoch_key_check,
     fixture_tests::{fixture, hex, Expected, CURRENT},
@@ -215,6 +217,70 @@ fn vectors() -> Value {
     })
 }
 
+/// What format 8 added, from the same inputs as `vectors()`: the signing
+/// seed's new label, and the seal over the rows never changed or removed.
+fn format_8_vectors() -> Value {
+    let vault_id: [u8; 32] = counting(0x10);
+    let device_id: [u8; 16] = counting(0x40);
+    let signing_seed: [u8; 32] = counting(0x60);
+    let root_key: [u8; 32] = counting(0x80);
+    let nonce: [u8; 24] = counting(0xe0);
+    let public_key = SigningKey::from_bytes(&signing_seed)
+        .verifying_key()
+        .to_bytes();
+    let aad = sealed_device_key_aad(&vault_id, &device_id, &public_key);
+
+    let sets = example_rows();
+    let seal_key = row_seal_key(&root_key).unwrap();
+    let marks = row_marks(&seal_key, &sets).unwrap();
+    let mark = |table: &str, key: &[u8]| hex(&row_mark(&seal_key, table, key).unwrap());
+    let hex_list = |keys: &[Vec<u8>]| keys.iter().map(|key| hex(key)).collect::<Vec<_>>();
+    let mut seal = nonce.to_vec();
+    seal.extend_from_slice(&encrypt(&root_key, &nonce, &row_seal_aad(&vault_id), &marks).unwrap());
+
+    json!({
+        "about": "What format 8 added, made from the inputs of vectors.json, whose counting patterns are repeated here. Bytes are lowercase hexadecimal. A row's mark is HMAC-SHA256 under seal_key, itself HMAC-SHA256 of the text osm-row-seal-key-v1 under root_key; the marks of a vault's rows are XORed together, in any order, and the seal is the nonce followed by those marks encrypted by root_key under row_seal_aad.",
+        "inputs": {
+            "vault_id": hex(&vault_id),
+            "device_id": hex(&device_id),
+            "signing_seed": hex(&signing_seed),
+            "root_key": hex(&root_key),
+            "nonce": hex(&nonce),
+            "row_sets": {
+                "revisions": sets.revisions,
+                "devices": hex_list(&sets.devices),
+                "revoked_devices": hex_list(&sets.revoked),
+                "epoch_keys": sets.epochs,
+            },
+        },
+        "keys": {
+            "device_public_key": hex(&public_key),
+            "signing_seed_aad": hex(&aad),
+            "signing_seed_wrapped_by_root_key": hex(&encrypt(&root_key, &nonce, &aad, &signing_seed).unwrap()),
+        },
+        "row_seal": {
+            "seal_key": hex(&*seal_key),
+            "mark_of_revision": mark("revisions", sets.revisions[0].as_bytes()),
+            "mark_of_device": mark("devices", &sets.devices[0]),
+            "mark_of_revoked_device": mark("revoked_devices", &sets.revoked[0]),
+            "mark_of_epoch_key": mark("epoch_keys", &sets.epochs[0].to_be_bytes()),
+            "marks_of_the_sets": hex(&marks),
+            "row_seal_aad": hex(&row_seal_aad(&vault_id)),
+            "row_seal": hex(&seal),
+        },
+    })
+}
+
+/// Rows of each of the four sealed sets, to mark.
+fn example_rows() -> RowSets {
+    RowSets {
+        revisions: vec!["0".repeat(64), "f".repeat(64)],
+        devices: vec![counting::<16>(0x40).to_vec(), counting::<16>(0x50).to_vec()],
+        revoked: vec![counting::<16>(0x50).to_vec()],
+        epochs: vec![1, 2, 3],
+    }
+}
+
 /// Says where two values differ, so that a failure names the encoding.
 fn differences(path: &str, frozen: &Value, made: &Value, found: &mut Vec<String>) {
     match (frozen, made) {
@@ -234,24 +300,32 @@ fn differences(path: &str, frozen: &Value, made: &Value, found: &mut Vec<String>
     }
 }
 
-#[test]
-fn the_encodings_are_the_frozen_ones() {
-    let path = crate::fixture_tests::crate_dir().join("fixtures/vectors.json");
-    let made = vectors();
+/// The frozen file `name` in the fixtures, after checking that `made`
+/// matches it.
+fn frozen(name: &str, made: &Value) -> Value {
+    let path = crate::fixture_tests::crate_dir()
+        .join("fixtures")
+        .join(name);
     // A frozen file is not written over. To add one for a new format, run
     // once with `OSM_WRITE_NEW_FIXTURES=1` while it does not exist.
     if !path.exists() && std::env::var_os("OSM_WRITE_NEW_FIXTURES").is_some() {
-        std::fs::write(&path, serde_json::to_string_pretty(&made).unwrap() + "\n").unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(made).unwrap() + "\n").unwrap();
     }
     let frozen: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let mut found = Vec::new();
-    differences("vectors", &frozen, &made, &mut found);
+    differences("vectors", &frozen, made, &mut found);
     found.sort();
     found.dedup();
     assert!(
         found.is_empty(),
-        "these no longer match the frozen values: {found:#?}"
+        "these no longer match the frozen values in {name}: {found:#?}"
     );
+    frozen
+}
+
+#[test]
+fn the_encodings_are_the_frozen_ones() {
+    let frozen = frozen("vectors.json", &vectors());
 
     // And back: what was frozen opens with the same keys.
     let text = |section: &str, name: &str| unhex(frozen[section][name].as_str().unwrap());
@@ -290,6 +364,108 @@ fn the_encodings_are_the_frozen_ones() {
     let as_json: EncryptedRevision =
         serde_json::from_str(edit["as_json"].as_str().unwrap()).unwrap();
     assert_eq!(as_json.revision_id(), edit["revision_id"]);
+}
+
+#[test]
+fn the_format_8_encodings_are_the_frozen_ones() {
+    let frozen = frozen("vectors-8.json", &format_8_vectors());
+
+    // And back: the frozen wrapping opens under its label, and not under the
+    // label of earlier formats.
+    let text = |section: &str, name: &str| unhex(frozen[section][name].as_str().unwrap());
+    let inputs = |name: &str| unhex(frozen["inputs"][name].as_str().unwrap());
+    let root: [u8; 32] = inputs("root_key").try_into().unwrap();
+    let nonce: [u8; 24] = inputs("nonce").try_into().unwrap();
+    let vault_id: [u8; 32] = inputs("vault_id").try_into().unwrap();
+    let device_id: [u8; 16] = inputs("device_id").try_into().unwrap();
+    let public_key: [u8; 32] = text("keys", "device_public_key").try_into().unwrap();
+    let wrapped = text("keys", "signing_seed_wrapped_by_root_key");
+    let seed = decrypt(&root, &nonce, &text("keys", "signing_seed_aad"), &wrapped).unwrap();
+    assert_eq!(hex(&seed), frozen["inputs"]["signing_seed"]);
+    assert!(decrypt(
+        &root,
+        &nonce,
+        &device_key_aad(&vault_id, &device_id, &public_key),
+        &wrapped
+    )
+    .is_err());
+
+    // The seal opens to the marks of the sets, which are the XOR of each
+    // row's mark, and differ with any one row taken out of any set.
+    let seal = text("row_seal", "row_seal");
+    let marks = decrypt(
+        &root,
+        seal[..24].try_into().unwrap(),
+        &text("row_seal", "row_seal_aad"),
+        &seal[24..],
+    )
+    .unwrap();
+    assert_eq!(hex(&marks), frozen["row_seal"]["marks_of_the_sets"]);
+    let seal_key: [u8; 32] = text("row_seal", "seal_key").try_into().unwrap();
+    let sets = format_8_rows(&frozen["inputs"]["row_sets"]);
+    let mut each = [0; 32];
+    let rows = sets
+        .revisions
+        .iter()
+        .map(|id| ("revisions", id.as_bytes().to_vec()));
+    let rows = rows
+        .chain(sets.devices.iter().map(|id| ("devices", id.clone())))
+        .chain(
+            sets.revoked
+                .iter()
+                .map(|id| ("revoked_devices", id.clone())),
+        )
+        .chain(
+            sets.epochs
+                .iter()
+                .map(|epoch| ("epoch_keys", epoch.to_be_bytes().to_vec())),
+        );
+    for (table, key) in rows {
+        xor_into(&mut each, &row_mark(&seal_key, table, &key).unwrap());
+    }
+    assert_eq!(hex(&each), frozen["row_seal"]["marks_of_the_sets"]);
+    let mut fewer = vec![hex(&each)];
+    for set in 0..4 {
+        let mut smaller = format_8_rows(&frozen["inputs"]["row_sets"]);
+        match set {
+            0 => drop(smaller.revisions.pop()),
+            1 => drop(smaller.devices.pop()),
+            2 => drop(smaller.revoked.pop()),
+            _ => drop(smaller.epochs.pop()),
+        }
+        fewer.push(hex(&row_marks(&seal_key, &smaller).unwrap()));
+    }
+    fewer.sort();
+    fewer.dedup();
+    assert_eq!(fewer.len(), 5);
+}
+
+/// The row sets as the format 8 vectors write them.
+fn format_8_rows(sets: &Value) -> RowSets {
+    let keys = |name: &str| -> Vec<Vec<u8>> {
+        sets[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| unhex(key.as_str().unwrap()))
+            .collect()
+    };
+    RowSets {
+        revisions: sets["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap().to_owned())
+            .collect(),
+        devices: keys("devices"),
+        revoked: keys("revoked_devices"),
+        epochs: sets["epoch_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|epoch| epoch.as_u64().unwrap())
+            .collect(),
+    }
 }
 
 /// Reads the frozen vault's rows with the encodings above and nothing else:
@@ -334,7 +510,7 @@ fn the_frozen_vault_is_laid_out_as_the_encodings_say() {
     let seed = decrypt(
         &root,
         &nonce("SELECT device_key_nonce FROM vault_meta"),
-        &device_key_aad(&vault_id, &device_id, &public_key),
+        &sealed_device_key_aad(&vault_id, &device_id, &public_key),
         &blob("SELECT device_wrapped_signing_key FROM vault_meta"),
     )
     .unwrap();
@@ -418,6 +594,52 @@ fn the_frozen_vault_is_laid_out_as_the_encodings_say() {
         epoch_keys.insert(epoch, key);
     }
 
+    // The seal is the one over the rows the file holds, each set sorted.
+    fn column<T: rusqlite::types::FromSql>(connection: &Connection, sql: &str) -> Vec<T> {
+        let mut statement = connection.prepare(sql).unwrap();
+        let rows = statement.query_map([], |row| row.get(0)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+    let sets = RowSets {
+        revisions: column(
+            &connection,
+            "SELECT revision FROM revisions ORDER BY revision",
+        ),
+        devices: column(
+            &connection,
+            "SELECT device_id FROM devices ORDER BY device_id",
+        ),
+        revoked: column(
+            &connection,
+            "SELECT device_id FROM revoked_devices ORDER BY device_id",
+        ),
+        epochs: column::<i64>(&connection, "SELECT epoch FROM epoch_keys ORDER BY epoch")
+            .into_iter()
+            .map(|epoch| u64::try_from(epoch).unwrap())
+            .collect(),
+    };
+    assert_eq!(sets.epochs, epoch_keys.keys().copied().collect::<Vec<_>>());
+    assert!(!sets.revisions.is_empty());
+    let seal = blob("SELECT row_seal FROM vault_meta");
+    let marks = decrypt(
+        &root,
+        seal[..24].try_into().unwrap(),
+        &row_seal_aad(&vault_id),
+        &seal[24..],
+    )
+    .unwrap();
+    assert_eq!(
+        marks.as_slice(),
+        row_marks(&row_seal_key(&root).unwrap(), &sets).unwrap()
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT rows_changed FROM vault_meta", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
     // Every stored, held, and staged revision: its ID, its signature when
     // its author is known here, and its content.
     let mut read = 0;
@@ -471,6 +693,41 @@ fn the_frozen_vault_is_laid_out_as_the_encodings_say() {
         }
     }
     assert_eq!(read, 11 + 2 + 1);
+
+    // The heads are the revisions that no other names as a parent.
+    let mut follows = std::collections::BTreeMap::new();
+    let mut named = Vec::new();
+    let mut statement = connection
+        .prepare("SELECT revision, item_id, parents, tombstone FROM revisions")
+        .unwrap();
+    let mut rows = statement.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let parents: String = row.get(2).unwrap();
+        named.extend(
+            (0..parents.len())
+                .step_by(64)
+                .map(|at| parents[at..at + 64].to_owned()),
+        );
+        follows.insert(
+            row.get::<_, String>(0).unwrap(),
+            (
+                row.get::<_, String>(1).unwrap(),
+                row.get::<_, bool>(3).unwrap(),
+            ),
+        );
+    }
+    for parent in named {
+        follows.remove(&parent);
+    }
+    let mut statement = connection
+        .prepare("SELECT revision, item_id, tombstone FROM heads")
+        .unwrap();
+    let heads: std::collections::BTreeMap<String, (String, bool)> = statement
+        .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(heads, follows);
 }
 
 /// The fields of an item are part of record format 2. Since Phase 8 a

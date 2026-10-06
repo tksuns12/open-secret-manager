@@ -16,6 +16,7 @@ longer reads what an earlier build wrote.
 | `format-5` | `22b56b2` | 5 | 3 |
 | `format-6` | `39d3563` | 6 | 4 |
 | `format-7` | `fe01f0a` | 7 | 4 |
+| `format-8` | the commit that adds it (Phase 10, stop 1) | 8 | 4 |
 
 Each folder has `vault.sqlite3`, `backup.json` (a backup of that vault), and
 `expected.json` (what a reader should find, with the password and the
@@ -25,14 +26,15 @@ password hashing cost.
 
 `vectors.json` holds the encodings the formats are built from: inputs anyone
 can write down and what the code made of them. Another implementation can
-check itself against it.
+check itself against it. `vectors-8.json` adds, from the same inputs, what
+format 8 brought: the signing key's new label and the row seal.
 
 `SHA256SUMS` lists the binary files. Opening an older vault where it lies
 upgrades it, so tests copy a file before they open it, and one test checks
 the sums.
 
-The password, the recovery keys, and every key in `vectors.json` open only
-these files. None of them is a secret.
+The password, the recovery keys, and every key in the two vector files open
+only these files. None of them is a secret.
 
 ## How they were made
 
@@ -47,10 +49,12 @@ commit in the table (what `extras` uses did not exist yet). Format 7 has
 both parts: besides the three items every fixture holds, it has a conflict
 between two authors, a removed device, revisions held for review, a revision
 staged while locked, two key epochs, a raised write fence, and a recovery
-key not yet confirmed.
+key not yet confirmed. Format 8 has both parts as well,
+made by the code that seals the rows; its vault was sealed as it was
+written.
 
 ## When the format changes
 
-Do not touch these folders. Add `format-8` with the new code, add its files
+Do not touch these folders. Add `format-9` with the new code, add its files
 to `SHA256SUMS`, add the format to the tests' list, and write the test that
-takes `format-7` through the upgrade. `docs/formats.md` has the whole rule.
+takes `format-8` through the upgrade. `docs/formats.md` has the whole rule.

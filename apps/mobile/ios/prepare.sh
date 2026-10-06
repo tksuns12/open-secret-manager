@@ -47,3 +47,11 @@ xcodebuild -create-xcframework \
 
 mkdir -p "$ios/UITests/Fixtures"
 cp crates/vault-core/fixtures/format-7/vault.sqlite3 "$ios/UITests/Fixtures/format-7-vault.sqlite3"
+# A sealed vault with an earlier version of Mail taken out of its file, as
+# anyone who can write the file could, for the screens that say so.
+take_out() {
+    cp crates/vault-core/fixtures/format-8/vault.sqlite3 "$1"
+    sqlite3 "$1" "DROP TRIGGER revisions_no_delete; DELETE FROM revisions WHERE revision IN \
+        (SELECT revision FROM revisions WHERE item_id='fixture-mail' AND parents='');"
+}
+take_out "$ios/UITests/Fixtures/sealed-taken-out-vault.sqlite3"

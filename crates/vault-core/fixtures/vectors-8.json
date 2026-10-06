@@ -1,0 +1,43 @@
+{
+  "about": "What format 8 added, made from the inputs of vectors.json, whose counting patterns are repeated here. Bytes are lowercase hexadecimal. A row's mark is HMAC-SHA256 under seal_key, itself HMAC-SHA256 of the text osm-row-seal-key-v1 under root_key; the marks of a vault's rows are XORed together, in any order, and the seal is the nonce followed by those marks encrypted by root_key under row_seal_aad.",
+  "inputs": {
+    "device_id": "404142434445464748494a4b4c4d4e4f",
+    "nonce": "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7",
+    "root_key": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "row_sets": {
+      "devices": [
+        "404142434445464748494a4b4c4d4e4f",
+        "505152535455565758595a5b5c5d5e5f"
+      ],
+      "epoch_keys": [
+        1,
+        2,
+        3
+      ],
+      "revisions": [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      ],
+      "revoked_devices": [
+        "505152535455565758595a5b5c5d5e5f"
+      ]
+    },
+    "signing_seed": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+    "vault_id": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+  },
+  "keys": {
+    "device_public_key": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5",
+    "signing_seed_aad": "6f736d2d6465766963652d7369676e696e672d6b65792d763200101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f404142434445464748494a4b4c4d4e4f174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5",
+    "signing_seed_wrapped_by_root_key": "80d35a83a9a334c3e586fc02dc801c18f2ce311e9616eb9dc56494e53a4ba29176ab8c5e6523ca0b6e31c65cd356d6bd"
+  },
+  "row_seal": {
+    "mark_of_device": "58e3dc764b2447e516d0353855a7dbbf2d5da2baea41c6a0736068088a73b6fd",
+    "mark_of_epoch_key": "f349eb0a160c470a0db147f353ece88cdfdd20e14566a89f7c821e97b609fea4",
+    "mark_of_revision": "69de056db9e38e67e909525e90115a7e2eec2bd3f2b057a1cf29e1029ecb9790",
+    "mark_of_revoked_device": "e291736270d6b5568a6041d4e2f87ebab2be8e2b8621a71d8c1ecbcbc58f5240",
+    "marks_of_the_sets": "6db4c300a0039ff9f164715b07bb49e39338eb90ec4c6ed15e94ec39030df396",
+    "row_seal": "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f78d06fbe06dc5cd5d7c8be732b7563b941187a8fd0e2ff33be38902a7453b2f78b78fde06d93770f8cc1a25180b4d8588",
+    "row_seal_aad": "6f736d2d726f772d7365616c2d763100101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+    "seal_key": "5ac37ceff2cb4b181620e8f818fc16611fedf223a90667882354392077421024"
+  }
+}
