@@ -219,6 +219,39 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
     Ok((items, warnings))
 }
 
+/// A Bitwarden card or identity field's name as the owner reads it; one
+/// this build does not know keeps the export's own.
+fn readable(name: &str) -> String {
+    match name {
+        "cardholderName" => "Cardholder name",
+        "brand" => "Brand",
+        "number" => "Number",
+        "expMonth" => "Expiry month",
+        "expYear" => "Expiry year",
+        "code" => "Security code",
+        "title" => "Title",
+        "firstName" => "First name",
+        "middleName" => "Middle name",
+        "lastName" => "Last name",
+        "address1" => "Address line 1",
+        "address2" => "Address line 2",
+        "address3" => "Address line 3",
+        "city" => "City",
+        "state" => "State or province",
+        "postalCode" => "Postal code",
+        "country" => "Country",
+        "company" => "Company",
+        "email" => "Email",
+        "phone" => "Phone",
+        "ssn" => "Social security number",
+        "username" => "Username",
+        "passportNumber" => "Passport number",
+        "licenseNumber" => "License number",
+        other => other,
+    }
+    .to_owned()
+}
+
 fn flatten_values(
     target: &mut BTreeMap<String, String>,
     values: Option<&mut BTreeMap<String, Value>>,
@@ -230,7 +263,7 @@ fn flatten_values(
             Value::Bool(value) => value.to_string(),
             _ => continue,
         };
-        match target.entry(name.clone()) {
+        match target.entry(readable(name)) {
             std::collections::btree_map::Entry::Vacant(slot) if !string.is_empty() => {
                 slot.insert(string);
             }

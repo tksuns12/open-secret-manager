@@ -588,6 +588,39 @@ fn import_requires_preview_then_consuming_confirmation() {
 }
 
 #[test]
+fn a_bitwarden_card_or_identity_comes_in_with_fields_named_for_people() {
+    let bitwarden = br#"{"items": [
+        {"type":3,"name":"Visa","card":{"cardholderName":"Owner","brand":"Visa","number":"4111111111111111","expMonth":"12","expYear":"2030","code":"123","added":"kept"}},
+        {"type":4,"name":"Passport","identity":{"firstName":"Owner","passportNumber":"X1","postalCode":"12345"}}
+    ]}"#;
+    let preview = preview_import(ImportFormat::BitwardenJson, bitwarden).unwrap();
+    let names = |index: usize| -> Vec<String> {
+        preview.items()[index]
+            .custom_fields
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        names(0),
+        [
+            "Brand",
+            "Cardholder name",
+            "Expiry month",
+            "Expiry year",
+            "Number",
+            "Security code",
+            "added"
+        ]
+    );
+    assert_eq!(names(1), ["First name", "Passport number", "Postal code"]);
+    assert_eq!(
+        preview.items()[0].custom_fields["Number"],
+        "4111111111111111"
+    );
+}
+
+#[test]
 fn oversized_import_rolls_back_every_item() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.db");
