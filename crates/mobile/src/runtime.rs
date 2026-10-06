@@ -235,6 +235,7 @@ impl Runtime {
             favorite: item.favorite,
             has_password: !item.password.is_empty(),
             has_one_time_code: item.totp_secret.is_some(),
+            fields: item.custom_fields.keys().cloned().collect(),
             conflict: found.conflict,
             revision: found.revision.clone(),
         })
@@ -484,6 +485,16 @@ impl Runtime {
         let vault = self.vault.lock().await;
         let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
         Ok(vault.get(id)?.item.password.clone())
+    }
+
+    pub(crate) async fn field(&self, id: &str, name: &str) -> Result<String, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let item = vault.get(id)?.item;
+        item.custom_fields
+            .get(name)
+            .cloned()
+            .ok_or(MobileError::NoSuchField)
     }
 
     pub(crate) async fn one_time_code(&self, id: &str) -> Result<String, MobileError> {

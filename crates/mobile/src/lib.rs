@@ -62,6 +62,8 @@ pub enum MobileError {
     InvalidInvitation,
     #[error("the item has no one-time code")]
     NoOneTimeCode,
+    #[error("the item has no such field")]
+    NoSuchField,
     #[error("that is not an https origin")]
     InvalidOrigin,
     #[error("that login is not for this page")]
@@ -200,6 +202,11 @@ pub struct ItemDetail {
     pub favorite: bool,
     pub has_password: bool,
     pub has_one_time_code: bool,
+    /// The names of the item's other fields, in the vault's order (by
+    /// name): a card's number and security code, an identity's name and
+    /// address, or a login's own extra fields. Their values are not here;
+    /// `Device::field` gives one to copy.
+    pub fields: Vec<String>,
     pub conflict: bool,
     /// The revision it was read at, which an edit names: an edit of an item
     /// that changed since is refused.
@@ -436,6 +443,12 @@ impl Device {
     /// The item's current one-time code.
     pub fn one_time_code(&self, id: String) -> Result<String, MobileError> {
         self.tokio.block_on(self.inner.one_time_code(&id))
+    }
+
+    /// The value of one of the item's other fields, by a name `fields`
+    /// gave, to copy.
+    pub fn field(&self, id: String, name: String) -> Result<String, MobileError> {
+        self.tokio.block_on(self.inner.field(&id, &name))
     }
 
     /// The logins for a page of `origin` (`https://host` or

@@ -36,6 +36,62 @@ final class AppTests: UITestCase {
         XCTAssertFalse(said.exists)
     }
 
+    func testAnItemsOtherFieldsAreNamedAndCopiedButNotShown() {
+        // The format 8 fixture with a card and an identity added (prepare.sh
+        // makes it).
+        let cards = Bundle(for: AppTests.self).path(forResource: "cards-vault", ofType: "sqlite3")!
+        let app = launchApp(vault: cards)
+        unlock(in: app)
+        XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
+        func open(_ title: String) {
+            let row = app.buttons["item:\(title)"]
+            for _ in 0..<5 where !row.waitForExistence(timeout: 3) { app.swipeUp() }
+            row.tap()
+        }
+        func copies(_ name: String) {
+            XCTAssertEqual(app.staticTexts["field:\(name)"].label, "••••••••", name)
+            app.buttons["copy-field:\(name)"].tap()
+            XCTAssert(app.staticTexts["notice"].waitForLabel("\(name) copied · cleared in 30 seconds"), name)
+        }
+        func shows(_ text: String) -> Bool {
+            app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", text)).firstMatch.exists
+        }
+
+        // A card: every field by name, none shown, each copied.
+        open("Visa")
+        XCTAssert(app.buttons["copy-field:Number"].waitForExistence(timeout: 15))
+        for name in ["Cardholder name", "Expiry month", "Expiry year", "Number", "Security code"] {
+            XCTAssert(app.staticTexts["field:\(name)"].exists, name)
+        }
+        XCTAssertFalse(shows("4111111111111111"))
+        XCTAssert(app.staticTexts["edit-elsewhere"].exists)
+        XCTAssertFalse(app.buttons["edit"].exists)
+        capture("app-card")
+        copies("Number")
+        app.buttons["back"].tap()
+
+        // An identity, likewise.
+        open("Passport")
+        XCTAssert(app.buttons["copy-field:Passport number"].waitForExistence(timeout: 15))
+        XCTAssertFalse(shows("X1234567"))
+        copies("Passport number")
+        app.buttons["back"].tap()
+
+        // A login's own extra fields, beside what it had.
+        open("Bank")
+        XCTAssert(app.buttons["copy-field:PIN"].waitForExistence(timeout: 15))
+        XCTAssert(app.buttons["copy-password"].exists && app.staticTexts["field:Branch"].exists)
+        copies("PIN")
+
+        // What was copied last is the field's value, pasted in another app.
+        fixture.launch()
+        let field = fixture.textFields["fixture-username"]
+        field.waitAndTap(timeout: startTimeout)
+        field.press(forDuration: 1.2)
+        fixture.menuItems["Paste"].waitAndTap()
+        XCTAssert(fixture.staticTexts["filled"].waitForLabel("0000|"))
+    }
+
     func testAWrongPasswordIsRefused() {
         let app = launchApp(vault: frozenVault)
         unlock(in: app, password: "not the password")

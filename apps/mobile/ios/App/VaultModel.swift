@@ -352,6 +352,15 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    /// Copies the value of one of the item's other fields, as a secret.
+    func copyField(_ id: String, _ name: String) {
+        Task {
+            guard let value = await call(nil, { try $0.field(id: id, name: name) }) else { return }
+            SecretPasteboard.copy(value, secret: true)
+            notice = "\(name) copied · cleared in 30 seconds"
+        }
+    }
+
     /// The app came to the front: open the device again if it was let go,
     /// take part, and keep the list current.
     func becameActive() {

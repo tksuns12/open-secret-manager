@@ -639,3 +639,119 @@ fn records_taken_out_of_the_file_are_said_after_unlocking_until_confirmed() {
     device.unlock(PASSWORD.into()).unwrap();
     assert!(!device.rows_changed());
 }
+
+/// A card's, an identity's, and a login's other fields are named, in the
+/// vault's order, and their values given one at a time to copy. A phone
+/// edits neither a card nor an identity, and its edit of a login keeps the
+/// login's other fields.
+#[test]
+fn an_items_other_fields_are_named_and_given_one_at_a_time() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    // A card and an identity, as a computer or an import makes them.
+    let (card, identity) = {
+        let mut vault = osm_vault_core::Vault::open(folder.join("vault.sqlite3")).unwrap();
+        vault.unlock(PASSWORD).unwrap();
+        let mut card = osm_vault_core::Item::new("Visa");
+        card.kind = osm_vault_core::ItemKind::Card;
+        card.custom_fields
+            .insert("Number".into(), "4111111111111111".into());
+        card.custom_fields
+            .insert("Security code".into(), "123".into());
+        card.custom_fields
+            .insert("Cardholder name".into(), "Owner".into());
+        let card = vault.put(card).unwrap().item_id;
+        let mut identity = osm_vault_core::Item::new("Passport");
+        identity.kind = osm_vault_core::ItemKind::Identity;
+        identity
+            .custom_fields
+            .insert("Passport number".into(), "X1234567".into());
+        (card, vault.put(identity).unwrap().item_id)
+    };
+
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    assert!(matches!(
+        device.field("fixture-bank".into(), "PIN".into()),
+        Err(MobileError::Locked)
+    ));
+    device.unlock(PASSWORD.into()).unwrap();
+
+    let shown = device.item(card.clone()).unwrap();
+    assert_eq!(shown.kind, ItemKind::Card);
+    assert_eq!(shown.fields, ["Cardholder name", "Number", "Security code"]);
+    assert!(!shown.has_password);
+    assert_eq!(
+        device.field(card.clone(), "Security code".into()).unwrap(),
+        "123"
+    );
+    assert!(matches!(
+        device.field(card.clone(), "security code".into()),
+        Err(MobileError::NoSuchField)
+    ));
+    let shown = device.item(identity.clone()).unwrap();
+    assert_eq!(shown.kind, ItemKind::Identity);
+    assert_eq!(shown.fields, ["Passport number"]);
+    assert_eq!(
+        device.field(identity, "Passport number".into()).unwrap(),
+        "X1234567"
+    );
+    assert!(matches!(
+        device.field("no such item".into(), "Number".into()),
+        Err(MobileError::NotFound)
+    ));
+
+    // A login's own: kept by an edit made here.
+    let bank = device.item("fixture-bank".into()).unwrap();
+    assert_eq!(bank.fields, ["Branch", "PIN"]);
+    assert!(device
+        .item("fixture-mail".into())
+        .unwrap()
+        .fields
+        .is_empty());
+    device
+        .update_item(
+            "fixture-bank".into(),
+            bank.revision,
+            ItemDraft {
+                title: "Bank".into(),
+                kind: ItemKind::Login,
+                username: bank.username,
+                url: bank.url,
+                notes: "edited on a phone".into(),
+                favorite: bank.favorite,
+                password: None,
+                one_time_code_secret: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        device.item("fixture-bank".into()).unwrap().fields,
+        ["Branch", "PIN"]
+    );
+    assert_eq!(
+        device.field("fixture-bank".into(), "PIN".into()).unwrap(),
+        "0000"
+    );
+    // A card is still not edited here.
+    let card_now = device.item(card.clone()).unwrap();
+    assert!(device
+        .update_item(
+            card,
+            card_now.revision,
+            ItemDraft {
+                title: "Visa".into(),
+                kind: ItemKind::Card,
+                username: String::new(),
+                url: String::new(),
+                notes: String::new(),
+                favorite: false,
+                password: None,
+                one_time_code_secret: None,
+            },
+        )
+        .is_err());
+    device.lock();
+    assert!(matches!(
+        device.field("fixture-bank".into(), "PIN".into()),
+        Err(MobileError::Locked)
+    ));
+}

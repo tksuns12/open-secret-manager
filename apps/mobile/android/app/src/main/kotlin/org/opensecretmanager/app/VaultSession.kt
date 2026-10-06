@@ -307,6 +307,12 @@ class VaultSession(private val context: Context, private val folder: File) {
         _state.update { it.copy(notice = "Code copied · cleared in 30 seconds") }
     }
 
+    /** Copies the value of one of the item's other fields, as a secret. */
+    fun copyField(id: String, name: String) = run(null) {
+        SecretClipboard.copy(context, name, device!!.field(id, name), secret = true)
+        _state.update { it.copy(notice = "$name copied · cleared in 30 seconds") }
+    }
+
     /** The logins saved for [origin]'s pages; then, on the main thread, [done]. */
     fun loginsForWeb(origin: String, done: (List<ItemSummary>) -> Unit) = run(null) {
         val logins = device!!.loginsForWeb(origin).sortedBy { it.title.lowercase() }
@@ -463,6 +469,7 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.Removed -> "This phone was removed from the vault"
         is MobileException.InvalidInvitation -> "That is not an invitation · copy it again from your computer"
         is MobileException.NoOneTimeCode -> "This item has no one-time code"
+        is MobileException.NoSuchField -> "This item no longer has that field · open it again"
         is MobileException.InvalidOrigin -> "Logins are filled only into https pages"
         is MobileException.NotForThisPage -> "That login is not saved for this page"
         is MobileException.NotALogin -> "Only a login can be filled"

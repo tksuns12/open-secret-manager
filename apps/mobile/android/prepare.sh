@@ -1,7 +1,8 @@
 #!/bin/sh
 # Puts in place what the vault module is built from and tested with: the
-# shared code's library for arm64 Android, its Kotlin bindings, and a copy
-# of the frozen format 7 vault for the tests. None of it is committed.
+# shared code's library for arm64 Android, its Kotlin bindings, and the
+# vaults the tests open: a copy of the frozen format 7 vault, and two made
+# from the format 8 one. None of it is committed.
 #
 #   apps/mobile/android/prepare.sh <scratch folder> [release]
 #
@@ -54,3 +55,7 @@ for module in vault app; do
         "$android/$module/src/androidTest/assets/format-7-vault.sqlite3"
 done
 take_out "$android/app/src/androidTest/assets/sealed-taken-out-vault.sqlite3"
+# A vault with a card and an identity, which no frozen vault holds and a
+# phone cannot make, for the screens that show an item's other fields.
+cargo run --locked -q -p osm-mobile --example cards_vault -- \
+    crates/vault-core/fixtures/format-8 "$android/app/src/androidTest/assets/cards-vault.sqlite3"

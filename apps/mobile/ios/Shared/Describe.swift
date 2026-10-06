@@ -19,6 +19,7 @@ func describe(_ error: Error) -> String {
     case .Removed: return "This phone was removed from the vault"
     case .InvalidInvitation: return "That is not an invitation · copy it again from your computer"
     case .NoOneTimeCode: return "This item has no one-time code"
+    case .NoSuchField: return "This item no longer has that field · open it again"
     case .InvalidOrigin: return "Logins are filled only into https pages"
     case .NotForThisPage: return "That login is not saved for this page"
     case .NotALogin: return "Only a login can be filled"

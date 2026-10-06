@@ -1,8 +1,9 @@
 #!/bin/sh
 # Puts in place what the iOS project is built from and tested with: the
 # shared code's static library for the simulator and for iPhones, as
-# build/OSMVaultFFI.xcframework, its Swift bindings, and a copy of the
-# frozen format 7 vault for the UI tests. None of it is committed.
+# build/OSMVaultFFI.xcframework, its Swift bindings, and the vaults the UI
+# tests open: a copy of the frozen format 7 vault, and two made from the
+# format 8 one. None of it is committed.
 #
 #   apps/mobile/ios/prepare.sh <scratch folder> [release]
 #
@@ -55,3 +56,7 @@ take_out() {
         (SELECT revision FROM revisions WHERE item_id='fixture-mail' AND parents='');"
 }
 take_out "$ios/UITests/Fixtures/sealed-taken-out-vault.sqlite3"
+# A vault with a card and an identity, which no frozen vault holds and a
+# phone cannot make, for the screens that show an item's other fields.
+cargo run --locked -q -p osm-mobile --example cards_vault -- \
+    crates/vault-core/fixtures/format-8 "$ios/UITests/Fixtures/cards-vault.sqlite3"

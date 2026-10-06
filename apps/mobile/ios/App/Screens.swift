@@ -264,6 +264,14 @@ private struct Detail: View {
                     }
                 }
                 if !detail.url.isEmpty { Field(label: "Website", value: detail.url) {} }
+                // A card's number, an identity's address, a login's own
+                // extras: named, and copied rather than shown, as on the
+                // computer.
+                ForEach(detail.fields, id: \.self) { name in
+                    Field(label: name, value: "••••••••", identifier: "field:\(name)") {
+                        Button("Copy") { model.copyField(detail.id, name) }.accessibilityIdentifier("copy-field:\(name)")
+                    }
+                }
                 if !detail.notes.isEmpty { Field(label: "Notes", value: detail.notes, identifier: "detail-notes") {} }
             }
             Section {

@@ -60,6 +60,9 @@ class DeviceTest {
             assertEquals("account 42", bank.username)
             assertTrue(bank.hasPassword && bank.hasOneTimeCode && bank.favorite)
             assertEquals("line one\nline two", bank.notes)
+            assertEquals(listOf("Branch", "PIN"), bank.fields)
+            assertEquals("0000", device.field("fixture-bank", "PIN"))
+            fails<MobileException.NoSuchField> { device.field("fixture-bank", "pin") }
             assertEquals("p@ss \"quoted\" \\ and 🔑", device.password("fixture-bank"))
             val code = device.oneTimeCode("fixture-bank")
             assertTrue(code, code.length == 6 && code.all { it.isDigit() })

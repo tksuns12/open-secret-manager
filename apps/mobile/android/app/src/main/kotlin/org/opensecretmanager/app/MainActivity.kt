@@ -445,6 +445,15 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
             }
         }
         if (detail.url.isNotEmpty()) Field("Website", detail.url)
+        // A card's number, an identity's address, a login's own extras:
+        // named, and copied rather than shown, as on the computer.
+        for (name in detail.fields) {
+            Field(name, "••••••••", "field:$name") {
+                TextButton(onClick = { session.copyField(detail.id, name) }, modifier = Modifier.testTag("copy-field:$name")) {
+                    Text("Copy")
+                }
+            }
+        }
         if (detail.notes.isNotEmpty()) Field("Notes", detail.notes, "detail-notes")
         TextButton(onClick = { session.openHistory(detail) }, modifier = Modifier.testTag("history")) {
             Text("History: every version, and which device made it")

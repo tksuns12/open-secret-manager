@@ -5,13 +5,18 @@ import android.content.ClipboardManager
 import android.os.Build
 import android.view.WindowManager
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -110,6 +115,71 @@ class AppTest {
         compose.onNodeWithTag("unlock").performClick()
         waitFor("item:Bank")
         compose.onNodeWithTag("rows-changed").assertDoesNotExist()
+    }
+
+    @Test
+    fun anItemsOtherFieldsAreNamedAndCopiedButNotShown() {
+        // The format 8 fixture with a card and an identity added (prepare.sh
+        // makes it).
+        session.reopenForTests { folder ->
+            BiometricUnlock(instrumentation.targetContext).disable()
+            instrumentation.context.assets.open("cards-vault.sqlite3").use { input ->
+                File(folder, "vault.sqlite3").outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Bank")
+        val clipboard = instrumentation.targetContext.getSystemService(ClipboardManager::class.java)
+        val sensitive = if (Build.VERSION.SDK_INT >= 33) ClipDescription.EXTRA_IS_SENSITIVE else "android.content.extra.IS_SENSITIVE"
+        fun open(title: String) {
+            compose.onNodeWithTag("search").performTextClearance()
+            compose.onNodeWithTag("search").performTextInput(title)
+            waitFor("item:$title")
+            compose.onNodeWithTag("item:$title").performClick()
+        }
+        fun copies(name: String, value: String) {
+            compose.onNodeWithTag("field:$name").assertTextEquals("••••••••")
+            compose.onNodeWithTag("copy-field:$name").performScrollTo().performClick()
+            compose.waitUntil(10_000) {
+                instrumentation.runOnMainSync { }
+                clipboard.primaryClip?.getItemAt(0)?.text?.toString() == value
+            }
+            assertTrue(clipboard.primaryClipDescription!!.extras!!.getBoolean(sensitive))
+            compose.waitUntilAtLeastOneExists(hasText("$name copied · cleared in 30 seconds"), 10_000)
+            // Gone before the next tap, which it could cover.
+            compose.waitUntil(15_000) { session.state.value.notice == null }
+        }
+
+        // A card: every field by name, none shown, each copied as a secret.
+        open("Visa")
+        waitFor("copy-field:Number")
+        for (name in listOf("Cardholder name", "Expiry month", "Expiry year", "Number", "Security code")) {
+            compose.onNodeWithTag("field:$name").assertExists()
+        }
+        compose.onAllNodesWithText("4111111111111111", substring = true).assertCountEquals(0)
+        compose.onNodeWithTag("edit-elsewhere").assertExists()
+        compose.onNodeWithTag("edit").assertDoesNotExist()
+        copies("Security code", "123")
+        copies("Number", "4111111111111111")
+        compose.onNodeWithTag("back").performClick()
+
+        // An identity, likewise.
+        waitFor("search")
+        open("Passport")
+        waitFor("copy-field:Passport number")
+        compose.onAllNodesWithText("X1234567", substring = true).assertCountEquals(0)
+        copies("Passport number", "X1234567")
+        compose.onNodeWithTag("back").performClick()
+
+        // A login's own extra fields, beside what it had.
+        waitFor("search")
+        open("Bank")
+        waitFor("copy-field:PIN")
+        compose.onNodeWithTag("copy-password").assertExists()
+        compose.onNodeWithTag("field:Branch").assertExists()
+        copies("PIN", "0000")
     }
 
     @Test
