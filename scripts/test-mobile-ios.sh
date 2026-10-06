@@ -11,7 +11,8 @@
 # (apps/mobile/ios/Tests/configure-ui-tests.swift). Variables named
 # OSM_TEST_* are passed on to the tests. OSM_IOS_OPTIMIZED=1 builds the apps
 # and the shared code optimized, as a release, keeping only the debug
-# build's hooks for the tests. Needs Xcode, an iOS simulator runtime, and
+# build's hooks for the tests. OSM_IOS_ROOT_CERT names a certificate
+# authority for the simulator to trust. Needs Xcode, an iOS simulator runtime, and
 # `rustup target add aarch64-apple-ios-sim aarch64-apple-ios`.
 set -eu
 cd "$(dirname "$0")/.."
@@ -55,6 +56,11 @@ device=$(xcrun simctl --set "$set_dir" create "Open Secret Manager UI tests" \
     com.apple.CoreSimulator.SimDeviceType.iPhone-17 "$runtime")
 xcrun simctl --set "$set_dir" boot "$device"
 xcrun simctl --set "$set_dir" bootstatus "$device" -b >/dev/null
+# A certificate authority for a test site the tests should trust
+# (scripts/test-mobile-safari.sh).
+if [ -n "${OSM_IOS_ROOT_CERT:-}" ]; then
+    xcrun simctl --set "$set_dir" keychain "$device" add-root-cert "$OSM_IOS_ROOT_CERT"
+fi
 for app in OpenSecretManager LoginFixture UITests-Runner; do
     xcrun simctl --set "$set_dir" install "$device" "$products/$app.app"
 done

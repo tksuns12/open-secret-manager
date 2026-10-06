@@ -115,7 +115,8 @@ class UITestCase: XCTestCase {
         if let folder = ProcessInfo.processInfo.environment["OSM_TEST_FAILURES"] {
             let file = "\(folder)/\(name.filter { $0.isLetter || $0.isNumber })-\(Int(Date().timeIntervalSince1970))"
             try? XCUIScreen.main.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: file + ".png"))
-            let trees = [XCUIApplication(), XCUIApplication(bundleIdentifier: "org.opensecretmanager.loginfixture"), springboard]
+            let trees = [XCUIApplication(), XCUIApplication(bundleIdentifier: "org.opensecretmanager.loginfixture"),
+                         XCUIApplication(bundleIdentifier: "com.apple.mobilesafari"), springboard]
                 .map(\.debugDescription).joined(separator: "\n\n")
             try? (issue.compactDescription + "\n\n" + trees).write(toFile: file + ".txt", atomically: true, encoding: .utf8)
         }

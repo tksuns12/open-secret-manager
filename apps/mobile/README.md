@@ -86,7 +86,8 @@ open ios/OpenSecretManager.xcodeproj
 ```
 
 `scripts/test-mobile-ios.sh` builds the project and runs the UI tests in a
-simulator of its own; `scripts/test-mobile-join.sh ios` has the app join a
+simulator of its own; `scripts/test-mobile-safari.sh` has real Safari fill
+and save on a test site; `scripts/test-mobile-join.sh ios` has the app join a
 desktop-side device on the same machine. xcodebuild runs UI tests only on
 simulators of the default device set, so the script installs the apps and
 starts XCTest's runner itself, with the configuration Xcode would write

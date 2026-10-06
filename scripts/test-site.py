@@ -1,7 +1,7 @@
-"""The test site for scripts/test-mobile-chrome.sh: a sign-in page and then a
-page that asks for a one-time code, over HTTPS on 127.0.0.1:8443 only, with
-the certificate in the folder given; what each form sends is appended to
-server.log there.
+"""The test site for scripts/test-mobile-chrome.sh and test-mobile-safari.sh:
+a sign-in page and then a page that asks for a one-time code, over HTTPS on
+127.0.0.1:8443 only, with the certificate in the folder given; what each
+form sends is appended to server.log there.
 
     python3 scripts/test-site.py <folder with site.crt and site.key>
 """

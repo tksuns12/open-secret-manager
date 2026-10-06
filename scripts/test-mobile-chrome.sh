@@ -6,7 +6,7 @@
 #
 # The folder holds a certificate authority made for these tests only and the
 # test site's certificate, which the first run makes
-# (scripts/test-site-certs.sh).
+# (scripts/test-site-certs.sh; scripts/test-mobile-safari.sh shares them).
 # Android lets two things be done only through its screens, once per
 # emulator:
 #
