@@ -62,6 +62,8 @@ phone sold since 2019 is):
   the phone offers no Edit, and choosing a version on the computer clears
   it on the phone.
 - Delete it on the phone: it goes from the computer too.
+- Open Recently deleted on the phone and restore it: it comes back on the computer, as it was.
+- Change its password on the computer, then open its History on the phone and restore the version before: the computer shows the earlier password again.
 
 ## Leaving and coming back
 

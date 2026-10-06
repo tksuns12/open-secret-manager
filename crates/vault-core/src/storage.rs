@@ -1136,7 +1136,7 @@ impl Vault {
         let revisions = statement
             .query_map([item_id], row_to_revision)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        revisions
+        let mut history = revisions
             .iter()
             .map(|revision| {
                 let item = if revision.tombstone {
@@ -1152,9 +1152,31 @@ impl Vault {
                     parents: revision.parents.clone(),
                     author_device_id: revision.author_device_id,
                     item,
+                    changed: Vec::new(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // What each changed from the first version it followed that held
+        // the item.
+        let changed: Vec<Vec<&'static str>> = history
+            .iter()
+            .map(|version| {
+                let before = version.parents.iter().find_map(|parent| {
+                    history
+                        .iter()
+                        .find(|other| &other.revision == parent)
+                        .and_then(|other| other.item.as_ref())
+                });
+                match (before, version.item.as_ref()) {
+                    (Some(before), Some(item)) => item.changed_from(before),
+                    _ => Vec::new(),
+                }
+            })
+            .collect();
+        for (version, changed) in history.iter_mut().zip(changed) {
+            version.changed = changed;
+        }
+        Ok(history)
     }
 
     /// The items that every one of their current versions deletes, most

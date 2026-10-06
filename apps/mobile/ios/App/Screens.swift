@@ -11,7 +11,7 @@ struct RootView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     if model.screen == .unlocked && model.editor == nil {
-                        if model.detail == nil {
+                        if model.detail == nil && model.history == nil && model.deleted == nil {
                             ToolbarItem(placement: .topBarLeading) {
                                 Button("New", action: model.startNew).accessibilityIdentifier("new-item")
                             }
@@ -50,6 +50,10 @@ struct RootView: View {
         case .unlocked:
             if let editor = model.editor {
                 ItemEditor(model: model, detail: editor.detail)
+            } else if let history = model.history {
+                HistoryList(model: model, history: history)
+            } else if let deleted = model.deleted {
+                DeletedList(model: model, deleted: deleted)
             } else if let detail = model.detail {
                 Detail(model: model, detail: detail)
             } else {
@@ -172,6 +176,7 @@ private struct Items: View {
                 .accessibilityIdentifier("item:\(item.title)")
             }
             Section {
+                Button("Recently deleted…", action: model.openDeleted).accessibilityIdentifier("recently-deleted")
                 if autofill == false { AutofillOffer(enabled: $autofill) }
                 SyncLine(model: model)
             }
@@ -249,12 +254,109 @@ private struct Detail: View {
                 if !detail.url.isEmpty { Field(label: "Website", value: detail.url) {} }
                 if !detail.notes.isEmpty { Field(label: "Notes", value: detail.notes, identifier: "detail-notes") {} }
             }
+            Section {
+                Button("History: every version, and which device made it") { model.openHistory(detail) }
+                    .accessibilityIdentifier("history")
+            }
         }
         .alert("Delete \(detail.title)?", isPresented: $confirmingDelete) {
             Button("Delete", role: .destructive) { model.delete(detail) }.accessibilityIdentifier("confirm-delete")
             Button("Keep", role: .cancel) {}.accessibilityIdentifier("keep")
         } message: {
             Text("It is deleted on all your devices. Its earlier versions stay in the vault's history and in backups.")
+        }
+    }
+}
+
+/// Whether a phone restores items of `kind`: logins and secure notes.
+private func restoresHere(_ kind: ItemKind) -> Bool {
+    kind == .login || kind == .secureNote
+}
+
+private func said(_ version: HistoryEntry) -> String {
+    if version.deleted { return "Deleted the item" }
+    if version.first { return "Made the item" }
+    if version.merged { return "Settled a conflict between versions" }
+    if !version.changed.isEmpty { return "Changed \(version.changed.joined(separator: ", "))" }
+    return "Saved without a change"
+}
+
+/// An item's versions, newest first; one that is not current can be brought back.
+private struct HistoryList: View {
+    @ObservedObject var model: VaultModel
+    let history: History
+    @State private var confirming: HistoryEntry?
+
+    private var restorable: Bool {
+        restoresHere(history.detail.kind) && history.versions.filter(\.current).count == 1
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Button("‹ \(history.detail.title)", action: model.closeHistory).accessibilityIdentifier("back")
+            }
+            Section {
+                Text("Newest first. Restoring a version makes it the newest; the others stay. Times are not kept, only the order.")
+                if !restorable {
+                    Text("Identities, cards, and items in conflict are restored on your computer.")
+                        .accessibilityIdentifier("restore-elsewhere")
+                }
+            }
+            ForEach(Array(history.versions.enumerated()), id: \.element.revision) { index, version in
+                Section {
+                    Text((version.thisDevice ? "This phone" : "Device \(version.device)") + (version.current ? " · current" : ""))
+                        .font(.headline)
+                    Text(said(version)).accessibilityIdentifier("said-\(index)")
+                    if !version.deleted {
+                        Text([version.title, version.username, version.url].filter { !$0.isEmpty }.joined(separator: " · "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if restorable && !version.current && !version.deleted {
+                        Button("Restore this version…") { confirming = version }.accessibilityIdentifier("restore-\(index)")
+                    }
+                }
+            }
+        }
+        .alert("Restore this version?", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            Button("Restore") { if let version = confirming { model.restore(version) } }.accessibilityIdentifier("confirm-restore")
+            Button("Keep the current", role: .cancel) {}.accessibilityIdentifier("keep")
+        } message: {
+            Text("It becomes the newest version on all your devices. The current one stays in the history.")
+        }
+    }
+}
+
+/// The items deleted on any device, which can be brought back as they were.
+private struct DeletedList: View {
+    @ObservedObject var model: VaultModel
+    let deleted: [DeletedEntry]
+
+    var body: some View {
+        List {
+            Section {
+                Button("‹ All items", action: model.closeDeleted).accessibilityIdentifier("back")
+            }
+            Section {
+                Text(deleted.isEmpty
+                    ? "Nothing has been deleted."
+                    : "Deleted on any of your devices, most recently first. Restoring one brings it back on all of them, as it was before it was deleted.")
+                    .accessibilityIdentifier("deleted-hint")
+            }
+            ForEach(deleted, id: \.id) { entry in
+                Section {
+                    Text(entry.title).font(.headline).accessibilityIdentifier("deleted:\(entry.title)")
+                    let shown = [entry.username, entry.url].filter { !$0.isEmpty }
+                    if !shown.isEmpty { Text(shown.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary) }
+                    Text("Deleted on " + (entry.thisDevice ? "this phone" : "device \(entry.device)")).font(.caption)
+                    if restoresHere(entry.kind) {
+                        Button("Restore") { model.restoreDeleted(entry) }.accessibilityIdentifier("restore:\(entry.title)")
+                    } else {
+                        Text("Identities and cards are restored on your computer.").font(.caption)
+                    }
+                }
+            }
         }
     }
 }

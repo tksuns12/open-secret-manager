@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -62,6 +63,8 @@ import androidx.compose.ui.unit.sp
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import org.opensecretmanager.vault.DeletedEntry
+import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemKind
@@ -122,6 +125,8 @@ fun VaultScreen(
                 title = {
                     Text(
                         when {
+                            fields == null && state.history != null -> "History"
+                            fields == null && state.deleted != null -> "Recently deleted"
                             fields == null -> "Open Secret Manager"
                             state.editor?.detail == null -> "New item"
                             else -> "Edit item"
@@ -138,7 +143,7 @@ fun VaultScreen(
                             modifier = Modifier.testTag("save"),
                         ) { Text("Save") }
                     } else if (state.screen == Screen.UNLOCKED) {
-                        if (state.detail == null) {
+                        if (state.detail == null && state.history == null && state.deleted == null) {
                             TextButton(onClick = session::startNew, modifier = Modifier.testTag("new-item")) { Text("New") }
                         }
                         TextButton(onClick = session::lock, modifier = Modifier.testTag("lock")) { Text("Lock") }
@@ -155,6 +160,8 @@ fun VaultScreen(
                 Screen.JOINING -> JoinConfirm(state, session)
                 Screen.LOCKED -> Unlock(state, session, biometric, onUnlockWithBiometric, onRememberWithBiometric)
                 Screen.UNLOCKED -> fields?.let { ItemEditor(it, state.editor?.detail, session) }
+                    ?: state.history?.let { HistoryList(it, session) }
+                    ?: state.deleted?.let { DeletedList(it, session) }
                     ?: state.detail?.let { Detail(it, session) }
                     ?: Items(state, session)
                 Screen.REMOVED -> Message(
@@ -317,6 +324,7 @@ private fun Items(state: UiState, session: VaultSession) {
         LazyColumn(Modifier.weight(1f)) {
             items(shown, key = { it.id }) { item -> ItemRow(item) { session.open(item.id) } }
         }
+        TextButton(onClick = session::openDeleted, modifier = Modifier.testTag("recently-deleted")) { Text("Recently deleted…") }
         AutofillOffer()
         SyncLine(state.sync, session)
     }
@@ -398,6 +406,9 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
         }
         if (detail.url.isNotEmpty()) Field("Website", detail.url)
         if (detail.notes.isNotEmpty()) Field("Notes", detail.notes, "detail-notes")
+        TextButton(onClick = { session.openHistory(detail) }, modifier = Modifier.testTag("history")) {
+            Text("History: every version, and which device made it")
+        }
     }
     if (confirmingDelete) {
         AlertDialog(
@@ -417,6 +428,119 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
                 TextButton(onClick = { confirmingDelete = false }, modifier = Modifier.testTag("keep")) { Text("Keep") }
             },
         )
+    }
+}
+
+/** Whether a phone restores items of [kind]: logins and secure notes. */
+private fun restoresHere(kind: ItemKind) = kind == ItemKind.LOGIN || kind == ItemKind.SECURE_NOTE
+
+private fun said(version: HistoryEntry): String = when {
+    version.deleted -> "Deleted the item"
+    version.first -> "Made the item"
+    version.merged -> "Settled a conflict between versions"
+    version.changed.isNotEmpty() -> "Changed ${version.changed.joinToString(", ")}"
+    else -> "Saved without a change"
+}
+
+/** An item's versions, newest first; one that is not current can be brought back. */
+@Composable
+private fun HistoryList(history: History, session: VaultSession) {
+    var confirming by remember(history) { mutableStateOf<HistoryEntry?>(null) }
+    val restorable = restoresHere(history.detail.kind) && history.versions.count { it.current } == 1
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        item {
+            TextButton(onClick = session::closeHistory, modifier = Modifier.testTag("back")) { Text("‹ ${history.detail.title}") }
+            Text(
+                "Newest first. Restoring a version makes it the newest; the others stay. Times are not kept, only the order.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            if (!restorable) {
+                Text(
+                    "Identities, cards, and items in conflict are restored on your computer.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(top = 8.dp).testTag("restore-elsewhere"),
+                )
+            }
+        }
+        itemsIndexed(history.versions, key = { _, version -> version.revision }) { index, version ->
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("version-$index")) {
+                Text(
+                    (if (version.thisDevice) "This phone" else "Device ${version.device}") + if (version.current) " · current" else "",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(said(version), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("said-$index"))
+                if (!version.deleted) {
+                    Text(
+                        listOf(version.title, version.username, version.url).filter { it.isNotEmpty() }.joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (restorable && !version.current && !version.deleted) {
+                    TextButton(onClick = { confirming = version }, modifier = Modifier.testTag("restore-$index")) {
+                        Text("Restore this version…")
+                    }
+                }
+            }
+            HorizontalDivider()
+        }
+    }
+    confirming?.let { version ->
+        AlertDialog(
+            onDismissRequest = { confirming = null },
+            title = { Text("Restore this version?") },
+            text = { Text("It becomes the newest version on all your devices. The current one stays in the history.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirming = null
+                        session.restoreVersion(version)
+                    },
+                    modifier = Modifier.testTag("confirm-restore"),
+                ) { Text("Restore") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirming = null }, modifier = Modifier.testTag("keep")) { Text("Keep the current") }
+            },
+        )
+    }
+}
+
+/** The items deleted on any device, which can be brought back as they were. */
+@Composable
+private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        item {
+            TextButton(onClick = session::closeDeleted, modifier = Modifier.testTag("back")) { Text("‹ All items") }
+            Text(
+                if (deleted.isEmpty()) {
+                    "Nothing has been deleted."
+                } else {
+                    "Deleted on any of your devices, most recently first. Restoring one brings it back on all of them, as it was before it was deleted."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.testTag("deleted-hint"),
+            )
+        }
+        items(deleted, key = { it.id }) { entry ->
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("deleted:${entry.title}")) {
+                Text(entry.title, style = MaterialTheme.typography.titleMedium)
+                listOf(entry.username, entry.url).filter { it.isNotEmpty() }.takeIf { it.isNotEmpty() }?.let {
+                    Text(it.joinToString(" · "), style = MaterialTheme.typography.bodySmall)
+                }
+                Text(
+                    "Deleted on " + if (entry.thisDevice) "this phone" else "device ${entry.device}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (restoresHere(entry.kind)) {
+                    TextButton(onClick = { session.restoreDeleted(entry) }, modifier = Modifier.testTag("restore:${entry.title}")) {
+                        Text("Restore")
+                    }
+                } else {
+                    Text("Identities and cards are restored on your computer.", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            HorizontalDivider()
+        }
     }
 }
 

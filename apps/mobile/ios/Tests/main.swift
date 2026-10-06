@@ -63,6 +63,14 @@ do {
     check(filled.username == "owner@example.test" && filled.password == "third password, with ünïcödé", "a login fills its page")
     check(fails({ try device.fillForWeb(id: "fixture-bank", origin: "https://mail.example.test") }) { if case .NotForThisPage = $0 { true } else { false } }, "a login fills no other page")
     check(try device.fillForApp(id: "fixture-bank").username == "account 42", "a login fills the app it was chosen for")
+    // An item's history, and a deleted note, come back.
+    let history = try device.history(id: "fixture-mail")
+    check(history.map { $0.changed } == [["password", "notes"], ["password"], []], "a history says what each version changed")
+    try device.restore(id: "fixture-mail", revision: history[2].revision, heads: [history[0].revision])
+    check(try device.password(id: "fixture-mail") == "first password", "an earlier version comes back")
+    let note = try device.deletedItems().first { $0.title == "A note that was deleted" }!
+    try device.restore(id: note.id, revision: note.last, heads: note.heads)
+    check(try device.item(id: note.id).notes == "gone", "a deleted note comes back as it was")
     // A one-time code goes only where its login would.
     check(try device.withOneTimeCodes(ids: try device.items().map { $0.id }).map { $0.title } == ["Bank"], "only Bank has a one-time code")
     check(try device.oneTimeCodeForWeb(id: "fixture-bank", origin: "https://bank.example.test:8443").count == 6, "a code fills its login's page")

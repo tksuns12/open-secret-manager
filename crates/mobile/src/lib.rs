@@ -13,8 +13,8 @@
 //! owner's edits cross the other way, into the shared code, which keeps
 //! them only in the vault.
 //!
-//! On a phone the owner creates, edits, and deletes logins and secure
-//! notes, and saves what another app's login form submitted; identities and
+//! On a phone the owner creates, edits, deletes, and restores logins and
+//! secure notes, and saves what another app's login form submitted; identities and
 //! cards are read there and edited on a computer, as are conflicts between
 //! devices.
 //!
@@ -310,6 +310,46 @@ pub struct SaveCandidate {
     pub has_this_password: bool,
 }
 
+/// One version of an item, as its history shows it: what it changed, by
+/// field name, and what it held that may be shown. No secret.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct HistoryEntry {
+    pub revision: String,
+    /// It deleted the item.
+    pub deleted: bool,
+    /// It is one of the item's current versions.
+    pub current: bool,
+    /// It made the item.
+    pub first: bool,
+    /// It settled a conflict between versions.
+    pub merged: bool,
+    pub title: String,
+    pub username: String,
+    pub url: String,
+    /// The fields it changed from the version it followed.
+    pub changed: Vec<String>,
+    /// The first eight hex digits of the device that made it.
+    pub device: String,
+    pub this_device: bool,
+}
+
+/// An item deleted on every device that has it, as it was before. No secret.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DeletedEntry {
+    pub id: String,
+    pub title: String,
+    pub kind: ItemKind,
+    pub username: String,
+    pub url: String,
+    /// The version before the deletion, which a restore brings back.
+    pub last: String,
+    /// The deletions, which a restore follows.
+    pub heads: Vec<String>,
+    /// The first eight hex digits of the device that deleted it.
+    pub device: String,
+    pub this_device: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum SyncState {
     /// Not taking part: the app is in the background, or never went online.
@@ -442,6 +482,31 @@ impl Device {
     /// every device. Its earlier versions stay in the vault's history.
     pub fn delete_item(&self, id: String, revision: String) -> Result<(), MobileError> {
         self.tokio.block_on(self.inner.delete_item(&id, &revision))
+    }
+
+    /// Every version of an item, newest first.
+    pub fn history(&self, id: String) -> Result<Vec<HistoryEntry>, MobileError> {
+        self.tokio.block_on(self.inner.history(&id))
+    }
+
+    /// The items deleted, most recently first.
+    pub fn deleted_items(&self) -> Result<Vec<DeletedEntry>, MobileError> {
+        self.tokio.block_on(self.inner.deleted_items())
+    }
+
+    /// Brings back what version `revision` of the login or secure note
+    /// `id` held, or the item as it was before it was deleted, following
+    /// its current versions `heads`, which the owner was shown. Refused for
+    /// an identity or a card, and for an item in conflict. Online, it syncs
+    /// at once.
+    pub fn restore(
+        &self,
+        id: String,
+        revision: String,
+        heads: Vec<String>,
+    ) -> Result<(), MobileError> {
+        self.tokio
+            .block_on(self.inner.restore(&id, &revision, &heads))
     }
 
     /// For saving what a login form submitted: of the logins in `ids`,

@@ -67,6 +67,15 @@ class DeviceTest {
             fails<MobileException.NoOneTimeCode> { device.oneTimeCode("fixture-mail") }
             fails<MobileException.NotFound> { device.item("no such item") }
 
+            // An item's history, and a deleted note, come back.
+            val history = device.history("fixture-mail")
+            assertEquals(listOf("password", "notes"), history[0].changed)
+            device.restore("fixture-mail", history[2].revision, listOf(history[0].revision))
+            assertEquals("first password", device.password("fixture-mail"))
+            val note = device.deletedItems().first { it.title == "A note that was deleted" }
+            device.restore(note.id, note.last, note.heads)
+            assertEquals("gone", device.item(note.id).notes)
+
             // A one-time code goes only where its login would.
             assertEquals(listOf("Bank"), device.withOneTimeCodes(device.items().map { it.id }).map { it.title })
             assertEquals(6, device.oneTimeCodeForWeb("fixture-bank", "https://bank.example.test:8443").length)

@@ -10,6 +10,12 @@ struct Editor: Equatable {
     let detail: ItemDetail?
 }
 
+/// An item's versions, newest first, while its history is open.
+struct History: Equatable {
+    let detail: ItemDetail
+    let versions: [HistoryEntry]
+}
+
 /// The device of the vault, as the screens use it. Every call to it runs off
 /// the main thread, one at a time; the screens follow what is published.
 @MainActor
@@ -27,6 +33,10 @@ final class VaultModel: ObservableObject {
     @Published private(set) var unreadable: String?
     /// While the editor is open.
     @Published private(set) var editor: Editor?
+    /// While an item's history is open.
+    @Published private(set) var history: History?
+    /// The items deleted, while that list is open.
+    @Published private(set) var deleted: [DeletedEntry]?
     let biometric = BiometricUnlock()
 
     private let queue = DispatchQueue(label: "org.opensecretmanager.device")
@@ -84,7 +94,11 @@ final class VaultModel: ObservableObject {
         // A detail stays open only while its item does.
         if let detail, !(screen == .unlocked && items.contains { $0.id == detail.id }) { self.detail = nil }
         if screen != .joining { joinCode = nil }
-        if screen != .unlocked { editor = nil }
+        if screen != .unlocked {
+            editor = nil
+            history = nil
+            deleted = nil
+        }
     }
 
     private func openDevice() async {
@@ -137,6 +151,8 @@ final class VaultModel: ObservableObject {
         Task {
             detail = nil
             editor = nil
+            history = nil
+            deleted = nil
             await call { $0.lock() }
         }
     }
@@ -237,6 +253,71 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    func openHistory(_ detail: ItemDetail) {
+        Task {
+            if let versions = await call(nil, { try $0.history(id: detail.id) }) {
+                history = History(detail: detail, versions: versions)
+            }
+        }
+    }
+
+    func closeHistory() {
+        history = nil
+    }
+
+    /// Brings back what `version` held as the newest version, following the
+    /// current versions the history showed. If the item changed since, the
+    /// history is read again.
+    func restore(_ version: HistoryEntry) {
+        guard let device, let shown = history else { return }
+        let heads = shown.versions.filter(\.current).map(\.revision)
+        Task {
+            busy = "Restoring…"
+            notice = nil
+            defer { busy = nil }
+            do {
+                let now = try await onQueue { () -> ItemDetail in
+                    try device.restore(id: shown.detail.id, revision: version.revision, heads: heads)
+                    return try device.item(id: shown.detail.id)
+                }
+                history = nil
+                detail = now
+                notice = "Version restored"
+            } catch MobileError.ChangedElsewhere {
+                if let versions = try? await onQueue({ try device.history(id: shown.detail.id) }) {
+                    history = History(detail: shown.detail, versions: versions)
+                }
+                notice = describe(MobileError.ChangedElsewhere)
+            } catch {
+                notice = describe(error)
+            }
+            await refresh()
+        }
+    }
+
+    func openDeleted() {
+        Task {
+            if let items = await call(nil, { try $0.deletedItems() }) { deleted = items }
+        }
+    }
+
+    func closeDeleted() {
+        deleted = nil
+    }
+
+    /// Brings back a deleted item as it was before it was deleted.
+    func restoreDeleted(_ entry: DeletedEntry) {
+        Task {
+            guard let now = await call("Restoring…", { device -> ItemDetail in
+                try device.restore(id: entry.id, revision: entry.last, heads: entry.heads)
+                return try device.item(id: entry.id)
+            }) else { return }
+            deleted = nil
+            detail = now
+            notice = "\(entry.title) restored"
+        }
+    }
+
     /// A new password from the shared generator.
     func generatePassword() -> String {
         (try? OpenSecretManager.generatePassword(length: 20)) ?? ""
@@ -288,6 +369,8 @@ final class VaultModel: ObservableObject {
         self.device = nil
         detail = nil
         editor = nil
+        history = nil
+        deleted = nil
         if joinCode != nil {
             joinCode = nil
             notice = "The join stopped when the app left the screen · start again from your computer"

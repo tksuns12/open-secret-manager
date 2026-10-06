@@ -31,9 +31,14 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::{
-    DeviceState, FillCredentials, ItemDetail, ItemDraft, ItemSummary, MobileError, SaveCandidate,
-    SyncState, SyncStatus,
+    DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail, ItemDraft, ItemSummary,
+    MobileError, SaveCandidate, SyncState, SyncStatus,
 };
+
+/// The first eight hex digits of a device's ID, as the screens name it.
+fn short_device(id: &[u8; 16]) -> String {
+    id[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// The files of one device, as the desktop app names them.
 const VAULT_FILE: &str = "vault.sqlite3";
@@ -269,6 +274,100 @@ impl Runtime {
                 return Err(MobileError::NotEditableHere);
             }
             vault.delete(id, revision)?;
+        }
+        self.sync_soon();
+        Ok(())
+    }
+
+    pub(crate) async fn history(&self, id: &str) -> Result<Vec<HistoryEntry>, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let this_device = vault.device_id();
+        let history = vault.history(id)?;
+        Ok(history
+            .iter()
+            .map(|version| {
+                // What a deletion deleted: the version it followed.
+                let shown = version.item.as_ref().or_else(|| {
+                    version.parents.iter().find_map(|parent| {
+                        history
+                            .iter()
+                            .find(|other| &other.revision == parent)
+                            .and_then(|other| other.item.as_ref())
+                    })
+                });
+                HistoryEntry {
+                    revision: version.revision.clone(),
+                    deleted: version.item.is_none(),
+                    current: version.current,
+                    first: version.parents.is_empty(),
+                    merged: version.parents.len() > 1,
+                    title: shown.map(|item| item.title.clone()).unwrap_or_default(),
+                    username: shown.map(|item| item.username.clone()).unwrap_or_default(),
+                    url: shown.map(|item| item.url.clone()).unwrap_or_default(),
+                    changed: version
+                        .changed
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect(),
+                    device: short_device(&version.author_device_id),
+                    this_device: Some(version.author_device_id) == this_device,
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) async fn deleted_items(&self) -> Result<Vec<DeletedEntry>, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let this_device = vault.device_id();
+        Ok(vault
+            .deleted_items()?
+            .into_iter()
+            .filter_map(|deleted| {
+                let item = deleted.last.item.as_ref()?;
+                Some(DeletedEntry {
+                    id: deleted.item_id.clone(),
+                    title: item.title.clone(),
+                    kind: item.kind.into(),
+                    username: item.username.clone(),
+                    url: item.url.clone(),
+                    last: deleted.last.revision.clone(),
+                    device: short_device(&deleted.deleted_by),
+                    this_device: Some(deleted.deleted_by) == this_device,
+                    heads: deleted.heads,
+                })
+            })
+            .collect())
+    }
+
+    pub(crate) async fn restore(
+        self: &Arc<Self>,
+        id: &str,
+        revision: &str,
+        heads: &[String],
+    ) -> Result<(), MobileError> {
+        {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            let history = vault.history(id)?;
+            if history.iter().filter(|version| version.current).count() > 1 {
+                return Err(MobileError::InConflict);
+            }
+            let version = history
+                .iter()
+                .find(|version| version.revision == revision)
+                .ok_or(MobileError::NotFound)?;
+            let item = version
+                .item
+                .as_ref()
+                .ok_or_else(|| MobileError::InvalidItem {
+                    reason: "that version deletes the item: choose one before it".into(),
+                })?;
+            if !crate::ItemKind::from(item.kind).editable_here() {
+                return Err(MobileError::NotEditableHere);
+            }
+            vault.restore(id, revision, heads)?;
         }
         self.sync_soon();
         Ok(())

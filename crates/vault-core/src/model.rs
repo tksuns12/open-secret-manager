@@ -29,6 +29,29 @@ pub struct Item {
     pub favorite: bool,
 }
 
+impl Item {
+    /// The fields this item has changed from `before`, by name: `title`,
+    /// `type`, `username`, `password`, `website`, `one-time code`, `notes`,
+    /// `other fields`, `tags`, `favorite`. Names only, never values.
+    pub fn changed_from(&self, before: &Item) -> Vec<&'static str> {
+        [
+            (before.title != self.title, "title"),
+            (before.kind != self.kind, "type"),
+            (before.username != self.username, "username"),
+            (before.password != self.password, "password"),
+            (before.url != self.url, "website"),
+            (before.totp_secret != self.totp_secret, "one-time code"),
+            (before.notes != self.notes, "notes"),
+            (before.custom_fields != self.custom_fields, "other fields"),
+            (before.tags != self.tags, "tags"),
+            (before.favorite != self.favorite, "favorite"),
+        ]
+        .into_iter()
+        .filter_map(|(changed, name)| changed.then_some(name))
+        .collect()
+    }
+}
+
 impl Drop for Item {
     fn drop(&mut self) {
         self.id.zeroize();
@@ -246,6 +269,10 @@ pub struct HistoryVersion {
     pub item: Option<Item>,
     /// It is one of the item's current versions.
     pub current: bool,
+    /// What it changed from the version it followed, by field (see
+    /// [`Item::changed_from`]); nothing for the first version or a
+    /// deletion.
+    pub changed: Vec<&'static str>,
 }
 
 impl fmt::Debug for HistoryVersion {
@@ -256,6 +283,7 @@ impl fmt::Debug for HistoryVersion {
             .field("author_device_id", &self.author_device_id)
             .field("deleted", &self.item.is_none())
             .field("current", &self.current)
+            .field("changed", &self.changed)
             .finish()
     }
 }

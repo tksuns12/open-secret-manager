@@ -150,6 +150,104 @@ fn a_folder_without_a_vault_and_one_with_a_damaged_vault_are_told_apart() {
 }
 
 #[test]
+fn an_items_history_shows_its_versions_and_a_login_or_a_note_comes_back() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+
+    // Mail was edited twice: three versions, newest first, each saying
+    // what it changed.
+    let history = device.history("fixture-mail".into()).unwrap();
+    let seen: Vec<(bool, bool, Vec<String>)> = history
+        .iter()
+        .map(|version| (version.current, version.first, version.changed.clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (true, false, vec!["password".to_owned(), "notes".to_owned()]),
+            (false, false, vec!["password".to_owned()]),
+            (false, true, vec![]),
+        ]
+    );
+    assert!(history
+        .iter()
+        .all(|version| version.title == "Mail" && version.this_device));
+    // Which fields changed, never what they held.
+    assert!(!format!("{history:?}").contains("first password"));
+
+    // The first version comes back, its password with it.
+    let heads = vec![history[0].revision.clone()];
+    device
+        .restore(
+            "fixture-mail".into(),
+            history[2].revision.clone(),
+            heads.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        device.password("fixture-mail".into()).unwrap(),
+        "first password"
+    );
+    assert_eq!(device.history("fixture-mail".into()).unwrap().len(), 4);
+    assert!(matches!(
+        device.restore("fixture-mail".into(), history[2].revision.clone(), heads),
+        Err(MobileError::ChangedElsewhere)
+    ));
+
+    // The frozen vault's deleted note is listed, and comes back.
+    let deleted = device.deleted_items().unwrap();
+    let note = deleted
+        .iter()
+        .find(|item| item.title == "A note that was deleted")
+        .unwrap();
+    assert_eq!(note.kind, ItemKind::SecureNote);
+    let note_history = device.history(note.id.clone()).unwrap();
+    assert!(note_history[0].deleted && note_history[0].title == "A note that was deleted");
+    assert!(matches!(
+        device.restore(
+            note.id.clone(),
+            note_history[0].revision.clone(),
+            note.heads.clone()
+        ),
+        Err(MobileError::InvalidItem { .. })
+    ));
+    device
+        .restore(note.id.clone(), note.last.clone(), note.heads.clone())
+        .unwrap();
+    assert_eq!(device.item(note.id.clone()).unwrap().notes, "gone");
+    assert!(device
+        .deleted_items()
+        .unwrap()
+        .iter()
+        .all(|item| item.id != note.id));
+
+    // An item in conflict is left to a computer.
+    let conflicted = device
+        .items()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.conflict)
+        .unwrap();
+    let versions = device.history(conflicted.id.clone()).unwrap();
+    let oldest = versions.last().unwrap().revision.clone();
+    let current: Vec<String> = versions
+        .iter()
+        .filter(|version| version.current)
+        .map(|version| version.revision.clone())
+        .collect();
+    assert!(matches!(
+        device.restore(conflicted.id, oldest, current),
+        Err(MobileError::InConflict)
+    ));
+    device.lock();
+    assert!(matches!(
+        device.history("fixture-mail".into()),
+        Err(MobileError::Locked)
+    ));
+}
+
+#[test]
 fn a_one_time_code_goes_only_where_its_login_would() {
     let (_dir, folder) = copy_of_the_frozen_vault();
     let device = Device::open_listening_on(folder, 0).unwrap();

@@ -13,10 +13,11 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
 - `app`: the app. It joins a vault from a computer by invitation and
   comparison of codes, unlocks with its own password or, once turned on,
   a fingerprint, lists and searches the items, copies a username,
-  password, or one-time code, and creates, edits, and deletes logins and
-  secure notes. It locks and stops taking part when it
-  leaves the screen, and keeps the vault out of screenshots. Once picked
-  as the phone's autofill service, it fills logins into other apps and
+  password, or one-time code, creates, edits, and deletes logins and
+  secure notes, and shows an item's history and the items deleted,
+  restoring a login or note from either. It locks and stops taking part
+  when it leaves the screen, and keeps the vault out of screenshots. Once
+  picked as the phone's autofill service, it fills logins into other apps and
   into pages of the browsers it trusts (`res/raw/trusted_browsers.json`,
   made by `android/trusted-browsers.mjs`), after the owner unlocks and
   chooses the login on its fill screen (and its one-time code into a field
@@ -55,8 +56,9 @@ synchronized with these):
 - `App`: the app, in SwiftUI. It joins a vault from a computer by
   invitation and comparison of codes, unlocks with its own password or,
   once turned on, Face ID or Touch ID, lists and searches the items,
-  copies a username, password, or one-time code, and creates, edits, and
-  deletes logins and secure notes. It locks, stops taking
+  copies a username, password, or one-time code, creates, edits, and
+  deletes logins and secure notes, and shows an item's history and the
+  items deleted, restoring a login or note from either. It locks, stops taking
   part, and closes the vault's files when it leaves the screen, and hides
   the vault in the app switcher.
 - `AutoFill`: the AutoFill extension. Once turned on (the app asks iOS

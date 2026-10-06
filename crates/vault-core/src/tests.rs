@@ -104,6 +104,9 @@ fn an_items_history_lists_every_version_and_an_earlier_version_or_a_deleted_item
         .iter()
         .all(|version| version.author_device_id == device));
     assert_eq!(history[1].item.as_ref().unwrap().password, "first password");
+    // What each changed, by name, from the version it followed.
+    assert_eq!(history[0].changed, ["username", "password"]);
+    assert!(history[1].changed.is_empty());
     assert!(!format!("{history:?}").contains("first password"));
 
     // An earlier version comes back as the newest, after the current one.

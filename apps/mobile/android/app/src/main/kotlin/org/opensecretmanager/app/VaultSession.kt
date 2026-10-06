@@ -16,9 +16,11 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.DeviceState
 import org.opensecretmanager.vault.FillCredentials
+import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemSummary
@@ -43,7 +45,14 @@ data class UiState(
     val unreadable: String? = null,
     /** An item being written, while the editor is open. */
     val editor: Editor? = null,
+    /** An item's versions, while its history is open. */
+    val history: History? = null,
+    /** The items deleted, while that list is open. */
+    val deleted: List<DeletedEntry>? = null,
 )
+
+/** The versions of [detail], newest first. */
+data class History(val detail: ItemDetail, val versions: List<HistoryEntry>)
 
 /** A new item when [detail] is null, otherwise that item as it was read. */
 data class Editor(val detail: ItemDetail?)
@@ -128,6 +137,8 @@ class VaultSession(private val context: Context, private val folder: File) {
                 sync = device.syncStatus(),
                 joinCode = current.joinCode.takeIf { screen == Screen.JOINING },
                 editor = current.editor.takeIf { screen == Screen.UNLOCKED },
+                history = current.history.takeIf { screen == Screen.UNLOCKED },
+                deleted = current.deleted.takeIf { screen == Screen.UNLOCKED },
             )
         }
     }
@@ -142,7 +153,7 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     fun lock() = run(null) {
         device?.lock()
-        _state.update { it.copy(detail = null, editor = null) }
+        _state.update { it.copy(detail = null, editor = null, history = null, deleted = null) }
         refresh()
     }
 
@@ -217,6 +228,53 @@ class VaultSession(private val context: Context, private val folder: File) {
     fun delete(detail: ItemDetail) = run(null) {
         device!!.deleteItem(detail.id, detail.revision)
         _state.update { it.copy(detail = null, notice = "Item deleted") }
+        refresh()
+    }
+
+    fun openHistory(detail: ItemDetail) = run(null) {
+        val versions = device!!.history(detail.id)
+        _state.update { it.copy(history = History(detail, versions)) }
+    }
+
+    fun closeHistory() {
+        _state.update { it.copy(history = null) }
+    }
+
+    /**
+     * Brings back what [version] held, as the newest version, following the
+     * current versions the history showed. If the item changed since, the
+     * history is read again.
+     */
+    fun restoreVersion(version: HistoryEntry) = run("Restoring…") {
+        val device = device!!
+        val history = _state.value.history ?: return@run
+        val heads = history.versions.filter { it.current }.map { it.revision }
+        try {
+            device.restore(history.detail.id, version.revision, heads)
+            val now = device.item(history.detail.id)
+            _state.update { it.copy(history = null, detail = now, notice = "Version restored") }
+        } catch (error: MobileException.ChangedElsewhere) {
+            val versions = device.history(history.detail.id)
+            _state.update { it.copy(history = history.copy(versions = versions), notice = describe(error)) }
+        }
+        refresh()
+    }
+
+    fun openDeleted() = run(null) {
+        val deleted = device!!.deletedItems()
+        _state.update { it.copy(deleted = deleted) }
+    }
+
+    fun closeDeleted() {
+        _state.update { it.copy(deleted = null) }
+    }
+
+    /** Brings back a deleted item as it was before it was deleted. */
+    fun restoreDeleted(entry: DeletedEntry) = run("Restoring…") {
+        val device = device!!
+        device.restore(entry.id, entry.last, entry.heads)
+        val now = device.item(entry.id)
+        _state.update { it.copy(deleted = null, detail = now, notice = "${entry.title} restored") }
         refresh()
     }
 
@@ -358,7 +416,7 @@ class VaultSession(private val context: Context, private val folder: File) {
             if (device.state() == DeviceState.JOINING) return@run
             device.lock()
             device.goOffline()
-            _state.update { it.copy(detail = null, editor = null) }
+            _state.update { it.copy(detail = null, editor = null, history = null, deleted = null) }
             refresh()
         }
     }

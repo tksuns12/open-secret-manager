@@ -6,7 +6,7 @@
 //! The window is told what each version held that it may show (title,
 //! username, website) and which fields it changed, never a secret.
 
-use osm_vault_core::{HistoryVersion, Item, ItemKind, ItemSummary};
+use osm_vault_core::{HistoryVersion, ItemKind, ItemSummary};
 use serde::Serialize;
 use tauri::{AppHandle, Runtime};
 
@@ -64,25 +64,6 @@ pub(crate) fn short_device(id: &[u8; 16]) -> String {
     id[..4].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The fields `item` changed from `before`, by the names the window uses.
-fn changes(before: &Item, item: &Item) -> Vec<&'static str> {
-    [
-        (before.title != item.title, "title"),
-        (before.kind != item.kind, "type"),
-        (before.username != item.username, "username"),
-        (before.password != item.password, "password"),
-        (before.url != item.url, "website"),
-        (before.totp_secret != item.totp_secret, "one-time code"),
-        (before.notes != item.notes, "notes"),
-        (before.custom_fields != item.custom_fields, "other fields"),
-        (before.tags != item.tags, "tags"),
-        (before.favorite != item.favorite, "favorite"),
-    ]
-    .into_iter()
-    .filter_map(|(changed, name)| changed.then_some(name))
-    .collect()
-}
-
 pub(crate) fn entries(
     history: &[HistoryVersion],
     this_device: Option<[u8; 16]>,
@@ -90,17 +71,13 @@ pub(crate) fn entries(
     history
         .iter()
         .map(|version| {
-            // What it followed: the nearest version that held the item.
+            // What a deletion deleted: the version it followed.
             let before = version.parents.iter().find_map(|parent| {
                 history
                     .iter()
                     .find(|other| &other.revision == parent)
                     .and_then(|other| other.item.as_ref())
             });
-            let changed = match (before, version.item.as_ref()) {
-                (Some(before), Some(item)) => changes(before, item),
-                _ => Vec::new(),
-            };
             let shown = version.item.as_ref().or(before);
             HistoryEntry {
                 revision: version.revision.clone(),
@@ -111,7 +88,7 @@ pub(crate) fn entries(
                 title: shown.map(|item| item.title.clone()).unwrap_or_default(),
                 username: shown.map(|item| item.username.clone()).unwrap_or_default(),
                 url: shown.map(|item| item.url.clone()).unwrap_or_default(),
-                changed,
+                changed: version.changed.clone(),
                 device: short_device(&version.author_device_id),
                 this_device: Some(version.author_device_id) == this_device,
             }
