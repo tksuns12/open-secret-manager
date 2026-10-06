@@ -42,7 +42,9 @@ cd android && ./gradlew :app:assembleDebug
 screens and autofill on a running emulator or device (it installs the
 stand-in app, and makes this app the autofill service for each autofill
 test, putting the earlier one back after it); `scripts/test-mobile.sh join`
-has the app join a desktop-side device on the same machine. A debug
+has the app join a desktop-side device on the same machine;
+`scripts/test-mobile-chrome.sh` has real Chrome fill and save on a test
+site, after a setup by hand that the script describes. A debug
 build made with `-Posm.screenshots=true` lets its screens be captured
 for review; no other build does.
 

@@ -109,7 +109,8 @@ class AutofillTest {
         val offer = find(By.text("Open Secret Manager · unlock to fill"))
         name?.let { capture("$it-offer") }
         offer.click()
-        find(mine("password"))
+        // The fill screen's first start can take long on an emulator.
+        find(mine("password"), 60_000)
         name?.let { capture("$it-locked") }
         find(mine("password")).text = password
         find(mine("unlock")).click()
@@ -200,15 +201,18 @@ class AutofillTest {
     }
 
     /**
-     * Types [text] as keys into the page's focused field: one key, which
-     * closes the offer to fill under the field, and then the rest. While the
-     * offer shows, the system passes keys through it, and loses or reorders
-     * some (a space even chooses it); the on-screen keyboard's typing does
-     * not go that way.
+     * Types [text] as keys into the page's focused field. While the offer to
+     * fill shows under the field, the system passes keys through it, and
+     * loses or reorders some (a space even chooses it); the on-screen
+     * keyboard's typing does not go that way. One key closes the offer, so
+     * it is typed once the offer shows, and the rest once it is gone: on a
+     * slow emulator the offer can take seconds to come.
      */
     private fun typeKeys(text: String) {
+        device.wait(Until.hasObject(By.text("Open Secret Manager · unlock to fill")), 15_000)
         shell("input text ${text.take(1)}")
-        Thread.sleep(1_500)
+        device.wait(Until.gone(By.text("Open Secret Manager · unlock to fill")), 15_000)
+        Thread.sleep(500)
         shell("input text ${text.drop(1)}")
     }
 
@@ -235,10 +239,8 @@ class AutofillTest {
             for (attempt in 1..3) {
                 if (attempt > 1) shell("am start -W -S -n $FIXTURE/.$activity --es origin $origin")
                 find(By.clazz("android.widget.EditText").pkg(FIXTURE), 30_000).click()
-                Thread.sleep(1_500)
                 typeKeys(username)
                 device.pressKeyCode(KeyEvent.KEYCODE_TAB)
-                Thread.sleep(1_500)
                 typeKeys(password)
                 if (find(By.res(FIXTURE, "filled")).wait(Until.textEquals("$username|$password"), 5_000) == true) break
                 check(attempt < 3) { "the page never got all the keys typed" }
@@ -255,10 +257,13 @@ class AutofillTest {
                 }
             }
         }
-        val save = find(By.res("android", "autofill_save_yes"))
+        // The offer slides up: tapped while it moves, the tap can land beside
+        // it, which closes it.
+        find(By.res("android", "autofill_save_yes"))
+        Thread.sleep(2_000)
         name?.let { capture("$it-save-offer") }
-        save.click()
-        find(mine("password"))
+        find(By.res("android", "autofill_save_yes")).click()
+        find(mine("password"), 60_000)
         find(mine("password")).text = this.password
         find(mine("unlock")).click()
         find(mine("asker"))
