@@ -68,6 +68,8 @@ class VaultSession(private val context: Context, private val folder: File) {
     val state: StateFlow<UiState> = _state
     private var device: Device? = null
     private var foreground: Job? = null
+    /** The app is on the screen, where it takes part and syncs anyway. */
+    @Volatile private var inFront = false
 
     init {
         openDevice()
@@ -386,6 +388,7 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     /** The app came to the front: take part again, and keep the list current. */
     fun onForeground() {
+        inFront = true
         run(null) {
             device?.let { device ->
                 if (device.state() == DeviceState.LOCKED || device.state() == DeviceState.UNLOCKED) {
@@ -409,6 +412,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      * other device's screen.
      */
     fun onBackground() {
+        inFront = false
         foreground?.cancel()
         foreground = null
         run(null) {
@@ -419,6 +423,21 @@ class VaultSession(private val context: Context, private val folder: File) {
             _state.update { it.copy(detail = null, editor = null, history = null, deleted = null) }
             refresh()
         }
+    }
+
+    /**
+     * A sync while the app is closed: takes part just long enough to sync,
+     * and never unlocks; what arrives waits for the next unlock. Nothing
+     * while the app is on the screen, which syncs anyway, or without a
+     * vault this phone belongs to.
+     */
+    fun syncInBackground() = run(null) {
+        val device = device ?: return@run
+        if (inFront) return@run
+        val state = device.state()
+        if (state != DeviceState.LOCKED && state != DeviceState.UNLOCKED) return@run
+        runCatching { device.syncInBackground() }
+        refresh()
     }
 
     private fun describe(error: MobileException): String = when (error) {

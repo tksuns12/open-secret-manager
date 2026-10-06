@@ -39,6 +39,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -326,7 +327,26 @@ private fun Items(state: UiState, session: VaultSession) {
         }
         TextButton(onClick = session::openDeleted, modifier = Modifier.testTag("recently-deleted")) { Text("Recently deleted…") }
         AutofillOffer()
+        BackgroundSyncSwitch()
         SyncLine(state.sync, session)
+    }
+}
+
+/** Whether this phone syncs now and then while the app is closed. */
+@Composable
+private fun BackgroundSyncSwitch() {
+    val context = LocalContext.current
+    var on by remember { mutableStateOf(BackgroundSync.enabled(context)) }
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("Sync now and then while the app is closed", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        Switch(
+            checked = on,
+            onCheckedChange = {
+                on = it
+                BackgroundSync.set(context, it)
+            },
+            modifier = Modifier.testTag("background-sync"),
+        )
     }
 }
 

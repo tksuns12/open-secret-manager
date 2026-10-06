@@ -16,8 +16,10 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   password, or one-time code, creates, edits, and deletes logins and
   secure notes, and shows an item's history and the items deleted,
   restoring a login or note from either. It locks and stops taking part
-  when it leaves the screen, and keeps the vault out of screenshots. Once
-  picked as the phone's autofill service, it fills logins into other apps and
+  when it leaves the screen, and keeps the vault out of screenshots; while
+  it is closed it syncs now and then without unlocking, unless that is
+  turned off. Once picked as the phone's autofill service, it fills
+  logins into other apps and
   into pages of the browsers it trusts (`res/raw/trusted_browsers.json`,
   made by `android/trusted-browsers.mjs`), after the owner unlocks and
   chooses the login on its fill screen (and its one-time code into a field

@@ -232,6 +232,7 @@ else
     done
     "$adb" forward tcp:47820 tcp:47820 >/dev/null
     "$adb" logcat -c
+    "$adb" shell rm -f /data/local/tmp/osm-desktop-wrote
 
     (cd apps/mobile/android && ./gradlew --quiet :app:connectedDebugAndroidTest \
         -Pandroid.testInstrumentationRunnerArguments.class=org.opensecretmanager.app.JoinDesktopTest \
@@ -248,8 +249,33 @@ else
     echo "desktop shows $desktop_code, phone shows $phone_code"
     if [ "$phone_code" = "$desktop_code" ]; then echo y >&3; else echo n >&3; fi
 
+    # Once the app has left the screen, the desktop writes a login, which
+    # the phone's background sync must take in.
+    for _ in $(seq 1 600); do
+        "$adb" logcat -d -s OSMJoin:I | grep -q PHONE-AWAY && break
+        kill -0 "$phone" 2>/dev/null || break
+        sleep 0.5
+    done
+    if "$adb" logcat -d -s OSMJoin:I | grep -q PHONE-AWAY; then
+        # A new ADDED: the one for Mail is there already.
+        added=$(grep -c "^ADDED" "$work/out" || true)
+        echo "add Away" >&3
+        for _ in $(seq 1 240); do
+            [ "$(grep -c "^ADDED" "$work/out" || true)" -gt "$added" ] && break
+            sleep 0.5
+        done
+        if [ "$(grep -c "^ADDED" "$work/out" || true)" -gt "$added" ]; then
+            "$adb" shell touch /data/local/tmp/osm-desktop-wrote
+            echo "the desktop wrote a login while the phone was away"
+        else
+            echo "the desktop could not write a login: $(grep "^FAILED" "$work/out" | tail -1)" >&2
+        fi
+    fi
+
     status=0
     wait "$phone" || status=$?
+    "$adb" shell rm -f /data/local/tmp/osm-desktop-wrote
+    "$adb" logcat -d -s OSMJoin:I | sed -n 's/.*\(PHONE-SYNCED-AWAY\)/\1/p' | tail -1
     "$adb" logcat -d -s OSMJoin:I | sed -n 's/.*\(PHONE-HAS .*\)/\1/p' | tail -1
     if [ "$status" != 0 ]; then
         tail -30 "$work/gradle.log" >&2

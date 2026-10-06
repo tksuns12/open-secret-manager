@@ -92,11 +92,13 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.4.0")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("androidx.work:work-runtime-ktx:2.12.0")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4:1.10.5")
     androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
+    androidTestImplementation("androidx.work:work-testing:2.12.0")
     debugImplementation("androidx.compose.ui:ui-test-manifest:1.10.5")
 }
 

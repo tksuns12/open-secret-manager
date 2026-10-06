@@ -5,6 +5,8 @@ import android.content.ClipboardManager
 import android.os.Build
 import android.view.WindowManager
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -14,8 +16,10 @@ import androidx.compose.ui.test.performTextInput
 import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.work.WorkManager
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeFalse
@@ -77,6 +81,27 @@ class AppTest {
         compose.waitUntil(10_000) { session.state.value.screen == Screen.LOCKED }
         compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
         waitFor("locked")
+    }
+
+    @Test
+    fun syncingWhileClosedIsScheduledUntilTurnedOff() {
+        val context = instrumentation.targetContext
+        BackgroundSync.set(context, true)
+        val work = WorkManager.getInstance(context)
+        fun scheduled() = work.getWorkInfosForUniqueWork("background-sync").get().any { !it.state.isFinished }
+        assertTrue(scheduled())
+
+        withTheFrozenVault()
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Bank")
+        compose.onNodeWithTag("background-sync").assertIsOn().performClick()
+        compose.waitUntil(10_000) { !scheduled() }
+        assertFalse(BackgroundSync.enabled(context))
+        compose.onNodeWithTag("background-sync").assertIsOff().performClick()
+        compose.waitUntil(10_000) { scheduled() }
+        assertTrue(BackgroundSync.enabled(context))
     }
 
     @Test

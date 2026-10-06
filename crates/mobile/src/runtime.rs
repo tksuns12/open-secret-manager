@@ -704,6 +704,29 @@ impl Runtime {
         Ok(self.status())
     }
 
+    pub(crate) async fn sync_in_background(self: &Arc<Self>) -> Result<SyncStatus, MobileError> {
+        let was_online = self.control.lock().await.is_some();
+        if !was_online {
+            // Going online starts a sync of its own.
+            self.go_online().await?;
+        }
+        // A sync of its own once none is under way (one under way would make
+        // it a no-op), and none under way when it goes offline again.
+        self.no_sync_under_way().await;
+        let result = self.sync_with_members().await;
+        self.no_sync_under_way().await;
+        if !was_online {
+            self.go_offline().await;
+        }
+        result.map(|()| self.status())
+    }
+
+    async fn no_sync_under_way(&self) {
+        while self.syncing.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     pub(crate) fn status(&self) -> SyncStatus {
         self.status
             .lock()

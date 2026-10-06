@@ -572,6 +572,15 @@ impl Device {
         self.tokio.block_on(self.inner.sync_now())
     }
 
+    /// For a sync while the app is away from the screen: takes part just
+    /// long enough to sync with every member it can reach, then stops,
+    /// unless it was taking part already. It never unlocks the vault: a
+    /// locked device sends what it wrote, and what arrives waits for the
+    /// next unlock.
+    pub fn sync_in_background(&self) -> Result<SyncStatus, MobileError> {
+        self.tokio.block_on(self.inner.sync_in_background())
+    }
+
     pub fn sync_status(&self) -> SyncStatus {
         self.inner.status()
     }

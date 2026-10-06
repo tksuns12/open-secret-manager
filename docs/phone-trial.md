@@ -77,6 +77,13 @@ phone sold since 2019 is):
   was there before) is pasted.
 - On Android, the app's preview in the recent-apps view and any screenshot
   are blank. On iOS, the app switcher shows a cover instead of the vault.
+- On Android, with "Sync now and then while the app is closed" on (it is
+  on unless turned off): close the app, change an item on the computer, and
+  wait half an hour with the phone on Wi-Fi. Open the app: before unlocking,
+  the line under the list says it synced after you closed it, and after
+  unlocking the change is there at once. Android may wait longer on a phone
+  saving battery. Turn the switch off, and the line stops moving while the
+  app is closed.
 
 ## Fingerprint and face
 

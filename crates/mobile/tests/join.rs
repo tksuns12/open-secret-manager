@@ -507,3 +507,63 @@ fn what_a_phone_writes_reaches_the_desktop_and_a_change_made_on_both_waits_for_t
         on_desktop(&forum).is_none()
     });
 }
+
+#[test]
+fn a_locked_phone_away_from_the_screen_syncs_both_ways_and_stays_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop_runtime = tokio::runtime::Runtime::new().unwrap();
+    let desktop = desktop_runtime.block_on(Desktop::found(dir.path()));
+    let on_desktop = |title: &str| {
+        desktop_runtime.block_on(async {
+            desktop
+                .vault
+                .lock()
+                .await
+                .list()
+                .unwrap()
+                .iter()
+                .any(|item| item.title == title)
+        })
+    };
+    let phone = joined_phone(&desktop_runtime, &desktop, dir.path().join("phone"));
+
+    // Written on the phone while it could reach nobody, then the app left
+    // the screen: locked and offline. The desktop writes meanwhile.
+    phone.go_offline();
+    phone
+        .create_item(draft("Written on the phone", "", Some("phone password")))
+        .unwrap();
+    phone.lock();
+    desktop_runtime.block_on(desktop.put(login("Written on the desktop", "desktop password")));
+    assert!(!on_desktop("Written on the phone"));
+    assert_eq!(phone.sync_status().state, SyncState::Offline);
+
+    // A sync in the background sends what the phone wrote, takes in what
+    // the desktop wrote for the next unlock, and stops again, locked.
+    let status = phone.sync_in_background().unwrap();
+    assert!(status.last_synced_at.is_some());
+    assert!(status.pending > 0, "{status:?}");
+    assert!(on_desktop("Written on the phone"));
+    assert_eq!(phone.state(), DeviceState::Locked);
+    assert_eq!(phone.sync_status().state, SyncState::Offline);
+    // Back in front, unlocked and online, as the app does, the phone
+    // verifies what waited and shows it.
+    phone.unlock(PHONE_PASSWORD.into()).unwrap();
+    phone.go_online().unwrap();
+    let titles: Vec<String> = phone
+        .items()
+        .unwrap()
+        .into_iter()
+        .map(|item| item.title)
+        .collect();
+    assert!(
+        titles.contains(&"Written on the desktop".to_owned()),
+        "{titles:?}"
+    );
+    assert_eq!(phone.sync_status().pending, 0);
+
+    // While the app is in front, it stays online after one.
+    phone.sync_in_background().unwrap();
+    assert_ne!(phone.sync_status().state, SyncState::Offline);
+    phone.go_offline();
+}
