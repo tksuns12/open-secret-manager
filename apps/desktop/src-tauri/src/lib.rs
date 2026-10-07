@@ -203,15 +203,16 @@ async fn copy_field(
 }
 
 /// Puts a secret on the clipboard and takes it off 30 seconds later, unless
-/// something else was put there since. On macOS the entry stays on this Mac
-/// and asks clipboard history apps to leave it out; locking takes it off too.
+/// something else was put there since. On macOS and Linux the entry asks
+/// clipboard history apps to leave it out (on macOS it also stays on this
+/// Mac), and locking takes it off too.
 fn copy_for_a_while(secret: &str) -> Result<(), CommandError> {
     let unavailable = || CommandError {
         code: "clipboard",
         message: "operating-system clipboard is unavailable".into(),
     };
     const WHILE: std::time::Duration = std::time::Duration::from_secs(30);
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
         let copied = osm_desktop_session::copy_secret(secret).ok_or_else(unavailable)?;
         std::thread::spawn(move || {
             std::thread::sleep(WHILE);

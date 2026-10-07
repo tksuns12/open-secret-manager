@@ -1,15 +1,21 @@
-//! What the desktop app needs from macOS that Tauri does not give it:
+//! What the desktop app needs from the system that Tauri does not give it:
 //! notice that the owner's session went away from the app (the computer
 //! sleeping, the displays sleeping, the screen locking, the screen saver
 //! starting, another user taking the screen), and a clipboard entry that
-//! stays on this Mac, that clipboard managers leave alone, and that comes
-//! off again.
+//! clipboard managers leave alone, and that comes off again.
 //!
-//! Only macOS is done. Elsewhere [`watch`] watches nothing and
+//! On macOS from the system's notifications, and an entry that also stays on
+//! this Mac. On Linux (since Phase 10) from logind over the system bus: the
+//! computer going to sleep, the session told to lock or its screen locker
+//! saying it locked, and the session leaving the seat to another; and an
+//! entry marked as a password manager's, which this process keeps serving
+//! until it is taken off. Elsewhere [`watch`] watches nothing and
 //! [`copy_secret`] declines, and the app does without.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -48,11 +54,30 @@ pub fn watch(on_away: impl Fn(Away) + Send + Sync + 'static) -> bool {
         macos::watch(std::sync::Arc::new(on_away));
         true
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::watch(std::sync::Arc::new(on_away))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = on_away;
         false
     }
+}
+
+/// Watches logind on the bus at `address` instead of the system bus. For
+/// tests only, which serve a stand-in for logind on a bus of their own.
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub fn watch_bus(address: &str, on_away: impl Fn(Away) + Send + Sync + 'static) -> bool {
+    linux::watch_bus(address, std::sync::Arc::new(on_away))
+}
+
+/// The names a stand-in for logind answers to, for tests.
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub mod logind {
+    pub use crate::linux::{LOGIND, MANAGER, MANAGER_PATH, SESSION, USER};
 }
 
 /// Calls `on_away` with `away` whenever the system-wide notification `name`
@@ -72,21 +97,27 @@ pub fn watch_system_notification(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Copied {
     /// What the clipboard counted when the secret was put there; it counts
-    /// every change.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// every change. On Linux, which has no such count, this process's own
+    /// count of the secrets it put there.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     change: isize,
 }
 
-/// Puts `text` on the clipboard for this Mac only (not for the owner's
-/// other devices), marked as concealed and transient for clipboard history
-/// apps. `None` where this system cannot.
+/// Puts `text` on the clipboard, marked for clipboard history apps to leave
+/// out: on macOS as concealed and transient, and for this Mac only (not for
+/// the owner's other devices); on Linux with `x-kde-passwordManagerHint`.
+/// `None` where this system cannot.
 pub fn copy_secret(text: &str) -> Option<Copied> {
     #[cfg(target_os = "macos")]
     {
         macos::copy_secret(&objc2_app_kit::NSPasteboard::generalPasteboard(), text)
             .map(|change| Copied { change })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::copy_secret(text).map(|change| Copied { change })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = text;
         None
@@ -98,6 +129,8 @@ pub fn copy_secret(text: &str) -> Option<Copied> {
 pub fn clear_last_secret() {
     #[cfg(target_os = "macos")]
     macos::clear_last(&objc2_app_kit::NSPasteboard::generalPasteboard());
+    #[cfg(target_os = "linux")]
+    linux::clear(None);
 }
 
 /// Clears the clipboard if nothing was put there since `copied`.
@@ -107,6 +140,8 @@ pub fn clear_if_unchanged(copied: Copied) {
         &objc2_app_kit::NSPasteboard::generalPasteboard(),
         copied.change,
     );
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    linux::clear(Some(copied.change));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = copied;
 }

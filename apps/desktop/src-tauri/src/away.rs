@@ -2,7 +2,7 @@
 //! going to sleep, the displays sleeping, the screen locking, the screen
 //! saver starting, or another user taking the screen. The window's own
 //! timer and its being covered are the interface's to watch; these the
-//! system tells the app, on macOS only so far.
+//! system tells the app, on macOS and, through logind, on Linux.
 
 use osm_desktop_session::Away;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -13,8 +13,9 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     osm_desktop_session::watch(move |away| {
         let app = app.clone();
-        // Called on the main thread, which must not wait for the vault: a
-        // command holding it may be waiting for the main thread.
+        // Called on the main thread (on Linux, on a thread of the session
+        // crate's), which must not wait for the vault: a command holding it
+        // may be waiting for the main thread.
         tauri::async_runtime::spawn(async move { went_away(&app, away).await });
     });
 }

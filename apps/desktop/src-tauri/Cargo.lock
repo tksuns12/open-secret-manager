@@ -3076,10 +3076,13 @@ dependencies = [
 name = "osm-desktop-session"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "block2",
+ "dbus",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "zeroize",
 ]
 
 [[package]]
