@@ -87,7 +87,14 @@ class VaultAutofillService : AutofillService() {
             callback.onFailure("The form sent no password")
             return
         }
-        val id = PendingSave.put(PendingSave.Save(form, form.username?.let(values::get).orEmpty(), password))
+        // Named as the save screen names it, for the app to offer it by if
+        // Android does not start that screen.
+        val from = when (val requester = Requester.of(this, form)) {
+            is Requester.Web -> requester.origin.removePrefix("https://")
+            is Requester.App -> requester.label
+            null -> form.packageName
+        }
+        val id = PendingSave.put(PendingSave.Save(form, form.username?.let(values::get).orEmpty(), password), from)
         val intent = Intent(this, SaveActivity::class.java).putExtra(SaveActivity.SAVE, id)
         val sender = PendingIntent.getActivity(
             this,

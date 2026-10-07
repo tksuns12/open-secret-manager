@@ -25,6 +25,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TestName
 import org.junit.runner.RunWith
+import org.opensecretmanager.app.autofill.Form
+import org.opensecretmanager.app.autofill.PendingSave
 import org.opensecretmanager.app.autofill.Requester
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.ItemDraft
@@ -77,6 +79,7 @@ class AutofillTest {
         animationScales.forEach { shell("settings put global $it 0") }
         context.getSharedPreferences("app-logins", 0).edit().clear().commit()
         Requester.trustedForTests.clear()
+        PendingSave.forgetForTests()
         session.reopenForTests { folder ->
             BiometricUnlock(context).disable()
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
@@ -88,6 +91,7 @@ class AutofillTest {
     @After
     fun putTheServiceBack() {
         Requester.trustedForTests.clear()
+        PendingSave.forgetForTests()
         shell("am force-stop $FIXTURE")
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")
         animationScales.zip(previousScales).forEach { (name, scale) ->
@@ -332,6 +336,68 @@ class AutofillTest {
         find(mine("fill:Login fixture")).click()
         assertFilled("new account|newer password")
         assertLockedAgain()
+    }
+
+    @Test
+    fun aSaveAndroidDidNotOpenIsOfferedWhenTheAppIsOpened() {
+        // The stand-in closes on signing in, and Save is tapped well after:
+        // Android does not start the save screen (`BAL_BLOCK` in its log).
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.NativeLoginActivity --es after close")
+        find(By.res(FIXTURE, "username")).click()
+        find(By.res(FIXTURE, "username")).text = "late account"
+        find(By.res(FIXTURE, "password")).text = "late password"
+        find(By.res(FIXTURE, "sign_in")).click()
+        val left = System.currentTimeMillis()
+        find(By.res("android", "autofill_save_yes"), 30_000)
+        // Past the few seconds Android still allows it after the app left.
+        Thread.sleep(maxOf(0L, left + 25_000 - System.currentTimeMillis()))
+        device.wakeUp()
+        find(By.res("android", "autofill_save_yes")).click()
+        if (device.wait(Until.hasObject(mine("password")), 10_000) == true) fail("Android opened the save screen after all")
+
+        // Opened, the app offers it, named as the save screen names it.
+        shell("am start -W -n ${context.packageName}/.MainActivity")
+        find(mine("waiting-save"), 30_000)
+        find(By.text("A login from Login fixture is waiting to be saved"))
+        capture("waiting-save")
+        find(mine("waiting-save-open")).click()
+        find(mine("password"), 60_000).text = password
+        find(mine("unlock")).click()
+        find(mine("asker"))
+        find(mine("save-new")).click()
+        // Saved, from the app's own screen: the app is in front, unlocked,
+        // and offers it no more.
+        if (device.wait(Until.gone(mine("waiting-save")), 15_000) != true) fail("the save is still offered")
+        val deadline = System.currentTimeMillis() + 15_000
+        while (session.state.value.items.none { it.title == "Login fixture" } && System.currentTimeMillis() < deadline) Thread.sleep(100)
+        assertTrue(session.state.value.items.any { it.title == "Login fixture" && it.username == "late account" })
+        assertNull(PendingSave.waiting())
+
+        // Android held its start back, and makes it once the stand-in is
+        // opened again: the save screen sees the save was handled, and
+        // closes at once.
+        shell("am start -W -n $FIXTURE/.NativeLoginActivity")
+        if (device.wait(Until.hasObject(mine("password")), 15_000) == true) fail("a save screen opened for a save already made")
+
+        askToFill("NativeLoginActivity")
+        find(mine("fill:Login fixture")).click()
+        assertFilled("late account|late password")
+        assertLockedAgain()
+    }
+
+    @Test
+    fun aWaitingSaveCanBeDiscarded() {
+        val form = Form(FIXTURE, null, null, null, null, null)
+        PendingSave.put(PendingSave.Save(form, "someone", "a password"), "Login fixture")
+        shell("am start -W -n ${context.packageName}/.MainActivity")
+        find(mine("waiting-save-discard"), 30_000).click()
+        if (device.wait(Until.gone(mine("waiting-save")), 15_000) != true) fail("the save is still offered")
+        assertNull(PendingSave.waiting())
+        // Not offered again when the app comes back.
+        shell("am start -W -n ${context.packageName}/.MainActivity")
+        device.waitForIdle()
+        assertNull(device.findObject(mine("waiting-save")))
     }
 
     @Test

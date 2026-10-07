@@ -13,9 +13,10 @@ import android.widget.TextView
  * A login form of the app's own. It shows what was filled, for the tests to
  * read. Signing in takes the form away and leaves the app open, as most
  * apps go on to their next screen: the system offers to save once the
- * form's fields are gone. (Android 15 and later start the save screen only
- * while the form's app is in front or has just left it, so an app that
- * closed itself would make the save depend on how soon Save is tapped.)
+ * form's fields are gone. With the extra `after` set to `close`, signing in
+ * closes the app's screen instead, and the offer comes over whatever is
+ * left; Android 15 and later then start the save screen only if Save is
+ * tapped soon after.
  */
 class NativeLoginActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -34,6 +35,9 @@ class NativeLoginActivity : Activity() {
         username.addTextChangedListener(show)
         password.addTextChangedListener(show)
         val signIn = findViewById<Button>(R.id.sign_in)
-        signIn.setOnClickListener { listOf(signIn, username, password).forEach { it.visibility = View.GONE } }
+        val closes = intent.getStringExtra("after") == "close"
+        signIn.setOnClickListener {
+            if (closes) finish() else listOf(signIn, username, password).forEach { it.visibility = View.GONE }
+        }
     }
 }

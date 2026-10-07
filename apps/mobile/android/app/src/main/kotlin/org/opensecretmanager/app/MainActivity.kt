@@ -52,9 +52,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -63,6 +66,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import org.opensecretmanager.app.autofill.PendingSave
+import org.opensecretmanager.app.autofill.SaveActivity
 import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
@@ -153,25 +158,69 @@ fun VaultScreen(
         },
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
-        Box(Modifier.padding(padding).fillMaxSize()) {
-            when (state.screen) {
-                Screen.OPENING -> Message("Opening…")
-                Screen.NO_VAULT -> JoinStart(state, session)
-                Screen.JOINING -> JoinConfirm(state, session)
-                Screen.LOCKED -> Unlock(state, session, biometric, onUnlockWithBiometric, onRememberWithBiometric)
-                Screen.UNLOCKED -> fields?.let { ItemEditor(it, state.editor?.detail, session) }
-                    ?: state.history?.let { HistoryList(it, session) }
-                    ?: state.deleted?.let { DeletedList(it, session) }
-                    ?: state.detail?.let { Detail(it, session) }
-                    ?: Items(state, session)
-                Screen.REMOVED -> Message(
-                    "This phone was removed from the vault",
-                    "Your other devices moved to a new key that this phone never received. What it already held stays readable here.",
-                )
-                Screen.UNREADABLE -> Message("The vault on this phone cannot be opened", state.unreadable ?: "")
+        Column(Modifier.padding(padding).fillMaxSize()) {
+            if (fields == null && (state.screen == Screen.LOCKED || state.screen == Screen.UNLOCKED)) WaitingSave()
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                when (state.screen) {
+                    Screen.OPENING -> Message("Opening…")
+                    Screen.NO_VAULT -> JoinStart(state, session)
+                    Screen.JOINING -> JoinConfirm(state, session)
+                    Screen.LOCKED -> Unlock(state, session, biometric, onUnlockWithBiometric, onRememberWithBiometric)
+                    Screen.UNLOCKED -> fields?.let { ItemEditor(it, state.editor?.detail, session) }
+                        ?: state.history?.let { HistoryList(it, session) }
+                        ?: state.deleted?.let { DeletedList(it, session) }
+                        ?: state.detail?.let { Detail(it, session) }
+                        ?: Items(state, session)
+                    Screen.REMOVED -> Message(
+                        "This phone was removed from the vault",
+                        "Your other devices moved to a new key that this phone never received. What it already held stays readable here.",
+                    )
+                    Screen.UNREADABLE -> Message("The vault on this phone cannot be opened", state.unreadable ?: "")
+                }
+                state.busy?.let { Busy(it) }
             }
-            state.busy?.let { Busy(it) }
         }
+    }
+}
+
+/**
+ * A login the owner chose to save in the system's offer, whose save screen
+ * Android did not open: Android 15 and later open it only while the form's
+ * app is on the screen or has just left it. Offered here until it is saved
+ * or discarded, or its time is up ([PendingSave.KEPT_MILLIS]).
+ */
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun WaitingSave() {
+    val context = LocalContext.current
+    var waiting by remember { mutableStateOf(PendingSave.waiting()) }
+    LifecycleResumeEffect(Unit) {
+        waiting = PendingSave.waiting()
+        onPauseOrDispose { }
+    }
+    val shown = waiting ?: return
+    // Tags as resource ids: the autofill tests find this from outside.
+    Column(Modifier.fillMaxWidth().padding(16.dp).semantics { testTagsAsResourceId = true }.testTag("waiting-save")) {
+        Text("A login from ${shown.from} is waiting to be saved", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "You chose Save, but Android did not open the save screen. The login is kept in this app's memory " +
+                "for up to ${PendingSave.KEPT_MILLIS / 60_000} minutes, and nowhere else.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { context.startActivity(Intent(context, SaveActivity::class.java).putExtra(SaveActivity.SAVE, shown.id)) },
+                modifier = Modifier.testTag("waiting-save-open"),
+            ) { Text("Save it") }
+            TextButton(
+                onClick = {
+                    PendingSave.forget(shown.id)
+                    waiting = null
+                },
+                modifier = Modifier.testTag("waiting-save-discard"),
+            ) { Text("Discard") }
+        }
+        HorizontalDivider()
     }
 }
 

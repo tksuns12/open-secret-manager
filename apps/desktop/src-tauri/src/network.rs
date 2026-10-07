@@ -345,7 +345,14 @@ fn move_vault_files(vault_path: &Path, archive: &Path, vault_first: bool) -> std
             let file = format!("{name}{suffix}");
             let from = directory.join(&file);
             if from.exists() {
-                std::fs::rename(from, archive.join(&file))?;
+                match std::fs::rename(&from, archive.join(&file)) {
+                    // SQLite deletes a database's side files when its last
+                    // connection closes, which a store just shut down can
+                    // still be doing as they are moved.
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+                    result => result?,
+                }
             }
         }
     }

@@ -150,6 +150,12 @@ phone sold since 2019 is):
    afterwards, and to no other.
 4. Note any app or site where no save is offered after signing in, and
    whether the app asked for the username and password on separate screens.
+5. In an app that closes after signing in (or switch to the home screen as
+   soon as you have signed in), wait half a minute before choosing Save in
+   Android's offer. If no save screen opens, open Open Secret Manager: it
+   should offer "A login from … is waiting to be saved". Note whether the
+   save screen opened at once, opened only later (for example when you went
+   back to that app), or not at all.
 
 **iOS** (26.2 or later):
 

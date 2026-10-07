@@ -72,7 +72,14 @@ class SaveActivity : FragmentActivity() {
             window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         }
         id = intent.getIntExtra(SAVE, 0)
-        val save = PendingSave.get(id)
+        val save = PendingSave.open(id)
+        // Android can start this screen late, once the form's app is opened
+        // again, for a save the owner already handled from the app's screen.
+        if (save == null && PendingSave.settled(id)) {
+            Toast.makeText(applicationContext, "That login was already saved or discarded", Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
         val session = (application as VaultApp).session
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session)
