@@ -1,6 +1,9 @@
 package org.opensecretmanager.app
 
 import android.content.Context
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -481,3 +484,14 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.Storage -> "Something went wrong on this phone · ${error.reason}"
     }
 }
+
+/**
+ * The session's state as a screen reads it, collected on the main thread,
+ * where screens are drawn: the session changes it from its own threads.
+ * Collected in the screen's own context instead, a test's screen was once
+ * redrawn on the thread that changed it, which Android refuses, and the
+ * app then crashed when the screen closed.
+ */
+@Composable
+fun VaultSession.screenState(): State<UiState> =
+    state.collectAsStateWithLifecycle(context = Dispatchers.Main.immediate)

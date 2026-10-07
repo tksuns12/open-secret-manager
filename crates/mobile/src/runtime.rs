@@ -75,6 +75,18 @@ impl Control {
     }
 }
 
+/// Marks a sync under way until it ends, also when its task is stopped
+/// part-way, as going offline stops it: a mark left behind would make
+/// every later sync do nothing, and a sync in the background wait for it
+/// without end.
+struct SyncUnderWay<'a>(&'a AtomicBool);
+
+impl Drop for SyncUnderWay<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A join between showing the code and finishing.
 struct JoinState {
     connection: PairingConnection,
@@ -633,10 +645,7 @@ impl Runtime {
         }
         self.maintain(&control).await;
         // Fetch the vault's contents right away.
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            let _ = runtime.sync_with_members().await;
-        });
+        self.sync_once(&control);
         Ok(())
     }
 
@@ -718,11 +727,23 @@ impl Runtime {
             .await?;
         self.update_status(|status| status.state = SyncState::Idle);
         self.maintain(&control).await;
+        self.sync_once(&control);
+        Ok(())
+    }
+
+    /// Starts a sync with the members as one of the control plane's tasks,
+    /// so that going offline stops it with the others: one left running
+    /// would still send what was written after.
+    fn sync_once(self: &Arc<Self>, control: &Control) {
         let runtime = self.clone();
-        tokio::spawn(async move {
+        let sync = tokio::spawn(async move {
             let _ = runtime.sync_with_members().await;
         });
-        Ok(())
+        control
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(sync);
     }
 
     pub(crate) async fn go_offline(&self) {
@@ -957,6 +978,7 @@ impl Runtime {
         if self.syncing.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        let under_way = SyncUnderWay(&self.syncing);
         let peers = control.endpoint.sync_peers();
         if !peers.is_empty() {
             self.update_status(|status| status.state = SyncState::Syncing);
@@ -979,7 +1001,7 @@ impl Runtime {
                 Err(error) => failure = Some(error),
             }
         }
-        self.syncing.store(false, Ordering::SeqCst);
+        drop(under_way);
         // One member being away is not a failed sync if another answered.
         let result = match failure {
             Some(osm_vault_peer::Error::Removed) => Err(osm_vault_peer::Error::Removed),

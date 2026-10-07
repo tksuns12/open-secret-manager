@@ -63,7 +63,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.LifecycleResumeEffect
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
@@ -109,7 +108,7 @@ fun VaultScreen(
     onUnlockWithBiometric: () -> Unit,
     onRememberWithBiometric: (String) -> Unit,
 ) {
-    val state by session.state.collectAsStateWithLifecycle()
+    val state by session.screenState()
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.notice) {
         state.notice?.let {

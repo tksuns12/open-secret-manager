@@ -398,7 +398,19 @@ async fn a_removal_takes_effect_only_once_a_quorum_completes_it() {
     // needs B in the new configuration: it stays pending, and the new
     // epoch is not active anywhere.
     net.router.heal(c.id());
-    control::submit(&a.node, removal.clone()).await.unwrap();
+    // The leader reaches C again within a few heartbeats, which on a busy
+    // machine once took longer than one write may wait. Submitting again is
+    // safe: the request's ID makes it the same request.
+    let mut submitted = control::submit(&a.node, removal.clone()).await;
+    for _ in 0..10 {
+        if !matches!(&submitted, Err(Error::Membership(error))
+            if matches!(**error, osm_vault_membership::Error::QuorumUnavailable))
+        {
+            break;
+        }
+        submitted = control::submit(&a.node, removal.clone()).await;
+    }
+    submitted.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     for member in [&a, &c] {
         let state = member.state();

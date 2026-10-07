@@ -98,6 +98,8 @@ before a commit:
 scripts/check.sh              # formatting, lints, all tests, both interfaces, licenses
 scripts/check.sh --network    # also the advisory audits of every dependency
 scripts/check.sh --browsers   # also the extension in headless Chromium and Firefox
+scripts/check.sh --mobile     # also both phone apps, in a simulator and on an emulator
+scripts/check.sh --linux      # also the desktop's Linux code, in a Linux container
 ```
 
 Every dependency has to come from the official registry under a license a

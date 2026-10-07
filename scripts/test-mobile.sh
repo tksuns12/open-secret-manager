@@ -11,6 +11,8 @@
 #          screens, on a running emulator or attached device (adb). On an
 #          emulator with a fingerprint enrolled, its sensor is touched
 #          throughout, so that unlocking with a fingerprint is tested too.
+#          What the screen showed at a failed wait of the autofill tests
+#          is brought back into OSM_TEST_FAILURES/android, if set.
 # join     the Android app joining a desktop-side device on this machine
 #          over the network (scripts/test-mobile-join.sh).
 # join-ios the same with the iOS app.
@@ -81,6 +83,13 @@ android)
     "$root/apps/mobile/android/prepare.sh" "$work"
     adb=${ADB:-adb}
     command -v "$adb" >/dev/null || adb="${ANDROID_HOME:-$HOME/Library/Android/sdk}/platform-tools/adb"
+    # A device that does not answer, as an emulator short of memory can
+    # stop doing, fails every test at its first wait, which says nothing.
+    within() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+    if [ "$(within 60 "$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != 1 ]; then
+        echo "The device did not answer within a minute, or has not finished starting." >&2
+        exit 1
+    fi
     # The app is tested in front, with the input focus: the screen on and
     # unlocked, and no system dialog over it.
     "$adb" shell input keyevent KEYCODE_WAKEUP
@@ -91,6 +100,7 @@ android)
     fi
     "$adb" shell wm dismiss-keyguard
     "$adb" shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
+    "$adb" shell rm -rf /data/local/tmp/osm-failures
     # An emulator's fingerprint sensor, touched until the tests end.
     (while :; do "$adb" emu finger touch 1 >/dev/null 2>&1; sleep 2; done) &
     toucher=$!
@@ -98,6 +108,15 @@ android)
     (cd apps/mobile/android && ./gradlew --quiet :vault:connectedDebugAndroidTest :app:connectedDebugAndroidTest) || status=$?
     kill "$toucher" 2>/dev/null || true
     wait "$toucher" 2>/dev/null || true
+    if [ "$status" != 0 ] && [ -n "$("$adb" shell ls /data/local/tmp/osm-failures 2>/dev/null)" ]; then
+        if [ -n "${OSM_TEST_FAILURES:-}" ]; then
+            mkdir -p "$OSM_TEST_FAILURES/android"
+            "$adb" pull /data/local/tmp/osm-failures/. "$OSM_TEST_FAILURES/android" >/dev/null
+            echo "What the screen showed at each failed wait: $OSM_TEST_FAILURES/android" >&2
+        else
+            echo "What the screen showed at each failed wait is on the device in /data/local/tmp/osm-failures (or set OSM_TEST_FAILURES)." >&2
+        fi
+    fi
     [ "$status" = 0 ] || exit "$status"
     ;;
 join)

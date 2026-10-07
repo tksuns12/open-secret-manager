@@ -102,7 +102,17 @@ pub(crate) async fn until_devices(
     what: &str,
     wanted: impl Fn(&network::DevicesInfo) -> bool,
 ) -> network::DevicesInfo {
-    for _ in 0..600 {
+    until_devices_within(app, what, 600, wanted).await
+}
+
+/// [`until_devices`], polling up to `polls` times, a tenth of a second apart.
+pub(crate) async fn until_devices_within(
+    app: &AppHandle<MockRuntime>,
+    what: &str,
+    polls: usize,
+    wanted: impl Fn(&network::DevicesInfo) -> bool,
+) -> network::DevicesInfo {
+    for _ in 0..polls {
         let info = devices(app).await;
         if wanted(&info) {
             return info;
@@ -264,8 +274,10 @@ fn desktop_shells_enroll_sync_remove_and_refuse_without_quorum() {
 
         // C learns that it was removed and is reset at once: its copy,
         // which never got the new key or anything written since, is moved
-        // aside, and C is a device without a vault again.
-        let reset = until_devices(&c, "C is reset after its removal", |info| {
+        // aside, and C is a device without a vault again. It hears only at
+        // its next connection, which once took over a minute on a machine
+        // under heavy load.
+        let reset = until_devices_within(&c, "C is reset after its removal", 1_800, |info| {
             info.setup == "none" && info.reset_archive.is_some()
         })
         .await;

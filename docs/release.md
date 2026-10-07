@@ -158,7 +158,8 @@ from 3.35); the shared code's tests ran against the simulator's.
 
 From a commit with nothing uncommitted:
 
-1. `scripts/check.sh --network --browsers` passes.
+1. `scripts/check.sh --network --browsers --linux` passes (`--linux` needs a
+   Docker engine; `OSM_COLIMA_PROFILE` names a colima machine to start for it).
 2. `scripts/release-macos.sh`, with `OSM_SIGNING_IDENTITY` (a Developer ID
    Application identity) and `OSM_NOTARY_PROFILE` (a notarytool keychain
    profile) set for a signed and notarized release. Without them the app is

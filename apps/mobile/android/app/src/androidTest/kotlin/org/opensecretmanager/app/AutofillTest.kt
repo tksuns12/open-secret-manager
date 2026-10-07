@@ -21,7 +21,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TestName
 import org.junit.runner.RunWith
 import org.opensecretmanager.app.autofill.Requester
 import org.opensecretmanager.vault.Device
@@ -38,6 +40,11 @@ import org.opensecretmanager.vault.ItemKind
  * In a build made with `-Posm.screenshots=true` and run with the
  * instrumentation argument `screens=true`, it also captures the screens it
  * passes through for a person to look at (see [ScreensForReview]).
+ *
+ * When a wait fails, the test leaves what the screen showed, the window
+ * tree, and why in [FAILURES] on the device, which `scripts/test-mobile.sh`
+ * brings back (in any build; the app's own screens show black unless
+ * screenshots are allowed).
  */
 @RunWith(AndroidJUnit4::class)
 class AutofillTest {
@@ -47,6 +54,11 @@ class AutofillTest {
     private val session = (context.applicationContext as VaultApp).session
     private val device = UiDevice.getInstance(instrumentation)
     private var previousService: String? = null
+    private val animationScales = listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
+    private var previousScales = emptyList<String>()
+
+    @get:Rule
+    val test = TestName()
 
     private fun shell(command: String): String =
         ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command))
@@ -59,6 +71,10 @@ class AutofillTest {
         previousService = shell("settings get secure autofill_service").trim()
             .takeIf { it.isNotEmpty() && it != "null" && !it.startsWith("${context.packageName}/") }
         shell("settings put secure autofill_service ${context.packageName}/.autofill.VaultAutofillService")
+        // Without animations, an offer sliding up is where it is found
+        // when it is tapped.
+        previousScales = animationScales.map { shell("settings get global $it").trim() }
+        animationScales.forEach { shell("settings put global $it 0") }
         context.getSharedPreferences("app-logins", 0).edit().clear().commit()
         Requester.trustedForTests.clear()
         session.reopenForTests { folder ->
@@ -74,10 +90,30 @@ class AutofillTest {
         Requester.trustedForTests.clear()
         shell("am force-stop $FIXTURE")
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")
+        animationScales.zip(previousScales).forEach { (name, scale) ->
+            shell(if (scale.isEmpty() || scale == "null") "settings delete global $name" else "settings put global $name $scale")
+        }
+    }
+
+    /** Fails with [message], leaving what the screen shows, its window tree, and the message in [FAILURES]. */
+    private fun fail(message: String): Nothing {
+        val folder = context.getExternalFilesDir("failures")!!
+        val name = "${test.methodName}-${System.currentTimeMillis()}"
+        runCatching {
+            File(folder, "$name.png").outputStream().use { output ->
+                instrumentation.uiAutomation.takeScreenshot()?.compress(Bitmap.CompressFormat.PNG, 100, output)
+            }
+        }
+        runCatching { File(folder, "$name.xml").outputStream().use { device.dumpWindowHierarchy(it) } }
+        File(folder, "$name.txt").writeText("$message\n")
+        // Out of the app's own folders, which go when the run uninstalls it.
+        shell("mkdir -p $FAILURES")
+        shell("cp ${folder.path}/$name.png ${folder.path}/$name.xml ${folder.path}/$name.txt $FAILURES/")
+        throw AssertionError(message)
     }
 
     private fun find(selector: BySelector, timeout: Long = 15_000): UiObject2 =
-        device.wait(Until.findObject(selector), timeout) ?: throw AssertionError("nothing matches $selector")
+        device.wait(Until.findObject(selector), timeout) ?: fail("nothing matches $selector")
 
     private val capturing =
         BuildConfig.ALLOW_SCREENSHOTS && InstrumentationRegistry.getArguments().getString("screens") == "true"
@@ -100,13 +136,15 @@ class AutofillTest {
     private fun askToFill(activity: String, origin: String? = null, name: String? = null, field: String = "username", extras: String = "") {
         device.wakeUp()
         shell("am start -W -S -n $FIXTURE/.$activity" + (origin?.let { " --es origin $it" } ?: "") + extras)
-        val field = if (origin == null) {
-            find(By.res(FIXTURE, field))
-        } else {
-            find(By.clazz("android.widget.EditText").pkg(FIXTURE), 30_000)
+        val form = if (origin == null) By.res(FIXTURE, field) else By.clazz("android.widget.EditText").pkg(FIXTURE)
+        find(form, 30_000).click()
+        // The system asks the service when the field takes the focus, and
+        // on a busy emulator its offer was seen to take over 15 seconds, or
+        // not to come; a field tapped again asks again.
+        val offer = device.wait(Until.findObject(OFFER), 30_000) ?: run {
+            find(form).click()
+            find(OFFER, 30_000)
         }
-        field.click()
-        val offer = find(By.text("Open Secret Manager · unlock to fill"))
         name?.let { capture("$it-offer") }
         offer.click()
         // The fill screen's first start can take long on an emulator.
@@ -119,17 +157,14 @@ class AutofillTest {
 
     private fun assertFilled(expected: String) {
         val filled = find(By.res(FIXTURE, "filled"))
-        assertTrue(
-            "filled: ${filled.text}",
-            filled.wait(Until.textEquals(expected), 15_000) == true,
-        )
+        if (filled.wait(Until.textEquals(expected), 15_000) != true) fail("filled: ${filled.text}")
     }
 
     /** The fill screen gone, the vault locks again. */
     private fun assertLockedAgain() {
         val deadline = System.currentTimeMillis() + 15_000
         while (session.state.value.screen != Screen.LOCKED && System.currentTimeMillis() < deadline) Thread.sleep(100)
-        assertEquals(Screen.LOCKED, session.state.value.screen)
+        if (session.state.value.screen != Screen.LOCKED) fail("not locked again: ${session.state.value.screen}")
     }
 
     @Test
@@ -201,19 +236,23 @@ class AutofillTest {
     }
 
     /**
-     * Types [text] as keys into the page's focused field. While the offer to
+     * Types [text] as keys into the page's focused field, and says whether
+     * the page then reports what [shows] makes of it. While the offer to
      * fill shows under the field, the system passes keys through it, and
      * loses or reorders some (a space even chooses it); the on-screen
      * keyboard's typing does not go that way. One key closes the offer, so
-     * it is typed once the offer shows, and the rest once it is gone: on a
-     * slow emulator the offer can take seconds to come.
+     * it is typed once the offer shows, and the rest once the page has it
+     * and the offer is gone: on a slow emulator the offer can take seconds
+     * to come.
      */
-    private fun typeKeys(text: String) {
-        device.wait(Until.hasObject(By.text("Open Secret Manager · unlock to fill")), 15_000)
+    private fun typeKeys(text: String, shows: (String) -> String): Boolean {
+        val filled = find(By.res(FIXTURE, "filled"))
+        device.wait(Until.hasObject(OFFER), 15_000)
         shell("input text ${text.take(1)}")
-        device.wait(Until.gone(By.text("Open Secret Manager · unlock to fill")), 15_000)
-        Thread.sleep(500)
+        if (filled.wait(Until.textEquals(shows(text.take(1))), 5_000) != true) return false
+        device.wait(Until.gone(OFFER), 15_000)
         shell("input text ${text.drop(1)}")
+        return filled.wait(Until.textEquals(shows(text)), 5_000) == true
     }
 
     /**
@@ -239,11 +278,13 @@ class AutofillTest {
             for (attempt in 1..3) {
                 if (attempt > 1) shell("am start -W -S -n $FIXTURE/.$activity --es origin $origin")
                 find(By.clazz("android.widget.EditText").pkg(FIXTURE), 30_000).click()
-                typeKeys(username)
-                device.pressKeyCode(KeyEvent.KEYCODE_TAB)
-                typeKeys(password)
-                if (find(By.res(FIXTURE, "filled")).wait(Until.textEquals("$username|$password"), 5_000) == true) break
-                check(attempt < 3) { "the page never got all the keys typed" }
+                if (typeKeys(username) { "$it|" } &&
+                    device.pressKeyCode(KeyEvent.KEYCODE_TAB) &&
+                    typeKeys(password) { "$username|$it" }
+                ) {
+                    break
+                }
+                if (attempt == 3) fail("the page never got all the keys typed")
             }
             // The page's one button is its Sign in, uncovered now that the
             // offer to fill is closed. The web view may redo its tree, so
@@ -257,10 +298,9 @@ class AutofillTest {
                 }
             }
         }
-        // The offer slides up: tapped while it moves, the tap can land beside
-        // it, which closes it.
+        // With animations off, the offer does not slide up: a tap while it
+        // moved could land beside it, which closes it.
         find(By.res("android", "autofill_save_yes"))
-        Thread.sleep(2_000)
         name?.let { capture("$it-save-offer") }
         find(By.res("android", "autofill_save_yes")).click()
         find(mine("password"), 60_000)
@@ -354,7 +394,7 @@ class AutofillTest {
     /** The stand-in shows the current code of [secret] (or the one before, as the step may just have turned). */
     private fun assertFilledWithCodeOf(secret: String) {
         val filled = find(By.res(FIXTURE, "filled"))
-        assertTrue("filled: ${filled.text}", filled.wait(Until.textMatches("[0-9]{6}"), 15_000) == true)
+        if (filled.wait(Until.textMatches("[0-9]{6}"), 15_000) != true) fail("filled: ${filled.text}")
         val now = System.currentTimeMillis() / 1000
         assertTrue("filled: ${filled.text}", filled.text in setOf(totp(secret, now), totp(secret, now - 30)))
     }
@@ -417,6 +457,12 @@ class AutofillTest {
 
     private companion object {
         const val FIXTURE = "org.opensecretmanager.loginfixture"
+
+        /** The service's offer under a field, to unlock and fill it. */
+        val OFFER: BySelector = By.text("Open Secret Manager · unlock to fill")
+
+        /** Where a failed wait leaves what it saw, on the device. */
+        const val FAILURES = "/data/local/tmp/osm-failures"
 
         /** Bank's one-time code secret in the frozen vault (`crates/vault-core/examples/make_fixture.rs`). */
         const val BANK_CODE_SECRET = "JBSWY3DPEHPK3PXP"

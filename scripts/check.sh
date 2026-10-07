@@ -11,17 +11,25 @@
 #                                 iOS simulator, and those and the Android
 #                                 app on a running emulator or device
 #                                 (OSM_DEVICE_PIN if it has a screen lock)
+#   scripts/check.sh --linux      also the desktop's Linux code in a Linux
+#                                 container (scripts/test-linux.sh), on the
+#                                 working tree; OSM_COLIMA_PROFILE names a
+#                                 colima machine to start for it and stop
+#                                 again, which leaves the Docker context as
+#                                 it was
 set -eu
 cd "$(dirname "$0")/.."
 
 network=no
 browsers=no
 mobile=no
+linux=no
 for argument in "$@"; do
     case "$argument" in
         --network) network=yes ;;
         --browsers) browsers=yes ;;
         --mobile) mobile=yes ;;
+        --linux) linux=yes ;;
         *) echo "unknown option: $argument" >&2; exit 2 ;;
     esac
 done
@@ -64,6 +72,29 @@ if [ "$browsers" = yes ]; then
     step "Extension in headless browsers"
     cargo build --locked -p osm-native-host -p osm-vault-browser
     (cd apps/browser-extension && npm run test:e2e && npm run test:e2e:firefox)
+fi
+
+# Before the phones: a colima machine started here is stopped again first,
+# and an emulator can be killed for memory while one runs.
+if [ "$linux" = yes ]; then
+    step "Desktop's Linux code in a container"
+    profile=${OSM_COLIMA_PROFILE:-}
+    if [ -n "$profile" ] && ! colima status "$profile" >/dev/null 2>&1; then
+        context=$(docker context show)
+        trap 'colima stop "$profile"' EXIT
+        colima start "$profile"
+        # Starting makes the machine's context the current one.
+        docker context use "$context" >/dev/null
+    fi
+    if [ -n "$profile" ]; then
+        OSM_DOCKER_CONTEXT=$([ "$profile" = default ] && echo colima || echo "colima-$profile")
+        export OSM_DOCKER_CONTEXT
+    fi
+    OSM_ALLOW_CHANGES=1 scripts/test-linux.sh
+    if [ -n "${context:-}" ]; then
+        trap - EXIT
+        colima stop "$profile"
+    fi
 fi
 
 if [ "$mobile" = yes ]; then

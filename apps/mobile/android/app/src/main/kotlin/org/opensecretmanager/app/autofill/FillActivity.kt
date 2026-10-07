@@ -41,7 +41,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.opensecretmanager.app.BiometricUnlock
 import org.opensecretmanager.app.BuildConfig
 import org.opensecretmanager.app.Busy
@@ -51,6 +50,7 @@ import org.opensecretmanager.app.Screen
 import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
 import org.opensecretmanager.app.VaultSession
+import org.opensecretmanager.app.screenState
 import org.opensecretmanager.vault.FillCredentials
 import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
@@ -128,7 +128,7 @@ private fun FillScreen(
     onFill: (FillCredentials?, String?) -> Unit,
     onCancel: () -> Unit,
 ) {
-    val state by session.state.collectAsStateWithLifecycle()
+    val state by session.screenState()
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.notice) {
         state.notice?.let {

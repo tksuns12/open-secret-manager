@@ -3,7 +3,11 @@
 //! three passes), and the most memory the process held. For judging a
 //! phone, or an app extension with a memory limit, against a desktop.
 //!
-//!   cargo run --release -p osm-vault-core --example unlock_cost -- [folder] [rounds]
+//!   cargo run --release -p osm-vault-core --example unlock_cost -- [folder] [rounds] [items]
+//!
+//! The vault holds `items` items (100 if not given), one revision each. An
+//! unlock reads every revision to check the rows of the file (format 8), so
+//! its time grows with them.
 //!
 //! The peak memory is read from `/proc/self/status`, so it is reported on
 //! Linux and Android only; elsewhere measure the process from outside.
@@ -26,14 +30,17 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let folder = args.next().map_or_else(std::env::temp_dir, PathBuf::from);
     let rounds: u32 = args.next().map_or(3, |text| text.parse().expect("rounds"));
+    let items: u32 = args.next().map_or(100, |text| text.parse().expect("items"));
     let path = folder.join(format!("unlock-cost-{}.sqlite3", std::process::id()));
 
     let start = Instant::now();
     let (mut vault, _) = Vault::create(&path, PASSWORD).expect("create");
     println!("create: {} ms", start.elapsed().as_millis());
-    for n in 0..100 {
+    let start = Instant::now();
+    for n in 0..items {
         vault.put(Item::new(format!("Item {n}"))).expect("put");
     }
+    println!("{items} items: {} ms", start.elapsed().as_millis());
     drop(vault);
 
     for _ in 0..rounds {

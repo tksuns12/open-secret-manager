@@ -27,6 +27,8 @@ let previewEntries: VaultEntry[] = [
 const previewImport: ImportSummary = { file: "sample-export.csv", items: 2, logins: 2, notes: 0, cards: 0, identities: 0, already: 1, warnings: [{ row: 4, message: "entry has no password" }] };
 let previewImportChosen = false;
 let previewSettings: Settings = { autoLockMinutes: 5 };
+/** Whether the preview's owner confirmed its warning that records were taken out of the file. */
+let previewRowsConfirmed = false;
 
 const previewDetails = new Map<string, EntryDetail>();
 /** Items deleted in the preview, which it can bring back. */
@@ -202,11 +204,16 @@ export const bridge: DesktopBridge = {
     const invoke = native();
     if (invoke) await invoke("confirm_recovery_key");
   },
+  /** The preview says so, until confirmed, when its address asks, as in `/?rows-changed`, so the warning can be looked at. */
   async rowsChanged() {
     const invoke = native();
-    return invoke ? Boolean(await invoke("rows_changed")) : false;
+    return invoke ? Boolean(await invoke("rows_changed")) : !previewRowsConfirmed && new URLSearchParams(globalThis.location?.search).has("rows-changed");
   },
-  confirmRowsChanged: () => nativeOnly("confirm_rows_changed"),
+  async confirmRowsChanged() {
+    const invoke = native();
+    if (invoke) await invoke("confirm_rows_changed");
+    else previewRowsConfirmed = true;
+  },
   enableRecovery: (recoveryKey) => nativeOnly("enable_recovery", { recoveryKey }),
   syncNow: () => nativeOnly("sync_now"),
   async listArchives() {
