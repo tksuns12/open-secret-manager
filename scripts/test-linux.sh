@@ -2,7 +2,8 @@
 # The desktop app's own Linux code, tested on Linux in a container: what
 # the session crate hears from logind (a stand-in on a bus of the test's
 # own) and what it puts on the clipboard, as another program reads it on a
-# virtual display.
+# virtual display, and then as a Wayland program reads it under a headless
+# Sway (which offers the data-control protocol, as wlroots and KDE do).
 #
 #   scripts/test-linux.sh
 #
@@ -33,14 +34,30 @@ docker build --platform "$platform" -t osm-linux-build packaging/linux
 docker build --platform "$platform" -t osm-linux-test - <<'EOF'
 FROM osm-linux-build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends dbus xvfb xclip \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends dbus xvfb xclip sway wl-clipboard \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m tester
 EOF
+# Sway refuses to run as root, so it runs as `tester`; the tests, as root,
+# can still reach its socket.
 container=$(docker create --platform "$platform" osm-linux-test sh -c '
+    set -e
     Xvfb :99 -screen 0 1024x768x24 >/tmp/xvfb.log 2>&1 &
-    export DISPLAY=:99
     sleep 1
-    cd apps/desktop/src-tauri && cargo test --locked -p osm-desktop-session')
+    cd apps/desktop/src-tauri
+    DISPLAY=:99 cargo test --locked -p osm-desktop-session
+    mkdir -p /tmp/wayland && chown tester /tmp/wayland && chmod 700 /tmp/wayland
+    echo "xwayland disable" > /tmp/sway.config
+    runuser -u tester -- env XDG_RUNTIME_DIR=/tmp/wayland WLR_BACKENDS=headless \
+        WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman sway -c /tmp/sway.config >/tmp/sway.log 2>&1 &
+    tries=0
+    until [ -S /tmp/wayland/wayland-1 ]; do
+        tries=$((tries + 1))
+        [ "$tries" -le 60 ] || { cat /tmp/sway.log; exit 1; }
+        sleep 0.5
+    done
+    env -u DISPLAY XDG_RUNTIME_DIR=/tmp/wayland WAYLAND_DISPLAY=wayland-1 OSM_TEST_WAYLAND=1 \
+        cargo test --locked -p osm-desktop-session --test wayland')
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
 
 git archive --format=tar "$tree" | docker cp - "$container:/src"

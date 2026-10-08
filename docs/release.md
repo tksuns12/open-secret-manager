@@ -25,7 +25,7 @@ before the release are upgraded when opened.
 | macOS 26 on Apple Silicon | **Supported.** Built, tested, and run on macOS 26.6.2 (arm64). |
 | macOS 14 and 15 on Apple Silicon | The app installs (its minimum is macOS 14), but it was not run on them. |
 | macOS on Intel | Not built. |
-| Linux, x86_64 (`.deb`) | **Built, not verified.** Made in a container from Ubuntu 22.04, so it needs no newer system libraries than 22.04 has. No Linux desktop has run it. Locking when the computer sleeps or the screen locks, and keeping copied codes out of clipboard history, exist on macOS and, since Phase 10, on Linux (through logind and the clipboard's password-manager hint), where they were tried in a container against a stand-in for logind, not on a Linux desktop. |
+| Linux, x86_64 (`.deb`) | **Built, not verified.** Made in a container from Ubuntu 22.04, so it needs no newer system libraries than 22.04 has. No Linux desktop has run it. Locking when the computer sleeps or the screen locks, and keeping copied codes out of clipboard history, exist on macOS and, since Phase 10, on Linux (through logind and the clipboard's password-manager hint), where they were tried in a container against a stand-in for logind, not on a Linux desktop. Under Wayland, copies are made through the compositor's data-control protocol where it offers one, as wlroots compositors do (Sway was tried in a container); elsewhere, as on GNOME, they go through Xwayland, untried. |
 | Linux, arm64 | The packaging script builds it on request; not built for the release. A build of the Phase 9 code ran in an Ubuntu 22.04 container under a virtual display with a window manager: a vault made, a login added, Firefox 157 connected and filled through its extension. Not a desktop session (no GNOME or KDE), and the same limits as x86_64. |
 | Windows | **Not supported.** The app was never built for Windows, and its browser fill does not exist there. |
 | Android (9 and later, 64-bit ARM) | **Not yet a release.** The release build, shrunk and signed as it ships, joined a desktop-side device and synced on an Android 16 emulator; no real phone has run it ([phone-trial.md](phone-trial.md) is what is left). Other kinds of phone refuse to install it. |
@@ -62,7 +62,8 @@ evidence in the delivery matrix and the threat model.
   and the vault then locks on waking.
 - A copied one-time code stays on the clipboard for up to 30 seconds. On
   macOS and Linux it is marked for clipboard history apps to leave out,
-  which only apps that honor the mark do.
+  which only apps that honor the mark do: on Linux, KDE's Klipper does, and
+  CopyQ 6, the version Ubuntu 22.04 ships, keeps it.
 
 **Between devices**
 - A device that was lost keeps everything it had. Removing it, starting

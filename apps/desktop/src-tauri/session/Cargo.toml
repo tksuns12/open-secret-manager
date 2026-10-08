@@ -15,9 +15,12 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard"] }
 
 # logind over D-Bus, through the libdbus binding the windowing already
-# links on Linux; and a clipboard this process keeps serving.
+# links on Linux; and a clipboard this process keeps serving. Under a
+# Wayland compositor that offers the data-control protocol (wlroots, KDE)
+# the clipboard is set there: through Xwayland, Wayland programs were not
+# given what the app copied. Elsewhere, as on GNOME, it goes through X11.
 [target.'cfg(target_os = "linux")'.dependencies]
-arboard = "3.6.1"
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 dbus = "0.9.12"
 zeroize = "1.8.2"
 
