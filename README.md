@@ -100,7 +100,8 @@ scripts/check.sh              # formatting, lints, all tests, both interfaces, l
 scripts/check.sh --network    # also the advisory audits of every dependency
 scripts/check.sh --browsers   # also the extension in headless Chromium and Firefox
 scripts/check.sh --mobile     # also both phone apps, in a simulator and on an emulator
-scripts/check.sh --linux      # also the desktop's Linux code, in a Linux container
+scripts/check.sh --linux      # also the desktop's Linux code and the real app end to end,
+                              # in a Linux container
 ```
 
 The window's tests need Playwright's WebKit once: `npx playwright install webkit`

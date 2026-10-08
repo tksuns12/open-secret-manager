@@ -88,7 +88,8 @@ login, and nothing is written before the owner unlocks and chooses.
   dependency policy and advisory audits. With `--mobile` it also runs the
   phone tests: the bindings in an iOS simulator and on an Android emulator,
   and the two apps' UI and autofill tests through the real shared code. With
-  `--linux` it runs the desktop's Linux code in a container. The desktop
+  `--linux` it runs the desktop's Linux code in a container, and drives
+  the real app there end to end (pairing, backup and restore, archive). The desktop
   window's own tests (`apps/desktop/window/`) run in headless WebKit on its
   browser preview every time.
 - Frozen formats: files every build reads, in each crate's `fixtures/`.

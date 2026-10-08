@@ -11,7 +11,8 @@
     "host": "node scripts/host.mjs",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test:window": "node --test --test-concurrency=1 \"window/*.test.mjs\""
+    "test:window": "node --test --test-concurrency=1 \"window/*.test.mjs\"",
+    "test:app": "node --test --test-concurrency=1 \"e2e/*.test.mjs\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
@@ -25,6 +26,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "playwright": "^1.63.0",
+    "selenium-webdriver": "^4.50.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.3"
   }

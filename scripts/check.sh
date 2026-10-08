@@ -15,7 +15,9 @@
 #                                 app on a running emulator or device
 #                                 (OSM_DEVICE_PIN if it has a screen lock)
 #   scripts/check.sh --linux      also the desktop's Linux code in a Linux
-#                                 container (scripts/test-linux.sh), on the
+#                                 container (scripts/test-linux.sh) and the
+#                                 real app driven end to end there
+#                                 (scripts/test-linux-app.sh), on the
 #                                 working tree; OSM_COLIMA_PROFILE names a
 #                                 colima machine to start for it and stop
 #                                 again, which leaves the Docker context as
@@ -94,6 +96,7 @@ if [ "$linux" = yes ]; then
         export OSM_DOCKER_CONTEXT
     fi
     OSM_ALLOW_CHANGES=1 scripts/test-linux.sh
+    OSM_ALLOW_CHANGES=1 scripts/test-linux-app.sh
     if [ -n "${context:-}" ]; then
         trap - EXIT
         colima stop "$profile"
