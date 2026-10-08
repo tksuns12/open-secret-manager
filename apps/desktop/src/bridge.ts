@@ -18,12 +18,28 @@ async function nativeOnly<T>(cmd: string, args?: unknown): Promise<T> {
 /**
  * Whether the preview's address asks for a state the browser preview
  * otherwise never has, so that it can be looked at and tested: as in
- * `/?rows-changed`, `/?recovery-key`, `/?held`, or `/?conflict`. Each shows
- * sample data, no secret.
+ * `/?rows-changed`, `/?recovery-key`, `/?held`, `/?conflict`, or `/?devices`.
+ * Each shows sample data, no secret.
  */
 function previewAsks(what: string): boolean {
   return new URLSearchParams(globalThis.location?.search).has(what);
 }
+
+/** Whether the preview shows a vault of two devices (`?devices`): this one, which votes, and a phone, which does not. */
+export function previewHasDevices(): boolean {
+  return !native() && previewAsks("devices");
+}
+
+const previewDevices: DevicesInfo = {
+  setup: "ready",
+  thisDevice: "a1b2c3d4e5f60718",
+  members: [
+    { id: "a1b2c3d4e5f60718", thisDevice: true, leader: true, votes: true },
+    { id: "9f8e7d6c5b4a3921", thisDevice: false, leader: false, votes: false, address: "192.168.1.23:47820" },
+  ],
+  epoch: 1,
+  quorum: 1,
+};
 
 let previewEntries: VaultEntry[] = ([
   { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", favorite: true },
@@ -35,8 +51,8 @@ let previewEntries: VaultEntry[] = ([
 
 /** With `?conflict`: the two versions of GitHub that were changed independently. */
 const previewConflict: VersionSummary[] = [
-  { revision: "preview-conflict-here", deleted: false, title: "GitHub", username: "northstar-labs", url: "github.com", device: "preview", thisDevice: true },
-  { revision: "preview-conflict-there", deleted: false, title: "GitHub", username: "northstar-ops", url: "github.com", device: "3f9a1c2e", thisDevice: false },
+  { revision: "preview-conflict-here", deleted: false, title: "GitHub", username: "northstar-labs", url: "github.com", device: "preview", thisDevice: true, differs: ["username", "password"] },
+  { revision: "preview-conflict-there", deleted: false, title: "GitHub", username: "northstar-ops", url: "github.com", device: "3f9a1c2e", thisDevice: false, differs: ["username", "password"] },
 ];
 
 /** With `?held`: changes written by a device that was removed, waiting for the owner. */
@@ -207,12 +223,12 @@ export const bridge: DesktopBridge = {
   async syncStatus() {
     const invoke = native();
     if (invoke) return (await invoke("sync_status")) as SyncStatus;
-    return { state: "local", devices: 0, pending: 0, replaced: [] };
+    return previewHasDevices() ? { state: "idle", devices: 1, pending: 0, replaced: [] } : { state: "local", devices: 0, pending: 0, replaced: [] };
   },
   async devices() {
     const invoke = native();
     if (invoke) return (await invoke("devices")) as DevicesInfo;
-    return { setup: "none", members: [], epoch: 0, quorum: 0 };
+    return previewHasDevices() ? previewDevices : { setup: "none", members: [], epoch: 0, quorum: 0 };
   },
   foundControlPlane: () => nativeOnly("found_control_plane"),
   removeDevice: (device) => nativeOnly("remove_device", { device }),
@@ -286,9 +302,15 @@ export const bridge: DesktopBridge = {
   },
   connectBrowser: (browser) => nativeOnly("connect_browser", { browser }),
   disconnectBrowser: (browser) => nativeOnly("disconnect_browser", { browser }),
-  startInvite: (votes) => nativeOnly("start_invite", { votes }),
+  /** With `?devices`, a sample invitation that pairs nothing. */
+  async startInvite(votes) {
+    if (native() || !previewHasDevices()) return nativeOnly("start_invite", { votes });
+    return { code: "OSM-PAIR1-PREVIEW-SAMPLE-NOT-AN-INVITATION", expiresAt: Date.now() + 15 * 60_000 };
+  },
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),
-  cancelInvite: () => nativeOnly("cancel_invite"),
+  async cancelInvite() {
+    if (native() || !previewHasDevices()) await nativeOnly("cancel_invite");
+  },
   joinStart: (code) => nativeOnly("join_start", { code }),
   joinFinish: (password) => nativeOnly("join_finish", { password: password ?? null }),
   cancelJoin: () => nativeOnly("cancel_join"),

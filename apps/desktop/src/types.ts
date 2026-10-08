@@ -106,6 +106,8 @@ export type VersionSummary = {
   url: string;
   device: string;
   thisDevice: boolean;
+  /** The fields in which this version differs from the others, by name only. */
+  differs: string[];
 };
 
 /** A change held for review: written by a device that is not, or is no longer, one of the vault's devices. Secrets are never included. */

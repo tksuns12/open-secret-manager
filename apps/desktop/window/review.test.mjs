@@ -46,6 +46,8 @@ test("an item changed on two devices shows both versions, and keeping one settle
   await versions.nth(1).waitFor();
   assert.match(await versions.nth(0).textContent(), /This device.*northstar-labs/);
   assert.match(await versions.nth(1).textContent(), /Device 3f9a1c2e.*northstar-ops/);
+  // What the fields shown do not tell is named, without its value.
+  assert.match(await versions.nth(1).textContent(), /Differs inusername, password/);
   await versions.nth(1).getByRole("button", { name: "Keep this version" }).click();
   await page.locator(".toast", { hasText: "Conflict resolved" }).waitFor();
   await page.locator(".entry-row", { hasText: "northstar-ops" }).waitFor();

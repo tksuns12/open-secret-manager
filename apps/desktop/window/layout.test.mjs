@@ -70,6 +70,7 @@ const DIALOGS = [
     await page.getByLabel("What the import adds").waitFor();
   }],
   ["the held changes", "?held", (page) => page.locator(".held-banner").getByRole("button", { name: "Review" }).click()],
+  ["the devices", "?devices", (page) => page.locator(".footer-bar").getByRole("button", { name: /Devices/ }).click()],
   ["an item's versions in conflict", "?conflict", async (page) => {
     await page.locator(".entry-row", { hasText: "GitHub" }).click();
     await page.locator(".detail-column").getByRole("button", { name: "Review versions" }).click();

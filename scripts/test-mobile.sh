@@ -21,7 +21,8 @@
 # aarch64-apple-ios-sim aarch64-apple-ios` and Xcode; each simulator is made
 # for the run in a device set of its own and deleted. Android needs `rustup target add
 # aarch64-linux-android` and the Android SDK and NDK. OSM_DEVICE_PIN
-# unlocks a device or emulator that has a screen lock.
+# unlocks a device or emulator that has a screen lock;
+# scripts/make-test-emulator.sh makes the emulator the tests expect.
 set -eu
 cd "$(dirname "$0")/.."
 root=$PWD

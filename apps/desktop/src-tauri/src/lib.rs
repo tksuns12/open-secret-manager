@@ -396,22 +396,29 @@ struct VersionSummary {
     /// Short hex prefix of the author device ID.
     device: String,
     this_device: bool,
+    /// The fields in which this version differs from the others, by name
+    /// only: what the title, username, and website shown do not tell.
+    differs: Vec<&'static str>,
 }
 
-#[tauri::command]
-async fn list_versions(
-    id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<VersionSummary>, CommandError> {
-    let vault = state.vault.lock().await;
-    let vault = vault.as_ref().ok_or_else(|| CommandError {
-        code: "locked",
-        message: "vault is locked".into(),
-    })?;
-    let this_device = vault.device_id();
-    Ok(vault
-        .versions(&id)?
-        .into_iter()
+/// The versions of an item in conflict, as the owner reviews them.
+fn version_summaries(
+    versions: Vec<osm_vault_core::ItemVersion>,
+    this_device: Option<[u8; 16]>,
+) -> Vec<VersionSummary> {
+    let differs = |item: &Item| {
+        let mut names = Vec::new();
+        for other in versions.iter().filter_map(|other| other.item.as_ref()) {
+            for name in item.changed_from(other) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    };
+    versions
+        .iter()
         .map(|version| VersionSummary {
             deleted: version.item.is_none(),
             title: version
@@ -431,9 +438,23 @@ async fn list_versions(
                 .unwrap_or_default(),
             device: history::short_device(&version.author_device_id),
             this_device: Some(version.author_device_id) == this_device,
-            revision: version.revision,
+            differs: version.item.as_ref().map(differs).unwrap_or_default(),
+            revision: version.revision.clone(),
         })
-        .collect())
+        .collect()
+}
+
+#[tauri::command]
+async fn list_versions(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<VersionSummary>, CommandError> {
+    let vault = state.vault.lock().await;
+    let vault = vault.as_ref().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    Ok(version_summaries(vault.versions(&id)?, vault.device_id()))
 }
 
 /// Resolves a conflict by keeping one of the versions the owner reviewed.
@@ -889,6 +910,35 @@ mod tests {
             serde_json::json!({ "credential": "secret" }),
         );
         item
+    }
+
+    #[test]
+    fn versions_in_conflict_say_in_which_fields_they_differ_by_name_only() {
+        let here = stored();
+        let mut there = stored();
+        there.notes = "a note only there".into();
+        there.password = "another password".into();
+        let version = |item: Option<Item>, author: u8| osm_vault_core::ItemVersion {
+            revision: format!("revision-{author}"),
+            author_device_id: [author; 16],
+            item,
+        };
+        let summaries = version_summaries(
+            vec![
+                version(Some(here), 1),
+                version(Some(there), 2),
+                version(None, 3),
+            ],
+            Some([1; 16]),
+        );
+        assert_eq!(summaries[0].differs, ["password", "notes"]);
+        assert_eq!(summaries[1].differs, ["password", "notes"]);
+        assert!(summaries[0].this_device && !summaries[1].this_device);
+        // A deletion is said as such; nothing of it differs by field.
+        assert!(summaries[2].deleted && summaries[2].differs.is_empty());
+        // Names only: no value reaches the window.
+        let sent = serde_json::to_string(&summaries).unwrap();
+        assert!(!sent.contains("another password") && !sent.contains("a note only there"));
     }
 
     #[test]
