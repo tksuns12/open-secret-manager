@@ -79,6 +79,14 @@ export type ImportSummary = {
   warnings: { row: number; message: string }[];
 };
 
+/** How long this device's vault has gone without a backup from this device. */
+export type BackupAge = {
+  /** Whole days since this device last saved a backup of its vault; `null` if it has not. */
+  days: number | null;
+  /** Whether to remind: 30 days or more since that backup, or since this device began counting without one. Never on a device without recovery, which cannot save one. */
+  due: boolean;
+};
+
 /** What the owner sets on this device. */
 export type Settings = {
   /** Minutes without activity before the window locks the vault: 1, 5, 15, or 60. */
@@ -345,6 +353,8 @@ export type DesktopBridge = {
   putUnreadableAway: () => Promise<string>;
   /** Asks where to save a backup and saves it; `null` if the owner closed the dialog. */
   saveBackup: () => Promise<SavedBackup | null>;
+  /** How long the unlocked vault has gone without a backup from this device. */
+  backupAge: () => Promise<BackupAge>;
   /** Asks for a backup to restore; resolves to its file name, or `null`. The path stays with the shell. */
   chooseBackup: () => Promise<string | null>;
   /** Restores the chosen backup as a new vault on this device, which has none. */

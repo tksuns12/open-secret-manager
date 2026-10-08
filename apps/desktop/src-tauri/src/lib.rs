@@ -831,6 +831,7 @@ pub fn run() {
             confirm_rows_changed,
             enable_recovery,
             backup::save_backup,
+            backup::backup_age,
             backup::choose_backup,
             backup::restore_backup,
             backup::reset_password,

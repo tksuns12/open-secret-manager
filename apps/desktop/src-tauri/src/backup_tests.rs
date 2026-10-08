@@ -67,10 +67,13 @@ fn after_every_device_is_lost_a_backup_and_the_recovery_key_bring_the_vault_back
         }
         let old_vault = vault_id(&old).await;
 
-        // The backup is read back as soon as it is written. An existing
-        // file is never replaced.
+        // The backup is read back as soon as it is written, and its time is
+        // noted for the reminder. An existing file is never replaced.
+        let age = || async { backup::backup_age(old.state()).await.unwrap() };
+        assert_eq!(age().await.days, None);
         let saved = backup::write(&old.state(), &saved_to).await.unwrap();
         assert_eq!((saved.items, saved.revisions, saved.held), (3, 6, 0));
+        assert_eq!((age().await.days, age().await.due), (Some(0), false));
         let written = std::fs::read(&saved_to).unwrap();
         assert_eq!(code(backup::write(&old.state(), &saved_to).await), "exists");
         assert_eq!(std::fs::read(&saved_to).unwrap(), written);

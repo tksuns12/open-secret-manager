@@ -3,7 +3,8 @@
 // WebKit, the engine that draws the window on macOS and Linux. Without the
 // native shell the window runs as its browser preview (src/bridge.ts), on
 // sample data, and its address asks for the states the preview otherwise
-// never has: `?rows-changed`, `?recovery-key`, `?held`, and `?conflict`.
+// never has: `?rows-changed`, `?recovery-key`, `?held`, `?conflict`, `?devices`,
+// and `?backup-due`.
 
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";

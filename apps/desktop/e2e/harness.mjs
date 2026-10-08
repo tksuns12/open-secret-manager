@@ -168,6 +168,17 @@ export async function addLogin(window, title, username, password) {
   await window.wait(until.elementLocated(By.xpath(`//*[contains(@class, "entry-row")]//strong[normalize-space(.) = ${quoted(title)}]`)), PATIENCE_MS);
 }
 
+/** Locks the vault and unlocks it again with `password`, as the owner coming back would. */
+export async function unlockAgain(window, password) {
+  await (await window.wait(until.elementLocated(By.css('[title="Lock vault"]')), PATIENCE_MS)).click();
+  await fill(window, "Vault password", password);
+  await press(window, "Unlock", { partly: true });
+  await window.wait(until.elementLocated(By.css(".entry-row")), PATIENCE_MS);
+}
+
+/** Where a device keeps its vault and the files beside it, under its home folder. */
+export const vaultFolder = (device) => path.join(device.home, ".local/share/OpenSecretManager");
+
 /** Opens the Devices dialog from the window's footer. */
 export async function openDevices(window) {
   await press(window, "Devices", { within: "//footer" });

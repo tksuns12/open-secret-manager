@@ -22,7 +22,8 @@ what it did not cover.
   key together are the vault) and apart from your devices, for example on a
   USB drive kept elsewhere. Changes made after a backup are not in it, so
   make a new one after important changes. The app never replaces a file: a
-  new backup needs a new name.
+  new backup needs a new name. When this computer has not saved a backup in
+  30 days, a line above the list says so, with *Back up*.
 - **Each device's password.** Each device has its own; forgetting one is
   recoverable with the recovery key (below).
 

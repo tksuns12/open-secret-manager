@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
-import { start, titles } from "./harness.mjs";
+import { edges, SMALLEST_SIZE, start, titles } from "./harness.mjs";
 
 let window;
 before(async () => {
@@ -111,6 +111,31 @@ test("the time after which the vault locks is kept", async () => {
   await page.getByRole("button", { name: /Settings/ }).click();
   assert.equal(await page.getByLabel("Lock the vault after").inputValue(), "15");
   assert.deepEqual(errors, []);
+});
+
+test("a vault without a recent backup from this computer says so in one quiet line", async () => {
+  const { page, errors } = await window.open("?backup-due", SMALLEST_SIZE);
+  const line = page.locator(".backup-reminder");
+  await line.waitFor();
+  assert.equal((await line.textContent()).trim(), "Last backup from this computer 45 days agoBack up");
+  // One line in the list's column, above the search.
+  const drawn = await edges(line);
+  const column = await edges(page.locator(".list-column"));
+  const search = await edges(page.locator(".search-box"));
+  assert.ok(drawn.bottom - drawn.top < 24, `${drawn.bottom - drawn.top} pixels high`);
+  assert.ok(drawn.left >= column.left && drawn.right <= column.right, "outside the list's column");
+  assert.ok(drawn.bottom <= search.top, "over the search");
+  // Gone while locked.
+  await page.getByTitle("Lock vault").click();
+  await page.getByLabel("Vault password").waitFor();
+  assert.equal(await line.count(), 0);
+  assert.deepEqual(errors, []);
+
+  // A recent backup says nothing.
+  const recent = await window.open();
+  await recent.page.locator(".entry-row").first().waitFor();
+  assert.equal(await recent.page.locator(".backup-reminder").count(), 0);
+  assert.deepEqual(recent.errors, []);
 });
 
 test("locking hides the items until the vault is unlocked again", async () => {

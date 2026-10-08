@@ -1050,7 +1050,7 @@ pub struct DevicesInfo {
     pub(crate) reset_reason: Option<&'static str>,
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

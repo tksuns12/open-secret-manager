@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, Sparkles, Trash2, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge, previewHasDevices } from "./bridge";
-import type { ArchiveInfo, ArchivedItem, BrowserInfo, BrowserStatus, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, HistoryEntry, ImportFormat, ImportSummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, ArchivedItem, BackupAge, BrowserInfo, BrowserStatus, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, HistoryEntry, ImportFormat, ImportSummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
 /** How long without input in the window locks the vault, as the owner may set it. */
@@ -49,6 +49,7 @@ function App() {
   const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
   // Whether the last unlock found records taken out of the vault's file.
   const [rowsChanged, setRowsChanged] = useState(false);
+  const [backupAge, setBackupAge] = useState<BackupAge | null>(null);
   const [previewMode] = useState(() => !hasNativeBridge());
   // The preview has devices to show only when its address asks.
   const devicesUnavailable = previewMode && !previewHasDevices();
@@ -114,6 +115,12 @@ function App() {
   useEffect(() => {
     if (locked) { setRowsChanged(false); return; }
     void bridge.rowsChanged().then(setRowsChanged).catch(() => {});
+  }, [locked]);
+  // How long since this computer last saved a backup: read at each unlock and after each backup.
+  const loadBackupAge = () => { void bridge.backupAge().then(setBackupAge).catch(() => {}); };
+  useEffect(() => {
+    if (locked) { setBackupAge(null); return; }
+    loadBackupAge();
   }, [locked]);
   useEffect(() => {
     void bridge.syncStatus().then(setSync).catch(() => {});
@@ -626,6 +633,7 @@ function App() {
         <div className="workspace">
           <div className="list-column">
             <div className="list-heading"><div><p className="eyebrow">{filter.toUpperCase()}</p><h1>{visible.length} <span>items</span></h1></div><button className="icon-button bordered" title="Import" onClick={() => setImportOpen(true)} disabled={locked}><ArrowDownToLine size={17} /></button></div>
+            {!locked && backupAge?.due && <div className="backup-reminder"><HardDriveDownload size={13} /><span>{backupAge.days === null ? "No backup made on this computer yet" : `Last backup from this computer ${backupAge.days} days ago`}</span><button onClick={() => setBackupOpen(true)} disabled={previewMode}>Back up</button></div>}
             {!locked && held.length > 0 && <div className="conflict-banner held-banner"><CircleAlert size={16} /><div><strong>{held.length} {held.length === 1 ? "change is" : "changes are"} held for review</strong><span>Written by a device that is not one of this vault's devices. Not part of your vault until you decide.</span></div><button className="conflict-action" onClick={() => setHeldOpen(true)}>Review</button></div>}
             <label className="search-box"><Search size={17} /><input ref={searchRef} aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
             <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{entry.username || kindLabel(entry.kind)}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}</div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
@@ -639,7 +647,7 @@ function App() {
       {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} onDelete={editor.mode === "edit" ? deleteEntry : undefined} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd>{version.differs.length > 0 && <><dt>Differs in</dt><dd>{version.differs.join(", ")}</dd></>}</dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
       {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
-      {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onNotice={setNotice} /></div></div>}
+      {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onSaved={loadBackupAge} onNotice={setNotice} /></div></div>}
       {archivesOpen && <div className="modal-backdrop" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">ARCHIVE</p><h2>Copies put away on this device</h2></div><button className="icon-button" aria-label="Close" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><X size={18} /></button></div><ArchivesPanel canCopy={!locked} onCopied={() => { void bridge.listEntries().then(setEntries).catch(() => {}); }} onNotice={setNotice} /></div></div>}
       {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes) => void startInvite(votes)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
       {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
@@ -972,7 +980,7 @@ function HeldPanel({ held, otherDevices, onDecide }: { held: HeldChange[]; other
 
 /** Saves a backup, which the recovery key opens, and says what it holds as
  * read back from the file. */
-function BackupPanel({ recoveryOn, onOpenDevices, onNotice }: { recoveryOn: boolean; onOpenDevices: () => void; onNotice: (text: string) => void }) {
+function BackupPanel({ recoveryOn, onOpenDevices, onSaved, onNotice }: { recoveryOn: boolean; onOpenDevices: () => void; onSaved: () => void; onNotice: (text: string) => void }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<SavedBackup | null>(null);
 
@@ -980,7 +988,7 @@ function BackupPanel({ recoveryOn, onOpenDevices, onNotice }: { recoveryOn: bool
     setSaving(true);
     try {
       const result = await bridge.saveBackup();
-      if (result) setSaved(result);
+      if (result) { setSaved(result); onSaved(); }
     } catch (error) {
       const code = (error as { code?: string } | null)?.code;
       onNotice(code === "exists" ? "A file of that name is already there · an older backup is never replaced, so choose another name" : commandMessage(error, "The backup could not be saved"));

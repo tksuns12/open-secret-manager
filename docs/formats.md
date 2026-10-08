@@ -76,6 +76,8 @@ Recommended logical tables are vault metadata, encrypted revisions, parent edges
 
 The desktop app keeps the owner's settings in `settings.json` beside the vault in its data folder (since Phase 8): a JSON object with `autoLockMinutes`, the minutes without activity that lock the vault, one of 1, 5, 15, and 60. A missing file, or one with anything else, means 5. It is written whole (to `settings.json.partial`, then renamed), is not synced, and stays when the device is reset.
 
+Beside it, `backups.json` (since Phase 12) notes when this device last saved a backup, for the window's reminder: a JSON object with `vault`, the vault's ID in hex; `since`, when the device began counting (the first time it looked, for a vault it has not backed up), in seconds since 1970; and `lastBackup`, when it last saved a backup, in seconds since 1970, or `null`. It holds no secret and is not synced. A file for another vault ID, or with anything else, is taken for none and replaced with a new count; it is written whole like the settings.
+
 ## Immutable record revisions
 
 The target authenticated revision header contains:

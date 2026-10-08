@@ -1,4 +1,4 @@
-import type { ArchiveInfo, BrowserStatus, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, BackupAge, BrowserStatus, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -18,7 +18,8 @@ async function nativeOnly<T>(cmd: string, args?: unknown): Promise<T> {
 /**
  * Whether the preview's address asks for a state the browser preview
  * otherwise never has, so that it can be looked at and tested: as in
- * `/?rows-changed`, `/?recovery-key`, `/?held`, `/?conflict`, or `/?devices`.
+ * `/?rows-changed`, `/?recovery-key`, `/?held`, `/?conflict`, `/?devices`, or
+ * `/?backup-due`.
  * Each shows sample data, no secret.
  */
 function previewAsks(what: string): boolean {
@@ -244,6 +245,12 @@ export const bridge: DesktopBridge = {
   },
   putUnreadableAway: () => nativeOnly("put_unreadable_away"),
   saveBackup: () => nativeOnly("save_backup"),
+  /** The preview's last backup was 45 days ago with `?backup-due`, and is recent otherwise. */
+  async backupAge() {
+    const invoke = native();
+    if (invoke) return (await invoke("backup_age")) as BackupAge;
+    return previewAsks("backup-due") ? { days: 45, due: true } : { days: 2, due: false };
+  },
   chooseBackup: () => nativeOnly("choose_backup"),
   restoreBackup: (recoveryKey, password) => nativeOnly("restore_backup", { recoveryKey, password }),
   resetPassword: (recoveryKey, newPassword) => nativeOnly("reset_password", { recoveryKey, newPassword }),

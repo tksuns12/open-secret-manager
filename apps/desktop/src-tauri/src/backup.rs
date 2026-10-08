@@ -8,11 +8,15 @@
 //!
 //! The window never names a file: the owner picks one in the system's
 //! dialog, which these commands open, and the path stays here.
+//!
+//! This device notes when it last saved a backup of its vault, beside the
+//! vault in `backups.json`, so that the window can remind the owner once
+//! [`REMIND_AFTER_DAYS`] have passed without one.
 
 use std::path::{Path, PathBuf};
 
 use osm_vault_core::RecoveryKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_dialog::{DialogExt, FileDialogBuilder};
 use zeroize::Zeroizing;
@@ -42,12 +46,16 @@ fn locked() -> CommandError {
     }
 }
 
+/// Seconds since 1970 by this computer's clock.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// Today's date as the calendar has it in UTC, for a file's name.
 fn today() -> String {
-    let days = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() / 86_400);
-    date_of(days as i64)
+    date_of((now() / 86_400) as i64)
 }
 
 /// The date `days` days after 1970-01-01, by Howard Hinnant's
@@ -137,12 +145,116 @@ pub(crate) async fn write(state: &AppState, path: &Path) -> Result<Saved, Comman
         error => error.into(),
     })?;
     let check = vault.check_backup(path)?;
+    // The backup stands whether or not its time is noted; a time that could
+    // not be noted only brings the reminder sooner.
+    let _ = note_backup(&state.path, &vault.vault_id(), now());
     Ok(Saved {
         path: path.to_string_lossy().into_owned(),
         items: check.items,
         revisions: check.revisions,
         held: check.held,
     })
+}
+
+/// Days without a backup after which the window reminds of one.
+pub const REMIND_AFTER_DAYS: u64 = 30;
+const DAY: u64 = 86_400;
+
+/// When this device last saved a backup, kept beside the vault in
+/// `backups.json`. Only the vault it holds now counts: once that is another
+/// vault (one restored, joined, or made anew), the count starts again.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupRecord {
+    /// The vault the times are for.
+    vault: String,
+    /// When this device began counting, for a vault it has not backed up:
+    /// the first time it looked. Seconds since 1970.
+    since: u64,
+    /// When this device last saved a backup of the vault. Seconds since 1970.
+    last_backup: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupAge {
+    /// Whole days since this device last saved a backup of its vault; none
+    /// if it has not.
+    pub(crate) days: Option<u64>,
+    /// Whether to remind the owner: [`REMIND_AFTER_DAYS`] or more since that
+    /// backup, or since the device began counting without one.
+    pub(crate) due: bool,
+}
+
+fn record_file(vault: &Path) -> PathBuf {
+    vault.with_file_name("backups.json")
+}
+
+fn read_record(vault: &Path, id: &str) -> Option<BackupRecord> {
+    std::fs::read(record_file(vault))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BackupRecord>(&bytes).ok())
+        .filter(|record| record.vault == id)
+}
+
+fn write_record(vault: &Path, record: &BackupRecord) -> std::io::Result<()> {
+    let path = record_file(vault);
+    let partial = path.with_extension("json.partial");
+    std::fs::write(&partial, serde_json::to_vec_pretty(record)?)?;
+    std::fs::rename(&partial, &path)
+}
+
+/// Notes that this device saved a backup of the vault `id` at `at`.
+pub(crate) fn note_backup(vault: &Path, id: &[u8], at: u64) -> std::io::Result<()> {
+    let id = network::hex(id);
+    let since = read_record(vault, &id).map_or(at, |record| record.since);
+    write_record(
+        vault,
+        &BackupRecord {
+            vault: id,
+            since,
+            last_backup: Some(at),
+        },
+    )
+}
+
+/// How long the vault `id` has gone without a backup from this device, at
+/// `at`. A device without recovery cannot save one, so it is not reminded.
+pub(crate) fn backup_age_at(vault: &Path, id: &[u8], recovery: bool, at: u64) -> BackupAge {
+    let id = network::hex(id);
+    let record = read_record(vault, &id).unwrap_or_else(|| {
+        let record = BackupRecord {
+            vault: id,
+            since: at,
+            last_backup: None,
+        };
+        // Not noted, the count starts again at the next look: the reminder
+        // comes later, never sooner.
+        let _ = write_record(vault, &record);
+        record
+    });
+    let days = record.last_backup.map(|last| at.saturating_sub(last) / DAY);
+    let counted = at.saturating_sub(record.last_backup.unwrap_or(record.since)) / DAY;
+    BackupAge {
+        days,
+        due: recovery && counted >= REMIND_AFTER_DAYS,
+    }
+}
+
+/// How long this device's vault has gone without a backup from it.
+#[tauri::command]
+pub async fn backup_age(state: tauri::State<'_, AppState>) -> Result<BackupAge, CommandError> {
+    let vault = state.vault.lock().await;
+    let vault = vault
+        .as_ref()
+        .filter(|vault| vault.is_unlocked())
+        .ok_or_else(locked)?;
+    Ok(backup_age_at(
+        &state.path,
+        &vault.vault_id(),
+        vault.recovery_enabled(),
+        now(),
+    ))
 }
 
 /// Asks for a backup to restore and keeps the owner's choice for
@@ -218,6 +330,40 @@ pub async fn reset_password<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_backup_is_due_thirty_days_after_the_last_one_or_after_counting_began() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.sqlite3");
+        let start = 1_800_000_000;
+        // Whole days since the last backup, and whether one is due, at `at`.
+        let age_of = |id: [u8; 32], recovery: bool, at: u64| {
+            let age = backup_age_at(&vault, &id, recovery, at);
+            (age.days, age.due)
+        };
+        let age = |at| age_of([1; 32], true, at);
+        // Never backed up here: counting begins at the first look.
+        assert_eq!(age(start), (None, false));
+        assert_eq!(age(start + 30 * DAY - 1), (None, false));
+        assert_eq!(age(start + 30 * DAY), (None, true));
+        // A backup starts the count again, by whole days.
+        note_backup(&vault, &[1; 32], start + 31 * DAY).unwrap();
+        assert_eq!(age(start + 31 * DAY + 3_600), (Some(0), false));
+        assert_eq!(age(start + 61 * DAY - 1), (Some(29), false));
+        assert_eq!(age(start + 61 * DAY), (Some(30), true));
+        // A device without recovery cannot back up, so is not reminded.
+        assert_eq!(age_of([1; 32], false, start + 90 * DAY), (Some(59), false));
+        // A clock set back counts no days.
+        assert_eq!(age(start), (Some(0), false));
+        // Another vault in its place starts again; its first look is noted.
+        assert_eq!(age_of([2; 32], true, start + 100 * DAY), (None, false));
+        assert_eq!(age_of([2; 32], true, start + 130 * DAY), (None, true));
+        // What another program left there is not taken for a record.
+        std::fs::write(dir.path().join("backups.json"), b"not json").unwrap();
+        assert_eq!(age_of([2; 32], true, start + 200 * DAY), (None, false));
+    }
+
     #[test]
     fn a_days_count_is_written_as_the_calendar_has_it() {
         for (days, date) in [
@@ -227,7 +373,7 @@ mod tests {
             (20_729, "2026-10-03"),
             (47_541, "2100-03-01"),
         ] {
-            assert_eq!(super::date_of(days), date);
+            assert_eq!(date_of(days), date);
         }
     }
 }
