@@ -61,6 +61,11 @@ phone sold since 2019 is):
   app is closed, then open it: both show the item as needing a decision,
   the phone offers no Edit, and choosing a version on the computer clears
   it on the phone.
+- Open the item's editor on the phone and change its username; before
+  saving, change its notes on the computer and wait for the phone to sync
+  (the computer shows the phone as reached). Save on the phone: the editor
+  stays open, says another device changed the notes, and holds both your
+  username and the computer's notes. Save again: both devices show both.
 - Delete it on the phone: it goes from the computer too.
 - Open Recently deleted on the phone and restore it: it comes back on the computer, as it was.
 - Change its password on the computer, then open its History on the phone and restore the version before: the computer shows the earlier password again.
@@ -150,6 +155,8 @@ phone sold since 2019 is):
    afterwards, and to no other.
 4. Note any app or site where no save is offered after signing in, and
    whether the app asked for the username and password on separate screens.
+   For a sign-in on separate screens (Android 10 or later), note whether
+   the save screen shows the username typed on the first screen.
 5. In an app that closes after signing in (or switch to the home screen as
    soon as you have signed in), wait half a minute before choosing Save in
    Android's offer. If no save screen opens, open Open Secret Manager: it

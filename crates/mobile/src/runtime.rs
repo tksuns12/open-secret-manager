@@ -32,7 +32,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail, ItemDraft, ItemSummary,
-    MobileError, SaveCandidate, SyncState, SyncStatus,
+    MobileError, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
 };
 
 /// The first eight hex digits of a device's ID, as the screens name it.
@@ -301,6 +301,39 @@ impl Runtime {
         }
         self.sync_soon();
         Ok(())
+    }
+
+    pub(crate) async fn rebase_edit(
+        &self,
+        id: &str,
+        revision: &str,
+        draft: ItemDraft,
+    ) -> Result<RebasedEdit, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let VaultItem {
+            item: now,
+            revision: current,
+            conflict,
+        } = vault.get(id)?;
+        if conflict {
+            return Err(MobileError::InConflict);
+        }
+        let read = vault
+            .history(id)?
+            .into_iter()
+            .find(|version| version.revision == revision)
+            .and_then(|version| version.item)
+            .ok_or(MobileError::NotFound)?;
+        Ok(RebasedEdit {
+            changed_elsewhere: now
+                .changed_from(&read)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            draft: draft.rebased(&read, &now),
+            revision: current,
+        })
     }
 
     pub(crate) async fn delete_item(

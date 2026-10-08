@@ -122,7 +122,7 @@ fun VaultScreen(
         }
     }
     val fields = state.editor?.takeIf { state.screen == Screen.UNLOCKED }?.let { editor ->
-        remember(editor) { EditorFields(editor.detail) }
+        remember(editor) { EditorFields(editor.detail, editor.draft) }
     }
     Scaffold(
         topBar = {
@@ -166,7 +166,7 @@ fun VaultScreen(
                     Screen.NO_VAULT -> JoinStart(state, session)
                     Screen.JOINING -> JoinConfirm(state, session)
                     Screen.LOCKED -> Unlock(state, session, biometric, onUnlockWithBiometric, onRememberWithBiometric)
-                    Screen.UNLOCKED -> fields?.let { ItemEditor(it, state.editor?.detail, session) }
+                    Screen.UNLOCKED -> fields?.let { ItemEditor(it, state.editor?.detail, state.editor?.changedElsewhere.orEmpty(), session) }
                         ?: state.history?.let { HistoryList(it, session) }
                         ?: state.deleted?.let { DeletedList(it, session) }
                         ?: state.detail?.let { Detail(it, session) }
@@ -646,17 +646,18 @@ private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
  * [detail] as it was read. A blank password or one-time code secret keeps
  * what the item has.
  */
-class EditorFields(detail: ItemDetail?) {
-    var kind by mutableStateOf(detail?.kind ?: ItemKind.LOGIN)
-    var title by mutableStateOf(detail?.title ?: "")
-    var username by mutableStateOf(detail?.username ?: "")
-    var url by mutableStateOf(detail?.url ?: "")
-    var password by mutableStateOf("")
+/** The editor's fields, from [draft] if there is one, else from the item as read. */
+class EditorFields(detail: ItemDetail?, draft: ItemDraft? = null) {
+    var kind by mutableStateOf(draft?.kind ?: detail?.kind ?: ItemKind.LOGIN)
+    var title by mutableStateOf(draft?.title ?: detail?.title ?: "")
+    var username by mutableStateOf(draft?.username ?: detail?.username ?: "")
+    var url by mutableStateOf(draft?.url ?: detail?.url ?: "")
+    var password by mutableStateOf(draft?.password ?: "")
     var showPassword by mutableStateOf(false)
-    var code by mutableStateOf("")
-    var removeCode by mutableStateOf(false)
-    var notes by mutableStateOf(detail?.notes ?: "")
-    var favorite by mutableStateOf(detail?.favorite ?: false)
+    var code by mutableStateOf(draft?.oneTimeCodeSecret?.takeIf { it.isNotEmpty() } ?: "")
+    var removeCode by mutableStateOf(draft?.oneTimeCodeSecret == "")
+    var notes by mutableStateOf(draft?.notes ?: detail?.notes ?: "")
+    var favorite by mutableStateOf(draft?.favorite ?: detail?.favorite ?: false)
 
     fun draft(): ItemDraft {
         val login = kind == ItemKind.LOGIN
@@ -679,13 +680,27 @@ class EditorFields(detail: ItemDetail?) {
 }
 
 @Composable
-private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, session: VaultSession) {
+private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, changedElsewhere: List<String>, session: VaultSession) {
     BackHandler(onBack = session::closeEditor)
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (detail != null) Text(detail.title, style = MaterialTheme.typography.titleLarge)
+        if (changedElsewhere.isNotEmpty()) {
+            Column(Modifier.fillMaxWidth().testTag("changed-elsewhere")) {
+                Text(
+                    "Another device changed this item while you edited it",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    "It changed its ${changedElsewhere.joinToString(", ")}. What you typed is kept, on top of the item as it is " +
+                        "now; nothing is saved until you save.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
                 selected = fields.kind == ItemKind.LOGIN,

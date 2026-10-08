@@ -5,9 +5,13 @@ import UIKit
 enum Screen: Equatable { case opening, noVault, joining, locked, unlocked, removed, unreadable }
 
 /// An item being written: a new one when `detail` is nil, otherwise that
-/// item as it was read.
-struct Editor: Equatable {
+/// item as it was read. A save refused because the item changed elsewhere
+/// opens it again with `draft`, what was typed put on top of the item as it
+/// is now, and names what changed in `changedElsewhere`.
+struct Editor: Hashable {
     let detail: ItemDetail?
+    var draft: ItemDraft? = nil
+    var changedElsewhere: [String] = []
 }
 
 /// An item's versions, newest first, while its history is open.
@@ -234,11 +238,25 @@ final class VaultModel: ObservableObject {
                 detail = saved
                 notice = editing == nil ? "Item created" : "Changes saved"
             } catch MobileError.ChangedElsewhere {
-                // What was read is out of date: show the item as it is now.
-                let current = try? await onQueue { try device.item(id: editing?.id ?? "") }
-                editor = nil
-                detail = current
-                notice = describe(MobileError.ChangedElsewhere)
+                // What was read is out of date: what was typed is put on top
+                // of the item as it is now, and the edit stays open. The
+                // item is read before the edit is moved, so a change between
+                // the two is refused again rather than undone.
+                guard let editing else { return }
+                do {
+                    let (current, edit) = try await onQueue { () -> (ItemDetail, RebasedEdit) in
+                        let current = try device.item(id: editing.id)
+                        return (current, try device.rebaseEdit(id: editing.id, revision: editing.revision, draft: draft))
+                    }
+                    editor = Editor(detail: current, draft: edit.draft, changedElsewhere: edit.changedElsewhere)
+                    notice = "Changed on another device meanwhile · your changes are kept"
+                } catch {
+                    // It cannot be moved (it is now in conflict, or gone):
+                    // show the item as it is now.
+                    editor = nil
+                    detail = try? await onQueue { try device.item(id: editing.id) }
+                    notice = describe(MobileError.ChangedElsewhere)
+                }
             } catch {
                 notice = describe(error)
             }

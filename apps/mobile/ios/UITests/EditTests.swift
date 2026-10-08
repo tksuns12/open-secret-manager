@@ -125,9 +125,9 @@ final class EditTests: UITestCase {
         XCTAssertFalse(app.buttons["delete"].exists)
     }
 
-    func testASaveOfAnItemThatChangedMeanwhileShowsItAsItIsNow() {
+    func testASaveOfAnItemThatChangedMeanwhileKeepsWhatWasTypedOnTopOfIt() {
         // As the editor opens for Bank, a second device object on the same
-        // folder changes it (App/TestSupport.swift), as a sync would.
+        // folder changes its notes (App/TestSupport.swift), as a sync would.
         let app = XCUIApplication()
         app.launchEnvironment["OSM_TEST_VAULT"] = frozenVault
         app.launchEnvironment["OSM_TEST_BIOMETRICS"] = "off"
@@ -138,9 +138,21 @@ final class EditTests: UITestCase {
         app.buttons["edit"].waitAndTap()
         replace("edit-username", with: "changed here", in: app)
         app.buttons["save"].tap()
-        let notice = app.staticTexts["notice"]
-        XCTAssert(notice.waitForExistence(timeout: 15))
-        XCTAssert(notice.label.hasPrefix("This item changed since you opened it"), notice.label)
-        XCTAssert(app.staticTexts["detail-username"].waitForLabel("changed elsewhere"))
+
+        // Refused, the edit stays open: what was typed is kept, on top of the
+        // item as it is now, and what changed elsewhere is named.
+        let note = field("changed-elsewhere", in: app)
+        XCTAssert(note.waitForExistence(timeout: 15))
+        XCTAssert(note.label.contains("It changed its notes."), note.label)
+        XCTAssertEqual(field("edit-username", in: app).value as? String, "changed here")
+        // The notes are further down the form, which shows only what fits.
+        let notes = field("edit-notes", in: app)
+        for _ in 0..<5 where !notes.waitForExistence(timeout: 3) { app.swipeUp() }
+        XCTAssertEqual(notes.value as? String, "changed elsewhere")
+
+        // Saved again, both changes stand.
+        app.buttons["save"].tap()
+        XCTAssert(app.staticTexts["detail-username"].waitForLabel("changed here"))
+        XCTAssert(app.staticTexts["detail-notes"].waitForLabel("changed elsewhere"))
     }
 }

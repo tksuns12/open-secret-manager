@@ -5,8 +5,8 @@ import Foundation
 /// device's folder is opened. `OSM_TEST_VAULT` empties the folder and, unless
 /// it is `none`, puts the vault file it names there; `OSM_TEST_BIOMETRICS=off`
 /// forgets a password kept for Face ID or Touch ID. And
-/// `OSM_TEST_CHANGE_WHILE_EDITING` (`<item id>|<username>|<password>`) changes
-/// that item's username through a second device object on the folder as the
+/// `OSM_TEST_CHANGE_WHILE_EDITING` (`<item id>|<notes>|<password>`) changes
+/// that item's notes through a second device object on the folder as the
 /// editor opens for it, as a sync could while the owner edits.
 enum TestSupport {
     private static var prepared = false
@@ -34,8 +34,8 @@ enum TestSupport {
         guard let other = try? Device.open(folder: folder.path), (try? other.unlock(password: parts[2])) != nil,
               let item = try? other.item(id: id) else { return }
         try? other.updateItem(id: id, revision: item.revision, draft: ItemDraft(
-            title: item.title, kind: item.kind, username: parts[1], url: item.url,
-            notes: item.notes, favorite: item.favorite, password: nil, oneTimeCodeSecret: nil
+            title: item.title, kind: item.kind, username: item.username, url: item.url,
+            notes: parts[1], favorite: item.favorite, password: nil, oneTimeCodeSecret: nil
         ))
         other.lock()
     }

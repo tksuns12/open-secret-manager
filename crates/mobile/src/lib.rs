@@ -213,6 +213,18 @@ pub struct ItemDetail {
     pub revision: String,
 }
 
+/// An edit that met a change made elsewhere, put on top of the item as it
+/// is now (see [`Device::rebase_edit`]).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RebasedEdit {
+    /// The owner's changes on top of the item as it is now.
+    pub draft: ItemDraft,
+    /// The revision the item is at now, which saving the draft names.
+    pub revision: String,
+    /// What changed elsewhere since the edit began, by field name only.
+    pub changed_elsewhere: Vec<String>,
+}
+
 /// What the owner writes into a login or a secure note. A password or a
 /// one-time code secret of `None` keeps what the item has; an empty one
 /// removes it.
@@ -241,6 +253,37 @@ impl ItemDraft {
     /// Its values move into the item, which wipes them when it goes; what
     /// is left over is wiped here. (A record cannot wipe itself: the
     /// bindings move its fields out.)
+    /// This draft, made from the item as it was at `read`, put on top of
+    /// the item as it is now: each field the draft changed takes the
+    /// draft's value, and each it left takes the one it has now. A password
+    /// or a one-time code secret the draft leaves (`None`) stays as it is
+    /// now; none of the item's secrets is put into the draft.
+    fn rebased(self, read: &osm_vault_core::Item, now: &osm_vault_core::Item) -> ItemDraft {
+        fn pick<T: PartialEq>(mine: T, read: T, now: T) -> T {
+            if mine != read {
+                mine
+            } else {
+                now
+            }
+        }
+        let title = pick(self.title.trim(), read.title.as_str(), now.title.as_str()).to_owned();
+        let url = pick(self.url.trim(), read.url.as_str(), now.url.as_str()).to_owned();
+        ItemDraft {
+            title,
+            kind: pick(
+                self.kind,
+                ItemKind::from(read.kind),
+                ItemKind::from(now.kind),
+            ),
+            username: pick(&self.username, &read.username, &now.username).clone(),
+            url,
+            notes: pick(&self.notes, &read.notes, &now.notes).clone(),
+            favorite: pick(self.favorite, read.favorite, now.favorite),
+            password: self.password,
+            one_time_code_secret: self.one_time_code_secret,
+        }
+    }
+
     fn apply_to(self, item: &mut osm_vault_core::Item) {
         let title = Zeroizing::new(self.title);
         let url = Zeroizing::new(self.url);
@@ -502,6 +545,20 @@ impl Device {
     ) -> Result<(), MobileError> {
         self.tokio
             .block_on(self.inner.update_item(&id, &revision, draft))
+    }
+
+    /// For an edit of `id` read at `revision` that [`Device::update_item`]
+    /// refused as changed elsewhere: `draft` put on top of the item as it
+    /// is now, which the owner sees before saving it again at the revision
+    /// given. Nothing is written.
+    pub fn rebase_edit(
+        &self,
+        id: String,
+        revision: String,
+        draft: ItemDraft,
+    ) -> Result<RebasedEdit, MobileError> {
+        self.tokio
+            .block_on(self.inner.rebase_edit(&id, &revision, draft))
     }
 
     /// Deletes the login or secure note `id`, as read at `revision`, on

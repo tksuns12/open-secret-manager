@@ -1,16 +1,20 @@
 package org.opensecretmanager.app.autofill
 
 import android.app.PendingIntent
+import android.app.assist.AssistStructure
 import android.content.Intent
+import android.os.Build
 import android.os.CancellationSignal
-import android.service.autofill.Dataset
 import android.service.autofill.AutofillService
+import android.service.autofill.Dataset
 import android.service.autofill.FillCallback
+import android.service.autofill.FillContext
 import android.service.autofill.FillRequest
 import android.service.autofill.FillResponse
 import android.service.autofill.SaveCallback
 import android.service.autofill.SaveInfo
 import android.service.autofill.SaveRequest
+import android.view.autofill.AutofillId
 import android.widget.RemoteViews
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -27,9 +31,17 @@ class VaultAutofillService : AutofillService() {
     override fun onFillRequest(request: FillRequest, cancellationSignal: CancellationSignal, callback: FillCallback) {
         val structure = request.fillContexts.lastOrNull()?.structure
         val form = structure?.let(Form::parse)
-        // Not this app's own screens, and not a screen without a login form
-        // or a one-time code field.
-        if (form == null || form.packageName == packageName) {
+        if (form == null) {
+            // The first screen of a sign-in on two screens offers nothing to
+            // fill, but the system keeps what is typed there for the save
+            // the next screen asks for.
+            val first = structure?.let(Form::usernameScreen)?.takeIf { it.packageName != packageName }
+            val delayed = first?.let(::delayedSave)
+            callback.onSuccess(delayed?.let { FillResponse.Builder().setSaveInfo(it).build() })
+            return
+        }
+        // Not this app's own screens.
+        if (form.packageName == packageName) {
             callback.onSuccess(null)
             return
         }
@@ -52,18 +64,45 @@ class VaultAutofillService : AutofillService() {
             setAuthentication(sender)
         }.build()
         val response = FillResponse.Builder().addDataset(dataset)
-        saveInfo(form)?.let(response::setSaveInfo)
+        val usernameEarlier = form.username == null && earlierUsername(request.fillContexts, form) != null
+        saveInfo(form, usernameEarlier)?.let(response::setSaveInfo)
         callback.onSuccess(response.build())
     }
+
+    /**
+     * For the first screen of a sign-in on two screens: no offer to save
+     * there, but the screen kept for the next one's (Android 10 and later).
+     */
+    private fun delayedSave(first: Form): SaveInfo? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        val username = first.username ?: return null
+        return SaveInfo.Builder(SaveInfo.SAVE_DATA_TYPE_USERNAME, arrayOf(username))
+            .setFlags(SaveInfo.FLAG_DELAY_SAVE)
+            .build()
+    }
+
+    /**
+     * The username field of an earlier screen of the same sign-in, kept by
+     * [delayedSave], with the screen as it was read: the latest of the same
+     * app and the same site, if any.
+     */
+    private fun earlierUsername(contexts: List<FillContext>, form: Form): Pair<AssistStructure, AutofillId>? =
+        contexts.dropLast(1).asReversed().firstNotNullOfOrNull { context ->
+            Form.usernameScreen(context.structure)
+                ?.takeIf { it.packageName == form.packageName && it.webDomain == form.webDomain }
+                ?.username?.let { context.structure to it }
+        }
 
     /**
      * Asks the system to offer a save once the form is submitted with a
      * password the owner typed (not one this app filled), or once its fields
      * are gone, for apps that hide a form rather than close its screen.
+     * [usernameEarlier]: the username was asked for on an earlier screen.
      */
-    private fun saveInfo(form: Form): SaveInfo? {
+    private fun saveInfo(form: Form, usernameEarlier: Boolean): SaveInfo? {
         val password = form.password ?: return null
-        val type = SaveInfo.SAVE_DATA_TYPE_PASSWORD or (if (form.username != null) SaveInfo.SAVE_DATA_TYPE_USERNAME else 0)
+        val type = SaveInfo.SAVE_DATA_TYPE_PASSWORD or
+            (if (form.username != null || usernameEarlier) SaveInfo.SAVE_DATA_TYPE_USERNAME else 0)
         return SaveInfo.Builder(type, arrayOf(password)).apply {
             form.username?.let { setOptionalIds(arrayOf(it)) }
             setFlags(SaveInfo.FLAG_SAVE_ON_ALL_VIEWS_INVISIBLE)
@@ -83,6 +122,11 @@ class VaultAutofillService : AutofillService() {
         }
         val values = Form.values(structure, setOfNotNull(form.username, form.password))
         val password = form.password?.let(values::get).orEmpty()
+        // A screen that asked for the password alone: the username, if an
+        // earlier screen of the same sign-in asked for it.
+        val username = form.username?.let(values::get)
+            ?: earlierUsername(request.fillContexts, form)?.let { (screen, id) -> Form.values(screen, setOf(id))[id] }
+            ?: ""
         if (password.isEmpty()) {
             callback.onFailure("The form sent no password")
             return
@@ -94,7 +138,7 @@ class VaultAutofillService : AutofillService() {
             is Requester.App -> requester.label
             null -> form.packageName
         }
-        val id = PendingSave.put(PendingSave.Save(form, form.username?.let(values::get).orEmpty(), password), from)
+        val id = PendingSave.put(PendingSave.Save(form, username, password), from)
         val intent = Intent(this, SaveActivity::class.java).putExtra(SaveActivity.SAVE, id)
         val sender = PendingIntent.getActivity(
             this,

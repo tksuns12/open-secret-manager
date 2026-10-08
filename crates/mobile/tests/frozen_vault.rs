@@ -534,6 +534,79 @@ fn logins_and_notes_are_created_edited_and_deleted_and_the_rest_is_left_to_a_com
 }
 
 #[test]
+fn an_edit_that_met_a_change_made_elsewhere_is_put_on_top_of_it_keeping_what_was_typed() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    let id = device.create_item(draft("Forum", ItemKind::Login)).unwrap();
+    // The phone reads the login to edit it.
+    let read = device.item(id.clone()).unwrap();
+    let as_read = ItemDraft {
+        title: read.title.clone(),
+        kind: read.kind,
+        username: read.username.clone(),
+        url: read.url.clone(),
+        notes: read.notes.clone(),
+        favorite: read.favorite,
+        password: None,
+        one_time_code_secret: None,
+    };
+    // Meanwhile another device changes its notes and its password.
+    device
+        .update_item(
+            id.clone(),
+            read.revision.clone(),
+            ItemDraft {
+                notes: "changed elsewhere".into(),
+                password: Some("password from elsewhere".into()),
+                ..as_read.clone()
+            },
+        )
+        .unwrap();
+    // The phone's edit, from what it read, renames the account.
+    let mine = ItemDraft {
+        username: "renamed here".into(),
+        ..as_read
+    };
+    assert!(matches!(
+        device.update_item(id.clone(), read.revision.clone(), mine.clone()),
+        Err(MobileError::ChangedElsewhere)
+    ));
+    let rebased = device
+        .rebase_edit(id.clone(), read.revision.clone(), mine)
+        .unwrap();
+    // What changed elsewhere is named; the owner's change is kept, and the
+    // rest is as it is now, with no secret put into the draft.
+    assert_eq!(rebased.changed_elsewhere, ["password", "notes"]);
+    assert_eq!(rebased.draft.username, "renamed here");
+    assert_eq!(rebased.draft.notes, "changed elsewhere");
+    assert_eq!(rebased.draft.password, None);
+    // Nothing was written: saving it at the revision given does.
+    assert_eq!(device.item(id.clone()).unwrap().username, "me@example.test");
+    device
+        .update_item(id.clone(), rebased.revision, rebased.draft)
+        .unwrap();
+    let saved = device.item(id.clone()).unwrap();
+    assert_eq!(
+        (saved.username.as_str(), saved.notes.as_str()),
+        ("renamed here", "changed elsewhere")
+    );
+    assert_eq!(
+        device.password(id.clone()).unwrap(),
+        "password from elsewhere"
+    );
+    // A revision the item never had is refused.
+    assert!(matches!(
+        device.rebase_edit(
+            id,
+            "no such revision".into(),
+            draft("Forum", ItemKind::Login)
+        ),
+        Err(MobileError::NotFound)
+    ));
+}
+
+#[test]
 fn an_edit_or_a_saved_password_keeps_the_fields_of_a_later_build() {
     let (_dir, folder) = copy_of_the_frozen_vault();
     // A login a later build wrote, with a field this one does not know.

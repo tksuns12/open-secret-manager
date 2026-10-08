@@ -5,6 +5,7 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -43,6 +44,10 @@ class EditTest {
 
     private fun text(tag: String) =
         compose.onNodeWithTag(tag).fetchSemanticsNode().config[SemanticsProperties.Text].joinToString("")
+
+    /** What a field of the editor holds. */
+    private fun value(tag: String) =
+        compose.onNodeWithTag(tag).fetchSemanticsNode().config[SemanticsProperties.EditableText].text
 
     private fun unlocked() {
         session.reopenForTests { folder ->
@@ -144,15 +149,15 @@ class EditTest {
     }
 
     @Test
-    fun aSaveOfAnItemThatChangedMeanwhileShowsItAsItIsNow() {
+    fun aSaveOfAnItemThatChangedMeanwhileKeepsWhatWasTypedOnTopOfIt() {
         unlocked()
         compose.onNodeWithTag("item:Bank").performClick()
         waitFor("edit")
         compose.onNodeWithTag("edit").performClick()
         waitFor("edit-username")
 
-        // Meanwhile the item changes: here through a second device object on
-        // the same folder, as a sync would change it.
+        // Meanwhile another device changes the item's notes: here through a
+        // second device object on the same folder, as a sync would.
         Device.open(folder.path).use { other ->
             other.unlock(password)
             val bank = other.item("fixture-bank")
@@ -160,8 +165,8 @@ class EditTest {
                 "fixture-bank",
                 bank.revision,
                 org.opensecretmanager.vault.ItemDraft(
-                    title = "Bank", kind = bank.kind, username = "changed elsewhere", url = bank.url,
-                    notes = bank.notes, favorite = bank.favorite, password = null, oneTimeCodeSecret = null,
+                    title = "Bank", kind = bank.kind, username = bank.username, url = bank.url,
+                    notes = "changed elsewhere", favorite = bank.favorite, password = null, oneTimeCodeSecret = null,
                 ),
             )
         }
@@ -169,8 +174,20 @@ class EditTest {
         compose.onNodeWithTag("edit-username").performTextClearance()
         compose.onNodeWithTag("edit-username").performTextInput("changed here")
         save()
-        compose.waitUntilAtLeastOneExists(hasText("This item changed since you opened it", substring = true), 15_000)
+        // Refused, the edit stays open: what was typed is kept, on top of the
+        // item as it is now, and what changed elsewhere is named.
+        waitFor("changed-elsewhere")
+        compose.onNode(
+            hasText("It changed its notes.", substring = true) and hasAnyAncestor(hasTestTag("changed-elsewhere")),
+            useUnmergedTree = true,
+        ).assertExists()
+        assertEquals("changed here", value("edit-username"))
+        assertEquals("changed elsewhere", value("edit-notes"))
+
+        // Saved again, both changes stand.
+        save()
         waitFor("detail-username")
-        assertEquals("changed elsewhere", text("detail-username"))
+        assertEquals("changed here", text("detail-username"))
+        assertEquals("changed elsewhere", text("detail-notes"))
     }
 }

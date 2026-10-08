@@ -49,7 +49,9 @@ struct RootView: View {
             }
         case .unlocked:
             if let editor = model.editor {
-                ItemEditor(model: model, detail: editor.detail)
+                // A new editor, as after a save that met a change made
+                // elsewhere, starts from what it holds.
+                ItemEditor(model: model, editor: editor).id(editor)
             } else if let history = model.history {
                 HistoryList(model: model, history: history)
             } else if let deleted = model.deleted {
@@ -386,26 +388,35 @@ private struct DeletedList: View {
 private struct ItemEditor: View {
     @ObservedObject var model: VaultModel
     let detail: ItemDetail?
+    let changedElsewhere: [String]
     @State private var kind: ItemKind
     @State private var title: String
     @State private var username: String
     @State private var url: String
-    @State private var password = ""
+    @State private var password: String
     @State private var showPassword = false
-    @State private var code = ""
-    @State private var removeCode = false
+    @State private var code: String
+    @State private var removeCode: Bool
     @State private var notes: String
     @State private var favorite: Bool
 
-    init(model: VaultModel, detail: ItemDetail?) {
+    /// Starts from the editor's draft when it has one, otherwise from the
+    /// item as it was read (or empty, for a new item).
+    init(model: VaultModel, editor: Editor) {
         self.model = model
+        let detail = editor.detail
         self.detail = detail
-        _kind = State(initialValue: detail?.kind ?? .login)
-        _title = State(initialValue: detail?.title ?? "")
-        _username = State(initialValue: detail?.username ?? "")
-        _url = State(initialValue: detail?.url ?? "")
-        _notes = State(initialValue: detail?.notes ?? "")
-        _favorite = State(initialValue: detail?.favorite ?? false)
+        changedElsewhere = editor.changedElsewhere
+        let draft = editor.draft
+        _kind = State(initialValue: draft?.kind ?? detail?.kind ?? .login)
+        _title = State(initialValue: draft?.title ?? detail?.title ?? "")
+        _username = State(initialValue: draft?.username ?? detail?.username ?? "")
+        _url = State(initialValue: draft?.url ?? detail?.url ?? "")
+        _password = State(initialValue: draft?.password ?? "")
+        _code = State(initialValue: draft?.oneTimeCodeSecret ?? "")
+        _removeCode = State(initialValue: draft?.oneTimeCodeSecret == "")
+        _notes = State(initialValue: draft?.notes ?? detail?.notes ?? "")
+        _favorite = State(initialValue: draft?.favorite ?? detail?.favorite ?? false)
     }
 
     private var draft: ItemDraft {
@@ -424,6 +435,18 @@ private struct ItemEditor: View {
 
     var body: some View {
         Form {
+            if !changedElsewhere.isEmpty {
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Another device changed this item while you edited it").font(.headline)
+                        Text("It changed its \(changedElsewhere.joined(separator: ", ")). What you typed is kept, on top of the item as it is now; nothing is saved until you save.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("changed-elsewhere")
+                }
+            }
             Section {
                 Picker("Kind", selection: $kind) {
                     Text("Login").tag(ItemKind.login)

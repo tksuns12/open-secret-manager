@@ -60,7 +60,12 @@ data class UiState(
 data class History(val detail: ItemDetail, val versions: List<HistoryEntry>)
 
 /** A new item when [detail] is null, otherwise that item as it was read. */
-data class Editor(val detail: ItemDetail?)
+/**
+ * An item being made (`detail` null) or edited. After a save met a change
+ * made elsewhere, [draft] holds what the owner typed put on top of the item
+ * as it is now, and [changedElsewhere] names what the other device changed.
+ */
+data class Editor(val detail: ItemDetail?, val draft: ItemDraft? = null, val changedElsewhere: List<String> = emptyList())
 
 /**
  * The device of the vault, as the screens use it. Every call to it runs off
@@ -231,9 +236,24 @@ class VaultSession(private val context: Context, private val folder: File) {
                 it.copy(editor = null, detail = saved, notice = if (editing == null) "Item created" else "Changes saved")
             }
         } catch (error: MobileException.ChangedElsewhere) {
-            // What was read is out of date: show the item as it is now.
-            val current = editing?.let { runCatching { device.item(it.id) }.getOrNull() }
-            _state.update { it.copy(editor = null, detail = current, notice = describe(error)) }
+            // What was read is out of date. What the owner typed is kept, put
+            // on top of the item as it is now, for the owner to look at and
+            // save again; failing that, the item is shown as it is now. The
+            // item is read before the edit is moved, so a change between the
+            // two is refused again rather than undone.
+            val rebased = editing?.let { read ->
+                runCatching {
+                    val current = device.item(read.id)
+                    val edit = device.rebaseEdit(read.id, read.revision, draft)
+                    Editor(current, edit.draft, edit.changedElsewhere)
+                }.getOrNull()
+            }
+            if (rebased != null) {
+                _state.update { it.copy(editor = rebased, notice = "Changed on another device meanwhile · your changes are kept") }
+            } else {
+                val current = editing?.let { runCatching { device.item(it.id) }.getOrNull() }
+                _state.update { it.copy(editor = null, detail = current, notice = describe(error)) }
+            }
         }
         refresh()
     }

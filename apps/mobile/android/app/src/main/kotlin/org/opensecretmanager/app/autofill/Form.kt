@@ -65,6 +65,38 @@ data class Form(
             return found
         }
 
+        /**
+         * The first screen of a sign-in on two screens: a field that says it
+         * is a username or an email address, and neither a password field nor
+         * a one-time code field. Null for any other screen.
+         */
+        fun usernameScreen(structure: AssistStructure): Form? {
+            val fields = mutableListOf<AssistStructure.ViewNode>()
+            var webDomain: String? = null
+            var webScheme: String? = null
+            fun visit(node: AssistStructure.ViewNode) {
+                if (webDomain == null && node.webDomain != null) {
+                    webDomain = node.webDomain
+                    if (Build.VERSION.SDK_INT >= 28) webScheme = node.webScheme
+                }
+                if (node.autofillType == View.AUTOFILL_TYPE_TEXT && node.autofillId != null && node.visibility == View.VISIBLE) {
+                    fields += node
+                }
+                for (index in 0 until node.childCount) visit(node.getChildAt(index))
+            }
+            for (index in 0 until structure.windowNodeCount) visit(structure.getWindowNodeAt(index).rootViewNode)
+            if (fields.any { isPassword(it) || isOneTimeCode(it) }) return null
+            val username = fields.firstOrNull(::isUsername) ?: return null
+            return Form(
+                packageName = structure.activityComponent.packageName,
+                webDomain = webDomain,
+                webScheme = webScheme,
+                username = username.autofillId,
+                password = null,
+                oneTimeCode = null,
+            )
+        }
+
         /** Finds the login fields, or null if the screen has neither a password field nor a one-time code field. */
         fun parse(structure: AssistStructure): Form? {
             val fields = mutableListOf<AssistStructure.ViewNode>()

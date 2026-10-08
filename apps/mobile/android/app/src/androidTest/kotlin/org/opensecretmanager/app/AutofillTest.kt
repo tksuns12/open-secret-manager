@@ -387,6 +387,37 @@ class AutofillTest {
     }
 
     @Test
+    fun aSignInOnTwoScreensIsSavedWithTheUsernameOfTheFirst() {
+        // The account on one screen, the password on the next.
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.TwoStepUsernameActivity")
+        find(By.res(FIXTURE, "username")).click()
+        find(By.res(FIXTURE, "username")).text = "two step user"
+        find(By.res(FIXTURE, "next")).click()
+        find(By.res(FIXTURE, "password"), 30_000).click()
+        find(By.res(FIXTURE, "password")).text = "two step password"
+        if (find(By.res(FIXTURE, "filled")).wait(Until.textEquals("two step user|two step password"), 15_000) != true) {
+            fail("the second screen did not get what was typed")
+        }
+        find(By.res(FIXTURE, "sign_in")).click()
+        // The system offers to save both, from both screens.
+        find(By.res("android", "autofill_save_yes"), 30_000)
+        find(By.textContains("username and password"))
+        capture("two-step-save-offer")
+        find(By.res("android", "autofill_save_yes")).click()
+        find(mine("password"), 60_000).text = password
+        find(mine("unlock")).click()
+        find(mine("asker"))
+        assertEquals("two step user", find(mine("save-username")).text)
+        find(mine("save-new")).click()
+        assertLockedAgain()
+        Device.open(context.filesDir.resolve(VaultApp.DEVICE_FOLDER).path).use { vault ->
+            vault.unlock(password)
+            assertTrue(vault.items().any { it.title == "Login fixture" && it.username == "two step user" })
+        }
+    }
+
+    @Test
     fun aWaitingSaveCanBeDiscarded() {
         val form = Form(FIXTURE, null, null, null, null, null)
         PendingSave.put(PendingSave.Save(form, "someone", "a password"), "Login fixture")
