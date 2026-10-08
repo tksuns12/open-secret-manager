@@ -82,7 +82,7 @@ login, and nothing is written before the owner unlocks and chooses.
 ## The evidence
 
 - `scripts/check.sh --network --browsers` runs every check: formatting,
-  lints with warnings as errors, 255 Rust tests (the vault, membership,
+  lints with warnings as errors, 289 Rust tests (the vault, membership,
   pairing and sync in process, between processes, and in desktop shells),
   the extension's 19 tests in headless Chromium and Firefox, and the
   dependency policy and advisory audits. With `--mobile` it also runs the
@@ -122,6 +122,8 @@ The full list is the right-hand column of the delivery matrix in
 [implementation-status.md](implementation-status.md). In short: no outside
 review until this one; packages signed with a developer identity and
 notarized are waiting on that identity; coverage-guided fuzzing was not run;
-the native lifecycle locks and the new backup screens were checked through
-the code, not in a running window; the phone apps have run only on an
-emulator and in a simulator, and are not signed for distribution.
+the native lifecycle locks were checked through the code and in a Linux
+container, never with a real sleep or screen lock; the backup screens and
+the system's file dialogs were driven in the real app only on Linux; the
+phone apps have run only on an emulator and in a simulator, and are not
+signed for distribution.

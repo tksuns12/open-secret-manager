@@ -50,3 +50,26 @@ test("an invitation says which kind of device it is for", async () => {
   }
   assert.deepEqual(errors, []);
 });
+
+test("when the system says the owner went away, the vault locks, says why, and ends a pairing", async () => {
+  const { page, errors } = await window.open("?devices");
+  // The shell's events, given to the preview as the shell gives them; with
+  // no way to call the shell, the window stays the preview.
+  await page.addInitScript(() => {
+    const listeners = {};
+    globalThis.osmEmit = (event, payload) => { for (const handler of listeners[event] ?? []) handler({ payload }); };
+    globalThis.__TAURI__ = { event: { listen: async (event, handler) => { (listeners[event] ??= []).push(handler); return () => {}; } } };
+  });
+  await page.reload();
+  const panel = await openDevices(page);
+  await panel.getByRole("button", { name: "Invite a device" }).click();
+  await panel.getByRole("button", { name: "A computer that is usually on · it votes" }).click();
+  const invitation = panel.getByText("OSM-PAIR1-PREVIEW-SAMPLE-NOT-AN-INVITATION");
+  await invitation.waitFor();
+
+  await page.evaluate(() => globalThis.osmEmit("vault-locked", "screen_locked"));
+  await page.locator(".toast", { hasText: "Vault locked because the screen locked · the pairing was cancelled" }).waitFor();
+  await page.getByLabel("Vault password").waitFor();
+  assert.equal(await invitation.count(), 0);
+  assert.deepEqual(errors, []);
+});

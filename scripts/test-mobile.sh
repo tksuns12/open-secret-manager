@@ -11,8 +11,9 @@
 #          screens, on a running emulator or attached device (adb). On an
 #          emulator with a fingerprint enrolled, its sensor is touched
 #          throughout, so that unlocking with a fingerprint is tested too.
-#          What the screen showed at a failed wait of the autofill tests
-#          is brought back into OSM_TEST_FAILURES/android, if set.
+#          What the screen showed at a failed wait of the autofill tests,
+#          and the system's log of the run (with autofill's in full), are
+#          brought back into OSM_TEST_FAILURES/android, if set.
 # join     the Android app joining a desktop-side device on this machine
 #          over the network (scripts/test-mobile-join.sh).
 # join-ios the same with the iOS app.
@@ -102,6 +103,11 @@ android)
     "$adb" shell wm dismiss-keyguard
     "$adb" shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
     "$adb" shell rm -rf /data/local/tmp/osm-failures
+    # Autofill's own log in full while the tests run, as it was after: a
+    # session the system ends says why only there.
+    log_level=$("$adb" shell cmd autofill get log_level 2>/dev/null | tr -d '\r')
+    "$adb" shell cmd autofill set log_level verbose >/dev/null 2>&1 || true
+    since=$("$adb" shell "date '+%m-%d %H:%M:%S.000'" | tr -d '\r')
     # An emulator's fingerprint sensor, touched until the tests end.
     (while :; do "$adb" emu finger touch 1 >/dev/null 2>&1; sleep 2; done) &
     toucher=$!
@@ -109,11 +115,13 @@ android)
     (cd apps/mobile/android && ./gradlew --quiet :vault:connectedDebugAndroidTest :app:connectedDebugAndroidTest) || status=$?
     kill "$toucher" 2>/dev/null || true
     wait "$toucher" 2>/dev/null || true
+    "$adb" shell cmd autofill set log_level "${log_level:-off}" >/dev/null 2>&1 || true
     if [ "$status" != 0 ] && [ -n "$("$adb" shell ls /data/local/tmp/osm-failures 2>/dev/null)" ]; then
         if [ -n "${OSM_TEST_FAILURES:-}" ]; then
             mkdir -p "$OSM_TEST_FAILURES/android"
             "$adb" pull /data/local/tmp/osm-failures/. "$OSM_TEST_FAILURES/android" >/dev/null
-            echo "What the screen showed at each failed wait: $OSM_TEST_FAILURES/android" >&2
+            "$adb" logcat -d -v time -T "$since" >"$OSM_TEST_FAILURES/android/logcat.txt" 2>/dev/null || true
+            echo "What the screen showed at each failed wait, and the system's log: $OSM_TEST_FAILURES/android" >&2
         else
             echo "What the screen showed at each failed wait is on the device in /data/local/tmp/osm-failures (or set OSM_TEST_FAILURES)." >&2
         fi
