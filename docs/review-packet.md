@@ -82,16 +82,17 @@ login, and nothing is written before the owner unlocks and chooses.
 ## The evidence
 
 - `scripts/check.sh --network --browsers` runs every check: formatting,
-  lints with warnings as errors, 289 Rust tests (the vault, membership,
+  lints with warnings as errors, 291 Rust tests (the vault, membership,
   pairing and sync in process, between processes, and in desktop shells),
   the extension's 19 tests in headless Chromium and Firefox, and the
   dependency policy and advisory audits. With `--mobile` it also runs the
   phone tests: the bindings in an iOS simulator and on an Android emulator,
   and the two apps' UI and autofill tests through the real shared code. With
   `--linux` it runs the desktop's Linux code in a container, and drives
-  the real app there end to end (pairing, backup and restore, archive). The desktop
-  window's own tests (`apps/desktop/window/`) run in headless WebKit on its
-  browser preview every time.
+  the real app there end to end (pairing, backup and restore, archive, a
+  conflict settled through its review). The desktop window's own tests
+  (`apps/desktop/window/`) run in headless WebKit on its browser preview
+  every time.
 - Frozen formats: files every build reads, in each crate's `fixtures/`.
 - Property tests on every parser that takes outside input, and crash tests
   that kill a process writing to a vault (Phase 6a stop 2).

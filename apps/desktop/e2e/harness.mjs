@@ -53,22 +53,39 @@ export async function device(name) {
   const port = nextPort;
   nextPort += 2;
   const driver = spawn("tauri-driver", ["--port", String(port), "--native-port", String(port + 1)], { stdio: "ignore" });
-  await listening(port);
-  const capabilities = new Capabilities();
-  capabilities.setBrowserName("wry");
-  capabilities.set("tauri:options", { application: launcher });
-  const window = await new Builder().withCapabilities(capabilities).usingServer(`http://127.0.0.1:${port}/`).build();
-  await window.wait(until.elementLocated(By.css(".app-shell")), PATIENCE_MS);
+  let window;
+  try {
+    // tauri-driver hangs up on a session asked for before the WebKit
+    // driver it starts is listening.
+    await listening(port);
+    await listening(port + 1);
+    const capabilities = new Capabilities();
+    capabilities.setBrowserName("wry");
+    capabilities.set("tauri:options", { application: launcher });
+    window = await new Builder().withCapabilities(capabilities).usingServer(`http://127.0.0.1:${port}/`).build();
+    await window.wait(until.elementLocated(By.css(".app-shell")), PATIENCE_MS);
+  } catch (error) {
+    // A driver left running would keep the test file from ever ending.
+    await closing(window);
+    driver.kill();
+    throw error;
+  }
   window.osmName = name;
   return {
     name,
     home,
     window,
     async quit() {
-      await window.quit().catch(() => {});
+      await closing(window);
       driver.kill();
     },
   };
+}
+
+/** Ends a window's session, giving up after a while: a driver can stop answering. */
+async function closing(window) {
+  if (!window) return;
+  await Promise.race([window.quit().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 10_000))]);
 }
 
 const quoted = (text) => (text.includes('"') ? `'${text}'` : `"${text}"`);
@@ -115,6 +132,15 @@ export async function shows(window, text, timeout = PATIENCE_MS) {
     return await window.wait(until.elementLocated(By.xpath(`//body//*[${holds} and not(*[${holds}])]`)), timeout);
   } catch (error) {
     throw new Error(`${text} never showed; the window showed: ${await leaveTrace(window, "never-showed")}`, { cause: error });
+  }
+}
+
+/** Waits until `condition` holds; if it never does, says `what` and what the window showed. */
+export async function waitFor(window, what, condition, timeout = PATIENCE_MS) {
+  try {
+    return await window.wait(condition, timeout);
+  } catch (error) {
+    throw new Error(`never ${what}; the window showed: ${await leaveTrace(window, "never-came")}`, { cause: error });
   }
 }
 
@@ -168,12 +194,22 @@ export async function addLogin(window, title, username, password) {
   await window.wait(until.elementLocated(By.xpath(`//*[contains(@class, "entry-row")]//strong[normalize-space(.) = ${quoted(title)}]`)), PATIENCE_MS);
 }
 
-/** Locks the vault and unlocks it again with `password`, as the owner coming back would. */
-export async function unlockAgain(window, password) {
-  await (await window.wait(until.elementLocated(By.css('[title="Lock vault"]')), PATIENCE_MS)).click();
+/** Unlocks the vault of a device that shows its lock screen. */
+export async function unlock(window, password) {
   await fill(window, "Vault password", password);
   await press(window, "Unlock", { partly: true });
   await window.wait(until.elementLocated(By.css(".entry-row")), PATIENCE_MS);
+}
+
+/** Locks the vault and unlocks it again with `password`, as the owner coming back would. */
+export async function unlockAgain(window, password) {
+  await (await window.wait(until.elementLocated(By.css('[title="Lock vault"]')), PATIENCE_MS)).click();
+  await unlock(window, password);
+}
+
+/** The list's row of the item titled `title`, once there is one. */
+export async function row(window, title) {
+  return window.wait(until.elementLocated(By.xpath(`//*[contains(@class, "entry-row")][.//strong[normalize-space(.) = ${quoted(title)}]]`)), PATIENCE_MS);
 }
 
 /** Where a device keeps its vault and the files beside it, under its home folder. */

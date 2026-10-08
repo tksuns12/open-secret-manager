@@ -1473,3 +1473,352 @@ fn an_item_deleted_on_one_device_is_gone_from_the_other_until_either_restores_it
         assert!(history[0].current && !history[0].this_device && !history[0].deleted);
     });
 }
+
+/// Waits until `check` holds for the vault of `app`.
+async fn until_vault(app: &AppHandle<MockRuntime>, what: &str, check: impl Fn(&Vault) -> bool) {
+    for _ in 0..150 {
+        {
+            let state = app.state::<AppState>();
+            let vault = state.vault.lock().await;
+            if vault.as_ref().is_some_and(&check) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("never: {what}");
+}
+
+fn in_conflict(vault: &Vault) -> bool {
+    vault.list().unwrap().iter().any(|item| item.conflict)
+}
+
+#[test]
+fn an_item_changed_on_two_devices_is_reviewed_and_settled_on_both() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let apps: Vec<_> = dirs.iter().map(|dir| shell(dir.path())).collect();
+    let codes = record(&apps[0], "pairing-code");
+    let finished = record(&apps[0], "pairing-finished");
+    let (a, b) = (apps[0].handle().clone(), apps[1].handle().clone());
+
+    tauri::async_runtime::block_on(async move {
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "Shared").await;
+        pair(&a, &codes, &finished, 0, &b, Some("second password")).await;
+        eventually(&b, &["Shared"]).await;
+
+        // Each device changes the item before hearing of the other's change.
+        // Both vaults are held meanwhile, so no sync comes between.
+        let id = {
+            let a_state = a.state::<AppState>();
+            let b_state = b.state::<AppState>();
+            let mut on_a = a_state.vault.lock().await;
+            let mut on_b = b_state.vault.lock().await;
+            let mut id = String::new();
+            for (vault, username, password) in [
+                (on_a.as_mut().unwrap(), "changed on A", ""),
+                (on_b.as_mut().unwrap(), "changed on B", "password from B"),
+            ] {
+                let read = vault
+                    .list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|item| item.title == "Shared")
+                    .unwrap();
+                let mut item = vault.get(&read.id).unwrap().item.clone();
+                item.username = username.into();
+                item.password = password.into();
+                vault.update(item, &read.revision).unwrap();
+                id = read.id;
+            }
+            id
+        };
+        network::sync_now(a.clone()).await.unwrap();
+        for app in [&a, &b] {
+            until_vault(app, "the item in conflict", in_conflict).await;
+        }
+
+        // Each shows both versions, which one it wrote, and how they differ,
+        // without the password itself.
+        let versions = crate::list_versions(id.clone(), a.state()).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        let mine = versions.iter().find(|version| version.this_device).unwrap();
+        let theirs = versions
+            .iter()
+            .find(|version| !version.this_device)
+            .unwrap();
+        assert_eq!(
+            (mine.username.as_str(), theirs.username.as_str()),
+            ("changed on A", "changed on B")
+        );
+        for version in &versions {
+            assert!(
+                version.differs.contains(&"username"),
+                "{:?}",
+                version.differs
+            );
+            assert!(
+                version.differs.contains(&"password"),
+                "{:?}",
+                version.differs
+            );
+        }
+        let on_b = crate::list_versions(id.clone(), b.state()).await.unwrap();
+        let mut seen: Vec<_> = on_b
+            .iter()
+            .map(|version| (version.revision.clone(), !version.this_device))
+            .collect();
+        let mut expected: Vec<_> = versions
+            .iter()
+            .map(|version| (version.revision.clone(), version.this_device))
+            .collect();
+        seen.sort();
+        expected.sort();
+        assert_eq!(seen, expected);
+
+        // Only a version among those reviewed can be kept.
+        let heads: Vec<String> = versions
+            .iter()
+            .map(|version| version.revision.clone())
+            .collect();
+        let refused = crate::resolve_entry(
+            id.clone(),
+            "not one of them".into(),
+            heads.clone(),
+            a.state(),
+            a.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, "invalid_item");
+
+        // Keeping B's version on A settles the item on both devices.
+        crate::resolve_entry(
+            id.clone(),
+            theirs.revision.clone(),
+            heads,
+            a.state(),
+            a.clone(),
+        )
+        .await
+        .unwrap();
+        for app in [&a, &b] {
+            until_vault(app, "the conflict settled", |vault| !in_conflict(vault)).await;
+            let state = app.state::<AppState>();
+            let vault = state.vault.lock().await;
+            let item = vault.as_ref().unwrap().get(&id).unwrap().item.clone();
+            assert_eq!(
+                (item.username.as_str(), item.password.as_str()),
+                ("changed on B", "password from B")
+            );
+        }
+        for app in [&a, &b] {
+            network::shutdown(app).await;
+        }
+    });
+}
+
+/// Tells `app` where each of `others` listens now: a shell started again
+/// listens on a new port in tests (outside them a device keeps its port).
+async fn tell_where(app: &AppHandle<MockRuntime>, others: &[&AppHandle<MockRuntime>]) {
+    for other in others {
+        let id = devices(other).await.this_device.unwrap();
+        let port = network::listen_port(other).await.unwrap();
+        network::observe_address(app, &id, &format!("127.0.0.1:{port}")).await;
+    }
+}
+
+async fn password_in(app: &AppHandle<MockRuntime>, title: &str) -> String {
+    let state = app.state::<AppState>();
+    let vault = state.vault.lock().await;
+    let vault = vault.as_ref().unwrap();
+    let id = vault
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.title == title)
+        .unwrap()
+        .id;
+    vault.get(&id).unwrap().item.password.clone()
+}
+
+#[test]
+fn a_removed_devices_writes_passed_on_by_a_member_that_had_not_heard_are_held_on_the_others() {
+    let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let apps: Vec<_> = dirs.iter().map(|dir| shell(dir.path())).collect();
+    let codes = record(&apps[0], "pairing-code");
+    let finished = record(&apps[0], "pairing-finished");
+    let handles: Vec<_> = apps.iter().map(|app| app.handle().clone()).collect();
+    let (a, b, c, d) = (
+        handles[0].clone(),
+        handles[1].clone(),
+        handles[2].clone(),
+        handles[3].clone(),
+    );
+
+    tauri::async_runtime::block_on(async move {
+        // A and B vote; C and D, phones say, do not, so A and B can remove
+        // D while C and D are away.
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "Shared").await;
+        pair(&a, &codes, &finished, 0, &b, Some("second device password")).await;
+        pair_as(
+            &a,
+            &codes,
+            &finished,
+            1,
+            &c,
+            Some("third device password"),
+            false,
+        )
+        .await;
+        pair_as(
+            &a,
+            &codes,
+            &finished,
+            2,
+            &d,
+            Some("fourth device password"),
+            false,
+        )
+        .await;
+        for app in [&a, &b, &c, &d] {
+            until_devices(app, "four members", |info| {
+                info.setup == "ready" && info.members.len() == 4 && info.pending.is_none()
+            })
+            .await;
+            eventually(app, &["Shared"]).await;
+        }
+        let d_id = devices(&d).await.this_device.unwrap();
+
+        // C and D are away when D is removed: neither hears of it.
+        network::shutdown(&c).await;
+        network::shutdown(&d).await;
+        network::remove_device(d_id.clone(), a.clone())
+            .await
+            .unwrap();
+        for app in [&a, &b] {
+            until_devices(app, "the removal completes", |info| {
+                info.epoch == 2 && info.members.len() == 3 && info.pending.is_none()
+            })
+            .await;
+        }
+
+        // Then A and B are away. D, which does not know it was removed,
+        // adds an item and changes a password, and reaches C, which takes
+        // them in: as far as C knows, D is a member.
+        network::shutdown(&a).await;
+        network::shutdown(&b).await;
+        {
+            let state = d.state::<AppState>();
+            let mut vault = state.vault.lock().await;
+            let vault = vault.as_mut().unwrap();
+            vault.put(Item::new("Made after removal")).unwrap();
+            let shared = vault
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.title == "Shared")
+                .unwrap();
+            let mut changed = vault.get(&shared.id).unwrap().item.clone();
+            changed.password = "changed by the removed device".into();
+            vault.update(changed, &shared.revision).unwrap();
+        }
+        network::start(&c);
+        network::start(&d);
+        for app in [&c, &d] {
+            until_devices(app, "its control plane resumes", |info| {
+                info.setup == "ready"
+            })
+            .await;
+        }
+        tell_where(&d, &[&c]).await;
+        // A and B cannot be reached, which the sync reports.
+        let _ = network::sync_now(d.clone()).await;
+        eventually(&c, &["Made after removal", "Shared"]).await;
+        assert_eq!(
+            password_in(&c, "Shared").await,
+            "changed by the removed device"
+        );
+
+        // D goes; A and B come back, and C passes on what it took in. A and
+        // B hold it for the owner, and C hears of the removal.
+        network::shutdown(&d).await;
+        network::start(&a);
+        network::start(&b);
+        for app in [&a, &b] {
+            until_devices(app, "its control plane resumes", |info| {
+                info.setup == "ready"
+            })
+            .await;
+        }
+        tell_where(&c, &[&a, &b]).await;
+        tell_where(&a, &[&c]).await;
+        tell_where(&b, &[&c]).await;
+        let _ = network::sync_now(c.clone()).await;
+        for app in [&a, &b] {
+            for _ in 0..150 {
+                if crate::list_held(app.state()).await.unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let held = crate::list_held(a.state()).await.unwrap();
+        assert_eq!(held.len(), 2, "held on A");
+        assert_eq!(
+            crate::list_held(b.state()).await.unwrap().len(),
+            2,
+            "held on B"
+        );
+        assert_eq!(titles(&a).await, ["Shared"]);
+        assert_eq!(password_in(&a, "Shared").await, "");
+        assert!(held.iter().all(|change| change.removed_device));
+        assert!(held.iter().all(|change| d_id.starts_with(&change.device)));
+        let created = held.iter().find(|change| change.change == "new").unwrap();
+        assert_eq!(created.title, "Made after removal");
+        let edited = held.iter().find(|change| change.change == "edit").unwrap();
+        assert_eq!(
+            (edited.title.as_str(), &edited.changed),
+            ("Shared", &vec!["password"])
+        );
+        until_devices(&c, "C hears of the removal", |info| {
+            info.epoch == 2 && info.members.len() == 3
+        })
+        .await;
+
+        // Rejected on A, both are undone on every device, C included, which
+        // had taken them in.
+        for change in &held {
+            crate::discard_held(change.revision.clone(), a.state(), a.clone())
+                .await
+                .unwrap();
+        }
+        assert!(crate::list_held(a.state()).await.unwrap().is_empty());
+        let _ = network::sync_now(a.clone()).await;
+        for app in [&b, &c] {
+            eventually(app, &["Shared"]).await;
+            for _ in 0..150 {
+                if password_in(app, "Shared").await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_eq!(password_in(app, "Shared").await, "");
+        }
+        for _ in 0..150 {
+            if crate::list_held(b.state()).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(crate::list_held(b.state()).await.unwrap().is_empty());
+        for app in [&a, &b, &c] {
+            network::shutdown(app).await;
+        }
+    });
+}

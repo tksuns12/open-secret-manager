@@ -461,12 +461,12 @@ async fn list_versions(
 /// `heads` is the set that was shown, so a version that arrived since stays
 /// visible instead of being silently discarded.
 #[tauri::command]
-async fn resolve_entry(
+async fn resolve_entry<R: tauri::Runtime>(
     id: String,
     keep_revision: String,
     heads: Vec<String>,
     state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
 ) -> Result<(), CommandError> {
     let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
