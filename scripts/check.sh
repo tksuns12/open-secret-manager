@@ -2,7 +2,10 @@
 # Every check the project has, in one place. There is no CI: run this before
 # a commit and before a release.
 #
-#   scripts/check.sh              what runs without the network
+#   scripts/check.sh              what runs without the network, the
+#                                 desktop window's tests in headless WebKit
+#                                 included (once: npx playwright install
+#                                 webkit, in apps/desktop)
 #   scripts/check.sh --network    also the advisory audits, npm audit, and
 #                                 the licenses only the npm registry knows
 #   scripts/check.sh --browsers   also the extension in headless Chromium
@@ -51,7 +54,7 @@ cargo test --workspace --all-targets --locked
 cargo test --manifest-path "$desktop" --workspace --locked
 
 step "Desktop interface"
-(cd apps/desktop && npm run --silent typecheck && npm run --silent build)
+(cd apps/desktop && npm run --silent typecheck && npm run --silent build && npm run --silent test:window)
 
 step "Browser extension"
 (cd apps/browser-extension && npm run --silent typecheck && npm test && npm run --silent build)

@@ -216,10 +216,11 @@ function App() {
   }, [devicesOpen, locked]);
   // Held changes are read with the vault. A sync can add to them, and a
   // decision made on another device settles them here; both reload the list.
+  // The preview has some only when its address asks.
   useEffect(() => {
-    if (locked || previewMode) { setHeld([]); return; }
+    if (locked) { setHeld([]); return; }
     void bridge.listHeld().then(setHeld).catch(() => setHeld([]));
-  }, [locked, entries, previewMode]);
+  }, [locked, entries]);
   // Something else answers where one of the vault's devices used to: most
   // likely that device started over as a new vault and this one was left
   // behind. The owner is told once; the Devices panel says what to do.

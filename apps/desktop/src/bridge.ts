@@ -15,13 +15,38 @@ async function nativeOnly<T>(cmd: string, args?: unknown): Promise<T> {
   return (await invoke(cmd, args)) as T;
 }
 
-let previewEntries: VaultEntry[] = [
+/**
+ * Whether the preview's address asks for a state the browser preview
+ * otherwise never has, so that it can be looked at and tested: as in
+ * `/?rows-changed`, `/?recovery-key`, `/?held`, or `/?conflict`. Each shows
+ * sample data, no secret.
+ */
+function previewAsks(what: string): boolean {
+  return new URLSearchParams(globalThis.location?.search).has(what);
+}
+
+let previewEntries: VaultEntry[] = ([
   { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", favorite: true },
   { id: "2", title: "GitHub", kind: "login", username: "northstar-labs", url: "github.com", favorite: true },
   { id: "3", title: "Banking — checking", kind: "login", username: "•••• 4821", url: "secure.bank.example", favorite: false },
   { id: "4", title: "Recovery codes", kind: "secure_note", favorite: false },
   { id: "5", title: "Studio Wi-Fi", kind: "login", username: "studio", url: "network", favorite: false },
+] satisfies VaultEntry[]).map((entry) => (entry.id === "2" && previewAsks("conflict") ? { ...entry, conflict: true } : entry));
+
+/** With `?conflict`: the two versions of GitHub that were changed independently. */
+const previewConflict: VersionSummary[] = [
+  { revision: "preview-conflict-here", deleted: false, title: "GitHub", username: "northstar-labs", url: "github.com", device: "preview", thisDevice: true },
+  { revision: "preview-conflict-there", deleted: false, title: "GitHub", username: "northstar-ops", url: "github.com", device: "3f9a1c2e", thisDevice: false },
 ];
+
+/** With `?held`: changes written by a device that was removed, waiting for the owner. */
+let previewHeld: HeldChange[] = previewAsks("held") ? [
+  { revision: "preview-held-new", device: "7c41d09e", removedDevice: true, change: "new", title: "Old router", username: "admin", url: "192.168.0.1", changed: [] },
+  { revision: "preview-held-edit", device: "7c41d09e", removedDevice: true, change: "edit", title: "Proton Mail", username: "hello@northstar.dev", url: "proton.me", changed: ["password"] },
+] : [];
+
+/** Whether the preview's owner confirmed storing the sample recovery key `?recovery-key` shows. */
+let previewRecoveryConfirmed = false;
 
 /** What the preview's import would add: sample data, no secret. */
 const previewImport: ImportSummary = { file: "sample-export.csv", items: 2, logins: 2, notes: 0, cards: 0, identities: 0, already: 1, warnings: [{ row: 4, message: "entry has no password" }] };
@@ -93,7 +118,9 @@ export const bridge: DesktopBridge = {
   async listEntries() {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) return (await invoke("list_entries")) as VaultEntry[];
-    return previewEntries;
+    // A new list each time, as the shell's is: the window reloads what goes
+    // with the items when the list changes.
+    return [...previewEntries];
   },
   async lock() {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
@@ -150,19 +177,33 @@ export const bridge: DesktopBridge = {
     previewDeleted = [gone, ...previewDeleted];
   },
   // Conflicts only arise from revisions received from another device, so
-  // the browser preview has none to review.
+  // the browser preview has one only when its address asks (`?conflict`).
   async listVersions(id) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) return (await invoke("list_versions", { id })) as VersionSummary[];
+    if (previewEntries.find((entry) => entry.id === id)?.conflict) return previewConflict;
     throw new Error("preview");
   },
-  // Held changes come from other devices too; the preview has none.
+  // Held changes come from other devices too; the preview has them only
+  // when its address asks (`?held`).
   async listHeld() {
     const invoke = native();
-    return invoke ? ((await invoke("list_held")) as HeldChange[]) : [];
+    return invoke ? ((await invoke("list_held")) as HeldChange[]) : previewHeld;
   },
-  acceptHeld: (revision) => nativeOnly("accept_held", { revision }),
-  discardHeld: (revision) => nativeOnly("discard_held", { revision }),
+  async acceptHeld(revision) {
+    const invoke = native();
+    if (invoke) { await invoke("accept_held", { revision }); return; }
+    const change = previewHeld.find((held) => held.revision === revision);
+    if (!change) throw Object.assign(new Error("not_found"), { code: "not_found" });
+    previewHeld = previewHeld.filter((held) => held !== change);
+    if (change.change === "new") previewEntries = [...previewEntries, { id: crypto.randomUUID(), title: change.title, kind: "login", username: change.username, url: change.url, favorite: false }];
+  },
+  async discardHeld(revision) {
+    const invoke = native();
+    if (invoke) { await invoke("discard_held", { revision }); return; }
+    if (!previewHeld.some((held) => held.revision === revision)) throw Object.assign(new Error("not_found"), { code: "not_found" });
+    previewHeld = previewHeld.filter((held) => held.revision !== revision);
+  },
   async syncStatus() {
     const invoke = native();
     if (invoke) return (await invoke("sync_status")) as SyncStatus;
@@ -196,18 +237,21 @@ export const bridge: DesktopBridge = {
     const invoke = native();
     return invoke ? Boolean(await invoke("recovery_status")) : true;
   },
+  /** The preview shows a sample, until confirmed, with `?recovery-key`: not a key of any vault. */
   async pendingRecoveryKey() {
     const invoke = native();
-    return invoke ? ((await invoke("pending_recovery_key")) as string | null) : null;
+    if (invoke) return (await invoke("pending_recovery_key")) as string | null;
+    return previewAsks("recovery-key") && !previewRecoveryConfirmed ? "OSM-RK1-PREVIEW-SAMPLE-NOT-A-REAL-KEY" : null;
   },
   async confirmRecoveryKey() {
     const invoke = native();
     if (invoke) await invoke("confirm_recovery_key");
+    else previewRecoveryConfirmed = true;
   },
-  /** The preview says so, until confirmed, when its address asks, as in `/?rows-changed`, so the warning can be looked at. */
+  /** The preview says so, until confirmed, with `?rows-changed`. */
   async rowsChanged() {
     const invoke = native();
-    return invoke ? Boolean(await invoke("rows_changed")) : !previewRowsConfirmed && new URLSearchParams(globalThis.location?.search).has("rows-changed");
+    return invoke ? Boolean(await invoke("rows_changed")) : !previewRowsConfirmed && previewAsks("rows-changed");
   },
   async confirmRowsChanged() {
     const invoke = native();
@@ -316,7 +360,11 @@ export const bridge: DesktopBridge = {
   },
   async resolveEntry(id, keepRevision, heads) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
-    if (invoke) await invoke("resolve_entry", { id, keepRevision, heads });
-    else throw new Error("preview");
+    if (invoke) { await invoke("resolve_entry", { id, keepRevision, heads }); return; }
+    const kept = previewConflict.find((version) => version.revision === keepRevision);
+    const entry = previewEntries.find((existing) => existing.id === id);
+    if (!kept || !entry?.conflict) throw new Error("preview");
+    previewEntries = previewEntries.map((existing) => existing.id === id ? { ...existing, conflict: false, title: kept.title, username: kept.username, url: kept.url, revision: crypto.randomUUID() } : existing);
+    previewDetails.delete(id);
   },
 };

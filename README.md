@@ -95,12 +95,16 @@ Every check the project has runs from one script; there is no CI, so run it
 before a commit:
 
 ```text
-scripts/check.sh              # formatting, lints, all tests, both interfaces, licenses
+scripts/check.sh              # formatting, lints, all tests, both interfaces, licenses,
+                              # and the desktop window in headless WebKit
 scripts/check.sh --network    # also the advisory audits of every dependency
 scripts/check.sh --browsers   # also the extension in headless Chromium and Firefox
 scripts/check.sh --mobile     # also both phone apps, in a simulator and on an emulator
 scripts/check.sh --linux      # also the desktop's Linux code, in a Linux container
 ```
+
+The window's tests need Playwright's WebKit once: `npx playwright install webkit`
+in `apps/desktop`.
 
 Every dependency has to come from the official registry under a license a
 GPL-3.0 program may include (`dependency-policy.json`, checked by
