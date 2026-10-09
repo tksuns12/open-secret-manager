@@ -63,7 +63,7 @@ pub struct ArchivedItem {
 /// When the copy in a folder of this name was put away, if the name is one
 /// this app gives an archive folder: `archive-<seconds>`, with a counter
 /// after it when two were made in the same second.
-fn archived_at(name: &str) -> Option<u64> {
+pub(crate) fn archived_at(name: &str) -> Option<u64> {
     let mut parts = name.strip_prefix("archive-")?.split('-');
     let seconds = parts.next()?;
     let counter = parts.next();

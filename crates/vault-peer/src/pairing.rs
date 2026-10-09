@@ -113,8 +113,12 @@ impl Invitation {
         );
         let (body, rest): (InvitationBody, _) =
             postcard::take_from_bytes(&bytes).map_err(|_| Error::InvalidInvitation)?;
+        // One form only: not a number written in more bytes than it needs.
+        let one_form = postcard::to_allocvec(&body)
+            .map(Zeroizing::new)
+            .is_ok_and(|again| again.as_slice() == bytes.as_slice());
         let invitation = Self { body };
-        if !rest.is_empty() {
+        if !rest.is_empty() || !one_form {
             return Err(Error::InvalidInvitation);
         }
         if invitation.body.version != PAIRING_VERSION {

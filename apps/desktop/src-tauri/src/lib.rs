@@ -20,6 +20,8 @@ mod network;
 #[cfg(test)]
 mod network_tests;
 mod settings;
+#[cfg(test)]
+mod side_files_tests;
 
 use std::path::{Path, PathBuf};
 

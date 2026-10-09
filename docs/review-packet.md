@@ -82,7 +82,7 @@ login, and nothing is written before the owner unlocks and chooses.
 ## The evidence
 
 - `scripts/check.sh --network --browsers` runs every check: formatting,
-  lints with warnings as errors, 291 Rust tests (the vault, membership,
+  lints with warnings as errors, 300 Rust tests (the vault, membership,
   pairing and sync in process, between processes, and in desktop shells),
   the extension's 19 tests in headless Chromium and Firefox, and the
   dependency policy and advisory audits. With `--mobile` it also runs the
@@ -95,7 +95,8 @@ login, and nothing is written before the owner unlocks and chooses.
   every time.
 - Frozen formats: files every build reads, in each crate's `fixtures/`.
 - Property tests on every parser that takes outside input, and crash tests
-  that kill a process writing to a vault (Phase 6a stop 2).
+  that kill a process writing to a vault (Phase 6a stop 2); coverage-guided
+  fuzzing of six of those parsers, `scripts/fuzz.sh` (Phase 13).
 - The release scripts and the reproducibility check: see
   [release.md](release.md).
 
@@ -122,9 +123,11 @@ login, and nothing is written before the owner unlocks and chooses.
 The full list is the right-hand column of the delivery matrix in
 [implementation-status.md](implementation-status.md). In short: no outside
 review until this one; packages signed with a developer identity and
-notarized are waiting on that identity; coverage-guided fuzzing was not run;
-the native lifecycle locks were checked through the code and in a Linux
-container, never with a real sleep or screen lock; the backup screens and
-the system's file dialogs were driven in the real app only on Linux; the
-phone apps have run only on an emulator and in a simulator, and are not
-signed for distribution.
+notarized are waiting on that identity; coverage-guided fuzzing ran ten
+minutes per parser, once, not continuously; the extension's end-to-end
+tests no longer run on this Mac, where the browser may not start a program
+from the external disk the repository is on; the native lifecycle locks
+were checked through the code and in a Linux container, never with a real
+sleep or screen lock; the backup screens and the system's file dialogs
+were driven in the real app only on Linux; the phone apps have run only on
+an emulator and in a simulator, and are not signed for distribution.

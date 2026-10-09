@@ -1,0 +1,68 @@
+# Coverage-guided fuzzing of the parsers that take outside input, with
+# cargo-fuzz (libFuzzer). Its own workspace: it builds only with a nightly
+# toolchain, and nothing it holds ships. See scripts/fuzz.sh.
+[package]
+name = "osm-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+osm-browser-link = { path = "../crates/browser-link" }
+osm-origin = { path = "../crates/origin" }
+osm-vault-core = { path = "../crates/vault-core" }
+osm-vault-peer = { path = "../crates/vault-peer" }
+serde = "1"
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "origin"
+path = "fuzz_targets/origin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_key"
+path = "fuzz_targets/recovery_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invitation"
+path = "fuzz_targets/invitation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_messages"
+path = "fuzz_targets/peer_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "browser_messages"
+path = "fuzz_targets/browser_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import"
+path = "fuzz_targets/import.rs"
+test = false
+doc = false
+bench = false

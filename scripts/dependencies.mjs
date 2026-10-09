@@ -1,7 +1,8 @@
 // Checks every dependency of the project against `dependency-policy.json`:
 // its license must be one a GPL-3.0 program may include, and it must come
 // from the official registry (or be one of this repository's own crates).
-// Reads Cargo's metadata for the two Rust workspaces and the npm lockfiles
+// Reads Cargo's metadata for the three Rust workspaces (the fuzz targets'
+// included, though nothing in it ships) and the npm lockfiles
 // of the two JavaScript packages. Prints what it found and exits with 1 if
 // anything breaks the policy.
 //
@@ -121,6 +122,7 @@ function npm(workspace, folder) {
 const reports = [
   rust("Rust workspace", "Cargo.toml"),
   rust("desktop app", "apps/desktop/src-tauri/Cargo.toml"),
+  rust("fuzz targets", "fuzz/Cargo.toml"),
   npm("desktop app (JavaScript)", "apps/desktop"),
   npm("browser extension (JavaScript)", "apps/browser-extension"),
 ];

@@ -484,7 +484,7 @@ pub(crate) async fn read_json_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
 
 /// Reads one frame. The declared length is checked before the body is
 /// allocated.
-pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
+pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T> {
     read_frame_within(reader, MAX_FRAME_BYTES).await
@@ -496,7 +496,7 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
 pub(crate) const MAX_HANDSHAKE_FRAME_BYTES: usize = 64 * 1024;
 
 /// Reads one frame of at most `limit` bytes.
-pub(crate) async fn read_frame_within<R: AsyncRead + Unpin, T: DeserializeOwned>(
+pub(crate) async fn read_frame_within<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned>(
     reader: &mut R,
     limit: usize,
 ) -> Result<T> {

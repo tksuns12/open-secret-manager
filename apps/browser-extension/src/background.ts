@@ -5,7 +5,7 @@
 // and keeps none after, and never learns what the vault contains.
 
 import { answers, cancel, explain, fillRequest, GIVE_UP_AFTER_MS, NATIVE_HOST, pageOrigin, readResponse, type FillReply, type FillRequest } from "./protocol";
-import type { Field, FromPage, Prepared, ToPage } from "./page";
+import { isFilled, isPrepared, type Field, type Prepared, type ToPage } from "./page";
 
 /** A request the owner has yet to decide in the app. */
 type Waiting = {
@@ -35,14 +35,6 @@ function show(tabId: number, mark: Mark, text: string) {
   void chrome.action.setBadgeBackgroundColor({ tabId, color }).catch(() => {});
   void chrome.action.setBadgeText({ tabId, text: badge }).catch(() => {});
   void chrome.action.setTitle({ tabId, title: text ? `${TITLE}\n${text}` : TITLE }).catch(() => {});
-}
-
-function isPrepared(message: unknown): message is Prepared {
-  const value = message as Partial<Prepared> | null;
-  return typeof value === "object" && value !== null && value.type === "prepared"
-    && typeof value.documentId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(value.documentId)
-    && typeof value.origin === "string"
-    && Array.isArray(value.fields) && value.fields.every((field) => field === "username" || field === "password");
 }
 
 /** What the page's script found, once it says. */
@@ -197,7 +189,8 @@ async function deliver(request: Waiting, reply: FillReply) {
     const timer = setTimeout(() => resolve([]), PAGE_ANSWERS_WITHIN_MS);
     const done = (fields: Field[]) => { clearTimeout(timer); resolve(fields); };
     request.page.onDisconnect.addListener(() => done([]));
-    request.page.onMessage.addListener((message: FromPage) => { if (message.type === "filled") done(message.fields); });
+    // Only an answer that names fields of a form, each once, is believed.
+    request.page.onMessage.addListener((message: unknown) => { if (isFilled(message)) done(message.fields); });
     try {
       request.page.postMessage({ type: "fill", documentId: reply.documentId, origin: reply.origin, username: reply.username, password: reply.password } satisfies ToPage);
     } catch {

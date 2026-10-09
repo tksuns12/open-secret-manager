@@ -28,6 +28,10 @@
     "caniuse-lite": {
       "license": "CC-BY-4.0",
       "reason": "Browser data that Vite reads at build time; it is not in the built app. The FSF lists CC-BY-4.0 as compatible with GPLv3."
+    },
+    "libfuzzer-sys": {
+      "license": "(MIT OR Apache-2.0) AND NCSA",
+      "reason": "LLVM's libFuzzer, linked only into the fuzz targets (fuzz/, built with a nightly toolchain by scripts/fuzz.sh); it is in no build of the apps. The FSF lists the NCSA license as compatible with GPLv3."
     }
   }
 }

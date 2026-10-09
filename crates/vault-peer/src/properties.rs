@@ -14,6 +14,38 @@ use crate::{
     EnrollmentGrant, Invitation, JoinRequest, SyncMessage, SyncSession, PROTOCOL_VERSION,
 };
 
+/// A number written in more bytes than it needs is another form of the
+/// same message, which postcard alone takes; it is refused, in a frame and
+/// in an invitation. Fuzzing found it (Phase 13): the frozen invitation
+/// with its last number, 90, written as two bytes was read as the same.
+#[test]
+fn a_number_written_in_more_bytes_than_it_needs_is_refused() {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+
+    let longer = |bytes: &[u8], at: usize| {
+        assert!(bytes[at] < 0x80, "a one-byte number at {at}");
+        [&bytes[..at], &[bytes[at] | 0x80, 0x00], &bytes[at + 1..]].concat()
+    };
+
+    let sync: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/sync.json")).unwrap();
+    let body = crate::fixture::unhex(sync["hello"]["body"].as_str().unwrap());
+    assert!(decode_body::<SyncMessage>(&body).is_ok());
+    // A message's kind is its first number.
+    assert!(decode_body::<SyncMessage>(&longer(&body, 0)).is_err());
+
+    let pairing: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/pairing.json")).unwrap();
+    let text = pairing["invitation_text"].as_str().unwrap();
+    assert!(Invitation::decode(text).is_ok());
+    let bytes = Base64UrlUnpadded::decode_vec(text.strip_prefix("OSM-PAIR1-").unwrap()).unwrap();
+    let long = format!(
+        "OSM-PAIR1-{}",
+        Base64UrlUnpadded::encode_string(&longer(&bytes, bytes.len() - 1))
+    );
+    assert!(Invitation::decode(&long).is_err());
+}
+
 proptest! {
     /// Any bytes read as a message are refused, or are a message that is
     /// sent as exactly those bytes. A peer cannot pass one message off in

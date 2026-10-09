@@ -259,7 +259,7 @@ const LEFT_NOTE: &str = "left-vault";
 /// Present while a copy is being put away: why, and the archive folder it
 /// is going to, on two lines. An interruption is finished at the next
 /// launch from this.
-const PUTTING_AWAY: &str = "putting-away";
+pub(crate) const PUTTING_AWAY: &str = "putting-away";
 /// The files that belong to one vault on this device.
 const VAULT_FILES: [&str; 4] = [
     "control.sqlite3",
@@ -270,7 +270,7 @@ const VAULT_FILES: [&str; 4] = [
 
 /// Why a device's copy of its vault was put away.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PutAway {
+pub(crate) enum PutAway {
     /// The vault's devices removed this one.
     Removed,
     /// The owner asked for it on this device, to join another vault.
@@ -279,7 +279,7 @@ enum PutAway {
 
 impl PutAway {
     /// The note file that says so until this device has a vault again.
-    fn note(self) -> &'static str {
+    pub(crate) fn note(self) -> &'static str {
         match self {
             Self::Removed => RESET_NOTE,
             Self::Left => LEFT_NOTE,
@@ -363,15 +363,20 @@ fn move_vault_files(vault_path: &Path, archive: &Path, vault_first: bool) -> std
 /// archive folder, and a note says why and where. What is under way is
 /// written down first, so that an interruption is finished at the next
 /// launch instead of leaving half of the files behind.
-fn put_away(vault_path: &Path, reason: PutAway) -> std::io::Result<PathBuf> {
+pub(crate) fn put_away(vault_path: &Path, reason: PutAway) -> std::io::Result<PathBuf> {
     let directory = vault_path.parent().unwrap_or(Path::new("."));
     let archive = new_archive(directory)?;
     std::fs::write(
         directory.join(PUTTING_AWAY),
-        format!("{}\n{}", reason.name(), archive.to_string_lossy()),
+        putting_away_note(reason, &archive),
     )?;
     finish_put_away(vault_path, reason, &archive)?;
     Ok(archive)
+}
+
+/// What [`PUTTING_AWAY`] holds: why, and the archive folder, on two lines.
+pub(crate) fn putting_away_note(reason: PutAway, archive: &Path) -> String {
+    format!("{}\n{}", reason.name(), archive.to_string_lossy())
 }
 
 fn finish_put_away(vault_path: &Path, reason: PutAway, archive: &Path) -> std::io::Result<()> {
@@ -434,8 +439,16 @@ pub fn finish_interrupted_recovery(vault_path: &Path) {
     if let Ok(under_way) = std::fs::read_to_string(&marker) {
         let finished = under_way.split_once('\n').and_then(|(reason, archive)| {
             let archive = Path::new(archive);
-            // Only a folder this app made beside the vault is trusted.
-            (archive.parent() == Some(directory) && archive.is_dir())
+            // Only a folder this app made beside the vault is trusted: one
+            // with the name it gives an archive, and not a link, which
+            // could lead anywhere.
+            let made_here = archive.parent() == Some(directory)
+                && archive
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| crate::archive::archived_at(name).is_some())
+                && std::fs::symlink_metadata(archive).is_ok_and(|found| found.is_dir());
+            made_here
                 .then(|| finish_put_away(vault_path, PutAway::named(reason)?, archive).ok())
                 .flatten()
         });

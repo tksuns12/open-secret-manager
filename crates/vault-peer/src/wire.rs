@@ -23,12 +23,16 @@ pub fn encode_frame(message: &impl Serialize) -> Result<Vec<u8>> {
 }
 
 /// Decodes a body that has already been split from its length prefix.
-pub fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
+///
+/// Only the one form of a message is read. postcard alone would also take
+/// a number written in more bytes than it needs, so a message is read only
+/// if it is written back as exactly the bytes that came.
+pub fn decode_body<T: Serialize + DeserializeOwned>(body: &[u8]) -> Result<T> {
     if body.len() > MAX_FRAME_BYTES {
         return Err(Error::FrameTooLarge);
     }
     let (message, rest) = postcard::take_from_bytes(body).map_err(|_| Error::MalformedFrame)?;
-    if !rest.is_empty() {
+    if !rest.is_empty() || postcard::to_allocvec(&message).ok().as_deref() != Some(body) {
         return Err(Error::MalformedFrame);
     }
     Ok(message)
