@@ -44,7 +44,9 @@ stand-in app, and makes this app the autofill service for each autofill
 test, putting the earlier one back after it); `scripts/test-mobile.sh join`
 has the app join a desktop-side device on the same machine;
 `scripts/test-mobile-chrome.sh` has real Chrome fill and save on a test
-site, after a setup by hand that the script describes. A debug
+site, after a setup by hand that the script describes, or Chromium with
+`OSM_BROWSER_PACKAGE=org.chromium.chrome` where the emulator's Chrome is
+too old. A debug
 build made with `-Posm.screenshots=true` lets its screens be captured
 for review; no other build does.
 

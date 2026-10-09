@@ -4,6 +4,12 @@
 #
 #   scripts/test-mobile-chrome.sh <folder kept between runs>
 #
+# OSM_BROWSER_PACKAGE names another browser to drive instead of Chrome
+# (com.android.chrome): org.chromium.chrome for a Chromium build installed
+# on the emulator, where the emulator's own Chrome is too old and its Play
+# Store has no account to update it. The test then trusts that browser to
+# say which page it shows, as the app trusts only browsers on its list.
+#
 # The folder holds a certificate authority made for these tests only and the
 # test site's certificate, which the first run makes
 # (scripts/test-site-certs.sh; scripts/test-mobile-safari.sh shares them).
@@ -14,9 +20,9 @@
 #      Download as osm-phone-test-ca.crt, as a CA certificate: Settings ›
 #      Security & privacy › More security & privacy › Encryption &
 #      credentials › Install a certificate › CA certificate.
-#   2. In Chrome 135 or later, with this app as the phone's autofill
-#      service: Settings › Autofill services › Autofill using another
-#      service.
+#   2. In Chrome 135 or later (or Chromium), with this app as the phone's
+#      autofill service: Settings › Autofill and passwords › Autofill
+#      settings › Autofill using another service, then restart it.
 #
 # Each run then serves the test site (scripts/test-site.py) on
 # 127.0.0.1:8443, has Chrome reach login.osm.test there through its
@@ -32,6 +38,7 @@ mkdir -p "$keep"
 keep=$(cd "$keep" && pwd)
 adb=${ADB:-adb}
 command -v "$adb" >/dev/null || adb="${ANDROID_HOME:-$HOME/Library/Android/sdk}/platform-tools/adb"
+browser=${OSM_BROWSER_PACKAGE:-com.android.chrome}
 
 if [ "$(scripts/test-site-certs.sh "$keep")" = made ]; then
     "$adb" push "$keep/ca.crt" /sdcard/Download/osm-phone-test-ca.crt >/dev/null
@@ -47,9 +54,9 @@ trap 'kill "$site" 2>/dev/null || true; wait "$site" 2>/dev/null || true; rm -rf
 : >"$keep/server.log"
 
 # Chrome reads its command line from this file once it is the debug app.
-"$adb" shell am set-debug-app --persistent com.android.chrome
+"$adb" shell am set-debug-app --persistent "$browser"
 "$adb" shell "echo '_ --disable-fre --no-default-browser-check --no-first-run --host-resolver-rules=\"MAP login.osm.test 10.0.2.2\"' > /data/local/tmp/chrome-command-line"
-"$adb" shell am force-stop com.android.chrome
+"$adb" shell am force-stop "$browser"
 
 "$root/apps/mobile/android/prepare.sh" "$work/prepared"
 "$adb" shell input keyevent KEYCODE_WAKEUP
@@ -60,10 +67,16 @@ if [ -n "${OSM_DEVICE_PIN:-}" ]; then
 fi
 "$adb" shell wm dismiss-keyguard
 "$adb" logcat -c
+# Google Play services' changes to the system's settings for autofill end
+# every autofill session; they wait until the test ends.
+config_sync=$("$adb" shell device_config get_sync_disabled_for_tests 2>/dev/null | tr -d '\r')
+"$adb" shell device_config set_sync_disabled_for_tests until_reboot >/dev/null 2>&1 || true
 status=0
 (cd apps/mobile/android && ./gradlew --quiet :app:connectedDebugAndroidTest \
     -Pandroid.testInstrumentationRunnerArguments.class=org.opensecretmanager.app.ChromeTest \
-    -Pandroid.testInstrumentationRunnerArguments.chromeSite=https://login.osm.test:8443) || status=$?
+    -Pandroid.testInstrumentationRunnerArguments.chromeSite=https://login.osm.test:8443 \
+    -Pandroid.testInstrumentationRunnerArguments.browser="$browser") || status=$?
+"$adb" shell device_config set_sync_disabled_for_tests "${config_sync:-none}" >/dev/null 2>&1 || true
 "$adb" logcat -d -s OSMChrome:I | sed -n 's/.*\(CHROME-.*\)/\1/p'
 echo "the site received:"
 cat "$keep/server.log"
@@ -74,4 +87,5 @@ code=$("$adb" logcat -d -s OSMChrome:I | sed -n 's/.*CHROME-CODE //p' | tail -1 
 grep -qx 'LOGIN username=site-user password=site-pass-1' "$keep/server.log"
 grep -qx "CODE code=$code" "$keep/server.log"
 grep -qx 'LOGIN username=new-user password=new-pass-1' "$keep/server.log"
-echo "Chrome filled the login and its code, and the login typed into it was saved"
+grep -qx 'TWO-PAGE username=two-page-user password=two-page-pass-1' "$keep/server.log"
+echo "$browser filled the login and its code, and the logins typed into it, on one page and on two, were saved"

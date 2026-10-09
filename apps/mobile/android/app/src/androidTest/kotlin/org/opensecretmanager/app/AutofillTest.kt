@@ -183,6 +183,9 @@ class AutofillTest {
         capture("app-choose")
         find(mine("fill:Bank")).click()
         assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
+        // The fill screen let the app be seen beneath it, which only paused
+        // it: its fields never went out of the system's sight.
+        assertEquals("0", find(By.res(FIXTURE, "stopped")).text)
         assertLockedAgain()
 
         // The next time, the login chosen for it is offered, and only that.

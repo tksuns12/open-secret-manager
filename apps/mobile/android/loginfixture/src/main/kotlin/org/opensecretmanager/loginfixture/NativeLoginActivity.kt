@@ -16,9 +16,17 @@ import android.widget.TextView
  * form's fields are gone. With the extra `after` set to `close`, signing in
  * closes the app's screen instead, and the offer comes over whatever is
  * left; Android 15 and later then start the save screen only if Save is
- * tapped soon after.
+ * tapped soon after. It also shows how many times it was stopped.
  */
 class NativeLoginActivity : Activity() {
+    private var stops = 0
+
+    override fun onStop() {
+        super.onStop()
+        stops += 1
+        findViewById<TextView>(R.id.stopped).text = "$stops"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.native_login)

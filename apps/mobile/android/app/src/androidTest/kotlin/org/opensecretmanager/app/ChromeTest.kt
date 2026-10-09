@@ -23,6 +23,7 @@ import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.opensecretmanager.app.autofill.Requester
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemKind
@@ -35,6 +36,10 @@ import org.opensecretmanager.vault.ItemKind
  * send, which the script compares with what this test logs. Chrome must use
  * this app for autofill ("Autofill using another service"), which only its
  * own settings screen can choose. Skipped without the argument.
+ *
+ * With the argument `browser` naming another package, Chromium's for one,
+ * that browser is driven instead. It is not on the list of browsers the
+ * app trusts to say which page it shows, so this test trusts it.
  */
 @RunWith(AndroidJUnit4::class)
 class ChromeTest {
@@ -44,6 +49,7 @@ class ChromeTest {
     private val session = (context.applicationContext as VaultApp).session
     private val device = UiDevice.getInstance(instrumentation)
     private val site: String? = InstrumentationRegistry.getArguments().getString("chromeSite")
+    private val browser: String = InstrumentationRegistry.getArguments().getString("browser") ?: CHROME
     private var previousService: String? = null
 
     private fun shell(command: String): String =
@@ -59,6 +65,7 @@ class ChromeTest {
         previousService = shell("settings get secure autofill_service").trim()
             .takeIf { it.isNotEmpty() && it != "null" && !it.startsWith("${context.packageName}/") }
         shell("settings put secure autofill_service ${context.packageName}/.autofill.VaultAutofillService")
+        if (browser != CHROME) Requester.trustedForTests += browser
         session.reopenForTests { folder ->
             BiometricUnlock(context).disable()
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
@@ -80,6 +87,7 @@ class ChromeTest {
     @After
     fun putTheServiceBack() {
         if (site == null) return
+        Requester.trustedForTests.clear()
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")
     }
 
@@ -88,7 +96,7 @@ class ChromeTest {
 
     private fun mine(tag: String) = By.res(tag).pkg(context.packageName)
 
-    private fun inChrome(selector: BySelector) = selector.pkg(CHROME)
+    private fun inChrome(selector: BySelector) = selector.pkg(browser)
 
     /** The page's text fields, in order: not Chrome's address bar, which is one too. */
     private fun fields(): List<UiObject2> {
@@ -101,7 +109,7 @@ class ChromeTest {
     private fun open(path: String, text: String) {
         device.wakeUp()
         // A new address each time, so that Chrome loads the page afresh.
-        shell("am start -W -a android.intent.action.VIEW -d $site$path?at=${System.nanoTime()} $CHROME")
+        shell("am start -W -a android.intent.action.VIEW -d $site$path?at=${System.nanoTime()} $browser")
         find(inChrome(By.text(text).hasAncestor(By.clazz("android.webkit.WebView"))), 60_000)
     }
 
@@ -197,6 +205,28 @@ class ChromeTest {
         find(mine("fill:Test site"))
         find(mine("cancel")).click()
         assertLockedAgain()
+    }
+
+    @Test
+    fun aSignInOnTwoPagesIsSavedWithTheUsernameOfTheFirst() {
+        // The username on one page; the next asks for the password only,
+        // and the save takes the username from the page before.
+        open("/signin", "Email or username")
+        typeInto(fields()[0], "two-page-user")
+        press("Next")
+        find(inChrome(By.textContains("Signing in as two-page-user")), 60_000)
+        typeInto(fields()[0], "two-page-pass-1")
+        press("Sign in")
+        find(By.res("android", "autofill_save_yes"), 60_000)
+        Thread.sleep(2_000)
+        find(By.res("android", "autofill_save_yes")).click()
+        find(mine("password")).text = password
+        find(mine("unlock")).click()
+        assertEquals(Uri.parse(site).host, find(mine("save-title")).text)
+        assertEquals("two-page-user", find(mine("save-username")).text)
+        find(mine("save-new")).click()
+        assertLockedAgain()
+        Log.i("OSMChrome", "CHROME-TWO-PAGES-SAVED")
     }
 
     /**

@@ -53,12 +53,15 @@
         </service>
 
         <!-- Opened by the system over the app that asks; a task of its own,
-             so the vault's own screens stay where they were. -->
+             so the vault's own screens stay where they were. Its window is
+             marked translucent, so the app beneath is paused, not stopped
+             (see FillOver). -->
         <activity
             android:name=".autofill.FillActivity"
             android:excludeFromRecents="true"
             android:exported="false"
             android:taskAffinity=""
+            android:theme="@style/FillOver"
             android:windowSoftInputMode="adjustResize" />
         <activity
             android:name=".autofill.SaveActivity"

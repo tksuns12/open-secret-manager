@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The fill screen: the app's own look, opaque as before, in a window
+         marked translucent. The app that asked then stays visible beneath
+         it, paused rather than stopped, so its fields never go out of
+         sight. A stopped app's fields come back invisible for a frame, and
+         a fill response that saves once its fields are gone lets Android
+         end the session then, losing the login just chosen. -->
+    <style name="FillOver" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+    </style>
+</resources>

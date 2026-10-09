@@ -1,11 +1,12 @@
 """The test site for scripts/test-mobile-chrome.sh and test-mobile-safari.sh:
-a sign-in page and then a page that asks for a one-time code, over HTTPS on
-127.0.0.1:8443 only, with the certificate in the folder given; what each
-form sends is appended to server.log there.
+a sign-in page and then a page that asks for a one-time code, and a sign-in
+on two pages (/signin: the username, then the password on a page with no
+username field), over HTTPS on 127.0.0.1:8443 only, with the certificate in
+the folder given; what each form sends is appended to server.log there.
 
     python3 scripts/test-site.py <folder with site.crt and site.key>
 """
-import http.server, ssl, sys, urllib.parse, os
+import html, http.server, ssl, sys, urllib.parse, os
 
 here = sys.argv[1]
 log = open(os.path.join(here, "server.log"), "a", buffering=1)
@@ -27,6 +28,26 @@ CODE = b"""<!doctype html><html><head><meta name=viewport content="width=device-
 <p><button type=submit style="font-size:20px">Verify</button></p>
 </form></body></html>"""
 
+SIGNIN = b"""<!doctype html><html><head><meta name=viewport content="width=device-width">
+<title>Sign in</title></head><body style="font:18px sans-serif;margin:24px">
+<h1>Sign in</h1>
+<form method=post action=/signin>
+<p><label>Email or username<br><input name=username autocomplete=username style="font-size:20px;width:90%"></label></p>
+<p><button type=submit style="font-size:20px">Next</button></p>
+</form></body></html>"""
+
+def password_page(username):
+    """The second page: the account it is for as text, and a password field only."""
+    shown = html.escape(username, quote=True)
+    return f"""<!doctype html><html><head><meta name=viewport content="width=device-width">
+<title>Password</title></head><body style="font:18px sans-serif;margin:24px">
+<h1>Welcome</h1><p>Signing in as {shown}</p>
+<form method=post action=/signin/password>
+<input type=hidden name=username value="{shown}">
+<p><label>Password<br><input name=password type=password autocomplete=current-password style="font-size:20px;width:90%"></label></p>
+<p><button type=submit style="font-size:20px">Sign in</button></p>
+</form></body></html>""".encode()
+
 DONE = b"""<!doctype html><html><head><meta name=viewport content="width=device-width"><title>Signed in</title></head>
 <body style="font:18px sans-serif;margin:24px"><h1>Signed in</h1></body></html>"""
 
@@ -39,13 +60,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self.page(CODE if self.path.startswith("/code") else LOGIN)
+        if self.path.startswith("/signin"):
+            self.page(SIGNIN)
+        else:
+            self.page(CODE if self.path.startswith("/code") else LOGIN)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         form = urllib.parse.parse_qs(self.rfile.read(length).decode())
         value = lambda name: form.get(name, [""])[0]
-        if self.path.startswith("/login"):
+        if self.path.startswith("/signin/password"):
+            log.write(f"TWO-PAGE username={value('username')} password={value('password')}\n")
+            self.page(DONE)
+        elif self.path.startswith("/signin"):
+            self.page(password_page(value("username")))
+        elif self.path.startswith("/login"):
             log.write(f"LOGIN username={value('username')} password={value('password')}\n")
             self.page(CODE)
         else:

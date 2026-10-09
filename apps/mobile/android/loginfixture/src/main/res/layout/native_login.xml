@@ -30,4 +30,11 @@
         android:id="@+id/filled"
         android:layout_width="match_parent"
         android:layout_height="wrap_content" />
+    <!-- How many times this screen was stopped: a screen shown over it
+         that lets it be seen only pauses it. -->
+    <TextView
+        android:id="@+id/stopped"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="0" />
 </LinearLayout>

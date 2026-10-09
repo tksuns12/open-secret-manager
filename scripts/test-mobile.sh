@@ -13,7 +13,9 @@
 #          throughout, so that unlocking with a fingerprint is tested too.
 #          What the screen showed at a failed wait of the autofill tests,
 #          and the system's log of the run (with autofill's in full), are
-#          brought back into OSM_TEST_FAILURES/android, if set.
+#          brought back into OSM_TEST_FAILURES/android, if set. Google Play
+#          services' changes to the system's settings wait until the run
+#          ends, as each change to autofill's ends every autofill session.
 # join     the Android app joining a desktop-side device on this machine
 #          over the network (scripts/test-mobile-join.sh).
 # join-ios the same with the iOS app.
@@ -107,6 +109,12 @@ android)
     # session the system ends says why only there.
     log_level=$("$adb" shell cmd autofill get log_level 2>/dev/null | tr -d '\r')
     "$adb" shell cmd autofill set log_level verbose >/dev/null 2>&1 || true
+    # Google Play services changes the system's own settings for autofill
+    # when it likes, most often soon after the phone starts, and on each
+    # change Android ends every autofill session, one waiting on the fill
+    # screen included. Such changes wait until the tests end.
+    config_sync=$("$adb" shell device_config get_sync_disabled_for_tests 2>/dev/null | tr -d '\r')
+    "$adb" shell device_config set_sync_disabled_for_tests until_reboot >/dev/null 2>&1 || true
     since=$("$adb" shell "date '+%m-%d %H:%M:%S.000'" | tr -d '\r')
     # An emulator's fingerprint sensor, touched until the tests end.
     (while :; do "$adb" emu finger touch 1 >/dev/null 2>&1; sleep 2; done) &
@@ -116,6 +124,7 @@ android)
     kill "$toucher" 2>/dev/null || true
     wait "$toucher" 2>/dev/null || true
     "$adb" shell cmd autofill set log_level "${log_level:-off}" >/dev/null 2>&1 || true
+    "$adb" shell device_config set_sync_disabled_for_tests "${config_sync:-none}" >/dev/null 2>&1 || true
     if [ "$status" != 0 ] && [ -n "$("$adb" shell ls /data/local/tmp/osm-failures 2>/dev/null)" ]; then
         if [ -n "${OSM_TEST_FAILURES:-}" ]; then
             mkdir -p "$OSM_TEST_FAILURES/android"
