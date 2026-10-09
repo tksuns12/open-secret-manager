@@ -14,6 +14,9 @@
 # (osm-linux-app-target, osm-linux-app-cargo), so later runs build only
 # what changed. With OSM_TEST_FAILURES naming a folder, what the windows
 # showed when a wait ran out is brought back into its linux-app folder.
+# The run is given OSM_LINUX_TIME_LIMIT seconds (an hour if not set), after
+# which it fails and the container is removed: a test once waited for hours
+# on a driver that never answered.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -57,7 +60,10 @@ trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
 
 git archive --format=tar "$tree" | docker cp - "$container:/src"
 status=0
-docker start --attach "$container" || status=$?
+limit=${OSM_LINUX_TIME_LIMIT:-3600}
+perl -e 'alarm shift; exec @ARGV' "$limit" docker ${OSM_DOCKER_CONTEXT:+--context "$OSM_DOCKER_CONTEXT"} start --attach "$container" || status=$?
+# Stopped by the alarm.
+[ "$status" = 142 ] && echo "The run was stopped after $limit seconds." >&2
 if [ "$status" != 0 ] && [ -n "${OSM_TEST_FAILURES:-}" ]; then
     mkdir -p "$OSM_TEST_FAILURES/linux-app"
     docker cp "$container:/tmp/traces/." "$OSM_TEST_FAILURES/linux-app" 2>/dev/null \

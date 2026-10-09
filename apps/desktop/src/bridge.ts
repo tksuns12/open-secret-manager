@@ -34,9 +34,10 @@ export function previewHasDevices(): boolean {
 const previewDevices: DevicesInfo = {
   setup: "ready",
   thisDevice: "a1b2c3d4e5f60718",
+  // In the shell's order, by ID: this device is not first.
   members: [
-    { id: "a1b2c3d4e5f60718", thisDevice: true, leader: true, votes: true },
     { id: "9f8e7d6c5b4a3921", thisDevice: false, leader: false, votes: false, address: "192.168.1.23:47820" },
+    { id: "a1b2c3d4e5f60718", thisDevice: true, leader: true, votes: true },
   ],
   epoch: 1,
   quorum: 1,

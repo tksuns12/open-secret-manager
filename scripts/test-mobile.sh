@@ -16,6 +16,9 @@
 #          brought back into OSM_TEST_FAILURES/android, if set. Google Play
 #          services' changes to the system's settings wait until the run
 #          ends, as each change to autofill's ends every autofill session.
+#          The Android tests are given OSM_ANDROID_TIME_LIMIT seconds (an
+#          hour if not set), after which they are stopped and fail: an
+#          emulator that stopped answering once held a run for hours.
 # join     the Android app joining a desktop-side device on this machine
 #          over the network (scripts/test-mobile-join.sh).
 # join-ios the same with the iOS app.
@@ -117,10 +120,15 @@ android)
     "$adb" shell device_config set_sync_disabled_for_tests until_reboot >/dev/null 2>&1 || true
     since=$("$adb" shell "date '+%m-%d %H:%M:%S.000'" | tr -d '\r')
     # An emulator's fingerprint sensor, touched until the tests end.
-    (while :; do "$adb" emu finger touch 1 >/dev/null 2>&1; sleep 2; done) &
+    # Each touch gives up after 20 seconds, as the emulator's console can
+    # stop answering.
+    (while :; do perl -e 'alarm shift; exec @ARGV' 20 "$adb" emu finger touch 1 >/dev/null 2>&1; sleep 2; done) &
     toucher=$!
     status=0
-    (cd apps/mobile/android && ./gradlew --quiet :vault:connectedDebugAndroidTest :app:connectedDebugAndroidTest) || status=$?
+    limit=${OSM_ANDROID_TIME_LIMIT:-3600}
+    (cd apps/mobile/android && perl -e 'alarm shift; exec @ARGV' "$limit" ./gradlew --quiet :vault:connectedDebugAndroidTest :app:connectedDebugAndroidTest) || status=$?
+    # Stopped by the alarm.
+    [ "$status" = 142 ] && echo "The Android tests were stopped after $limit seconds: the emulator may have stopped answering." >&2
     kill "$toucher" 2>/dev/null || true
     wait "$toucher" 2>/dev/null || true
     "$adb" shell cmd autofill set log_level "${log_level:-off}" >/dev/null 2>&1 || true

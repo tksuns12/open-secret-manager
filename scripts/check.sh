@@ -40,16 +40,21 @@ for argument in "$@"; do
 done
 
 desktop=apps/desktop/src-tauri/Cargo.toml
+# The fuzz targets are formatted, linted, and audited here, not run: running
+# them needs a nightly toolchain (scripts/fuzz.sh).
+fuzz=fuzz/Cargo.toml
 step() { printf '\n== %s\n' "$*"; }
 
 step "Formatting"
 for script in scripts/*.sh; do sh -n "$script"; done
 cargo fmt --all -- --check
 cargo fmt --manifest-path "$desktop" --all -- --check
+cargo fmt --manifest-path "$fuzz" --all -- --check
 
 step "Lints, with warnings as errors"
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --manifest-path "$desktop" --workspace --all-targets --locked -- -D warnings
+cargo clippy --manifest-path "$fuzz" --all-targets --locked -- -D warnings
 
 step "Rust tests"
 cargo test --workspace --all-targets --locked
@@ -66,6 +71,7 @@ if [ "$network" = yes ]; then
     node scripts/dependencies.mjs
     cargo audit --deny warnings --file Cargo.lock
     cargo audit --deny warnings --file apps/desktop/src-tauri/Cargo.lock
+    cargo audit --deny warnings --file fuzz/Cargo.lock
     (cd apps/desktop && npm audit)
     (cd apps/browser-extension && npm audit)
 else

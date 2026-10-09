@@ -92,7 +92,7 @@ login, and nothing is written before the owner unlocks and chooses.
   the real app there end to end (pairing, backup and restore, archive, a
   conflict settled through its review). The desktop window's own tests
   (`apps/desktop/window/`) run in headless WebKit on its browser preview
-  every time.
+  every time, and the fuzz targets are linted and audited, not run.
 - Frozen formats: files every build reads, in each crate's `fixtures/`.
 - Property tests on every parser that takes outside input, and crash tests
   that kill a process writing to a vault (Phase 6a stop 2); coverage-guided

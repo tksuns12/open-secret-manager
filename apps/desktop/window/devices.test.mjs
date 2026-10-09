@@ -20,7 +20,7 @@ async function openDevices(page) {
   return panel;
 }
 
-test("the panel lists this device and marks the phone that does not vote", async () => {
+test("the panel lists this device first and marks the phone that does not vote", async () => {
   const { page, errors } = await window.open("?devices");
   const panel = await openDevices(page);
   const rows = panel.locator(".peer-row");

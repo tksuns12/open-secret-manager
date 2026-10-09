@@ -45,10 +45,10 @@ test("a device joins through an invitation once both show the same code, and its
 
   // Both list both devices once the join completes.
   await first.window.wait(async () => (await first.window.findElements(By.css(".peer-row"))).length === 2, PATIENCE_MS);
-  // Listed by device ID, this device is either row.
+  // This device first, though the shell lists them by device ID.
   const rows = await first.window.findElements(By.css(".peer-row"));
-  const texts = await Promise.all(rows.map((row) => row.getAttribute("textContent")));
-  assert.equal(texts.filter((text) => /This device/.test(text)).length, 1);
+  assert.match(await rows[0].getAttribute("textContent"), /This device/);
+  assert.doesNotMatch(await rows[1].getAttribute("textContent"), /This device/);
 
   // Removed, the second device puts its copy away and has no vault.
   await press(first.window, "Remove…");

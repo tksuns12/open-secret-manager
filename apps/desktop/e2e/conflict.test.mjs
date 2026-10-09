@@ -85,9 +85,9 @@ test("a login changed on two devices while apart is reviewed on one and settled 
   await press(first.window, "Codes match");
   await row(second.window, "Shared");
   await waitFor(first.window, "listed both devices", async () => (await first.window.findElements(By.css(".peer-row"))).length === 2);
-  // Listed by device ID, in either order: this device votes, the other does not.
+  // This device first: it votes, the other does not.
   const rows = await first.window.findElements(By.css(".peer-row"));
-  const [here, other] = (await Promise.all(rows.map((row) => row.getAttribute("textContent")))).sort((a, b) => /This device/.test(b) - /This device/.test(a));
+  const [here, other] = await Promise.all(rows.map((row) => row.getAttribute("textContent")));
   assert.match(here, /This device/);
   assert.doesNotMatch(here, /does not vote/);
   assert.match(other, /does not vote/);

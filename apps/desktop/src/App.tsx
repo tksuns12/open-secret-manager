@@ -761,11 +761,13 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
   }
 
   const others = devices.members.filter((member) => !member.thisDevice);
+  // This device first, then the others in the shell's order.
+  const members = [...devices.members.filter((member) => member.thisDevice), ...others];
   const pending = devices.pending;
   const replaced = sync.replaced.filter((id) => others.some((member) => member.id === id));
   return <div className="device-panel">
     {replaced.length > 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Device {shortDevice(replaced[0])} answers as a different device</strong><span>Something else now answers at its address, so this device refuses it and cannot sync with it. If you started over as a new vault on that device, this copy was left behind: put it away to join the new vault. If you did not, change nothing here.</span></div><button className="conflict-action" onClick={() => setLeaving(true)}>Put this copy away…</button></div>}
-    {devices.members.map((member) => <div key={member.id} className="peer-row">
+    {members.map((member) => <div key={member.id} className="peer-row">
       <div className="device-icon"><Fingerprint size={18} /></div>
       <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}{member.votes ? "" : " · does not vote"}</span></div>
       {!member.thisDevice && !pending && (removing === member.id
