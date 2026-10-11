@@ -124,9 +124,7 @@ The full list is the right-hand column of the delivery matrix in
 [implementation-status.md](implementation-status.md). In short: no outside
 review until this one; packages signed with a developer identity and
 notarized are waiting on that identity; coverage-guided fuzzing ran ten
-minutes per parser, once, not continuously; the extension's end-to-end
-tests no longer run on this Mac, where the browser may not start a program
-from the external disk the repository is on; the native lifecycle locks
+minutes per parser, once, not continuously; the native lifecycle locks
 were checked through the code and in a Linux container, never with a real
 sleep or screen lock; the backup screens and the system's file dialogs
 were driven in the real app only on Linux; the phone apps have run only on

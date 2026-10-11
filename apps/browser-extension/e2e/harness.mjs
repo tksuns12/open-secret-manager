@@ -9,10 +9,12 @@
 // vault. Only the owner is played, by commands to the stand-in.
 
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -173,6 +175,31 @@ async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask
   return browse({ home, accountHome: home, closers, fakeHost, hostProgram, registerHost, forged, app, items, vault });
 }
 
+/**
+ * Where the browser can start `program` from. On macOS a browser does not
+ * start a program kept on an external disk, which the repository may be on:
+ * the program is left hanging before it runs. So it is started from a copy
+ * in the account's caches folder, one per build of it, kept between runs so
+ * that macOS checks each build only once; older builds' copies are removed.
+ */
+function startable(program) {
+  if (process.platform !== "darwin") return program;
+  const name = path.basename(program);
+  const folder = path.join(os.homedir(), "Library/Caches/OpenSecretManager-tests", name);
+  const build = createHash("sha256").update(readFileSync(program)).digest("hex").slice(0, 16);
+  const copy = path.join(folder, build, name);
+  if (!existsSync(copy)) {
+    mkdirSync(path.dirname(copy), { recursive: true });
+    cpSync(program, `${copy}.partial`);
+    chmodSync(`${copy}.partial`, 0o755);
+    renameSync(`${copy}.partial`, copy);
+  }
+  for (const other of readdirSync(folder)) {
+    if (other !== build) rmSync(path.join(folder, other), { recursive: true, force: true });
+  }
+  return copy;
+}
+
 /** The pages, and a browser with the extension, for the account whose home folder is `accountHome`. */
 async function browse({ home, accountHome, closers, fakeHost, hostProgram, registerHost, forged, app, items, vault }) {
   // The pages: one server for https under every name, one for plain http.
@@ -189,7 +216,7 @@ async function browse({ home, accountHome, closers, fakeHost, hostProgram, regis
   // written for each run: macOS holds the first start of a file it has not
   // seen until it has checked it, which can take many seconds.
   // `hostProgram` names the real host somewhere else: inside a packaged app.
-  const host = fakeHost ? path.join(here, "fake-host.mjs") : hostProgram ?? built("osm-native-host");
+  const host = hostProgram ?? startable(fakeHost ? path.join(here, "fake-host.mjs") : built("osm-native-host"));
   const setup = { home, accountHome, closers, host, registerHost, forged, securePort, plainPort };
   const driver = BROWSER === "firefox" ? await firefoxWith(setup) : await chromiumWith(setup);
   let pressed = null;
