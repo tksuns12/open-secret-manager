@@ -127,7 +127,7 @@ The full list is the right-hand column of the delivery matrix in
 review until this one; packages signed with a developer identity and
 notarized are waiting on that identity; coverage-guided fuzzing runs on
 request, minutes per parser, not continuously; the native lifecycle locks
-were checked through the code and in a Linux container, never with a real
-sleep or screen lock; the backup screens and the system's file dialogs
+were tried for real on macOS only for a screen lock and a sleep (Phase 14),
+on Linux only in a container; the backup screens and the system's file dialogs
 were driven in the real app only on Linux; the phone apps have run only on
 an emulator and in a simulator, and are not signed for distribution; the iOS app's keystore for the TLS key is written but not yet built or run.
