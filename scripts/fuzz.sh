@@ -9,10 +9,13 @@
 #   scripts/fuzz.sh [seconds per target] [target ...]
 #
 # Each target runs for the time given (60 seconds if none), one after the
-# other, starting from inputs made from the frozen fixtures and from what
-# earlier runs found, kept in fuzz/corpus/<target> (not committed). An
-# input that breaks a target is left in fuzz/artifacts/<target>, and the
-# script stops there with libFuzzer's status. Not part of scripts/check.sh.
+# other, starting from inputs made from the frozen fixtures (written to
+# fuzz/seeds, not committed) and from what earlier runs found, which is
+# kept in the repository in fuzz/corpus/<target>. What a run finds is
+# added there, and the corpus is then cut down to the fewest inputs that
+# reach everything it reached, so that a run can be committed as it ends.
+# An input that breaks a target is left in fuzz/artifacts/<target>, and the
+# script stops there. scripts/check.sh --fuzz runs it.
 set -eu
 cd "$(dirname "$0")/.."
 seconds=${1:-60}
@@ -21,7 +24,7 @@ targets=${*:-origin recovery_key invitation peer_messages browser_messages impor
 
 python3 - <<'EOF'
 import json, os
-here = "fuzz/corpus"
+here = "fuzz/seeds"
 def seed(target, name, data):
     os.makedirs(f"{here}/{target}", exist_ok=True)
     with open(f"{here}/{target}/seed-{name}", "wb") as out:
@@ -53,13 +56,33 @@ seed("import", "firefox", b"\x02url,username,password,httpRealm,formActionOrigin
      b"https://bank.example,a,p,,https://bank.example,{x},1,2,3\n")
 EOF
 
+# libFuzzer starts itself again to cut a corpus down, by a command line it
+# does not quote, so that is done here with paths relative to the
+# repository, which has a space in its path on the machine this was
+# written on (cargo fuzz cmin fails there, and leaves the corpus empty).
+host=$(rustc +nightly -vV | sed -n 's/^host: //p')
+sysroot=$(rustc +nightly --print sysroot)
+export DYLD_FALLBACK_LIBRARY_PATH="$sysroot/lib/rustlib/$host/lib"
+
 for target in $targets; do
     echo "== $target, $seconds seconds"
-    cargo +nightly fuzz run "$target" "fuzz/corpus/$target" --fuzz-dir fuzz -- \
+    mkdir -p "fuzz/corpus/$target"
+    before=$(ls "fuzz/corpus/$target" | wc -l)
+    cargo +nightly fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" --fuzz-dir fuzz -- \
         -max_total_time="$seconds" -print_final_stats=1 2>&1 \
         | grep -E "^#[0-9]+[[:space:]]+(INITED|DONE)|^stat::number_of_executed_units|^stat::peak_rss|^==[0-9]+== ERROR|panicked|SUMMARY|Test unit written|^Done" || true
     if ls "fuzz/artifacts/$target"/* >/dev/null 2>&1; then
         echo "$target broke on what is in fuzz/artifacts/$target" >&2
         exit 1
     fi
+    rm -rf "fuzz/corpus/.$target"
+    mkdir "fuzz/corpus/.$target"
+    "./fuzz/target/$host/release/$target" -merge=1 "fuzz/corpus/.$target" "fuzz/corpus/$target" \
+        >"fuzz/target/merge-$target.log" 2>&1 || {
+        echo "cutting down the corpus of $target failed: see fuzz/target/merge-$target.log" >&2
+        exit 1
+    }
+    rm -rf "fuzz/corpus/$target"
+    mv "fuzz/corpus/.$target" "fuzz/corpus/$target"
+    echo "corpus: $before inputs before, $(ls "fuzz/corpus/$target" | wc -l) after"
 done

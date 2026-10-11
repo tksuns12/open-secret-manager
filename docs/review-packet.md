@@ -92,11 +92,13 @@ login, and nothing is written before the owner unlocks and chooses.
   the real app there end to end (pairing, backup and restore, archive, a
   conflict settled through its review). The desktop window's own tests
   (`apps/desktop/window/`) run in headless WebKit on its browser preview
-  every time, and the fuzz targets are linted and audited, not run.
+  every time, and the fuzz targets are linted and audited; with `--fuzz`
+  they also run, five minutes each by default.
 - Frozen formats: files every build reads, in each crate's `fixtures/`.
 - Property tests on every parser that takes outside input, and crash tests
   that kill a process writing to a vault (Phase 6a stop 2); coverage-guided
-  fuzzing of six of those parsers, `scripts/fuzz.sh` (Phase 13).
+  fuzzing of six of those parsers, `scripts/fuzz.sh` (Phase 13), with the
+  inputs it has found kept in `fuzz/corpus/` (Phase 14).
 - The release scripts and the reproducibility check: see
   [release.md](release.md).
 
@@ -123,8 +125,8 @@ login, and nothing is written before the owner unlocks and chooses.
 The full list is the right-hand column of the delivery matrix in
 [implementation-status.md](implementation-status.md). In short: no outside
 review until this one; packages signed with a developer identity and
-notarized are waiting on that identity; coverage-guided fuzzing ran ten
-minutes per parser, once, not continuously; the native lifecycle locks
+notarized are waiting on that identity; coverage-guided fuzzing runs on
+request, minutes per parser, not continuously; the native lifecycle locks
 were checked through the code and in a Linux container, never with a real
 sleep or screen lock; the backup screens and the system's file dialogs
 were driven in the real app only on Linux; the phone apps have run only on

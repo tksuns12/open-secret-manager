@@ -22,6 +22,12 @@
 #                                 colima machine to start for it and stop
 #                                 again, which leaves the Docker context as
 #                                 it was
+#   scripts/check.sh --fuzz       also coverage fuzzing of the parsers
+#                                 (scripts/fuzz.sh, on a nightly
+#                                 toolchain), OSM_FUZZ_SECONDS per target
+#                                 (300 if unset: half an hour in all); what
+#                                 it finds is added to fuzz/corpus, to be
+#                                 committed
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -29,19 +35,21 @@ network=no
 browsers=no
 mobile=no
 linux=no
+fuzz_run=no
 for argument in "$@"; do
     case "$argument" in
         --network) network=yes ;;
         --browsers) browsers=yes ;;
         --mobile) mobile=yes ;;
         --linux) linux=yes ;;
+        --fuzz) fuzz_run=yes ;;
         *) echo "unknown option: $argument" >&2; exit 2 ;;
     esac
 done
 
 desktop=apps/desktop/src-tauri/Cargo.toml
-# The fuzz targets are formatted, linted, and audited here, not run: running
-# them needs a nightly toolchain (scripts/fuzz.sh).
+# The fuzz targets are formatted, linted, and audited here, and run only
+# with --fuzz: running them needs a nightly toolchain (scripts/fuzz.sh).
 fuzz=fuzz/Cargo.toml
 step() { printf '\n== %s\n' "$*"; }
 
@@ -83,6 +91,11 @@ if [ "$browsers" = yes ]; then
     step "Extension in headless browsers"
     cargo build --locked -p osm-native-host -p osm-vault-browser
     (cd apps/browser-extension && npm run test:e2e && npm run test:e2e:firefox)
+fi
+
+if [ "$fuzz_run" = yes ]; then
+    step "Coverage fuzzing, ${OSM_FUZZ_SECONDS:-300} seconds per target"
+    scripts/fuzz.sh "${OSM_FUZZ_SECONDS:-300}"
 fi
 
 # Before the phones: a colima machine started here is stopped again first,
