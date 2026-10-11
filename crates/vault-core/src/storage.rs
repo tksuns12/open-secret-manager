@@ -3368,12 +3368,13 @@ fn row_to_revision_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<En
 }
 
 fn split_parents(joined: &str) -> Option<Vec<String>> {
-    let chunks = joined.as_bytes().chunks_exact(64);
-    if !chunks.remainder().is_empty() || !joined.is_ascii() {
+    let (chunks, rest) = joined.as_bytes().as_chunks::<64>();
+    if !rest.is_empty() || !joined.is_ascii() {
         return None;
     }
     Some(
         chunks
+            .iter()
             .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
             .collect(),
     )

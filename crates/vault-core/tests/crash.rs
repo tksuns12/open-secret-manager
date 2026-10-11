@@ -58,9 +58,12 @@ fn worker() {
     let say = |line: String| println!("ACK {line}");
     match work.as_str() {
         "create" => {
-            for n in seed.. {
+            // Until killed.
+            let mut n = seed;
+            loop {
                 Vault::create(folder.join(format!("{n}.sqlite3")), PASSWORDS[0]).unwrap();
                 say(format!("CREATED {n}"));
+                n += 1;
             }
         }
         "write" => write_until_killed(&folder, seed, say),
