@@ -29,5 +29,7 @@ func describe(_ error: Error) -> String {
     case .NotEditableHere: return "Identities and cards are edited on your computer"
     case let .Network(reason): return "Could not reach your other devices · \(reason)"
     case let .Storage(reason): return "Something went wrong on this phone · \(reason)"
+    case .KeystoreUnavailable: return "This phone's keychain did not answer · try again"
+    case .KeystoreLost: return "This phone no longer holds its network key · remove it on your computer and join again"
     }
 }

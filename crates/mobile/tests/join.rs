@@ -16,8 +16,8 @@ use osm_mobile::{Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncStat
 use osm_vault_core::{Item, ItemKind as CoreKind, Vault};
 use osm_vault_membership::{device_id_from_bytes, ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
-    control, invite, serve_members, start_node, AddressBook, MemberEndpoint, PairingListener,
-    PeerStore, Voting,
+    control, invite, serve_members, start_node, AddressBook, Keystore, MemberEndpoint,
+    MemoryKeystore, NoKeystore, PairingListener, PeerStore, Voting,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -58,7 +58,7 @@ impl Desktop {
     async fn found(dir: &Path) -> Arc<Self> {
         let (vault, _) = Vault::create(dir.join("desktop.sqlite3"), DESKTOP_PASSWORD).unwrap();
         let peers_path = dir.join("desktop-peers.sqlite3");
-        let mut peers = PeerStore::open(&peers_path).unwrap();
+        let mut peers = PeerStore::open(&peers_path, Arc::new(NoKeystore)).unwrap();
         let endpoint = MemberEndpoint::new(
             vault.vault_id(),
             &mut peers,
@@ -344,7 +344,17 @@ fn joined_phone(
     desktop: &Arc<Desktop>,
     folder: PathBuf,
 ) -> Device {
-    let phone = Device::open_listening_on(folder, 0).unwrap();
+    joined_phone_with(desktop_runtime, desktop, folder, Arc::new(NoKeystore))
+}
+
+/// As [`joined_phone`], with `keystore` sealing the phone's network key.
+fn joined_phone_with(
+    desktop_runtime: &tokio::runtime::Runtime,
+    desktop: &Arc<Desktop>,
+    folder: PathBuf,
+    keystore: Arc<dyn Keystore>,
+) -> Device {
+    let phone = Device::open_with_keystore(folder, 0, keystore).unwrap();
     let (code, codes, answer) = desktop_runtime.block_on(desktop.invite());
     let shown = phone.join_start(code).unwrap();
     assert_eq!(codes.recv_timeout(Duration::from_secs(30)).unwrap(), shown);
@@ -525,7 +535,12 @@ fn a_locked_phone_away_from_the_screen_syncs_both_ways_and_stays_locked() {
                 .any(|item| item.title == title)
         })
     };
-    let phone = joined_phone(&desktop_runtime, &desktop, dir.path().join("phone"));
+    // The phone's network key is sealed by its keystore, which opens it
+    // without the vault's password.
+    let keystore = Arc::new(MemoryKeystore::default());
+    let folder = dir.path().join("phone");
+    let phone = joined_phone_with(&desktop_runtime, &desktop, folder.clone(), keystore.clone());
+    assert_eq!(keystore.len(), 1);
 
     // Written on the phone while it could reach nobody, then the app left
     // the screen: locked and offline. The desktop writes meanwhile.
@@ -566,4 +581,24 @@ fn a_locked_phone_away_from_the_screen_syncs_both_ways_and_stays_locked() {
     phone.sync_in_background().unwrap();
     assert_ne!(phone.sync_status().state, SyncState::Offline);
     phone.go_offline();
+
+    // Started afresh and never unlocked, as when the system wakes the app
+    // only to sync, the phone opens its sealed key and syncs.
+    drop(phone);
+    desktop_runtime.block_on(desktop.put(login("Written while the phone slept", "p")));
+    let phone = Device::open_with_keystore(folder.clone(), 0, keystore.clone()).unwrap();
+    assert_eq!(phone.state(), DeviceState::Locked);
+    let status = phone.sync_in_background().unwrap();
+    assert!(status.pending > 0, "{status:?}");
+    drop(phone);
+
+    // A keystore that lost the key, as after the files were restored onto
+    // another phone: the phone says so, and makes no new identity.
+    keystore.lose_everything();
+    let phone = Device::open_with_keystore(folder, 0, keystore.clone()).unwrap();
+    assert!(matches!(
+        phone.sync_in_background(),
+        Err(MobileError::KeystoreLost)
+    ));
+    assert!(keystore.is_empty());
 }

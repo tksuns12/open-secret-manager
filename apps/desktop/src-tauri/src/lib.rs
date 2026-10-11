@@ -16,6 +16,7 @@ mod history;
 mod import;
 #[cfg(test)]
 mod import_tests;
+mod keystore;
 mod network;
 #[cfg(test)]
 mod network_tests;
@@ -782,7 +783,8 @@ pub fn run() {
     let context = tauri::generate_context!();
     let path = default_vault_path();
     network::finish_interrupted_recovery(&path);
-    let network = match network::Network::open(&path) {
+    let network = match network::Network::open(&path, std::sync::Arc::new(keystore::SystemKeystore))
+    {
         Ok(network) => network,
         Err(problem) => return run_refused(context, &path, problem.message),
     };

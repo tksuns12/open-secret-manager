@@ -23,7 +23,8 @@ pub(crate) const PASSWORD: &str = "device password";
 
 pub(crate) fn shell(dir: &Path) -> App<MockRuntime> {
     let path = dir.join("vault.sqlite3");
-    let network = network::Network::open(&path).unwrap();
+    let network =
+        network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
     mock_builder()
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
@@ -357,8 +358,16 @@ fn a_pair_from_an_older_build_moves_onto_the_control_plane() {
     vault_b.put(Item::new("Unsynced on B")).unwrap();
     let b_device = vault_b.device_id().unwrap();
     {
-        let mut peers_a = PeerStore::open(dir_a.path().join("peers.sqlite3")).unwrap();
-        let mut peers_b = PeerStore::open(dir_b.path().join("peers.sqlite3")).unwrap();
+        let mut peers_a = PeerStore::open(
+            dir_a.path().join("peers.sqlite3"),
+            std::sync::Arc::new(osm_vault_peer::NoKeystore),
+        )
+        .unwrap();
+        let mut peers_b = PeerStore::open(
+            dir_b.path().join("peers.sqlite3"),
+            std::sync::Arc::new(osm_vault_peer::NoKeystore),
+        )
+        .unwrap();
         let pin_a = peers_a.transport_identity().unwrap().pin();
         let pin_b = peers_b.transport_identity().unwrap().pin();
         peers_a
@@ -1072,11 +1081,15 @@ fn a_device_store_of_a_later_version_is_refused_by_name_and_left_as_it_is() {
     for store in ["peers.sqlite3", "invitations.sqlite3"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.sqlite3");
-        drop(network::Network::open(&path).unwrap());
+        drop(
+            network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap(),
+        );
         mark_later(&dir.path().join(store));
         let before = std::fs::read(dir.path().join(store)).unwrap();
 
-        let Err(refused) = network::Network::open(&path) else {
+        let Err(refused) =
+            network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore))
+        else {
             panic!("{store} of a later version was opened");
         };
         assert_eq!(refused.code, "later_version");
@@ -1243,7 +1256,13 @@ fn putting_a_copy_away_is_finished_at_launch_if_it_was_interrupted() {
     let old_vault = vault.vault_id();
     drop(vault);
     std::fs::write(dir.path().join("control.sqlite3"), b"old control").unwrap();
-    drop(PeerStore::open(dir.path().join("peers.sqlite3")).unwrap());
+    drop(
+        PeerStore::open(
+            dir.path().join("peers.sqlite3"),
+            std::sync::Arc::new(osm_vault_peer::NoKeystore),
+        )
+        .unwrap(),
+    );
     let old_peers = std::fs::read(dir.path().join("peers.sqlite3")).unwrap();
 
     // The app stopped after moving the vault file and before the rest.

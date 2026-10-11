@@ -28,11 +28,19 @@ func fails<T>(_ call: () throws -> T, with expected: (MobileError) -> Bool) -> B
     }
 }
 
+/// No keystore: this program has no entitlement to the app group's
+/// Keychain items, so a network key would be kept unsealed. The app's own
+/// keystore (Shared/KeychainKeystore.swift) is used through the app.
+final class NoKeystore: PhoneKeystore {
+    func seal(key: Data) throws -> Data { throw KeystoreFailure.Unavailable }
+    func open(sealed: Data) throws -> Data { throw KeystoreFailure.Unavailable }
+}
+
 let folder = CommandLine.arguments[1]
 let password = "fixture password, not a secret"
 
 do {
-    let device = try Device.open(folder: folder)
+    let device = try Device.open(folder: folder, keystore: NoKeystore())
     check(device.state() == .locked, "a vault opens locked")
     check(fails({ try device.items() }) { if case .Locked = $0 { true } else { false } }, "nothing is listed while locked")
     check(fails({ try device.unlock(password: "not the password") }) { if case .InvalidCredentials = $0 { true } else { false } }, "a wrong password is refused")

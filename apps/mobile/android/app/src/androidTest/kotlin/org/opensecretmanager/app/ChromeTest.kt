@@ -24,6 +24,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.opensecretmanager.app.autofill.Requester
+import org.opensecretmanager.vault.AndroidKeystore
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemKind
@@ -71,7 +72,7 @@ class ChromeTest {
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
                 File(folder, "vault.sqlite3").outputStream().use { output -> input.copyTo(output) }
             }
-            Device.open(folder.path).use { vault ->
+            Device.open(folder.path, AndroidKeystore).use { vault ->
                 vault.unlock(password)
                 vault.createItem(
                     ItemDraft(

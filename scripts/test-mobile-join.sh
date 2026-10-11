@@ -31,7 +31,9 @@ work=$(mktemp -d)
 peer=target/debug/osm-peer
 export OSM_PASSWORD="desktop password"
 desktop=""
+# Keeps the status the script ends with: a failure stays one.
 cleanup() {
+    status=$?
     if [ "$platform" != ios ]; then
         "$adb" reverse --remove-all >/dev/null 2>&1 || true
         "$adb" forward --remove tcp:47820 >/dev/null 2>&1 || true
@@ -44,6 +46,7 @@ cleanup() {
         wait "$desktop" 2>/dev/null || true
     fi
     rm -rf "$work"
+    exit "$status"
 }
 trap cleanup EXIT
 
@@ -94,7 +97,9 @@ wait_text() {
     exit 1
 }
 tap_text() {
-    set -- $(wait_text "$1")
+    # `wait_text` exits only the command substitution it runs in.
+    found=$(wait_text "$1") || exit 1
+    set -- $found
     "$adb" shell input tap "$1" "$2"
 }
 hide_keyboard() {
@@ -162,7 +167,8 @@ if [ "$platform" = android-release ]; then
     wait_text "^$invitation\$" 20 >/dev/null
     tap_text '^Continue$'
     desktop_code=$(expect SAS)
-    phone_code=$(wait_text '^[0-9]{3} [0-9]{3}$' | cut -d' ' -f3-)
+    found=$(wait_text '^[0-9]{3} [0-9]{3}$') || exit 1
+    phone_code=$(printf '%s\n' "$found" | cut -d' ' -f3-)
     echo "desktop shows $desktop_code, phone shows $phone_code"
     if [ "$phone_code" = "$desktop_code" ]; then echo y >&3; else echo n >&3; fi
     tap_text '^New password for this phone$'

@@ -28,6 +28,7 @@ import org.junit.runner.RunWith
 import org.opensecretmanager.app.autofill.Form
 import org.opensecretmanager.app.autofill.PendingSave
 import org.opensecretmanager.app.autofill.Requester
+import org.opensecretmanager.vault.AndroidKeystore
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemKind
@@ -414,7 +415,7 @@ class AutofillTest {
         assertEquals("two step user", find(mine("save-username")).text)
         find(mine("save-new")).click()
         assertLockedAgain()
-        Device.open(context.filesDir.resolve(VaultApp.DEVICE_FOLDER).path).use { vault ->
+        Device.open(context.filesDir.resolve(VaultApp.DEVICE_FOLDER).path, AndroidKeystore).use { vault ->
             vault.unlock(password)
             assertTrue(vault.items().any { it.title == "Login fixture" && it.username == "two step user" })
         }
@@ -528,7 +529,7 @@ class AutofillTest {
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
                 File(folder, "vault.sqlite3").outputStream().use { output -> input.copyTo(output) }
             }
-            Device.open(folder.path).use { other ->
+            Device.open(folder.path, AndroidKeystore).use { other ->
                 other.unlock(password)
                 other.createItem(
                     ItemDraft(

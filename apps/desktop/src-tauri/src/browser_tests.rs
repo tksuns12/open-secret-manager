@@ -41,7 +41,8 @@ fn folder() -> tempfile::TempDir {
 
 fn shell(dir: &Path, home: &Path, host: Option<PathBuf>) -> App<MockRuntime> {
     let path = dir.join("vault.sqlite3");
-    let network = network::Network::open(&path).unwrap();
+    let network =
+        network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
     mock_builder()
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),

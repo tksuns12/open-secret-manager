@@ -36,7 +36,7 @@ final class FillRequestTests: XCTestCase {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
         try FileManager.default.copyItem(at: URL(fileURLWithPath: frozenVault), to: folder.appendingPathComponent("vault.sqlite3"))
-        let device = try Device.open(folder: folder.path)
+        let device = try Device.open(folder: folder.path, keystore: KeychainKeystore.shared)
         try device.unlock(password: fixturePassword)
 
         func offered(_ requester: FillRequester) throws -> [String] {

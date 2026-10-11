@@ -129,7 +129,11 @@ fn store_problem(file: &str, error: osm_vault_peer::Error) -> MobileError {
 }
 
 impl Runtime {
-    pub(crate) async fn open(directory: PathBuf, port: u16) -> Result<Self, MobileError> {
+    pub(crate) async fn open(
+        directory: PathBuf,
+        port: u16,
+        keystore: Arc<dyn osm_vault_peer::Keystore>,
+    ) -> Result<Self, MobileError> {
         std::fs::create_dir_all(&directory)?;
         let vault_path = directory.join(VAULT_FILE);
         let vault = if vault_path.symlink_metadata().is_ok() {
@@ -147,8 +151,8 @@ impl Runtime {
             None
         };
         let peers_path = directory.join(PEERS_FILE);
-        let peers =
-            PeerStore::open(&peers_path).map_err(|error| store_problem(PEERS_FILE, error))?;
+        let peers = PeerStore::open(&peers_path, keystore)
+            .map_err(|error| store_problem(PEERS_FILE, error))?;
         let addresses =
             AddressBook::open(&peers_path).map_err(|error| store_problem(PEERS_FILE, error))?;
         let removed = directory.join(REMOVED_MARKER).exists();

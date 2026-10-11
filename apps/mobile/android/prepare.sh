@@ -54,6 +54,8 @@ for module in vault app; do
     cp crates/vault-core/fixtures/format-7/vault.sqlite3 \
         "$android/$module/src/androidTest/assets/format-7-vault.sqlite3"
 done
+# A peer store from before Phase 14, with its network key unsealed.
+cp crates/vault-peer/fixtures/peers.sqlite3 "$android/vault/src/androidTest/assets/peers-1.sqlite3"
 take_out "$android/app/src/androidTest/assets/sealed-taken-out-vault.sqlite3"
 # A vault with a card and an identity, which no frozen vault holds and a
 # phone cannot make, for the screens that show an item's other fields.

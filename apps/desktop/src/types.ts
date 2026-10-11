@@ -209,6 +209,8 @@ export type DevicesInfo = {
   resetArchive?: string;
   /** Why: `removed` by the vault's devices, or `left` at the owner's request on this device. */
   resetReason?: "removed" | "left";
+  /** How this device's network key is kept: `sealed` by the system's keystore, or `in_file` where none sealed it. */
+  networkKey?: "sealed" | "in_file";
 };
 
 /** What starting over as a new vault produced. */

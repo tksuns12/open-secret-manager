@@ -1,0 +1,4 @@
+{
+  "about": "What a reader should find in peers-2.sqlite3 beside this file: the second layout, with the TLS key kept in the file because no keystore sealed it. Its TLS key identifies no real device.",
+  "transport_pin": "d34d068ca1ab376fcbecc1175d5d2b72a5fcf55bedf48d3a50bbd2fba57b9019"
+}

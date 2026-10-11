@@ -20,6 +20,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.opensecretmanager.vault.DeletedEntry
+import org.opensecretmanager.vault.AndroidKeystore
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.DeviceState
 import org.opensecretmanager.vault.FillCredentials
@@ -86,7 +87,7 @@ class VaultSession(private val context: Context, private val folder: File) {
     }
 
     private fun openDevice() = run(null) {
-        device = Device.open(folder.path)
+        device = Device.open(folder.path, AndroidKeystore)
         refresh()
     }
 
@@ -502,6 +503,8 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.NotEditableHere -> "Identities and cards are edited on your computer"
         is MobileException.Network -> "Could not reach your other devices · ${error.reason}"
         is MobileException.Storage -> "Something went wrong on this phone · ${error.reason}"
+        is MobileException.KeystoreUnavailable -> "This phone's keystore did not answer · try again"
+        is MobileException.KeystoreLost -> "This phone no longer holds its network key · remove it on your computer and join again"
     }
 }
 

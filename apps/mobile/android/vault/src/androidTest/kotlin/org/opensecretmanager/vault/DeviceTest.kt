@@ -41,7 +41,7 @@ class DeviceTest {
     @Test
     fun theFrozenVaultReadsThroughTheBindings() {
         val folder = copyOfTheFrozenVault()
-        val device = Device.open(folder.path)
+        val device = Device.open(folder.path, AndroidKeystore)
         try {
             assertEquals(DeviceState.LOCKED, device.state())
             fails<MobileException.Locked> { device.items() }
@@ -118,6 +118,61 @@ class DeviceTest {
             fails<MobileException.Locked> { device.password("fixture-bank") }
         } finally {
             device.close()
+            folder.deleteRecursively()
+        }
+    }
+
+    private inline fun <reified E : KeystoreFailure> keystoreFails(call: () -> Unit) {
+        try {
+            call()
+        } catch (error: KeystoreFailure) {
+            assertTrue("expected ${E::class.simpleName}, got $error", error is E)
+            return
+        }
+        fail("expected ${E::class.simpleName}, but the call succeeded")
+    }
+
+    @Test
+    fun theAndroidKeystoreSealsAKeyAndOpensOnlyWhatItSealed() {
+        val key = "a key that identifies no device".toByteArray()
+        val before = AndroidKeystore.count()
+        val sealed = AndroidKeystore.seal(key)
+        assertEquals(before + 1, AndroidKeystore.count())
+        assertTrue(sealed.toList().windowed(key.size).none { it == key.toList() })
+        assertTrue(AndroidKeystore.open(sealed).contentEquals(key))
+
+        val altered = sealed.copyOf().also { it[it.size - 1] = (it[it.size - 1] + 1).toByte() }
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(altered) }
+        val renamed = sealed.copyOf().also { it[1] = (it[1] + 1).toByte() }
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(renamed) }
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(byteArrayOf(1, 2, 3)) }
+
+        AndroidKeystore.forgetEverything()
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(sealed) }
+    }
+
+    @Test
+    fun aNetworkKeyAnEarlierBuildKeptUnsealedIsSealedByTheAndroidKeystore() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val folder = copyOfTheFrozenVault()
+        val peers = File(folder, "peers.sqlite3")
+        instrumentation.context.assets.open("peers-1.sqlite3").use { input ->
+            peers.outputStream().use { output -> input.copyTo(output) }
+        }
+        val before = peers.readBytes()
+        try {
+            AndroidKeystore.forgetEverything()
+            // Opening the device seals the key it found unsealed; that the
+            // key is then gone from the file is checked in the shared code
+            // (crates/vault-peer, the frozen peer stores).
+            Device.open(folder.path, AndroidKeystore).close()
+            assertEquals(1, AndroidKeystore.count())
+            assertTrue(!before.contentEquals(peers.readBytes()))
+            // Opened again, the sealed key is opened, not sealed again.
+            Device.open(folder.path, AndroidKeystore).close()
+            assertEquals(1, AndroidKeystore.count())
+        } finally {
+            AndroidKeystore.forgetEverything()
             folder.deleteRecursively()
         }
     }

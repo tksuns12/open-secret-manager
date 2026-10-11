@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::{Error, Result};
+use crate::{Error, Keystore, NoKeystore, Result};
 
 /// A device paired before the vault had a control plane, when the owner's
 /// confirmation alone authorized one peer. Kept only so that such a pair
@@ -23,6 +24,7 @@ pub struct Peer {
 /// This device's TLS identity: a self-signed Ed25519 certificate. It is
 /// separate from the revision signing key and is available while the vault
 /// is locked, so a locked device can still receive ciphertext.
+#[derive(Clone)]
 pub struct TransportIdentity {
     pub(crate) certificate: Vec<u8>,
     pub(crate) private_key: Zeroizing<Vec<u8>>,
@@ -48,39 +50,69 @@ pub(crate) fn pin_of(certificate: &[u8]) -> [u8; 32] {
 }
 
 /// The layout of the peer store file, which the address book shares.
-pub(crate) const STORE_VERSION: u32 = 1;
+/// Version 2 (Phase 14) keeps the TLS key sealed by the system's keystore,
+/// in `transport_key`; a build that knows only version 1 would not find it
+/// and would make the device another TLS identity, so it refuses the file.
+pub(crate) const STORE_VERSION: u32 = 2;
+
+/// How this device's TLS key is kept in the peer store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKept {
+    /// Sealed by the system's keystore.
+    Sealed,
+    /// Unsealed, in the file only, which only this account can read: the
+    /// system has no keystore, or it did not answer when the key was last
+    /// to be sealed. It is sealed the next time the store is opened with a
+    /// keystore that answers.
+    InFile,
+}
 
 /// This device's transport identity. A store written before the vault had a
 /// control plane may also name the one device it was paired with.
 ///
-/// The file holds the TLS private key unencrypted, because it must be usable
-/// while the vault is locked; it is created with owner-only permissions.
+/// The TLS key has to be usable while the vault is locked, so it is not
+/// encrypted under the vault's keys. It is sealed by the system's keystore
+/// ([`Keystore`]) where there is one; where there is none it is kept as it
+/// is, as before Phase 14. The file is created with owner-only permissions.
 /// Revision authenticity never depends on it.
 pub struct PeerStore {
     connection: Connection,
+    keystore: Arc<dyn Keystore>,
+    /// The identity once it has been read, so that the keystore is asked
+    /// once per opening of the store.
+    identity: Option<TransportIdentity>,
 }
 
 impl PeerStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Opens the store at `path`. A TLS key kept unsealed, by an earlier
+    /// build or because no keystore answered, is sealed now if `keystore`
+    /// does; that the keystore did not is not an error.
+    pub fn open(path: impl AsRef<Path>, keystore: Arc<dyn Keystore>) -> Result<Self> {
         let path = path.as_ref();
         let connection = Connection::open(path)?;
         restrict_permissions(path)?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, keystore)
     }
 
+    /// A store in memory, with no keystore.
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, Arc::new(NoKeystore))
     }
 
-    fn from_connection(connection: Connection) -> Result<Self> {
+    fn from_connection(connection: Connection, keystore: Arc<dyn Keystore>) -> Result<Self> {
         osm_vault_sync::claim_store_version(&connection, STORE_VERSION)?;
+        // Pages a key was on are overwritten when they are freed, so that
+        // sealing a key leaves no copy of it in the file.
         connection.execute_batch(
-            "PRAGMA journal_mode = DELETE;
+            "PRAGMA secure_delete = ON;
+             PRAGMA journal_mode = DELETE;
              PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS transport_identity (
+             CREATE TABLE IF NOT EXISTS transport_key (
                  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                  certificate BLOB NOT NULL,
-                 private_key BLOB NOT NULL
+                 private_key BLOB,
+                 sealed_key BLOB,
+                 CHECK((private_key IS NULL) <> (sealed_key IS NULL))
              ) STRICT;
              CREATE TABLE IF NOT EXISTS peers (
                  device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
@@ -90,37 +122,142 @@ impl PeerStore {
                  paired_at INTEGER NOT NULL
              ) STRICT;",
         )?;
-        Ok(Self { connection })
+        let mut store = Self {
+            connection,
+            keystore,
+            identity: None,
+        };
+        store.move_version_1_key()?;
+        store.seal_kept_key()?;
+        Ok(store)
     }
 
-    /// Returns this device's TLS identity, creating it on first use.
+    /// Moves the key a version 1 store kept into `transport_key`, unsealed
+    /// for now. This goes by what is in the file, not by its version
+    /// number, which the address book may have raised first.
+    fn move_version_1_key(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                           WHERE type = 'table' AND name = 'transport_identity')",
+            [],
+            |row| row.get(0),
+        )?;
+        if old {
+            transaction.execute(
+                "INSERT OR IGNORE INTO transport_key(singleton, certificate, private_key)
+                 SELECT singleton, certificate, private_key FROM transport_identity",
+                [],
+            )?;
+            transaction.execute("DROP TABLE transport_identity", [])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Seals a key kept unsealed, if the keystore does it now. The sealed
+    /// key replaces the unsealed one only once the keystore has opened it
+    /// again to the same key.
+    fn seal_kept_key(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let kept = transaction
+            .query_row(
+                "SELECT private_key FROM transport_key
+                 WHERE singleton = 1 AND private_key IS NOT NULL",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(Zeroizing::new);
+        if let Some(key) = kept {
+            if let Some(sealed) = seal_checked(self.keystore.as_ref(), &key) {
+                transaction.execute(
+                    "UPDATE transport_key SET sealed_key = ?1, private_key = NULL
+                     WHERE singleton = 1",
+                    params![sealed],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// How this device's TLS key is kept, or `None` before it has one.
+    pub fn key_kept(&self) -> Result<Option<KeyKept>> {
+        let sealed = self
+            .connection
+            .query_row(
+                "SELECT sealed_key IS NOT NULL FROM transport_key WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        Ok(sealed.map(|sealed| {
+            if sealed {
+                KeyKept::Sealed
+            } else {
+                KeyKept::InFile
+            }
+        }))
+    }
+
+    /// Returns this device's TLS identity, creating it on first use. A
+    /// sealed key is opened by the keystore; when the keystore cannot open
+    /// it this fails with [`Error::Keystore`], and nothing is replaced.
     pub fn transport_identity(&mut self) -> Result<TransportIdentity> {
+        if let Some(identity) = &self.identity {
+            return Ok(identity.clone());
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored = transaction
             .query_row(
-                "SELECT certificate, private_key FROM transport_identity WHERE singleton = 1",
+                "SELECT certificate, private_key, sealed_key FROM transport_key
+                 WHERE singleton = 1",
                 [],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
             )
             .optional()?;
         let identity = match stored {
-            Some((certificate, private_key)) => TransportIdentity {
+            Some((certificate, Some(private_key), _)) => TransportIdentity {
                 certificate,
                 private_key: Zeroizing::new(private_key),
             },
+            Some((certificate, None, Some(sealed))) => TransportIdentity {
+                certificate,
+                private_key: self.keystore.open(&sealed).map_err(Error::Keystore)?,
+            },
+            Some((_, None, None)) => return Err(Error::MalformedFrame),
             None => {
                 let identity = generate_identity()?;
-                transaction.execute(
-                    "INSERT INTO transport_identity(singleton, certificate, private_key)
-                     VALUES (1, ?1, ?2)",
-                    params![identity.certificate, identity.private_key.as_slice()],
-                )?;
+                match seal_checked(self.keystore.as_ref(), &identity.private_key) {
+                    Some(sealed) => transaction.execute(
+                        "INSERT INTO transport_key(singleton, certificate, sealed_key)
+                         VALUES (1, ?1, ?2)",
+                        params![identity.certificate, sealed],
+                    )?,
+                    None => transaction.execute(
+                        "INSERT INTO transport_key(singleton, certificate, private_key)
+                         VALUES (1, ?1, ?2)",
+                        params![identity.certificate, identity.private_key.as_slice()],
+                    )?,
+                };
                 identity
             }
         };
         transaction.commit()?;
+        self.identity = Some(identity.clone());
         Ok(identity)
     }
 
@@ -187,6 +324,15 @@ impl PeerStore {
     }
 }
 
+/// What `keystore` sealed `key` into, once it has opened that again to the
+/// same key; `None` when it did not, for whatever reason, so that the key
+/// stays kept unsealed rather than sealed into something that will not open.
+fn seal_checked(keystore: &dyn Keystore, key: &[u8]) -> Option<Vec<u8>> {
+    let sealed = keystore.seal(key).ok()?;
+    let opened = keystore.open(&sealed).ok()?;
+    (opened.as_slice() == key).then_some(sealed)
+}
+
 fn generate_identity() -> Result<TransportIdentity> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
         .map_err(|_| Error::Transport("could not generate a TLS key"))?;
@@ -211,4 +357,128 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::{KeystoreError, MemoryKeystore};
+
+    fn store(keystore: Arc<dyn Keystore>) -> (tempfile::TempDir, std::path::PathBuf, PeerStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.sqlite3");
+        let peers = PeerStore::open(&path, keystore).unwrap();
+        (dir, path, peers)
+    }
+
+    /// The part of the key that is secret: an Ed25519 PKCS#8 key holds its
+    /// 32-byte seed after a 16-byte prefix (and may end with the public
+    /// key, which the certificate also holds).
+    pub(crate) fn secret(identity: &TransportIdentity) -> Vec<u8> {
+        identity.private_key[16..48].to_vec()
+    }
+
+    fn in_file(path: &Path, secret: &[u8]) -> bool {
+        std::fs::read(path)
+            .unwrap()
+            .windows(secret.len())
+            .any(|window| window == secret)
+    }
+
+    #[test]
+    fn a_new_key_is_sealed_and_never_written_unsealed() {
+        let keystore = Arc::new(MemoryKeystore::default());
+        let (_dir, path, mut peers) = store(keystore.clone());
+        assert_eq!(peers.key_kept().unwrap(), None);
+        let identity = peers.transport_identity().unwrap();
+        assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::Sealed));
+        drop(peers);
+        assert!(!in_file(&path, &secret(&identity)));
+        let mut again = PeerStore::open(&path, keystore).unwrap();
+        assert_eq!(again.transport_identity().unwrap().pin(), identity.pin());
+    }
+
+    #[test]
+    fn a_key_made_while_the_keystore_did_not_answer_is_sealed_when_it_does() {
+        let keystore = Arc::new(MemoryKeystore::default());
+        keystore.set_unavailable(true);
+        let (_dir, path, mut peers) = store(keystore.clone());
+        let identity = peers.transport_identity().unwrap();
+        assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::InFile));
+        drop(peers);
+        assert!(in_file(&path, &secret(&identity)));
+
+        // Still not answering: the store opens, and the key is read as it is.
+        let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
+        assert_eq!(peers.transport_identity().unwrap().pin(), identity.pin());
+        drop(peers);
+
+        keystore.set_unavailable(false);
+        let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
+        assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::Sealed));
+        assert_eq!(peers.transport_identity().unwrap().pin(), identity.pin());
+        drop(peers);
+        assert!(!in_file(&path, &secret(&identity)));
+    }
+
+    #[test]
+    fn a_sealed_key_the_keystore_cannot_open_is_an_error_and_nothing_replaces_it() {
+        let keystore = Arc::new(MemoryKeystore::default());
+        let (_dir, path, mut peers) = store(keystore.clone());
+        let pin = peers.transport_identity().unwrap().pin();
+        drop(peers);
+
+        keystore.set_unavailable(true);
+        let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
+        assert!(matches!(
+            peers.transport_identity(),
+            Err(Error::Keystore(KeystoreError::Unavailable))
+        ));
+        drop(peers);
+        keystore.set_unavailable(false);
+        let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
+        assert_eq!(peers.transport_identity().unwrap().pin(), pin);
+        drop(peers);
+
+        // Lost for good: still an error each time, and not a new identity.
+        keystore.lose_everything();
+        for _ in 0..2 {
+            let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
+            assert!(matches!(
+                peers.transport_identity(),
+                Err(Error::Keystore(KeystoreError::Lost))
+            ));
+            assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::Sealed));
+        }
+        // Where there is no keystore at all, it is not opened either.
+        let mut peers = PeerStore::open(&path, Arc::new(NoKeystore)).unwrap();
+        assert!(matches!(
+            peers.transport_identity(),
+            Err(Error::Keystore(KeystoreError::Absent))
+        ));
+    }
+
+    /// Seals into something it then opens to another key.
+    struct Garbling;
+
+    impl Keystore for Garbling {
+        fn seal(&self, _key: &[u8]) -> std::result::Result<Vec<u8>, KeystoreError> {
+            Ok(vec![1])
+        }
+
+        fn open(&self, _sealed: &[u8]) -> std::result::Result<Zeroizing<Vec<u8>>, KeystoreError> {
+            Ok(Zeroizing::new(vec![2; 48]))
+        }
+    }
+
+    #[test]
+    fn a_key_is_not_sealed_into_something_that_does_not_open_to_it() {
+        let (_dir, path, mut peers) = store(Arc::new(Garbling));
+        let identity = peers.transport_identity().unwrap();
+        assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::InFile));
+        drop(peers);
+        let mut peers = PeerStore::open(&path, Arc::new(Garbling)).unwrap();
+        assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::InFile));
+        assert_eq!(peers.transport_identity().unwrap().pin(), identity.pin());
+    }
 }

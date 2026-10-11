@@ -86,6 +86,14 @@ pub enum MobileError {
     Network { reason: String },
     #[error("{reason}")]
     Storage { reason: String },
+    /// The phone's keystore did not open this device's network key now.
+    #[error("this phone's keystore did not answer")]
+    KeystoreUnavailable,
+    /// The phone's keystore no longer holds the key this device's network
+    /// key was sealed with, as after these files were restored onto
+    /// another phone: the device has to be removed and joined again.
+    #[error("this phone no longer holds this device's network key")]
+    KeystoreLost,
 }
 
 impl From<osm_vault_core::Error> for MobileError {
@@ -113,6 +121,8 @@ impl From<osm_vault_peer::Error> for MobileError {
             Error::Removed => Self::Removed,
             Error::NotConfirmed => Self::NotConfirmed,
             Error::Vault(error) => error.into(),
+            Error::Keystore(osm_vault_peer::KeystoreError::Lost) => Self::KeystoreLost,
+            Error::Keystore(_) => Self::KeystoreUnavailable,
             error => Self::Network {
                 reason: error.to_string(),
             },
@@ -124,6 +134,61 @@ impl From<std::io::Error> for MobileError {
     fn from(error: std::io::Error) -> Self {
         Self::Storage {
             reason: error.to_string(),
+        }
+    }
+}
+
+/// The phone's keystore, which seals this device's network (TLS) key so
+/// that its files alone do not give it away: the Android Keystore, the iOS
+/// Keychain. The app gives its own to [`Device::open`].
+#[uniffi::export(with_foreign)]
+pub trait PhoneKeystore: Send + Sync {
+    /// Seals `key`; what comes back is given to [`PhoneKeystore::open`].
+    fn seal(&self, key: Vec<u8>) -> Result<Vec<u8>, KeystoreFailure>;
+    /// Opens what [`PhoneKeystore::seal`] returned.
+    fn open(&self, sealed: Vec<u8>) -> Result<Vec<u8>, KeystoreFailure>;
+}
+
+/// Why the phone's keystore did not seal or open a key.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum KeystoreFailure {
+    /// Not now: locked, refused, or not answering.
+    #[error("the keystore did not answer")]
+    Unavailable,
+    /// The key it was sealed with is not there.
+    #[error("the keystore does not hold that key")]
+    Lost,
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for KeystoreFailure {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Unavailable
+    }
+}
+
+/// The phone's keystore as the peer store asks for one.
+struct ForeignKeystore(Arc<dyn PhoneKeystore>);
+
+impl osm_vault_peer::Keystore for ForeignKeystore {
+    fn seal(&self, key: &[u8]) -> Result<Vec<u8>, osm_vault_peer::KeystoreError> {
+        self.0
+            .seal(key.to_vec())
+            .map_err(KeystoreFailure::into_peer)
+    }
+
+    fn open(&self, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, osm_vault_peer::KeystoreError> {
+        self.0
+            .open(sealed.to_vec())
+            .map(Zeroizing::new)
+            .map_err(KeystoreFailure::into_peer)
+    }
+}
+
+impl KeystoreFailure {
+    fn into_peer(self) -> osm_vault_peer::KeystoreError {
+        match self {
+            Self::Unavailable => osm_vault_peer::KeystoreError::Unavailable,
+            Self::Lost => osm_vault_peer::KeystoreError::Lost,
         }
     }
 }
@@ -439,9 +504,18 @@ pub const SYNC_PORT: u16 = 47_820;
 impl Device {
     /// Opens the device whose files are in `folder`, making the folder if
     /// it is new. A vault file there that cannot be opened is reported.
+    /// `keystore` seals this device's network key.
     #[uniffi::constructor]
-    pub fn open(folder: String) -> Result<Arc<Self>, MobileError> {
-        Self::open_listening_on(PathBuf::from(folder), SYNC_PORT).map(Arc::new)
+    pub fn open(
+        folder: String,
+        keystore: Arc<dyn PhoneKeystore>,
+    ) -> Result<Arc<Self>, MobileError> {
+        Self::open_with_keystore(
+            PathBuf::from(folder),
+            SYNC_PORT,
+            Arc::new(ForeignKeystore(keystore)),
+        )
+        .map(Arc::new)
     }
 
     pub fn state(&self) -> DeviceState {
@@ -670,14 +744,25 @@ impl Device {
 }
 
 impl Device {
-    /// As [`Device::open`], accepting members on `port` if it is free, and
-    /// on any port otherwise (0 for any).
+    /// As [`Device::open`] with no keystore, so that the network key is
+    /// kept unsealed, accepting members on `port` if it is free, and on any
+    /// port otherwise (0 for any).
     pub fn open_listening_on(folder: PathBuf, port: u16) -> Result<Self, MobileError> {
+        Self::open_with_keystore(folder, port, Arc::new(osm_vault_peer::NoKeystore))
+    }
+
+    /// As [`Device::open_listening_on`], with `keystore` sealing the
+    /// network key.
+    pub fn open_with_keystore(
+        folder: PathBuf,
+        port: u16,
+        keystore: Arc<dyn osm_vault_peer::Keystore>,
+    ) -> Result<Self, MobileError> {
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()?;
-        let inner = tokio.block_on(Runtime::open(folder, port))?;
+        let inner = tokio.block_on(Runtime::open(folder, port, keystore))?;
         Ok(Self {
             tokio,
             inner: Arc::new(inner),

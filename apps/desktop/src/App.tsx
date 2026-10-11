@@ -766,6 +766,7 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
   const pending = devices.pending;
   const replaced = sync.replaced.filter((id) => others.some((member) => member.id === id));
   return <div className="device-panel">
+    {devices.networkKey === "in_file" && <p className="review-hint">No keystore on this computer sealed this device's network key, so it is kept in a file only your account can read. It is sealed the next time the app starts with a keystore that answers.</p>}
     {replaced.length > 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Device {shortDevice(replaced[0])} answers as a different device</strong><span>Something else now answers at its address, so this device refuses it and cannot sync with it. If you started over as a new vault on that device, this copy was left behind: put it away to join the new vault. If you did not, change nothing here.</span></div><button className="conflict-action" onClick={() => setLeaving(true)}>Put this copy away…</button></div>}
     {members.map((member) => <div key={member.id} className="peer-row">
       <div className="device-icon"><Fingerprint size={18} /></div>

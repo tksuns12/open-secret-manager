@@ -3,7 +3,9 @@
 # the session crate hears from logind (a stand-in on a bus of the test's
 # own) and what it puts on the clipboard, as another program reads it on a
 # virtual display, and then as a Wayland program reads it under a headless
-# Sway (which offers the data-control protocol, as wlroots and KDE do).
+# Sway (which offers the data-control protocol, as wlroots and KDE do); and
+# the keystore that seals the device's TLS key, with no Secret Service and
+# with GNOME Keyring's on a session bus of the test's own.
 #
 #   scripts/test-linux.sh
 #
@@ -34,7 +36,7 @@ docker build --platform "$platform" -t osm-linux-build packaging/linux
 docker build --platform "$platform" -t osm-linux-test - <<'EOF'
 FROM osm-linux-build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends dbus xvfb xclip sway wl-clipboard \
+ && apt-get install -y --no-install-recommends dbus xvfb xclip sway wl-clipboard gnome-keyring \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m tester
 EOF
@@ -57,7 +59,10 @@ container=$(docker create --platform "$platform" osm-linux-test sh -c '
         sleep 0.5
     done
     env -u DISPLAY XDG_RUNTIME_DIR=/tmp/wayland WAYLAND_DISPLAY=wayland-1 OSM_TEST_WAYLAND=1 \
-        cargo test --locked -p osm-desktop-session --test wayland')
+        cargo test --locked -p osm-desktop-session --test wayland
+    env -u DBUS_SESSION_BUS_ADDRESS cargo test --locked --lib keystore::tests::without -- --ignored
+    dbus-run-session -- sh -c "printf unlock | gnome-keyring-daemon --unlock --components=secrets >/dev/null \
+        && cargo test --locked --lib keystore::tests::the_system -- --ignored"')
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
 
 git archive --format=tar "$tree" | docker cp - "$container:/src"

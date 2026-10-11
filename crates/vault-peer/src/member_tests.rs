@@ -686,7 +686,7 @@ fn the_address_book_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("peers.db");
     // The peer store and the address book share one file.
-    let mut peers = PeerStore::open(&path).unwrap();
+    let mut peers = PeerStore::open(&path, std::sync::Arc::new(crate::NoKeystore)).unwrap();
     let pin = peers.transport_identity().unwrap().pin();
     let book = AddressBook::open(&path).unwrap();
     book.observe(1, "192.0.2.1:47820");
@@ -702,7 +702,7 @@ fn the_address_book_survives_a_restart() {
     assert_eq!(book.get(3), None);
     assert_eq!(book.get(4), None);
     assert_eq!(
-        PeerStore::open(&path)
+        PeerStore::open(&path, std::sync::Arc::new(crate::NoKeystore))
             .unwrap()
             .transport_identity()
             .unwrap()

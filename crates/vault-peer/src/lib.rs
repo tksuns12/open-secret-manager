@@ -15,6 +15,7 @@
 
 pub mod control;
 mod error;
+mod keystore;
 mod members;
 mod pairing;
 mod peers;
@@ -24,6 +25,7 @@ pub mod wire;
 
 pub use control::Voting;
 pub use error::{Error, Result};
+pub use keystore::{Keystore, KeystoreError, MemoryKeystore, NoKeystore};
 pub use members::{
     serve_members, start_node, AddressBook, ControlConnection, ControlLink, Incoming,
     MemberContact, MemberEndpoint, MemberSync, MAX_CONTACTS, MEMBER_PROTOCOL_VERSION,
@@ -32,7 +34,7 @@ pub use pairing::{
     approve_enrollment, invite, review_join, EnrollmentGrant, Invitation, JoinRequest, JoinReview,
     Joiner, MAX_INVITATION_TTL_SECS,
 };
-pub use peers::{Peer, PeerStore, TransportIdentity};
+pub use peers::{KeyKept, Peer, PeerStore, TransportIdentity};
 pub use session::{SyncMessage, SyncReport, SyncSession, PROTOCOL_VERSION};
 pub use transport::{
     start_pairing, start_pairing_with_vault, ApprovedEnrollment, IncomingJoin, PairingConnection,

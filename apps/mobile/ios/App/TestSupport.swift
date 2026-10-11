@@ -31,7 +31,7 @@ enum TestSupport {
         guard let asked = ProcessInfo.processInfo.environment["OSM_TEST_CHANGE_WHILE_EDITING"] else { return }
         let parts = asked.split(separator: "|", maxSplits: 2).map(String.init)
         guard parts.count == 3, parts[0] == id, let folder = try? DeviceFolder.url() else { return }
-        guard let other = try? Device.open(folder: folder.path), (try? other.unlock(password: parts[2])) != nil,
+        guard let other = try? Device.open(folder: folder.path, keystore: KeychainKeystore.shared), (try? other.unlock(password: parts[2])) != nil,
               let item = try? other.item(id: id) else { return }
         try? other.updateItem(id: id, revision: item.revision, draft: ItemDraft(
             title: item.title, kind: item.kind, username: item.username, url: item.url,

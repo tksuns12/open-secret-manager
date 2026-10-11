@@ -62,6 +62,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("transport: {0}")]
     Transport(&'static str),
+    #[error("{0}")]
+    Keystore(crate::KeystoreError),
 }
 
 impl From<osm_vault_membership::Error> for Error {

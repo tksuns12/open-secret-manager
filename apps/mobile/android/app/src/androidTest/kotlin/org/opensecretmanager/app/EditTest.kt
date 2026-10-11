@@ -22,6 +22,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.opensecretmanager.vault.AndroidKeystore
 import org.opensecretmanager.vault.Device
 
 /**
@@ -158,7 +159,7 @@ class EditTest {
 
         // Meanwhile another device changes the item's notes: here through a
         // second device object on the same folder, as a sync would.
-        Device.open(folder.path).use { other ->
+        Device.open(folder.path, AndroidKeystore).use { other ->
             other.unlock(password)
             val bank = other.item("fixture-bank")
             other.updateItem(

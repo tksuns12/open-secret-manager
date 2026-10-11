@@ -106,7 +106,8 @@ async fn run(args: &[String]) -> CliResult {
             } else {
                 Vault::open(vault)?
             };
-            let mut peers = PeerStore::open(peers)?;
+            let mut peers =
+                PeerStore::open(peers, std::sync::Arc::new(osm_vault_peer::NoKeystore))?;
             let device = device_id_from_bytes(vault.device_id().ok_or("the vault has no device")?);
             let (endpoint, node) = start_control(
                 vault.vault_id(),
@@ -124,7 +125,8 @@ async fn run(args: &[String]) -> CliResult {
         }
         ["join-device", code, vault, peers, control, listen] => {
             let mut lines = stdin_lines();
-            let mut peers = PeerStore::open(peers)?;
+            let mut peers =
+                PeerStore::open(peers, std::sync::Arc::new(osm_vault_peer::NoKeystore))?;
             let connection = start_pairing(Invitation::decode(code)?, &mut peers, now()).await?;
             println!("SAS {}", connection.sas());
             // The node runs from the start so that the leader can bring it

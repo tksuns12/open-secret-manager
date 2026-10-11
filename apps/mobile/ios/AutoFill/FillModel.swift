@@ -86,7 +86,7 @@ final class FillModel: ObservableObject {
         do {
             let folder = try DeviceFolder.url()
             let opened = try await withCheckedThrowingContinuation { continuation in
-                queue.async { continuation.resume(with: Result { try Device.open(folder: folder.path) }) }
+                queue.async { continuation.resume(with: Result { try Device.open(folder: folder.path, keystore: KeychainKeystore.shared) }) }
             }
             guard !closed else { return }
             device = opened

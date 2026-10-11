@@ -48,7 +48,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.sqlite3");
         Vault::create(&path, "device password").unwrap();
-        let network = network::Network::open(&path).unwrap();
+        let network =
+            network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
         let app = mock_builder()
             .manage(AppState {
                 vault: Mutex::new(Vault::open(&path).ok()),

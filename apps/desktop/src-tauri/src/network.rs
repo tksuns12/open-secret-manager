@@ -33,9 +33,9 @@ use osm_vault_membership::{
     Rejection,
 };
 use osm_vault_peer::{
-    control, invite, serve_members, start_node, AddressBook, Invitation, MemberEndpoint,
-    MemberSync, PairingConnection, PairingListener, PeerStore, PendingJoin, PreparedJoin, Voting,
-    MAX_INVITATION_TTL_SECS,
+    control, invite, serve_members, start_node, AddressBook, Invitation, KeyKept, Keystore,
+    MemberEndpoint, MemberSync, PairingConnection, PairingListener, PeerStore, PendingJoin,
+    PreparedJoin, Voting, MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use serde::Serialize;
@@ -108,6 +108,8 @@ impl Control {
 
 pub struct Network {
     directory: PathBuf,
+    /// What seals this device's TLS key in its peer store.
+    keystore: Arc<dyn Keystore>,
     peers: Mutex<PeerStore>,
     invitations: Mutex<InvitationStore>,
     addresses: StdMutex<AddressBook>,
@@ -138,12 +140,13 @@ struct JoinState {
 impl Network {
     /// Opens this device's peer and invitation stores beside the vault. A
     /// store a later version wrote is refused, untouched, by name.
-    pub fn open(vault_path: &Path) -> Result<Self, CommandError> {
+    /// `keystore` seals this device's TLS key.
+    pub fn open(vault_path: &Path, keystore: Arc<dyn Keystore>) -> Result<Self, CommandError> {
         let directory = vault_path.parent().unwrap_or(Path::new(".")).to_owned();
         std::fs::create_dir_all(&directory).map_err(storage_error)?;
         let peers_path = directory.join("peers.sqlite3");
-        let peers =
-            PeerStore::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
+        let peers = PeerStore::open(&peers_path, keystore.clone())
+            .map_err(|error| store_error("peers.sqlite3", error))?;
         let addresses =
             AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
         // One-use invitation tokens are recorded durably so a restart
@@ -156,6 +159,7 @@ impl Network {
         let removed = directory.join(REMOVED_MARKER).exists();
         Ok(Self {
             directory,
+            keystore,
             peers: Mutex::new(peers),
             invitations: Mutex::new(invitations),
             addresses: StdMutex::new(addresses),
@@ -413,7 +417,8 @@ fn with_stores_closed<T>(
         .map_err(|error| network_error(error.into()))?;
     let result = step();
     let peers_path = net.directory.join("peers.sqlite3");
-    *peers = PeerStore::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
+    *peers = PeerStore::open(&peers_path, net.keystore.clone())
+        .map_err(|error| store_error("peers.sqlite3", error))?;
     *net.addresses
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -1061,6 +1066,9 @@ pub struct DevicesInfo {
     /// Why it was put away: `removed` by the vault's devices, or `left` at
     /// the owner's request on this device.
     pub(crate) reset_reason: Option<&'static str>,
+    /// How this device's network (TLS) key is kept: `sealed` by the
+    /// system's keystore, or `in_file` where no keystore sealed it.
+    pub(crate) network_key: Option<&'static str>,
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -1096,6 +1104,11 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
     let has_vault = this_device.is_some();
     let joining = net.join.lock().await.is_some();
     let note = if has_vault { None } else { net.reset_note() };
+    let network_key = match net.peers.lock().await.key_kept() {
+        Ok(Some(KeyKept::Sealed)) => Some("sealed"),
+        Ok(Some(KeyKept::InFile)) => Some("in_file"),
+        Ok(None) | Err(_) => None,
+    };
     let empty = |setup| DevicesInfo {
         setup,
         this_device: this_device.map(|device| hex(&device)),
@@ -1105,6 +1118,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         quorum: 0,
         reset_reason: note.as_ref().map(|(reason, _)| reason.name()),
         reset_archive: note.as_ref().map(|(_, archive)| archive.clone()),
+        network_key,
     };
     if has_vault && net.is_removed() {
         return Ok(empty("removed"));
@@ -1155,6 +1169,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         epoch: state.epoch,
         reset_archive: None,
         reset_reason: None,
+        network_key,
     })
 }
 
@@ -2114,6 +2129,8 @@ fn network_error(error: osm_vault_peer::Error) -> CommandError {
         },
         Error::Rejected(Rejection::ChangeInProgress) => "change_in_progress",
         Error::Rejected(_) => "rejected",
+        Error::Keystore(osm_vault_peer::KeystoreError::Lost) => "keystore_lost",
+        Error::Keystore(_) => "keystore_unavailable",
         _ => "network",
     };
     CommandError {
