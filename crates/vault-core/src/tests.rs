@@ -358,6 +358,68 @@ fn each_version_says_when_it_was_saved_and_one_from_a_build_that_did_not_says_no
 }
 
 #[test]
+fn a_backup_noted_on_one_device_is_learned_by_the_others_and_is_no_item() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, _, _) = two_copies(dir.path());
+    assert_eq!(a.last_backup().unwrap(), None);
+
+    // A notes a backup; B learns of it when the note reaches it.
+    let start = now();
+    a.export_backup(dir.path().join("from-a.osmbak")).unwrap();
+    let noted = a.note_backup().unwrap();
+    let (at, by) = a.last_backup().unwrap().unwrap();
+    assert!((start..=now()).contains(&at));
+    assert_eq!(Some(by), a.device_id());
+    b.apply_encrypted_revision(wire(&a, &noted.revision))
+        .unwrap();
+    assert_eq!(b.last_backup().unwrap(), Some((at, by)));
+
+    // B's later backup is the latest on both.
+    let from_b = b.note_backup().unwrap();
+    a.apply_encrypted_revision(wire(&b, &from_b.revision))
+        .unwrap();
+    let latest = (b.last_backup().unwrap().unwrap().0, b.device_id().unwrap());
+    assert_eq!(b.last_backup().unwrap(), Some(latest));
+    assert_eq!(a.last_backup().unwrap(), Some(latest));
+
+    // Two noted at once, each on its own device, are both kept, and the
+    // next note follows both.
+    let on_a = a.note_backup().unwrap();
+    let on_b = b.note_backup().unwrap();
+    a.apply_encrypted_revision(wire(&b, &on_b.revision))
+        .unwrap();
+    b.apply_encrypted_revision(wire(&a, &on_a.revision))
+        .unwrap();
+    assert_eq!(head_set(&a, crate::BACKUPS_ID).len(), 2);
+    a.note_backup().unwrap();
+    assert_eq!(head_set(&a, crate::BACKUPS_ID).len(), 1);
+
+    // It is no item: not listed, not deleted, not counted in a backup, and
+    // no item takes its ID, here or from another device.
+    assert!(a
+        .list()
+        .unwrap()
+        .iter()
+        .all(|item| item.id != crate::BACKUPS_ID));
+    assert!(a
+        .deleted_items()
+        .unwrap()
+        .iter()
+        .all(|item| item.item_id != crate::BACKUPS_ID));
+    let path = dir.path().join("check.osmbak");
+    a.export_backup(&path).unwrap();
+    assert_eq!(
+        a.check_backup(&path).unwrap().items,
+        a.list().unwrap().len()
+    );
+    let mut taken = login("Taken");
+    taken.id = crate::BACKUPS_ID.into();
+    assert!(matches!(a.put(taken.clone()), Err(Error::InvalidItem(_))));
+    let forged = b.seal_for_test(&taken, Vec::new(), false).unwrap();
+    assert!(a.apply_encrypted_revision(forged).is_err());
+}
+
+#[test]
 fn concurrent_connections_cannot_overwrite_one_head() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.db");

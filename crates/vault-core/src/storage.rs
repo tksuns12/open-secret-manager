@@ -95,6 +95,14 @@ const RECORD_FORMAT_VERSION: u32 = 2;
 const BACKUP_FORMAT_VERSION: u32 = 4;
 /// Upper bound on heads one revision may supersede.
 const MAX_PARENTS: usize = 16;
+
+/// The item ID under which a vault notes the backups its devices save
+/// (since Phase 15): one deletion for each backup, which says when it was
+/// saved, so that every device of the vault learns of it by syncing. No
+/// item may take it, and it is never listed. Builds before Phase 15 list
+/// neither it nor a deletion with nothing before it, and do not read a
+/// deletion's content.
+pub const BACKUPS_ID: &str = "osm-backups";
 /// Upper bound on held revisions awaiting owner review.
 const MAX_QUARANTINE: i64 = 10_000;
 /// Bounds on received revisions awaiting processing.
@@ -1457,10 +1465,10 @@ impl Vault {
         self.key()?;
         let mut statement = self.connection.prepare(
             "SELECT h.item_id FROM heads h JOIN revisions r ON r.revision=h.revision \
-             GROUP BY h.item_id HAVING MIN(h.tombstone)=1 ORDER BY MAX(r.rowid) DESC",
+             WHERE h.item_id!=? GROUP BY h.item_id HAVING MIN(h.tombstone)=1 ORDER BY MAX(r.rowid) DESC",
         )?;
         let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([BACKUPS_ID], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         let mut deleted = Vec::with_capacity(ids.len());
@@ -1539,14 +1547,52 @@ impl Vault {
 
     pub fn list(&self) -> Result<Vec<ItemSummary>> {
         self.key()?;
-        let mut statement = self
-            .connection
-            .prepare("SELECT DISTINCT item_id FROM heads WHERE tombstone=0 ORDER BY item_id")?;
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT item_id FROM heads WHERE tombstone=0 AND item_id!=? ORDER BY item_id",
+        )?;
         let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([BACKUPS_ID], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         ids.iter().map(|id| self.get(id).map(Into::into)).collect()
+    }
+
+    /// Notes in the vault that this device saved a backup now, for its other
+    /// devices to learn when they sync (see [`BACKUPS_ID`]).
+    pub fn note_backup(&mut self) -> Result<RevisionInfo> {
+        let mut heads = head_ids(&self.connection, BACKUPS_ID)?;
+        heads.truncate(MAX_PARENTS);
+        let kind = if heads.is_empty() {
+            LocalWrite::Create
+        } else {
+            LocalWrite::Resolve
+        };
+        let mut record = Item::new("backups");
+        record.id = BACKUPS_ID.to_owned();
+        self.write_item(record, heads, true, kind)
+    }
+
+    /// When a device of this vault last saved a backup, by that device's
+    /// clock, and which device: the latest the vault has noted.
+    pub fn last_backup(&self) -> Result<Option<(u64, [u8; DEVICE_ID_LEN])>> {
+        self.key()?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {REVISION_COLUMNS} FROM revisions r WHERE r.item_id=? AND r.tombstone=1 \
+             ORDER BY r.rowid"
+        ))?;
+        let noted = statement
+            .query_map([BACKUPS_ID], row_to_revision)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut latest = None;
+        for revision in &noted {
+            if let (_, Some(at)) = self.open_version(revision)? {
+                // Of two noted in one second, the one stored last.
+                if latest.is_none_or(|(last, _)| at >= last) {
+                    latest = Some((at, revision.author_device_id));
+                }
+            }
+        }
+        Ok(latest)
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<ItemSummary>> {
@@ -1957,14 +2003,19 @@ impl Vault {
         );
         let payload: BackupPayload = serde_json::from_slice(&plaintext)
             .map_err(|_| Error::InvalidBackup("invalid payload".into()))?;
-        let items: BTreeSet<&str> = payload
+        // The backups the vault noted are not items.
+        let revisions: Vec<&EncryptedRevision> = payload
             .revisions
+            .iter()
+            .filter(|revision| revision.item_id != BACKUPS_ID)
+            .collect();
+        let items: BTreeSet<&str> = revisions
             .iter()
             .map(|revision| revision.item_id.as_str())
             .collect();
         Ok(BackupCheck {
             items: items.len(),
-            revisions: payload.revisions.len(),
+            revisions: revisions.len(),
             held: payload.quarantine.len(),
         })
     }

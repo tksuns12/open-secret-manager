@@ -122,11 +122,11 @@ test("the time after which the vault locks is kept", async () => {
   assert.deepEqual(errors, []);
 });
 
-test("a vault without a recent backup from this computer says so in one quiet line", async () => {
+test("a vault without a recent backup says so in one quiet line", async () => {
   const { page, errors } = await window.open("?backup-due", SMALLEST_SIZE);
   const line = page.locator(".backup-reminder");
   await line.waitFor();
-  assert.equal((await line.textContent()).trim(), "Last backup from this computer 45 days agoBack up");
+  assert.equal((await line.textContent()).trim(), "Last backup 45 days ago, from this computerBack up");
   // One line in the list's column, above the search.
   const drawn = await edges(line);
   const column = await edges(page.locator(".list-column"));

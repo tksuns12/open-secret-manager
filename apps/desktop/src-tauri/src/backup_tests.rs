@@ -190,6 +190,37 @@ fn after_every_device_is_lost_a_backup_and_the_recovery_key_bring_the_vault_back
             code(backup::write(&second.state(), &dirs[2].path().join("b.osmbackup")).await),
             "recovery_not_enabled"
         );
+
+        // A backup saved on the new computer counts on the second device
+        // too, once it syncs, which says whose it was.
+        let age_on = |app: tauri::AppHandle<tauri::test::MockRuntime>| async move {
+            backup::backup_age(app.state()).await.unwrap()
+        };
+        assert_eq!(age_on(second.clone()).await.days, None);
+        backup::write(&new.state(), &dirs[1].path().join("new.osmbackup"))
+            .await
+            .unwrap();
+        network::schedule_sync(&new);
+        let saved_by = {
+            let state = new.state::<AppState>();
+            let vault = state.vault.lock().await;
+            crate::history::short_device(&vault.as_ref().unwrap().device_id().unwrap())
+        };
+        let new_age = age_on(new.clone()).await;
+        assert_eq!((new_age.days, new_age.device), (Some(0), None));
+        let mut learned = None;
+        for _ in 0..600 {
+            let age = age_on(second.clone()).await;
+            if age.days.is_some() {
+                learned = Some(age);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let learned = learned.expect("the second device never learned of the backup");
+        assert_eq!((learned.days, learned.device), (Some(0), Some(saved_by)));
+        // It is no item there either.
+        eventually(&second, &["Bank", "Mail"]).await;
     });
 }
 

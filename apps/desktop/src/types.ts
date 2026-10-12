@@ -85,10 +85,12 @@ export type ImportSummary = {
 
 /** How long this device's vault has gone without a backup from this device. */
 export type BackupAge = {
-  /** Whole days since this device last saved a backup of its vault; `null` if it has not. */
+  /** Whole days since the latest backup of the vault, from this device or, as the vault noted it, from another; `null` if there is none. */
   days: number | null;
   /** Whether to remind: 30 days or more since that backup, or since this device began counting without one. Never on a device without recovery, which cannot save one. */
   due: boolean;
+  /** The device that saved the latest backup, when another than this one. */
+  device: string | null;
 };
 
 /** What the owner sets on this device. */

@@ -10,8 +10,10 @@
 //! dialog, which these commands open, and the path stays here.
 //!
 //! This device notes when it last saved a backup of its vault, beside the
-//! vault in `backups.json`, so that the window can remind the owner once
-//! [`REMIND_AFTER_DAYS`] have passed without one.
+//! vault in `backups.json`, and since Phase 15 in the vault itself, which
+//! syncs it to the vault's other devices, so that the window can remind the
+//! owner once [`REMIND_AFTER_DAYS`] have passed without one from any of
+//! them.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +23,7 @@ use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_dialog::{DialogExt, FileDialogBuilder};
 use zeroize::Zeroizing;
 
-use crate::{network, AppState, CommandError};
+use crate::{history, network, AppState, CommandError};
 
 /// What a backup file is called, for the dialogs.
 const KIND: &str = "Open Secret Manager backup";
@@ -125,14 +127,17 @@ pub async fn save_backup<R: Runtime>(
     let Some(path) = chosen(|answer| ask.save_file(answer)).await else {
         return Ok(None);
     };
-    write(&state, &path).await.map(Some)
+    let saved = write(&state, &path).await?;
+    // For the vault's other devices to learn of it.
+    network::schedule_sync(&app);
+    Ok(Some(saved))
 }
 
 /// Writes a backup to `path` and reads it back.
 pub(crate) async fn write(state: &AppState, path: &Path) -> Result<Saved, CommandError> {
-    let vault = state.vault.lock().await;
+    let mut vault = state.vault.lock().await;
     let vault = vault
-        .as_ref()
+        .as_mut()
         .filter(|vault| vault.is_unlocked())
         .ok_or_else(locked)?;
     vault.export_backup(path).map_err(|error| match error {
@@ -148,6 +153,7 @@ pub(crate) async fn write(state: &AppState, path: &Path) -> Result<Saved, Comman
     // The backup stands whether or not its time is noted; a time that could
     // not be noted only brings the reminder sooner.
     let _ = note_backup(&state.path, &vault.vault_id(), now());
+    let _ = vault.note_backup();
     Ok(Saved {
         path: path.to_string_lossy().into_owned(),
         items: check.items,
@@ -178,12 +184,15 @@ struct BackupRecord {
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupAge {
-    /// Whole days since this device last saved a backup of its vault; none
-    /// if it has not.
+    /// Whole days since the latest backup of its vault, from this device or,
+    /// as the vault noted it, from another; none if there is none.
     pub(crate) days: Option<u64>,
     /// Whether to remind the owner: [`REMIND_AFTER_DAYS`] or more since that
     /// backup, or since the device began counting without one.
     pub(crate) due: bool,
+    /// The device that saved the latest backup, as the first eight hex
+    /// digits of its ID, when it is another than this one.
+    pub(crate) device: Option<String>,
 }
 
 fn record_file(vault: &Path) -> PathBuf {
@@ -220,7 +229,20 @@ pub(crate) fn note_backup(vault: &Path, id: &[u8], at: u64) -> std::io::Result<(
 
 /// How long the vault `id` has gone without a backup from this device, at
 /// `at`. A device without recovery cannot save one, so it is not reminded.
+#[cfg(test)]
 pub(crate) fn backup_age_at(vault: &Path, id: &[u8], recovery: bool, at: u64) -> BackupAge {
+    backup_age_with(vault, id, recovery, None, at)
+}
+
+/// The same, counting also the latest backup the vault has noted, `noted`:
+/// when, and which device saved it if another than this one.
+pub(crate) fn backup_age_with(
+    vault: &Path,
+    id: &[u8],
+    recovery: bool,
+    noted: Option<(u64, Option<String>)>,
+    at: u64,
+) -> BackupAge {
     let id = network::hex(id);
     let record = read_record(vault, &id).unwrap_or_else(|| {
         let record = BackupRecord {
@@ -233,11 +255,20 @@ pub(crate) fn backup_age_at(vault: &Path, id: &[u8], recovery: bool, at: u64) ->
         let _ = write_record(vault, &record);
         record
     });
-    let days = record.last_backup.map(|last| at.saturating_sub(last) / DAY);
-    let counted = at.saturating_sub(record.last_backup.unwrap_or(record.since)) / DAY;
+    // This device's own, or the vault's, whichever is later.
+    let last = match (record.last_backup, noted) {
+        (Some(own), Some((other, _))) if own >= other => Some((own, None)),
+        (_, Some(noted)) => Some(noted),
+        (own, None) => own.map(|own| (own, None)),
+    };
+    let days = last
+        .as_ref()
+        .map(|(last, _)| at.saturating_sub(*last) / DAY);
+    let counted = at.saturating_sub(last.as_ref().map_or(record.since, |(last, _)| *last)) / DAY;
     BackupAge {
         days,
         due: recovery && counted >= REMIND_AFTER_DAYS,
+        device: last.and_then(|(_, device)| device),
     }
 }
 
@@ -249,10 +280,18 @@ pub async fn backup_age(state: tauri::State<'_, AppState>) -> Result<BackupAge, 
         .as_ref()
         .filter(|vault| vault.is_unlocked())
         .ok_or_else(locked)?;
-    Ok(backup_age_at(
+    let this_device = vault.device_id();
+    let noted = vault.last_backup()?.map(|(at, by)| {
+        (
+            at,
+            (Some(by) != this_device).then(|| history::short_device(&by)),
+        )
+    });
+    Ok(backup_age_with(
         &state.path,
         &vault.vault_id(),
         vault.recovery_enabled(),
+        noted,
         now(),
     ))
 }
@@ -362,6 +401,40 @@ mod tests {
         // What another program left there is not taken for a record.
         std::fs::write(dir.path().join("backups.json"), b"not json").unwrap();
         assert_eq!(age_of([2; 32], true, start + 200 * DAY), (None, false));
+    }
+
+    #[test]
+    fn a_backup_another_device_saved_counts_as_this_ones_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.sqlite3");
+        let start = 1_800_000_000;
+        let other = Some("9f8e7d6c".to_owned());
+        let age = |noted: Option<(u64, Option<String>)>, at: u64| {
+            let age = backup_age_with(&vault, &[1; 32], true, noted, at);
+            (age.days, age.due, age.device)
+        };
+        // Counting began here at the first look; another device's later
+        // backup puts the reminder off, and says whose it was.
+        assert_eq!(age(None, start), (None, false, None));
+        assert_eq!(age(None, start + 30 * DAY), (None, true, None));
+        let noted = Some((start + 29 * DAY, other.clone()));
+        assert_eq!(
+            age(noted.clone(), start + 30 * DAY),
+            (Some(1), false, other.clone())
+        );
+        // A backup saved here since is the latest, and is this device's.
+        note_backup(&vault, &[1; 32], start + 40 * DAY).unwrap();
+        assert_eq!(age(noted.clone(), start + 41 * DAY), (Some(1), false, None));
+        // The vault's note of this device's own backup names no other.
+        assert_eq!(
+            age(Some((start + 50 * DAY, None)), start + 80 * DAY),
+            (Some(30), true, None)
+        );
+        // One noted later on another device is the latest.
+        assert_eq!(
+            age(Some((start + 60 * DAY, other.clone())), start + 80 * DAY),
+            (Some(20), false, other)
+        );
     }
 
     #[test]

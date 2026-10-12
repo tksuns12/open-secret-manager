@@ -252,7 +252,7 @@ export const bridge: DesktopBridge = {
   async backupAge() {
     const invoke = native();
     if (invoke) return (await invoke("backup_age")) as BackupAge;
-    return previewAsks("backup-due") ? { days: 45, due: true } : { days: 2, due: false };
+    return previewAsks("backup-due") ? { days: 45, due: true, device: null } : { days: 2, due: false, device: null };
   },
   chooseBackup: () => nativeOnly("choose_backup"),
   restoreBackup: (recoveryKey, password) => nativeOnly("restore_backup", { recoveryKey, password }),

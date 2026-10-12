@@ -219,6 +219,11 @@ impl Item {
                 "TOTP secret must not be empty".into(),
             ));
         }
+        if self.id == crate::storage::BACKUPS_ID {
+            return Err(crate::Error::InvalidItem(
+                "that ID is the one the vault notes its backups under".into(),
+            ));
+        }
         if self
             .unknown_fields
             .keys()

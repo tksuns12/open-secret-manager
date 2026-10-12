@@ -82,7 +82,7 @@ login, and nothing is written before the owner unlocks and chooses.
 ## The evidence
 
 - `scripts/check.sh --network --browsers` runs every check: formatting,
-  lints with warnings as errors, 308 Rust tests (the vault, membership,
+  lints with warnings as errors, 310 Rust tests (the vault, membership,
   pairing and sync in process, between processes, and in desktop shells),
   the extension's 19 tests in headless Chromium and Firefox, and the
   dependency policy and advisory audits. With `--mobile` it also runs the
