@@ -43,6 +43,8 @@ final class VaultModel: ObservableObject {
     @Published private(set) var deleted: [DeletedEntry]?
     /// The last unlock found records taken out of the vault's file.
     @Published private(set) var rowsChanged = false
+    /// The screen that changes this phone's password is open.
+    @Published private(set) var passwordChange = false
     let biometric = BiometricUnlock()
 
     private let queue = DispatchQueue(label: "org.opensecretmanager.device")
@@ -105,6 +107,7 @@ final class VaultModel: ObservableObject {
             editor = nil
             history = nil
             deleted = nil
+            passwordChange = false
         }
     }
 
@@ -160,6 +163,7 @@ final class VaultModel: ObservableObject {
             editor = nil
             history = nil
             deleted = nil
+            passwordChange = false
             await call { $0.lock() }
         }
     }
@@ -326,6 +330,41 @@ final class VaultModel: ObservableObject {
         deleted = nil
     }
 
+    func openPasswordChange() {
+        passwordChange = true
+    }
+
+    func closePasswordChange() {
+        passwordChange = false
+    }
+
+    /// Makes `newPassword` this phone's password from now on, given
+    /// `current`. The password kept for Face ID or Touch ID is the old one,
+    /// so that is turned off, to be turned on again at an unlock. A wrong
+    /// current password changes nothing, and the screen stays open.
+    func changePassword(current: String, newPassword: String) {
+        Task {
+            guard let device else { return }
+            busy = "Changing the password…"
+            notice = nil
+            defer { busy = nil }
+            do {
+                try await onQueue { try device.changePassword(currentPassword: current, newPassword: newPassword) }
+            } catch MobileError.InvalidCredentials {
+                notice = "That is not this phone's current password · nothing was changed"
+                return
+            } catch {
+                notice = describe(error)
+                await refresh()
+                return
+            }
+            let hadBiometrics = biometric.enabled
+            biometric.disable()
+            passwordChange = false
+            notice = hadBiometrics ? "Password changed · turn on \(biometric.name) again at the next unlock" : "Password changed"
+        }
+    }
+
     /// The owner has seen that records were taken out of the vault's file.
     func confirmRowsChanged() {
         Task { _ = await call(nil, { try $0.confirmRowsChanged() }) }
@@ -406,6 +445,7 @@ final class VaultModel: ObservableObject {
         editor = nil
         history = nil
         deleted = nil
+        passwordChange = false
         if joinCode != nil {
             joinCode = nil
             notice = "The join stopped when the app left the screen · start again from your computer"

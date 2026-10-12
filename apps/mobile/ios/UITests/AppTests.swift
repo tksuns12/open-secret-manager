@@ -92,6 +92,48 @@ final class AppTests: UITestCase {
         XCTAssert(fixture.staticTexts["filled"].waitForLabel("0000|"))
     }
 
+    func testThePasswordChangesGivenTheCurrentOne() {
+        let app = launchApp(vault: frozenVault)
+        let newPassword = "eleven char and more"
+        unlock(in: app)
+        XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
+        app.buttons["change-password"].tap()
+        let current = app.secureTextFields["current-password"]
+        XCTAssert(current.waitForExistence(timeout: 15))
+
+        // Too short, then not the same twice: not offered.
+        let new = app.secureTextFields["new-password"]
+        new.tap()
+        new.typeText("eleven char")
+        XCTAssert(app.staticTexts["password-problem"].waitForLabel("Use at least 12 characters"))
+        XCTAssertFalse(app.buttons["save-password"].isEnabled)
+        new.typeText(" and more")
+        let again = app.secureTextFields["new-password-again"]
+        again.tap()
+        again.typeText("eleven char and mor")
+        XCTAssert(app.staticTexts["password-problem"].waitForLabel("The two passwords differ"))
+        again.typeText("e")
+        XCTAssert(app.staticTexts["password-problem"].waitForNonExistence(timeout: 5))
+
+        // A wrong current password changes nothing.
+        current.tap()
+        current.typeText("not the password")
+        app.buttons["save-password"].tap()
+        XCTAssert(app.staticTexts["notice"].waitForLabel("That is not this phone's current password · nothing was changed"))
+        current.tap()
+        current.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 16) + fixturePassword)
+        app.buttons["save-password"].tap()
+        XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
+        capture("app-password-changed")
+
+        // From the next unlock on, only the new one opens the vault.
+        app.buttons["lock"].tap()
+        unlock(in: app)
+        XCTAssert(app.staticTexts["notice"].waitForLabel("That password was rejected"))
+        unlock(in: app, password: newPassword)
+        XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
+    }
+
     func testAWrongPasswordIsRefused() {
         let app = launchApp(vault: frozenVault)
         unlock(in: app, password: "not the password")

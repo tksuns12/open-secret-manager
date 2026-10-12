@@ -135,6 +135,7 @@ fun VaultScreen(
                         when {
                             fields == null && state.history != null -> "History"
                             fields == null && state.deleted != null -> "Recently deleted"
+                            fields == null && state.passwordChange -> "Change password"
                             fields == null -> "Open Secret Manager"
                             state.editor?.detail == null -> "New item"
                             else -> "Edit item"
@@ -151,7 +152,7 @@ fun VaultScreen(
                             modifier = Modifier.testTag("save"),
                         ) { Text("Save") }
                     } else if (state.screen == Screen.UNLOCKED) {
-                        if (state.detail == null && state.history == null && state.deleted == null) {
+                        if (state.detail == null && state.history == null && state.deleted == null && !state.passwordChange) {
                             TextButton(onClick = session::startNew, modifier = Modifier.testTag("new-item")) { Text("New") }
                         }
                         TextButton(onClick = session::lock, modifier = Modifier.testTag("lock")) { Text("Lock") }
@@ -172,6 +173,7 @@ fun VaultScreen(
                     Screen.UNLOCKED -> fields?.let { ItemEditor(it, state.editor?.detail, state.editor?.changedElsewhere.orEmpty(), session) }
                         ?: state.history?.let { HistoryList(it, session) }
                         ?: state.deleted?.let { DeletedList(it, session) }
+                        ?: state.passwordChange.takeIf { it }?.let { PasswordChange(state, session) }
                         ?: state.detail?.let { Detail(it, session) }
                         ?: Items(state, session)
                     Screen.REMOVED -> Message(
@@ -315,6 +317,45 @@ private fun SecretField(value: String, onChange: (String) -> Unit, label: String
     )
 }
 
+/** This phone's password changed, given the current one. */
+@Composable
+private fun PasswordChange(state: UiState, session: VaultSession) {
+    var current by remember { mutableStateOf("") }
+    var new by remember { mutableStateOf("") }
+    var again by remember { mutableStateOf("") }
+    BackHandler(onBack = session::closePasswordChange)
+    // In characters, as the shared code counts them.
+    val long = new.codePointCount(0, new.length) >= 12
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        SecretField(current, { current = it }, "Current password", "current-password")
+        SecretField(new, { new = it }, "New password, at least 12 characters", "new-password")
+        SecretField(again, { again = it }, "New password again", "new-password-again")
+        when {
+            new.isNotEmpty() && !long -> "Use at least 12 characters"
+            again.isNotEmpty() && again != new -> "The two passwords differ"
+            else -> null
+        }?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("password-problem"))
+        }
+        Text(
+            "Only this phone's password changes: your other devices keep their own, and the recovery key opens the vault as before. " +
+                "Unlocking with a fingerprint is turned off, to be turned on again at the next unlock.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedButton(onClick = session::closePasswordChange, modifier = Modifier.testTag("cancel-password")) { Text("Cancel") }
+            Button(
+                onClick = { session.changePassword(current, new) },
+                enabled = current.isNotEmpty() && long && again == new && state.busy == null,
+                modifier = Modifier.testTag("save-password"),
+            ) { Text("Change password") }
+        }
+    }
+}
+
 @Composable
 internal fun Unlock(
     state: UiState,
@@ -378,6 +419,7 @@ private fun Items(state: UiState, session: VaultSession) {
             items(shown, key = { it.id }) { item -> ItemRow(item) { session.open(item.id) } }
         }
         TextButton(onClick = session::openDeleted, modifier = Modifier.testTag("recently-deleted")) { Text("Recently deleted…") }
+        TextButton(onClick = session::openPasswordChange, modifier = Modifier.testTag("change-password")) { Text("Change this phone's password…") }
         AutofillOffer()
         BackgroundSyncSwitch()
         StayUnlockedChoice()

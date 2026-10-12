@@ -373,6 +373,8 @@ export type DesktopBridge = {
   restoreBackup: (recoveryKey: string, password: string) => Promise<Restored>;
   /** For a forgotten password: unlocks with the recovery key and sets a new password on this device. */
   resetPassword: (recoveryKey: string, newPassword: string) => Promise<void>;
+  /** Makes `newPassword` this device's password, given the current one, while the vault is unlocked. */
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   /** Starts over from this device as a new vault; `password` is the vault password. */
   recoverVault: (password: string) => Promise<Recovered>;
   /** For a removed device: puts its copy in an archive folder so it can join again. Resolves to that folder. */

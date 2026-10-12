@@ -1576,6 +1576,7 @@ pub async fn restore<R: Runtime>(
     recovery: &osm_vault_core::RecoveryKey,
     password: &str,
 ) -> Result<Restored, CommandError> {
+    crate::check_new_password(password)?;
     let state = app.state::<AppState>();
     let net = &state.network;
     if net.join.lock().await.is_some() {
@@ -2104,11 +2105,8 @@ pub async fn join_finish<R: Runtime>(
         }
     };
     let password = password.unwrap_or_default();
-    if !keeps_vault && password.chars().count() < 12 {
-        return Err(CommandError {
-            code: "invalid_item",
-            message: "use at least 12 characters for this device password".into(),
-        });
+    if !keeps_vault {
+        crate::check_new_password(&password)?;
     }
     let Some(JoinState {
         connection,

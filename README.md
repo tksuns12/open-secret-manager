@@ -1,8 +1,11 @@
 # Open Secret Manager
 
 Open Secret Manager is an owner-controlled, peer-to-peer password manager for
-desktop platforms. Every device keeps its own encrypted vault. There is no
-account, hosted synchronisation service, relay, or telemetry.
+computers and phones. Every device keeps its own encrypted vault. There is no
+account, hosted synchronisation service, or telemetry. Devices that cannot
+reach each other directly can go through a relay the owner runs themselves
+(`osm-relay`), which passes their end-to-end TLS along and can read nothing
+of it ([reaching devices](docs/reaching-devices.md)).
 
 The repository is deliberately split at the security boundary:
 
@@ -19,7 +22,9 @@ The repository is deliberately split at the security boundary:
   plane (enrollment, removal with key rotation, reconciliation), and carries
   the control plane's own messages and sync between any two members over
   the same pinned TLS. The `osm-peer` binary is a development CLI that runs
-  one device of a vault as a process.
+  one device of a vault as a process, and `osm-relay` is the relay the owner
+  may run, which joins two devices' connections without holding a key of
+  either.
 - `crates/vault-membership` is the membership control plane on OpenRaft:
   signed enrollment and removal requests decided by a Raft majority, with
   SQLite-backed log and state. It also decides key epochs: a removal
@@ -62,7 +67,7 @@ The repository is deliberately split at the security boundary:
   copy what the vault holds, create and edit logins and notes, fill logins
   into other apps and into pages once the owner unlocks and chooses one,
   save a login another app or a page sent once the owner unlocks and
-  chooses where, and sync while open.
+  chooses where, change their own password, and sync while open.
   `scripts/test-mobile.sh` runs their tests on an emulator and in
   simulators; see `apps/mobile/README.md`.
 
@@ -71,9 +76,11 @@ on a peer or a network. Devices pair by invitation and a six-digit code the
 owner compares on both screens; the vault's devices then agree, by majority,
 to enroll the new one, and any device can later be removed, which moves the
 others to a new key. The desktop app does this from its Devices panel and
-syncs with every member automatically on the local network; a locked device
+syncs with every member automatically wherever it reaches them: on the local
+network, over the owner's VPN, or through the owner's relay; a locked device
 still takes part and stores what it receives until the next unlock. There is
-no discovery beyond the address in the invitation. Each device is invited
+no discovery beyond the addresses in the invitation and those the devices
+learn from each other. Each device is invited
 either to vote or not: the devices that vote decide together, and a change
 needs most of them reachable, so with two voters both must be. A device that
 does not vote, such as a phone, holds the keys and syncs like the others and

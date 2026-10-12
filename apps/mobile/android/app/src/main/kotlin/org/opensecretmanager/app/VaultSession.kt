@@ -58,6 +58,8 @@ data class UiState(
     val deleted: List<DeletedEntry>? = null,
     /** The last unlock found records taken out of the vault's file. */
     val rowsChanged: Boolean = false,
+    /** The screen that changes this phone's password is open. */
+    val passwordChange: Boolean = false,
 )
 
 /** The versions of [detail], newest first. */
@@ -162,6 +164,7 @@ class VaultSession(private val context: Context, private val folder: File) {
                 editor = current.editor.takeIf { screen == Screen.UNLOCKED },
                 history = current.history.takeIf { screen == Screen.UNLOCKED },
                 deleted = current.deleted.takeIf { screen == Screen.UNLOCKED },
+                passwordChange = current.passwordChange && screen == Screen.UNLOCKED,
                 rowsChanged = screen == Screen.UNLOCKED && device.rowsChanged(),
             )
         }
@@ -193,7 +196,7 @@ class VaultSession(private val context: Context, private val folder: File) {
     /** Locks the vault, and lets go of what the screens held of it. Under [calls]. */
     private fun lockVault(device: Device) {
         device.lock()
-        _state.update { it.copy(detail = null, editor = null, history = null, deleted = null) }
+        _state.update { it.copy(detail = null, editor = null, history = null, deleted = null, passwordChange = false) }
     }
 
     /** Locks an unlocked vault: not one being joined. Under [calls]. */
@@ -338,6 +341,38 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     fun closeDeleted() {
         _state.update { it.copy(deleted = null) }
+    }
+
+    fun openPasswordChange() {
+        _state.update { it.copy(passwordChange = true) }
+    }
+
+    fun closePasswordChange() {
+        _state.update { it.copy(passwordChange = false) }
+    }
+
+    /**
+     * Makes [new] this phone's password from now on, given [current]. The
+     * password kept for unlocking with a fingerprint is the old one, so that
+     * is turned off, to be turned on again at an unlock. A wrong current
+     * password changes nothing, and the screen stays open.
+     */
+    fun changePassword(current: String, new: String) = run("Changing the password…") {
+        try {
+            device!!.changePassword(current, new)
+        } catch (error: MobileException.InvalidCredentials) {
+            _state.update { it.copy(notice = "That is not this phone's current password · nothing was changed") }
+            return@run
+        }
+        val biometric = BiometricUnlock(context)
+        val hadFingerprint = biometric.enabled
+        biometric.disable()
+        _state.update {
+            it.copy(
+                passwordChange = false,
+                notice = if (hadFingerprint) "Password changed · turn on the fingerprint again at the next unlock" else "Password changed",
+            )
+        }
     }
 
     /** Brings back a deleted item as it was before it was deleted. */

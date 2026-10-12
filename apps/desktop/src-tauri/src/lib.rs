@@ -80,6 +80,45 @@ impl From<osm_vault_core::Error> for CommandError {
     }
 }
 
+/// The fewest characters a device's new password may have, as on the phones.
+const MIN_PASSWORD_CHARS: usize = 12;
+
+/// Refuses a new password for this device that is shorter than
+/// [`MIN_PASSWORD_CHARS`]. The window says so before it asks, and this holds
+/// for whatever calls the command without it.
+fn check_new_password(password: &str) -> Result<(), CommandError> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(CommandError {
+            code: "invalid_item",
+            message: format!(
+                "use at least {MIN_PASSWORD_CHARS} characters for this device password"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Makes `new_password` this device's password from now on, given the
+/// current one, while the vault is unlocked. The vault's other devices keep
+/// their own passwords; a wrong current password changes nothing.
+#[tauri::command]
+async fn change_password(
+    current_password: String,
+    new_password: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let current_password = Zeroizing::new(current_password);
+    let new_password = Zeroizing::new(new_password);
+    check_new_password(&new_password)?;
+    let mut vault = state.vault.lock().await;
+    let vault = vault.as_mut().ok_or_else(|| CommandError {
+        code: "vault_missing",
+        message: "vault has not been configured".into(),
+    })?;
+    vault.change_password(&current_password, &new_password)?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn vault_status(state: tauri::State<'_, AppState>) -> Result<&'static str, CommandError> {
     Ok(
@@ -632,6 +671,7 @@ async fn create_vault<R: tauri::Runtime>(
     // Wiped when dropped. The copies the bridge made on the way are beyond
     // reach.
     let password = Zeroizing::new(password);
+    check_new_password(&password)?;
     let recovery = {
         let mut vault = state.vault.lock().await;
         if vault.is_some() {
@@ -839,6 +879,7 @@ pub fn run() {
             backup::choose_backup,
             backup::restore_backup,
             backup::reset_password,
+            change_password,
             network::sync_status,
             network::sync_now,
             network::devices,

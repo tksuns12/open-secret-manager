@@ -115,6 +115,15 @@ do {
     check(try generatePassword(length: 24).count == 24, "the generator makes the length asked for")
     check(fails({ try device.goOnline() }) { if case .Network = $0 { true } else { false } }, "a copy of a vault does not go online")
     check(device.syncStatus().state == .offline, "it reports being offline")
+    // The password changes, given the current one.
+    let newPassword = "a new password for this phone"
+    check(fails({ try device.changePassword(currentPassword: "not the password", newPassword: newPassword) }) { if case .InvalidCredentials = $0 { true } else { false } }, "a wrong current password changes nothing")
+    check(fails({ try device.changePassword(currentPassword: password, newPassword: "eleven char") }) { if case .PasswordTooShort = $0 { true } else { false } }, "a short new password is refused")
+    try device.changePassword(currentPassword: password, newPassword: newPassword)
+    device.lock()
+    check(fails({ try device.unlock(password: password) }) { if case .InvalidCredentials = $0 { true } else { false } }, "the old password no longer unlocks")
+    try device.unlock(password: newPassword)
+    check(device.state() == .unlocked, "the new password unlocks")
     device.lock()
     check(fails({ try device.password(id: "fixture-bank") }) { if case .Locked = $0 { true } else { false } }, "locking hides the passwords again")
 } catch {

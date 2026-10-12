@@ -14,8 +14,9 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   comparison of codes, unlocks with its own password or, once turned on,
   a fingerprint, lists and searches the items, copies a username,
   password, or one-time code, creates, edits, and deletes logins and
-  secure notes, and shows an item's history and the items deleted,
-  restoring a login or note from either. It stops taking part when it
+  secure notes, shows an item's history and the items deleted,
+  restoring a login or note from either, and changes its own password. It
+  stops taking part when it
   leaves the screen and locks then, or after the time the owner chose (a
   minute unless changed), and at once when the screen turns off; it keeps
   the vault out of screenshots; while
@@ -66,8 +67,9 @@ synchronized with these):
   invitation and comparison of codes, unlocks with its own password or,
   once turned on, Face ID or Touch ID, lists and searches the items,
   copies a username, password, or one-time code, creates, edits, and
-  deletes logins and secure notes, and shows an item's history and the
-  items deleted, restoring a login or note from either. It locks, stops taking
+  deletes logins and secure notes, shows an item's history and the
+  items deleted, restoring a login or note from either, and changes its
+  own password. It locks, stops taking
   part, and closes the vault's files when it leaves the screen, and hides
   the vault in the app switcher.
 - `AutoFill`: the AutoFill extension. Once turned on (the app asks iOS

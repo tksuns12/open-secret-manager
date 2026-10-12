@@ -122,6 +122,36 @@ test("the time after which the vault locks is kept", async () => {
   assert.deepEqual(errors, []);
 });
 
+test("the settings change this device's password, given the current one", async () => {
+  const { page, errors } = await window.open();
+  await page.getByRole("button", { name: /Settings/ }).click();
+  const current = page.getByLabel("Current device password");
+  const next = page.getByLabel("New device password", { exact: true });
+  const again = page.getByLabel("New device password again");
+  const change = page.getByRole("button", { name: "Change this device's password" });
+  await current.fill("the password of the preview");
+  await next.fill("eleven char");
+  await again.fill("eleven char");
+  await change.click();
+  await toast(page).filter({ hasText: "Use at least 12 characters for this device password" }).waitFor();
+  await next.fill("a new password, long enough");
+  await again.fill("a new password, long enouhg");
+  await change.click();
+  await toast(page).filter({ hasText: "The two passwords differ" }).waitFor();
+  await again.fill("a new password, long enough");
+  await change.click();
+  await toast(page).filter({ hasText: "Password changed" }).waitFor();
+  assert.deepEqual([await current.inputValue(), await next.inputValue(), await again.inputValue()], ["", "", ""]);
+  // Locked, the settings say to unlock first.
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByTitle("Lock vault").click();
+  await page.getByLabel("Vault password").waitFor();
+  await page.getByRole("button", { name: /Settings/ }).click();
+  await page.getByText("Unlock the vault to change this device's password.").waitFor();
+  assert.equal(await current.count(), 0);
+  assert.deepEqual(errors, []);
+});
+
 test("a vault without a recent backup says so in one quiet line", async () => {
   const { page, errors } = await window.open("?backup-due", SMALLEST_SIZE);
   const line = page.locator(".backup-reminder");

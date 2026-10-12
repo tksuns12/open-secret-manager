@@ -122,6 +122,27 @@ class DeviceTest {
         }
     }
 
+    @Test
+    fun thePasswordChangesThroughTheBindings() {
+        val folder = copyOfTheFrozenVault()
+        val device = Device.open(folder.path, AndroidKeystore)
+        val new = "a new password for this phone"
+        try {
+            fails<MobileException.Locked> { device.changePassword(password, new) }
+            device.unlock(password)
+            fails<MobileException.InvalidCredentials> { device.changePassword("not the password", new) }
+            fails<MobileException.PasswordTooShort> { device.changePassword(password, "eleven char") }
+            device.changePassword(password, new)
+            device.lock()
+            fails<MobileException.InvalidCredentials> { device.unlock(password) }
+            device.unlock(new)
+            assertEquals(DeviceState.UNLOCKED, device.state())
+        } finally {
+            device.close()
+            folder.deleteRecursively()
+        }
+    }
+
     private inline fun <reified E : KeystoreFailure> keystoreFails(call: () -> Unit) {
         try {
             call()

@@ -121,6 +121,11 @@ whether the computer's Devices panel shows the phone's VPN address (its
   the finger or face alone.
 - Enroll another finger or face in the phone's settings, then try again: the
   app should ask for the password once.
+- In the list, choose "Change this phone's password…", type the current
+  password and a new one twice: the list comes back. Lock: the old password
+  is refused and the new one unlocks, and the fingerprint or face unlock is
+  off until turned on again at an unlock. The computer's password is
+  unchanged.
 
 ## Autofill
 

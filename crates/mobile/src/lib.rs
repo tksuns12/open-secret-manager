@@ -538,6 +538,21 @@ impl Device {
         self.tokio.block_on(self.inner.lock())
     }
 
+    /// Makes `new_password` the one that unlocks this device's vault from
+    /// now on, given the current one, while the vault is unlocked. The new
+    /// one needs at least 12 characters. A wrong current password changes
+    /// nothing. The vault's other devices keep their own passwords.
+    pub fn change_password(
+        &self,
+        current_password: String,
+        new_password: String,
+    ) -> Result<(), MobileError> {
+        let current_password = Zeroizing::new(current_password);
+        let new_password = Zeroizing::new(new_password);
+        self.tokio
+            .block_on(self.inner.change_password(&current_password, &new_password))
+    }
+
     /// Whether an unlock found records taken out of the vault's file or
     /// changed in it (an item, an edit, or a device's keys), and the owner
     /// has not yet confirmed seeing it. What is gone comes back from the

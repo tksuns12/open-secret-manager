@@ -836,3 +836,42 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
         Err(MobileError::Locked)
     ));
 }
+
+#[test]
+fn the_password_changes_given_the_current_one_and_a_long_enough_new_one() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder.clone(), 0).unwrap();
+    let new = "a new password for this phone";
+    // Only while unlocked.
+    assert!(matches!(
+        device.change_password(PASSWORD.into(), new.into()),
+        Err(MobileError::Locked)
+    ));
+    device.unlock(PASSWORD.into()).unwrap();
+    assert!(matches!(
+        device.change_password("not the password".into(), new.into()),
+        Err(MobileError::InvalidCredentials)
+    ));
+    assert!(matches!(
+        device.change_password(PASSWORD.into(), "eleven char".into()),
+        Err(MobileError::PasswordTooShort { minimum: 12 })
+    ));
+    device.change_password(PASSWORD.into(), new.into()).unwrap();
+    // Still unlocked; from the next unlock on, only the new one opens it.
+    assert_eq!(device.state(), DeviceState::Unlocked);
+    device.lock();
+    assert!(matches!(
+        device.unlock(PASSWORD.into()),
+        Err(MobileError::InvalidCredentials)
+    ));
+    device.unlock(new.into()).unwrap();
+    assert!(device
+        .items()
+        .unwrap()
+        .iter()
+        .any(|item| item.title == "Bank"));
+    // And so when the folder is opened again.
+    drop(device);
+    let again = Device::open_listening_on(folder, 0).unwrap();
+    again.unlock(new.into()).unwrap();
+}

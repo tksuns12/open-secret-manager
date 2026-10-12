@@ -11,7 +11,7 @@ struct RootView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     if model.screen == .unlocked && model.editor == nil {
-                        if model.detail == nil && model.history == nil && model.deleted == nil {
+                        if model.detail == nil && model.history == nil && model.deleted == nil && !model.passwordChange {
                             ToolbarItem(placement: .topBarLeading) {
                                 Button("New", action: model.startNew).accessibilityIdentifier("new-item")
                             }
@@ -56,6 +56,8 @@ struct RootView: View {
                 HistoryList(model: model, history: history)
             } else if let deleted = model.deleted {
                 DeletedList(model: model, deleted: deleted)
+            } else if model.passwordChange {
+                PasswordChange(model: model)
             } else if let detail = model.detail {
                 Detail(model: model, detail: detail)
             } else {
@@ -191,6 +193,7 @@ private struct Items: View {
             }
             Section {
                 Button("Recently deleted…", action: model.openDeleted).accessibilityIdentifier("recently-deleted")
+                Button("Change this phone's password…", action: model.openPasswordChange).accessibilityIdentifier("change-password")
                 if autofill == false { AutofillOffer(enabled: $autofill) }
                 SyncLine(model: model)
             }
@@ -359,6 +362,51 @@ private struct HistoryList: View {
 }
 
 /// The items deleted on any device, which can be brought back as they were.
+/// This phone's password changed, given the current one.
+private struct PasswordChange: View {
+    @ObservedObject var model: VaultModel
+    @State private var current = ""
+    @State private var newPassword = ""
+    @State private var again = ""
+
+    /// In characters, as the shared code counts them.
+    private var long: Bool { newPassword.unicodeScalars.count >= 12 }
+
+    private var problem: String? {
+        if !newPassword.isEmpty && !long { return "Use at least 12 characters" }
+        if !again.isEmpty && again != newPassword { return "The two passwords differ" }
+        return nil
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Button("‹ All items", action: model.closePasswordChange).accessibilityIdentifier("back")
+                Text("Change this phone's password").font(.title2)
+                SecureField("Current password", text: $current)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("current-password")
+                SecureField("New password, at least 12 characters", text: $newPassword)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("new-password")
+                SecureField("New password again", text: $again)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("new-password-again")
+                if let problem {
+                    Text(problem).font(.caption).foregroundStyle(.red).accessibilityIdentifier("password-problem")
+                }
+                Text("Only this phone's password changes: your other devices keep their own, and the recovery key opens the vault as before. Unlocking with \(model.biometric.name) is turned off, to be turned on again at the next unlock.")
+                    .font(.caption)
+                Button("Change password") { model.changePassword(current: current, newPassword: newPassword) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(current.isEmpty || !long || again != newPassword || model.busy != nil)
+                    .accessibilityIdentifier("save-password")
+            }
+            .padding(24)
+        }
+    }
+}
+
 private struct DeletedList: View {
     @ObservedObject var model: VaultModel
     let deleted: [DeletedEntry]

@@ -232,6 +232,22 @@ impl Runtime {
         }
     }
 
+    pub(crate) async fn change_password(
+        &self,
+        current: &str,
+        new: &str,
+    ) -> Result<(), MobileError> {
+        if new.chars().count() < MIN_PASSWORD_CHARS {
+            return Err(MobileError::PasswordTooShort {
+                minimum: MIN_PASSWORD_CHARS as u32,
+            });
+        }
+        let mut vault = self.vault.lock().await;
+        let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+        vault.change_password(current, new)?;
+        Ok(())
+    }
+
     pub(crate) async fn rows_changed(&self) -> bool {
         self.vault
             .lock()

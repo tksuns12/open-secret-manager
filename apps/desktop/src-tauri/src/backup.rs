@@ -353,6 +353,7 @@ pub async fn reset_password<R: Runtime>(
 ) -> Result<(), CommandError> {
     let recovery_key = Zeroizing::new(recovery_key);
     let new_password = Zeroizing::new(new_password);
+    crate::check_new_password(&new_password)?;
     let recovery = RecoveryKey::parse(recovery_key.trim())?;
     {
         let mut vault = state.vault.lock().await;

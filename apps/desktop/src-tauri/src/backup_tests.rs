@@ -345,3 +345,94 @@ fn a_forgotten_password_is_replaced_with_the_recovery_key() {
             .unwrap();
     });
 }
+
+#[test]
+fn a_new_password_shorter_than_twelve_characters_is_refused_without_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = shell(dir.path());
+    let handle = app.handle().clone();
+    let short = "eleven char";
+    assert_eq!(short.chars().count(), 11);
+
+    tauri::async_runtime::block_on(async move {
+        // No vault is made with it.
+        assert_eq!(
+            code(crate::create_vault(short.into(), handle.state(), handle.clone()).await),
+            "invalid_item"
+        );
+        assert_eq!(
+            crate::vault_status(handle.state()).await.unwrap(),
+            "missing"
+        );
+
+        // A restore is refused before it reads the backup.
+        let elsewhere = Vault::create(dir.path().join("elsewhere.sqlite3"), "x")
+            .unwrap()
+            .1;
+        assert_eq!(
+            code(
+                network::restore(
+                    &handle,
+                    &dir.path().join("no backup here"),
+                    &elsewhere,
+                    short
+                )
+                .await
+            ),
+            "invalid_item"
+        );
+
+        // A reset leaves the password as it was.
+        let recovery_key = crate::create_vault(PASSWORD.into(), handle.state(), handle.clone())
+            .await
+            .unwrap();
+        lock_vault(handle.state()).await.unwrap();
+        assert_eq!(
+            code(
+                backup::reset_password(recovery_key, short.into(), handle.state(), handle.clone())
+                    .await
+            ),
+            "invalid_item"
+        );
+        assert_eq!(crate::vault_status(handle.state()).await.unwrap(), "locked");
+        unlock_vault(PASSWORD.into(), handle.state(), handle.clone())
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn the_password_changes_given_the_current_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = shell(dir.path());
+    let handle = app.handle().clone();
+
+    tauri::async_runtime::block_on(async move {
+        let change = |current: &str, new: &str| {
+            crate::change_password(current.into(), new.into(), handle.state())
+        };
+        crate::create_vault(PASSWORD.into(), handle.state(), handle.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            code(change("not the password", NEW_PASSWORD).await),
+            "invalid_credentials"
+        );
+        assert_eq!(code(change(PASSWORD, "eleven char").await), "invalid_item");
+        change(PASSWORD, NEW_PASSWORD).await.unwrap();
+        assert_eq!(
+            crate::vault_status(handle.state()).await.unwrap(),
+            "unlocked"
+        );
+
+        lock_vault(handle.state()).await.unwrap();
+        assert_eq!(code(change(NEW_PASSWORD, PASSWORD).await), "locked");
+        assert_eq!(
+            code(unlock_vault(PASSWORD.into(), handle.state(), handle.clone()).await),
+            "invalid_credentials"
+        );
+        unlock_vault(NEW_PASSWORD.into(), handle.state(), handle.clone())
+            .await
+            .unwrap();
+    });
+}

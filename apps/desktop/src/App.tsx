@@ -653,7 +653,7 @@ function App() {
       {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
       {history && !locked && <div className="modal-backdrop" onClick={() => setHistory(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HISTORY</p><h2>{history.title}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHistory(null)}><X size={18} /></button></div><HistoryPanel versions={history.versions} onRestore={(revision) => void restore(history.id, revision, history.versions.filter((version) => version.current).map((version) => version.revision), "Version restored")} /></div></div>}
       {deleted && !locked && <div className="modal-backdrop" onClick={() => setDeleted(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DELETED</p><h2>Recently deleted</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDeleted(null)}><X size={18} /></button></div><DeletedPanel items={deleted} onRestore={(item) => void restore(item.id, item.last, item.heads, `${item.title} restored`)} /></div></div>}
-      {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">SETTINGS</p><h2>On this computer</h2></div><button className="icon-button" aria-label="Close" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div><SettingsPanel minutes={autoLockMinutes} onChange={(minutes) => void changeAutoLock(minutes)} /></div></div>}
+      {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">SETTINGS</p><h2>On this computer</h2></div><button className="icon-button" aria-label="Close" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div><SettingsPanel minutes={autoLockMinutes} locked={locked} onChange={(minutes) => void changeAutoLock(minutes)} onNotice={setNotice} /></div></div>}
       {importOpen && !locked && <div className="modal-backdrop" onClick={closeImport}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">IMPORT</p><h2>Bring in logins from another app</h2></div><button className="icon-button" aria-label="Close" onClick={closeImport}><X size={18} /></button></div><ImportPanel onImported={(added) => void imported(added)} onNotice={setNotice} /></div></div>}
       {fill && !locked && <div className="modal-backdrop"><div className="generator-modal entry-editor" role="dialog" aria-label="Fill a login"><div className="modal-head"><div><p className="eyebrow">ASKED BY {fill.browser.toUpperCase()}</p><h2 className="fill-origin">Fill a login into {fill.origin}</h2></div></div><FillPanel key={`${fill.requestId} ${fill.session}`} asked={fill} onFill={(login) => void sendFill(login)} onDeny={() => void denyFill()} /></div></div>}
       {notice && <div className={recoveryKey && !locked ? "toast toast-raised" : "toast"}><ShieldCheck size={15} />{notice}</div>}
@@ -1348,11 +1348,47 @@ function DeletedPanel({ items, onRestore }: { items: DeletedEntry[]; onRestore: 
 }
 
 /** What the owner sets on this computer. */
-function SettingsPanel({ minutes, onChange }: { minutes: number; onChange: (minutes: number) => void }) {
+function SettingsPanel({ minutes, locked, onChange, onNotice }: { minutes: number; locked: boolean; onChange: (minutes: number) => void; onNotice: (text: string) => void }) {
   return <div className="entry-form">
     <label>Lock the vault after<select aria-label="Lock the vault after" value={minutes} onChange={(event) => onChange(Number(event.target.value))}>{AUTO_LOCK_CHOICES.map((choice) => <option key={choice} value={choice}>{minutesText(choice)} without activity</option>)}</select></label>
     <p className="review-hint">Hiding or covering the window, the computer going to sleep, and the screen locking lock the vault at once, whatever this says. This setting stays on this computer; your other devices keep their own.</p>
+    {locked ? <p className="review-hint">Unlock the vault to change this device's password.</p> : <ChangePassword onNotice={onNotice} />}
   </div>;
+}
+
+/** This device's password changed, given the current one. */
+function ChangePassword({ onNotice }: { onNotice: (text: string) => void }) {
+  const [current, setCurrent] = useState("");
+  const [password, setPassword] = useState("");
+  const [again, setAgain] = useState("");
+  const [working, setWorking] = useState(false);
+
+  async function change() {
+    if (password.length < 12) { onNotice("Use at least 12 characters for this device password"); return; }
+    if (password !== again) { onNotice("The two passwords differ"); return; }
+    setWorking(true);
+    try {
+      await bridge.changePassword(current, password);
+      setCurrent("");
+      setPassword("");
+      setAgain("");
+      onNotice("Password changed · unlock with the new one from now on");
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      onNotice(code === "invalid_credentials" ? "That is not this device's current password · nothing was changed" : commandMessage(error, "The password was not changed"));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  return <>
+    <h3 className="settings-heading">This device's password</h3>
+    <label>Current password<input aria-label="Current device password" type="password" value={current} disabled={working} onChange={(event) => setCurrent(event.target.value)} /></label>
+    <label>New password<input aria-label="New device password" type="password" value={password} disabled={working} onChange={(event) => setPassword(event.target.value)} /></label>
+    <label>New password again<input aria-label="New device password again" type="password" value={again} disabled={working} onChange={(event) => setAgain(event.target.value)} /></label>
+    <div className="form-actions"><button className="generate-button" disabled={working || !current || !password || !again} onClick={() => void change()}>{working ? "Changing…" : "Change this device's password"}</button></div>
+    <p className="review-hint">Only this device's password changes: your other devices keep their own, and the recovery key and backups open the vault as before.</p>
+  </>;
 }
 
 const importSources: { format: ImportFormat; name: string; detail: string }[] = [

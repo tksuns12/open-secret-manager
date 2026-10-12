@@ -266,6 +266,12 @@ export const bridge: DesktopBridge = {
   chooseBackup: () => nativeOnly("choose_backup"),
   restoreBackup: (recoveryKey, password) => nativeOnly("restore_backup", { recoveryKey, password }),
   resetPassword: (recoveryKey, newPassword) => nativeOnly("reset_password", { recoveryKey, newPassword }),
+  /** The preview, whose unlock takes any password, takes any current one, and keeps nothing. */
+  async changePassword(currentPassword, newPassword) {
+    const invoke = native();
+    if (invoke) { await invoke("change_password", { currentPassword, newPassword }); return; }
+    if (newPassword.length < 12) throw Object.assign(new Error("use at least 12 characters for this device password"), { code: "invalid_item" });
+  },
   resetDevice: () => nativeOnly("reset_device"),
   leaveVault: (password) => nativeOnly("leave_vault", { password }),
   async recoveryStatus() {

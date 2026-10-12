@@ -6,6 +6,7 @@ import android.os.Build
 import android.view.WindowManager
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertTextEquals
@@ -132,6 +133,48 @@ class AppTest {
         compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
         waitFor("locked")
         StayUnlocked.set(context, 1)
+    }
+
+    @Test
+    fun thePasswordChangesGivenTheCurrentOne() {
+        withTheFrozenVault()
+        val new = "a new password for this phone"
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Bank")
+        compose.onNodeWithTag("change-password").performClick()
+        waitFor("current-password")
+
+        // Too short, then not the same twice: not offered.
+        compose.onNodeWithTag("new-password").performTextInput("eleven char")
+        compose.onNodeWithTag("password-problem").assertTextEquals("Use at least 12 characters")
+        compose.onNodeWithTag("save-password").assertIsNotEnabled()
+        compose.onNodeWithTag("new-password").performTextClearance()
+        compose.onNodeWithTag("new-password").performTextInput(new)
+        compose.onNodeWithTag("new-password-again").performTextInput("$new!")
+        compose.onNodeWithTag("password-problem").assertTextEquals("The two passwords differ")
+        compose.onNodeWithTag("new-password-again").performTextClearance()
+        compose.onNodeWithTag("new-password-again").performTextInput(new)
+
+        // A wrong current password changes nothing.
+        compose.onNodeWithTag("current-password").performTextInput("not the password")
+        compose.onNodeWithTag("save-password").performClick()
+        compose.waitUntilAtLeastOneExists(hasText("That is not this phone's current password · nothing was changed"), 30_000)
+        compose.onNodeWithTag("current-password").performTextClearance()
+        compose.onNodeWithTag("current-password").performTextInput(password)
+        compose.onNodeWithTag("save-password").performClick()
+        waitFor("item:Bank")
+
+        // From the next unlock on, only the new one opens the vault.
+        compose.onNodeWithTag("lock").performClick()
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        compose.waitUntilAtLeastOneExists(hasText("That password was rejected"), 30_000)
+        compose.onNodeWithTag("password").performTextInput(new)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Bank")
     }
 
     @Test
