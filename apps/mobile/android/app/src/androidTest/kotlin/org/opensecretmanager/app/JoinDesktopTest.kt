@@ -1,8 +1,6 @@
 package org.opensecretmanager.app
 
-import android.os.ParcelFileDescriptor
 import android.util.Log
-import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -43,22 +41,7 @@ class JoinDesktopTest {
     fun joinsTheDesktopAndShowsItsVault() {
         val invitation = InstrumentationRegistry.getArguments().getString("invitation")
         assumeTrue(invitation != null)
-        val session = (InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as VaultApp).session
-        session.reopenForTests { }
-        compose.waitUntilAtLeastOneExists(hasTestTag("invitation"), 30_000)
-        compose.onNodeWithTag("invitation").performTextInput(invitation!!)
-        compose.onNodeWithTag("join-continue").performClick()
-        compose.waitUntilAtLeastOneExists(hasTestTag("join-code"), 60_000)
-        val code = compose.onNodeWithTag("join-code").fetchSemanticsNode()
-            .config[SemanticsProperties.Text].joinToString("")
-        // The script reads this and compares it with the desktop's.
-        Log.i("OSMJoin", "PHONE-CODE $code")
-        compose.onNodeWithTag("new-password").performTextInput("phone password, long enough")
-        compose.onNodeWithTag("new-password-again").performTextInput("phone password, long enough")
-        compose.onNodeWithTag("join-finish").performClick()
-        // Joined, unlocked, and the desktop's item arrives as it syncs.
-        compose.waitUntilAtLeastOneExists(hasTestTag("item:Mail"), 120_000)
-        Log.i("OSMJoin", "PHONE-HAS Mail")
+        val session = joinTheDesktop(compose, invitation!!)
 
         // A login made on the phone goes the other way; the script then
         // looks for it on the desktop.
@@ -74,10 +57,6 @@ class JoinDesktopTest {
         // Away from the screen the vault locks and the phone stops taking
         // part; the desktop writes a login meanwhile.
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val shell = { command: String ->
-            ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command))
-                .bufferedReader().use { it.readText() }
-        }
         UiDevice.getInstance(instrumentation).pressHome()
         val away = System.currentTimeMillis() / 1000
         eventually("the vault locks when the app leaves the screen") { session.state.value.screen == Screen.LOCKED }
@@ -103,13 +82,5 @@ class JoinDesktopTest {
         compose.onNodeWithTag("unlock").performClick()
         compose.waitUntilAtLeastOneExists(hasTestTag("item:Away"), 60_000)
         Log.i("OSMJoin", "PHONE-HAS Away")
-    }
-
-    private fun eventually(what: String, check: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 180_000
-        while (!check()) {
-            check(System.currentTimeMillis() < deadline) { "never: $what" }
-            Thread.sleep(500)
-        }
     }
 }

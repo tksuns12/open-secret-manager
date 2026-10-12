@@ -35,6 +35,10 @@
 //! remove <device>       REMOVED <device>
 //! status                STATUS epoch= vault_epoch= members= held= staged= removed= voters=
 //! listen <addr>         LISTEN <addr>
+//! unlisten              UNLISTENED: the members' listener stops, as behind
+//!                       a router that lets nothing in
+//! relay <code>          RELAY-SET, then RELAY-CONNECTED: the vault keeps the
+//!                       relay's code (`osm-relay`), and this device uses it
 //! quit
 //! ```
 //!
@@ -58,9 +62,9 @@ use osm_vault_membership::{
     device_id_from_bytes, device_id_to_bytes, ControlNode, DeviceId, NodeOptions,
 };
 use osm_vault_peer::{
-    control, invite, serve_members, start_node, start_pairing, AddressBook, Invitation,
-    MemberEndpoint, MemberSync, PairingListener, PeerStore, SyncReport, Voting,
-    MAX_INVITATION_TTL_SECS,
+    control, invite, serve_members, serve_relayed, start_node, start_pairing, AddressBook,
+    Invitation, MemberEndpoint, MemberSync, PairingListener, PeerStore, Relay, RelayCode,
+    SyncReport, Voting, MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::{
@@ -136,7 +140,7 @@ async fn run(args: &[String]) -> CliResult {
             let (endpoint, node) =
                 start_control(vault_id, id, &mut peers, peers_path(&args), control).await?;
             let (sync, incoming) = mpsc::channel(4);
-            serve(listen, &endpoint, &node, &sync).await?;
+            let server = serve(listen, &endpoint, &node, &sync).await?;
             let owner_confirmed = lines.recv().await.as_deref() == Some("y");
             let (joiner, grant) = connection.receive_enrollment().await?;
             endpoint.introduce_grant(&joiner, &grant)?;
@@ -161,6 +165,7 @@ async fn run(args: &[String]) -> CliResult {
             let device = Device {
                 sync,
                 incoming: Mutex::new(Some(incoming)),
+                server: Mutex::new(Some(server)),
                 ..Device::new(vault, peers, endpoint, node)
             };
             device.run(lines).await
@@ -206,11 +211,11 @@ async fn serve(
     endpoint: &MemberEndpoint,
     node: &Arc<ControlNode>,
     sync: &mpsc::Sender<MemberSync>,
-) -> CliResult {
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     endpoint.set_listen_port(address.port());
-    tokio::spawn(serve_members(
+    let server = tokio::spawn(serve_members(
         listener,
         endpoint.clone(),
         node.clone(),
@@ -218,7 +223,7 @@ async fn serve(
     ));
     println!("LISTEN {address}");
     endpoint.announce_all().await;
-    Ok(())
+    Ok(server)
 }
 
 type Lines = mpsc::UnboundedReceiver<String>;
@@ -264,6 +269,8 @@ struct Device {
     /// Sync connections the listener took in, and where they are run.
     sync: mpsc::Sender<MemberSync>,
     incoming: Mutex<Option<mpsc::Receiver<MemberSync>>>,
+    /// The members' listener, while there is one.
+    server: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Device {
@@ -286,11 +293,40 @@ impl Device {
             node,
             sync,
             incoming: Mutex::new(Some(incoming)),
+            server: Mutex::new(None),
         }
     }
 
     async fn listen(&self, address: &str) -> CliResult {
-        serve(address, &self.endpoint, &self.node, &self.sync).await
+        let server = serve(address, &self.endpoint, &self.node, &self.sync).await?;
+        if let Some(old) = self.server.lock().await.replace(server) {
+            old.abort();
+        }
+        Ok(())
+    }
+
+    /// Keeps `code` in the vault as its relay's, and uses it.
+    async fn relay(&self, code: &str) -> CliResult {
+        let relay_code = RelayCode::decode(code)?;
+        self.vault.lock().await.set_relay(Some(code))?;
+        println!("RELAY-SET");
+        let identity = self.peers.lock().await.transport_identity()?;
+        let (relay, relayed) = Relay::start(relay_code, identity);
+        self.endpoint.set_relay(Some(relay.clone()));
+        tokio::spawn(serve_relayed(
+            relayed,
+            self.endpoint.clone(),
+            self.node.clone(),
+            Some(self.sync.clone()),
+        ));
+        for _ in 0..200 {
+            if relay.connected() {
+                println!("RELAY-CONNECTED");
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err("the relay could not be reached".into())
     }
 
     /// Brings the vault in line with committed control state, applies what
@@ -379,8 +415,8 @@ impl Device {
             }
             ["invite"] => self.invite(lines, Voting::Votes).await?,
             ["invite", "without-vote"] => self.invite(lines, Voting::WithoutVote).await?,
-            ["add", title] => {
-                self.vault.lock().await.put(Item::new(*title))?;
+            ["add", title @ ..] if !title.is_empty() => {
+                self.vault.lock().await.put(Item::new(title.join(" ")))?;
                 println!("ADDED");
             }
             ["list"] => {
@@ -435,6 +471,13 @@ impl Device {
                 );
             }
             ["listen", address] => self.listen(address).await?,
+            ["unlisten"] => {
+                if let Some(server) = self.server.lock().await.take() {
+                    server.abort();
+                }
+                println!("UNLISTENED");
+            }
+            ["relay", code] => self.relay(code).await?,
             _ => return Err("unknown command".into()),
         }
         Ok(())

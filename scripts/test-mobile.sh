@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs the phone tests on a simulator and an emulator.
 #
-#   scripts/test-mobile.sh [ios] [android] [join] [join-ios]
+#   scripts/test-mobile.sh [ios] [android] [join] [join-ios] [relay]
 #
 # ios      the phone interface through its Swift bindings, in an iOS
 #          simulator, on a copy of the frozen format 7 vault: what
@@ -22,6 +22,9 @@
 # join     the Android app joining a desktop-side device on this machine
 #          over the network (scripts/test-mobile-join.sh).
 # join-ios the same with the iOS app.
+# relay    the Android app syncing with a desktop-side device through a
+#          relay once neither can reach the other directly
+#          (scripts/test-mobile-relay.sh).
 #
 # Without arguments: ios and android. iOS needs `rustup target add
 # aarch64-apple-ios-sim aarch64-apple-ios` and Xcode; each simulator is made
@@ -152,6 +155,10 @@ join)
 join-ios)
     echo "== iOS app joins a desktop-side device"
     scripts/test-mobile-join.sh ios
+    ;;
+relay)
+    echo "== Android app syncs through a relay"
+    scripts/test-mobile-relay.sh
     ;;
 *)
     echo "unknown platform: $platform" >&2
