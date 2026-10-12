@@ -40,9 +40,13 @@ final class HistoryTests: UITestCase {
         let app = unlocked()
         openHistory("Mail", in: app)
         // Newest first, each saying what it changed.
+        // The frozen vault's versions were saved before versions said when.
         XCTAssertEqual(app.staticTexts["said-0"].label, "Changed password, notes")
+        XCTAssertEqual(app.staticTexts["time-0"].label, "Time not recorded")
         XCTAssertEqual(app.staticTexts["said-1"].label, "Changed password")
-        XCTAssertEqual(app.staticTexts["said-2"].label, "Made the item")
+        XCTAssertEqual(app.staticTexts["time-1"].label, "Time not recorded")
+        XCTAssertEqual(scrollTo(app.staticTexts["said-2"], in: app).label, "Made the item")
+        XCTAssertEqual(app.staticTexts["time-2"].label, "Time not recorded")
         XCTAssertFalse(app.buttons["restore-0"].exists)
         capture("history-1")
 
@@ -55,6 +59,10 @@ final class HistoryTests: UITestCase {
         XCTAssert(app.buttons["copy-password"].waitForExistence(timeout: 20))
         reveal(app.buttons["history"], in: app)
         XCTAssert(app.staticTexts["said-0"].waitForLabel("Changed password, notes", timeout: 20))
+        // The restore was saved here, and says when.
+        let year = String(Calendar.current.component(.year, from: Date()))
+        XCTAssert(app.staticTexts["time-0"].label.contains(year), app.staticTexts["time-0"].label)
+        XCTAssertEqual(app.staticTexts["time-1"].label, "Time not recorded")
         // Four versions now: the oldest is still the one that made the item.
         XCTAssertEqual(scrollTo(app.staticTexts["said-3"], in: app).label, "Made the item")
     }

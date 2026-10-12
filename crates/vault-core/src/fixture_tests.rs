@@ -829,14 +829,16 @@ fn the_bounds_of_the_format_hold_at_their_edges() {
     let mut vault = Vault::open(&path).unwrap();
     vault.unlock_with_recovery(&expected.recovery()).unwrap();
 
-    // An item of exactly the largest size is stored and read back; one
-    // byte more is refused.
+    // An item of exactly the largest size, with the time it was saved
+    // beside its fields, is stored and read back; one byte more is
+    // refused. (The time has ten digits until the year 2286.)
     const LARGEST: usize = 16 * 1024 * 1024;
+    let time = r#","saved_at":1234567890"#.len();
     let mut item = Item::new("As large as an item may be");
     item.id = "fixture-large".into();
-    let empty = serde_json::to_vec(&item).unwrap().len();
+    let empty = serde_json::to_vec(&item).unwrap().len() + time;
     item.notes = "n".repeat(LARGEST - empty);
-    assert_eq!(serde_json::to_vec(&item).unwrap().len(), LARGEST);
+    assert_eq!(serde_json::to_vec(&item).unwrap().len() + time, LARGEST);
     vault.put(item.clone()).unwrap();
     assert!(vault.get("fixture-large").unwrap().item.notes.len() == LARGEST - empty);
     let mut larger = item.clone();

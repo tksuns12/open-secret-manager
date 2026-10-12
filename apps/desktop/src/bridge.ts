@@ -76,11 +76,12 @@ let previewRowsConfirmed = false;
 const previewDetails = new Map<string, EntryDetail>();
 /** Items deleted in the preview, which it can bring back. */
 let previewDeleted: VaultEntry[] = [];
+const previewDeletedAt = new Map<string, number>();
 /** The versions the preview's own edits made, newest first, with what each held: sample data, no secret. */
 const previewHistory = new Map<string, { version: HistoryEntry; entry: VaultEntry }[]>();
 
 function previewVersions(entry: VaultEntry): { version: HistoryEntry; entry: VaultEntry }[] {
-  return previewHistory.get(entry.id) ?? [{ version: { revision: entry.revision ?? "preview", deleted: false, current: true, first: true, merged: false, title: entry.title, username: entry.username ?? "", url: entry.url ?? "", changed: [], device: "preview", thisDevice: true }, entry }];
+  return previewHistory.get(entry.id) ?? [{ version: { revision: entry.revision ?? "preview", deleted: false, current: true, first: true, merged: false, title: entry.title, username: entry.username ?? "", url: entry.url ?? "", changed: [], device: "preview", thisDevice: true, savedAt: null }, entry }];
 }
 
 /** Records the version an edit in the preview made, with the fields it changed. */
@@ -94,7 +95,7 @@ function recordPreviewVersion(entry: VaultEntry, input: EntryInput, previous?: E
     previous.url !== input.url ? "website" : "",
     previous.notes !== input.notes ? "notes" : "",
   ].filter(Boolean) : [];
-  const version: HistoryEntry = { revision: entry.revision ?? crypto.randomUUID(), deleted: false, current: true, first: !previous, merged: false, title: entry.title, username: entry.username ?? "", url: entry.url ?? "", changed, device: "preview", thisDevice: true };
+  const version: HistoryEntry = { revision: entry.revision ?? crypto.randomUUID(), deleted: false, current: true, first: !previous, merged: false, title: entry.title, username: entry.username ?? "", url: entry.url ?? "", changed, device: "preview", thisDevice: true, savedAt: Math.floor(Date.now() / 1000) };
   previewHistory.set(entry.id, [{ version, entry }, ...versions.map((older) => ({ ...older, version: { ...older.version, current: false } }))]);
 }
 
@@ -193,6 +194,7 @@ export const bridge: DesktopBridge = {
     if (!gone) throw new Error("not_found");
     previewEntries = previewEntries.filter((existing) => existing.id !== id);
     previewDeleted = [gone, ...previewDeleted];
+    previewDeletedAt.set(id, Math.floor(Date.now() / 1000));
   },
   // Conflicts only arise from revisions received from another device, so
   // the browser preview has one only when its address asks (`?conflict`).
@@ -333,7 +335,7 @@ export const bridge: DesktopBridge = {
   async deletedEntries() {
     const invoke = native();
     if (invoke) return (await invoke("deleted_entries")) as DeletedEntry[];
-    return previewDeleted.map((entry) => ({ id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", last: entry.revision ?? "preview", heads: ["preview-deletion"], device: "preview", thisDevice: true }));
+    return previewDeleted.map((entry) => ({ id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", last: entry.revision ?? "preview", heads: ["preview-deletion"], device: "preview", thisDevice: true, deletedAt: previewDeletedAt.get(entry.id) ?? null }));
   },
   async restoreEntry(id, revision, heads) {
     const invoke = native();
@@ -346,7 +348,7 @@ export const bridge: DesktopBridge = {
     if (!deleted && earlier) {
       const versions = previewVersions(current).map((saved) => ({ ...saved, version: { ...saved.version, current: false } }));
       const changed = [current.title !== restored.title ? "title" : "", current.username !== restored.username ? "username" : "", current.url !== restored.url ? "website" : ""].filter(Boolean);
-      previewHistory.set(id, [{ version: { ...earlier.version, revision: restored.revision ?? "", current: true, first: false, changed }, entry: restored }, ...versions]);
+      previewHistory.set(id, [{ version: { ...earlier.version, revision: restored.revision ?? "", current: true, first: false, changed, savedAt: Math.floor(Date.now() / 1000) }, entry: restored }, ...versions]);
       previewDetails.delete(id);
     }
     previewDeleted = previewDeleted.filter((gone) => gone.id !== id);

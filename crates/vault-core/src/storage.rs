@@ -26,6 +26,46 @@ use crate::{
     RevisionInfo, StageOutcome, UnlockSession, VaultItem,
 };
 
+/// What a version holds: the item's fields as JSON, with `saved_at` (the
+/// time it was saved, in seconds since 1970) beside them; a deletion holds
+/// `saved_at` alone. Builds before Phase 15 wrote no time, and an empty
+/// deletion.
+#[derive(Serialize)]
+struct Saved<'a> {
+    #[serde(flatten)]
+    item: &'a Item,
+    saved_at: u64,
+}
+
+pub(crate) fn version_plaintext(
+    item: Option<&Item>,
+    saved_at: Option<u64>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    Ok(Zeroizing::new(match (item, saved_at) {
+        (Some(item), Some(saved_at)) => serde_json::to_vec(&Saved { item, saved_at })?,
+        (Some(item), None) => serde_json::to_vec(item)?,
+        (None, Some(saved_at)) => format!("{{\"saved_at\":{saved_at}}}").into_bytes(),
+        (None, None) => Vec::new(),
+    }))
+}
+
+/// When a version says it was saved: `None` if it does not say, or says
+/// it in any other way than one whole number of seconds.
+pub(crate) fn saved_at(plaintext: &[u8]) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Time {
+        saved_at: Option<u64>,
+    }
+    serde_json::from_slice::<Time>(plaintext).ok()?.saved_at
+}
+
+/// This device's clock, in seconds since 1970.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// Storage layout: a per-device root key wraps the device key, the HPKE
 /// recipient secret, the authorized-author and revocation MACs, and the
 /// vault's epoch keys; a write fence holds writes until a committed epoch is
@@ -1195,6 +1235,18 @@ impl Vault {
         serde_json::from_slice(&plaintext).map_err(|_| Error::Crypto)
     }
 
+    /// A version's item, `None` for a deletion, and when it says it was
+    /// saved.
+    fn open_version(&self, revision: &EncryptedRevision) -> Result<(Option<Item>, Option<u64>)> {
+        let plaintext = self.open_revision(revision)?;
+        let item = if revision.tombstone {
+            None
+        } else {
+            Some(serde_json::from_slice(&plaintext).map_err(|_| Error::Crypto)?)
+        };
+        Ok((item, saved_at(&plaintext)))
+    }
+
     /// Adds another device's signing key to the authorized author set.
     ///
     /// This is the interim enrollment authority: call it only after the
@@ -1341,12 +1393,7 @@ impl Vault {
         let mut history = revisions
             .iter()
             .map(|revision| {
-                let item = if revision.tombstone {
-                    self.open_revision(revision)?;
-                    None
-                } else {
-                    Some(self.open_item(revision)?)
-                };
+                let (item, saved_at) = self.open_version(revision)?;
                 let id = revision.revision_id();
                 Ok(HistoryVersion {
                     current: heads.contains(&id),
@@ -1355,9 +1402,32 @@ impl Vault {
                     author_device_id: revision.author_device_id,
                     item,
                     changed: Vec::new(),
+                    saved_at,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // A version with the time of one it followed, which another device
+        // saved, was saved by a build that writes no time and kept the one
+        // it found as a field it did not know: it has no time of its own.
+        // (One device saving twice in a second gives both the same time.)
+        let carried: Vec<bool> = history
+            .iter()
+            .map(|version| {
+                version.saved_at.is_some()
+                    && version.parents.iter().any(|parent| {
+                        history.iter().any(|other| {
+                            &other.revision == parent
+                                && other.saved_at == version.saved_at
+                                && other.author_device_id != version.author_device_id
+                        })
+                    })
+            })
+            .collect();
+        for (version, carried) in history.iter_mut().zip(carried) {
+            if carried {
+                version.saved_at = None;
+            }
+        }
         // What each changed from the first version it followed that held
         // the item.
         let changed: Vec<Vec<&'static str>> = history
@@ -1436,6 +1506,7 @@ impl Vault {
                 },
                 heads: heads.iter().map(EncryptedRevision::revision_id).collect(),
                 deleted_by: newest.author_device_id,
+                deleted_at: self.open_version(&newest)?.1,
                 item_id,
             });
         }
@@ -1533,10 +1604,11 @@ impl Vault {
     /// Commits an import as one SQLite transaction after validating every item.
     pub(crate) fn put_items_atomic(&mut self, items: Vec<Item>) -> Result<Vec<RevisionInfo>> {
         self.key()?;
+        let saved = now();
         let mut ids = BTreeSet::new();
         for item in &items {
             item.validate()?;
-            if Zeroizing::new(serde_json::to_vec(item)?).len() > MAX_ITEM_BYTES {
+            if version_plaintext(Some(item), Some(saved))?.len() > MAX_ITEM_BYTES {
                 return Err(Error::InvalidItem("serialized item is too large".into()));
             }
             if !ids.insert(item.id.clone()) || !head_ids(&self.connection, &item.id)?.is_empty() {
@@ -1549,7 +1621,7 @@ impl Vault {
             items
                 .iter()
                 .map(|item| {
-                    let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
+                    let plaintext = version_plaintext(Some(item), Some(saved))?;
                     signer.seal(&item.id, Vec::new(), false, &plaintext)
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -1615,7 +1687,8 @@ impl Vault {
                 report.conflicts += 1;
             }
             for revision in &live {
-                versions.push(self.open_item(revision)?);
+                let (item, saved_at) = self.open_version(revision)?;
+                versions.extend(item.map(|item| (item, saved_at)));
             }
         }
         let count = |table: &str| -> Result<usize> {
@@ -1640,14 +1713,15 @@ impl Vault {
     /// Writes each item version as a revision of its own, without parents,
     /// in one transaction. Several versions of one item become concurrent
     /// heads.
-    fn seed(&mut self, versions: Vec<Item>) -> Result<()> {
+    /// Each keeps the time it was saved, if it has one.
+    fn seed(&mut self, versions: Vec<(Item, Option<u64>)>) -> Result<()> {
         let sealed = {
             let signer = self.signer()?;
             versions
                 .iter()
-                .map(|item| {
+                .map(|(item, saved_at)| {
                     item.validate()?;
-                    let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
+                    let plaintext = version_plaintext(Some(item), *saved_at)?;
                     signer.seal(&item.id, Vec::new(), false, &plaintext)
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -1739,11 +1813,7 @@ impl Vault {
         kind: LocalWrite,
     ) -> Result<RevisionInfo> {
         self.key()?;
-        let plaintext = if tombstone {
-            Zeroizing::new(Vec::new())
-        } else {
-            Zeroizing::new(serde_json::to_vec(&item)?)
-        };
+        let plaintext = version_plaintext((!tombstone).then_some(&item), Some(now()))?;
         if plaintext.len() > MAX_ITEM_BYTES {
             return Err(Error::InvalidItem("serialized item is too large".into()));
         }
@@ -2452,6 +2522,19 @@ impl Vault {
         };
         self.signer()?
             .seal(&item.id, parents, tombstone, &plaintext)
+    }
+
+    /// Seals `plaintext` as it is, as a version of `item_id`: what another
+    /// build might have written.
+    #[cfg(test)]
+    pub(crate) fn seal_plaintext_for_test(
+        &self,
+        item_id: &str,
+        parents: Vec<String>,
+        tombstone: bool,
+        plaintext: &[u8],
+    ) -> Result<EncryptedRevision> {
+        self.signer()?.seal(item_id, parents, tombstone, plaintext)
     }
 }
 

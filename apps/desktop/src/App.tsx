@@ -1268,6 +1268,11 @@ function RecordField({ label, value, masked, onCopy }: { label: string; value: s
   return <div className="record-field"><label>{label}</label><div><span className={masked ? "masked" : ""}>{value}</span>{onCopy && <button className="field-action" title={`Copy ${label.toLowerCase()}`} aria-label={`Copy ${label}`} onClick={onCopy}><Copy size={14} /></button>}</div></div>;
 }
 
+/** A time a device recorded, in seconds since 1970, as this computer writes dates. */
+function savedTime(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
 function deviceName(thisDevice: boolean, device: string): string {
   return thisDevice ? "This device" : `Device ${device}`;
 }
@@ -1277,9 +1282,10 @@ function HistoryPanel({ versions, onRestore }: { versions: HistoryEntry[]; onRes
   const [confirming, setConfirming] = useState<string | null>(null);
   const said = (version: HistoryEntry) => version.deleted ? "Deleted the item" : version.first ? "Made the item" : version.merged ? "Settled a conflict between versions" : version.changed.length > 0 ? `Changed ${version.changed.join(", ")}` : "Saved without a change";
   return <>
-    <p className="review-hint">Newest first. Restoring a version makes it the newest; the others stay here. Times are not kept, only the order.</p>
+    <p className="review-hint">Newest first. Restoring a version makes it the newest; the others stay here. Each time is by the clock of the device that saved the version; versions saved before times were kept have none.</p>
     <div className="version-list">{versions.map((version) => <div key={version.revision} className="version-card">
       <div className="version-meta"><strong>{deviceName(version.thisDevice, version.device)}{version.current ? " · current" : ""}</strong><code>{version.revision.slice(0, 10)}</code></div>
+      <span className="history-time">{version.savedAt === null ? "Time not recorded" : savedTime(version.savedAt)}</span>
       <span className={version.deleted ? "version-deleted" : "history-change"}>{said(version)}</span>
       {!version.deleted && <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd></dl>}
       {!version.current && !version.deleted && (confirming === version.revision
@@ -1297,7 +1303,7 @@ function DeletedPanel({ items, onRestore }: { items: DeletedEntry[]; onRestore: 
     <div className="version-list">{items.map((item) => <div key={item.id} className="version-card">
       <div className="version-meta"><strong>{item.title}</strong><code>{kindLabel(item.kind)}</code></div>
       <span className="history-change">{[item.username, item.url].filter(Boolean).join(" · ") || "—"}</span>
-      <span className="version-deleted">Deleted on {item.thisDevice ? "this device" : `device ${item.device}`}</span>
+      <span className="version-deleted">Deleted on {item.thisDevice ? "this device" : `device ${item.device}`}{item.deletedAt === null ? "" : ` · ${savedTime(item.deletedAt)}`}</span>
       <button className="generate-button" onClick={() => onRestore(item)}>Restore</button>
     </div>)}</div>
   </>;

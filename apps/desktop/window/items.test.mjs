@@ -52,6 +52,9 @@ test("an item is made and changed, and its history brings back the first version
   assert.equal(await versions.count(), 2);
   assert.match(await versions.nth(0).textContent(), /· current.*Changed username/);
   assert.match(await versions.nth(1).textContent(), /Made the item.*first-name/);
+  // Each says when it was saved, as this computer writes dates.
+  const year = String(new Date().getFullYear());
+  for (const index of [0, 1]) assert.match(await versions.nth(index).locator(".history-time").textContent(), new RegExp(year));
   await versions.nth(1).getByRole("button", { name: "Restore this version…" }).click();
   await versions.nth(1).getByRole("button", { name: "Restore this version", exact: true }).click();
   await toast(page).filter({ hasText: "Version restored" }).waitFor();
@@ -62,6 +65,11 @@ test("an item is made and changed, and its history brings back the first version
 test("a deleted item is listed under Recently deleted and comes back from there", async () => {
   const { page, errors } = await window.open();
   await page.locator(".entry-row", { hasText: "Studio Wi-Fi" }).click();
+  // A sample item was saved before times were kept, as an item from an
+  // older build was.
+  await page.getByRole("button", { name: /^History/ }).click();
+  assert.equal(await page.locator(".version-card .history-time").textContent(), "Time not recorded");
+  await page.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: /Edit$/ }).click();
   await page.getByRole("button", { name: "Delete…" }).click();
   await page.getByRole("button", { name: "Delete", exact: true }).click();
@@ -69,6 +77,7 @@ test("a deleted item is listed under Recently deleted and comes back from there"
 
   await page.getByRole("button", { name: /Recently deleted/ }).click();
   const card = page.locator(".version-card", { hasText: "Studio Wi-Fi" });
+  assert.match(await card.textContent(), new RegExp(`Deleted on this device · .*${new Date().getFullYear()}`));
   await card.getByRole("button", { name: "Restore" }).click();
   await toast(page).filter({ hasText: "Studio Wi-Fi restored" }).waitFor();
   await page.locator(".entry-row", { hasText: "Studio Wi-Fi" }).waitFor();

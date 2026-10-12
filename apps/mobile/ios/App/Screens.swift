@@ -295,6 +295,11 @@ private func restoresHere(_ kind: ItemKind) -> Bool {
     kind == .login || kind == .secureNote
 }
 
+/// A time a device recorded, in seconds since 1970, as this phone writes dates.
+private func savedTime(_ seconds: UInt64) -> String {
+    Date(timeIntervalSince1970: TimeInterval(seconds)).formatted(date: .abbreviated, time: .shortened)
+}
+
 private func said(_ version: HistoryEntry) -> String {
     if version.deleted { return "Deleted the item" }
     if version.first { return "Made the item" }
@@ -319,7 +324,7 @@ private struct HistoryList: View {
                 Button("‹ \(history.detail.title)", action: model.closeHistory).accessibilityIdentifier("back")
             }
             Section {
-                Text("Newest first. Restoring a version makes it the newest; the others stay. Times are not kept, only the order.")
+                Text("Newest first. Restoring a version makes it the newest; the others stay. Each time is by the clock of the device that saved the version; versions saved before times were kept have none.")
                 if !restorable {
                     Text("Identities, cards, and items in conflict are restored on your computer.")
                         .accessibilityIdentifier("restore-elsewhere")
@@ -329,6 +334,9 @@ private struct HistoryList: View {
                 Section {
                     Text((version.thisDevice ? "This phone" : "Device \(version.device)") + (version.current ? " · current" : ""))
                         .font(.headline)
+                    Text(version.savedAt.map(savedTime) ?? "Time not recorded")
+                        .font(.caption)
+                        .accessibilityIdentifier("time-\(index)")
                     Text(said(version)).accessibilityIdentifier("said-\(index)")
                     if !version.deleted {
                         Text([version.title, version.username, version.url].filter { !$0.isEmpty }.joined(separator: " · "))
@@ -371,7 +379,8 @@ private struct DeletedList: View {
                     Text(entry.title).font(.headline).accessibilityIdentifier("deleted:\(entry.title)")
                     let shown = [entry.username, entry.url].filter { !$0.isEmpty }
                     if !shown.isEmpty { Text(shown.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary) }
-                    Text("Deleted on " + (entry.thisDevice ? "this phone" : "device \(entry.device)")).font(.caption)
+                    Text("Deleted on " + (entry.thisDevice ? "this phone" : "device \(entry.device)")
+                        + (entry.deletedAt.map { " · " + savedTime($0) } ?? "")).font(.caption)
                     if restoresHere(entry.kind) {
                         Button("Restore") { model.restoreDeleted(entry) }.accessibilityIdentifier("restore:\(entry.title)")
                     } else {

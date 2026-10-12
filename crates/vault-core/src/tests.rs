@@ -241,6 +241,122 @@ fn an_items_history_lists_every_version_and_an_earlier_version_or_a_deleted_item
     assert!(matches!(vault.deleted_items(), Err(Error::Locked)));
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn each_version_says_when_it_was_saved_and_one_from_a_build_that_did_not_says_nothing() {
+    let dir = tempdir().unwrap();
+    let (mut vault, _) = Vault::create(dir.path().join("vault.db"), "initial password").unwrap();
+    let start = now();
+    let mut item = login("Mail");
+    let id = item.id.clone();
+    let first = vault.put(item.clone()).unwrap();
+    item.password = "second password".into();
+    let second = vault.update(item.clone(), &first.revision).unwrap();
+    let deleted = vault.delete(&id, &second.revision).unwrap();
+    let end = now();
+
+    // Each version, the deletion too, by this device's clock.
+    let history = vault.history(&id).unwrap();
+    assert_eq!(history.len(), 3);
+    for version in &history {
+        let saved = version.saved_at.expect("a version saved here has a time");
+        assert!(
+            (start..=end).contains(&saved),
+            "{saved} not in {start}..={end}"
+        );
+    }
+    let gone = vault.deleted_items().unwrap();
+    assert_eq!(gone[0].deleted_at, history[0].saved_at);
+
+    // The time is not one of the item's fields: an item read has the
+    // fields it was saved with and nothing more, and an edit writes its own
+    // time, not the one it read.
+    let restored = vault
+        .restore(
+            &id,
+            &first.revision,
+            std::slice::from_ref(&deleted.revision),
+        )
+        .unwrap();
+    let back = vault.get(&id).unwrap().item;
+    assert!(back.unknown_fields.is_empty());
+    let mut expected = login("Mail");
+    expected.id = id.clone();
+    assert_eq!(back, expected);
+
+    // What a build before this wrote: an item without a time, then a
+    // deletion with nothing in it. Neither says when.
+    let older = vault
+        .seal_plaintext_for_test(
+            &id,
+            vec![restored.revision.clone()],
+            false,
+            &serde_json::to_vec(&back).unwrap(),
+        )
+        .unwrap();
+    let older_id = older.revision_id();
+    vault.apply_encrypted_revision(older).unwrap();
+    let empty_deletion = vault
+        .seal_plaintext_for_test(&id, vec![older_id.clone()], true, &[])
+        .unwrap();
+    let empty_id = empty_deletion.revision_id();
+    vault.apply_encrypted_revision(empty_deletion).unwrap();
+    let history = vault.history(&id).unwrap();
+    assert_eq!(history[0].revision, empty_id);
+    assert_eq!(history[0].saved_at, None);
+    assert_eq!(history[1].revision, older_id);
+    assert_eq!(history[1].saved_at, None);
+    assert_eq!(vault.deleted_items().unwrap()[0].deleted_at, None);
+
+    // A build before this, on another device, that edits keeps the time it
+    // found, as a field it does not know: that version has no time of its
+    // own, and the one it followed keeps its time.
+    let other = tempdir().unwrap();
+    let (mut a, b, shared, base) = two_copies(other.path());
+    let base_time = a.history(&shared.id).unwrap()[0].saved_at.unwrap();
+    let mut carried = serde_json::to_value(&shared).unwrap();
+    carried["password"] = "from an older build".into();
+    carried["saved_at"] = base_time.into();
+    let carried = b
+        .seal_plaintext_for_test(
+            &shared.id,
+            vec![base],
+            false,
+            &serde_json::to_vec(&carried).unwrap(),
+        )
+        .unwrap();
+    a.apply_encrypted_revision(carried).unwrap();
+    let history = a.history(&shared.id).unwrap();
+    assert_eq!(history[0].saved_at, None);
+    assert_eq!(history[0].changed, ["password"]);
+    assert_eq!(history[1].saved_at, Some(base_time));
+    assert!(a.get(&shared.id).unwrap().item.unknown_fields.is_empty());
+
+    // A time in any other form is no time, and the item still reads.
+    let undeleted = vault
+        .restore(&id, &older_id, &head_set(&vault, &id))
+        .unwrap();
+    let mut odd = serde_json::to_value(&back).unwrap();
+    odd["saved_at"] = "yesterday".into();
+    let odd = vault
+        .seal_plaintext_for_test(
+            &id,
+            vec![undeleted.revision],
+            false,
+            &serde_json::to_vec(&odd).unwrap(),
+        )
+        .unwrap();
+    vault.apply_encrypted_revision(odd).unwrap();
+    assert_eq!(vault.history(&id).unwrap()[0].saved_at, None);
+    assert_eq!(vault.get(&id).unwrap().item.password, back.password);
+}
+
 #[test]
 fn concurrent_connections_cannot_overwrite_one_head() {
     let dir = tempdir().unwrap();
@@ -2275,6 +2391,10 @@ fn a_fork_starts_a_new_trust_domain_from_the_current_versions() {
     // revision are not. The conflict is still a conflict.
     assert_eq!(fork.list().unwrap().len(), 2);
     assert_eq!(fork.get(&kept.id).unwrap().item.password, "second version");
+    // Each keeps the time it was saved, not the fork's.
+    let saved = a.history(&kept.id).unwrap()[0].saved_at;
+    assert!(saved.is_some());
+    assert_eq!(fork.history(&kept.id).unwrap()[0].saved_at, saved);
     assert!(matches!(fork.get(&gone.id), Err(Error::NotFound)));
     assert!(fork.quarantined().unwrap().is_empty());
     assert!(fork.get(&item.id).unwrap().conflict);

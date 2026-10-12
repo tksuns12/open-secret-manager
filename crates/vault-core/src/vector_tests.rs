@@ -735,6 +735,57 @@ fn the_frozen_vault_is_laid_out_as_the_encodings_say() {
 /// so that an edit here does not drop a later build's field; builds from
 /// before drop it.
 #[test]
+fn a_versions_time_comes_after_the_items_fields_and_a_deletion_holds_it_alone() {
+    use crate::storage::{saved_at, version_plaintext};
+    let item: Item = serde_json::from_str(
+        r#"{"id":"i","title":"t","kind":"login","username":"","password":"","url":"","notes":"",
+            "totp_secret":null,"custom_fields":{},"tags":[],"favorite":false,"added_later":"x"}"#,
+    )
+    .unwrap();
+    let saved = version_plaintext(Some(&item), Some(1_767_225_600)).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&saved).unwrap(),
+        r#"{"id":"i","title":"t","kind":"login","username":"","password":"","url":"","notes":"","totp_secret":null,"custom_fields":{},"tags":[],"favorite":false,"added_later":"x","saved_at":1767225600}"#
+    );
+    let deletion = version_plaintext(None, Some(1_767_225_600)).unwrap();
+    assert_eq!(deletion.as_slice(), br#"{"saved_at":1767225600}"#);
+    assert_eq!(saved_at(&saved), Some(1_767_225_600));
+    assert_eq!(saved_at(&deletion), Some(1_767_225_600));
+    // Read back, the time is not one of the item's fields.
+    let read: Item = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(read, item);
+    assert_eq!(
+        read.unknown_fields.keys().collect::<Vec<_>>(),
+        ["added_later"]
+    );
+
+    // Without a time, as before Phase 15; and a time in any other form is
+    // none, while the item still reads.
+    assert_eq!(saved_at(b""), None);
+    assert_eq!(
+        saved_at(&version_plaintext(Some(&item), None).unwrap()),
+        None
+    );
+    for odd in [
+        r#""1767225600""#,
+        "-1",
+        "1.5",
+        "null",
+        "18446744073709551616",
+    ] {
+        let text = format!(
+            r#"{{"id":"i","title":"t","kind":"login","username":"","password":"","url":"","notes":"","totp_secret":null,"custom_fields":{{}},"tags":[],"favorite":false,"saved_at":{odd}}}"#
+        );
+        assert_eq!(saved_at(text.as_bytes()), None, "{odd}");
+        assert!(serde_json::from_str::<Item>(&text)
+            .unwrap()
+            .unknown_fields
+            .is_empty());
+    }
+    assert_eq!(saved_at(br#"{"saved_at":1,"saved_at":2}"#), None);
+}
+
+#[test]
 fn an_items_fields_are_fixed_and_one_it_does_not_know_is_kept_after_them() {
     let item: Item = serde_json::from_str(
         r#"{"id":"i","title":"t","kind":"card","username":"","password":"","url":"","notes":"",

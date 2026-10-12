@@ -41,7 +41,7 @@ pub struct Item {
 
 /// This build's names for an item's fields, which an unknown field may not
 /// take.
-const KNOWN_FIELDS: [&str; 11] = [
+const KNOWN_FIELDS: [&str; 12] = [
     "id",
     "title",
     "kind",
@@ -53,7 +53,14 @@ const KNOWN_FIELDS: [&str; 11] = [
     "custom_fields",
     "tags",
     "favorite",
+    SAVED_AT,
 ];
+
+/// When a version was saved, which is written beside an item's fields in
+/// its content (see the storage) but is not one of them: an item read
+/// leaves it out, so that two items with the same fields are the same
+/// item whenever each was saved.
+pub(crate) const SAVED_AT: &str = "saved_at";
 
 /// The fields an item's JSON has besides this build's, each once: a field
 /// given twice is refused, as one of this build's is.
@@ -72,6 +79,10 @@ fn unknown_fields<'de, D: Deserializer<'de>>(
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut fields = BTreeMap::new();
             while let Some(name) = map.next_key::<String>()? {
+                if name == SAVED_AT {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    continue;
+                }
                 let value = map.next_value()?;
                 if let Some(mut earlier) = fields.insert(name, value) {
                     zeroize_value(&mut earlier);
@@ -363,6 +374,12 @@ pub struct HistoryVersion {
     /// [`Item::changed_from`]); nothing for the first version or a
     /// deletion.
     pub changed: Vec<&'static str>,
+    /// When it was saved, in seconds since 1970, by the clock of the device
+    /// that saved it, which nothing checks: for showing only. `None` for a
+    /// version saved by a build that wrote no time, and for one whose time
+    /// is that of a version it followed, which a build that keeps fields it
+    /// does not know carried over.
+    pub saved_at: Option<u64>,
 }
 
 impl fmt::Debug for HistoryVersion {
@@ -374,6 +391,7 @@ impl fmt::Debug for HistoryVersion {
             .field("deleted", &self.item.is_none())
             .field("current", &self.current)
             .field("changed", &self.changed)
+            .field("saved_at", &self.saved_at)
             .finish()
     }
 }
@@ -388,6 +406,9 @@ pub struct DeletedItem {
     pub heads: Vec<String>,
     /// Who deleted it: the author of its newest deletion.
     pub deleted_by: [u8; 16],
+    /// When, by that device's clock, in seconds since 1970, if its
+    /// deletion says (see [`HistoryVersion::saved_at`]).
+    pub deleted_at: Option<u64>,
 }
 
 impl fmt::Debug for DeletedItem {
@@ -397,6 +418,7 @@ impl fmt::Debug for DeletedItem {
             .field("last", &self.last)
             .field("heads", &self.heads)
             .field("deleted_by", &self.deleted_by)
+            .field("deleted_at", &self.deleted_at)
             .finish()
     }
 }

@@ -531,6 +531,11 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
 /** Whether a phone restores items of [kind]: logins and secure notes. */
 private fun restoresHere(kind: ItemKind) = kind == ItemKind.LOGIN || kind == ItemKind.SECURE_NOTE
 
+/** A time a device recorded, in seconds since 1970, as this phone writes dates. */
+private fun savedTime(seconds: ULong): String =
+    java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT)
+        .format(java.util.Date(seconds.toLong() * 1000))
+
 private fun said(version: HistoryEntry): String = when {
     version.deleted -> "Deleted the item"
     version.first -> "Made the item"
@@ -548,7 +553,7 @@ private fun HistoryList(history: History, session: VaultSession) {
         item {
             TextButton(onClick = session::closeHistory, modifier = Modifier.testTag("back")) { Text("‹ ${history.detail.title}") }
             Text(
-                "Newest first. Restoring a version makes it the newest; the others stay. Times are not kept, only the order.",
+                "Newest first. Restoring a version makes it the newest; the others stay. Each time is by the clock of the device that saved the version; versions saved before times were kept have none.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             if (!restorable) {
@@ -564,6 +569,11 @@ private fun HistoryList(history: History, session: VaultSession) {
                 Text(
                     (if (version.thisDevice) "This phone" else "Device ${version.device}") + if (version.current) " · current" else "",
                     style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    version.savedAt?.let(::savedTime) ?: "Time not recorded",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("time-$index"),
                 )
                 Text(said(version), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("said-$index"))
                 if (!version.deleted) {
@@ -625,7 +635,8 @@ private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
                     Text(it.joinToString(" · "), style = MaterialTheme.typography.bodySmall)
                 }
                 Text(
-                    "Deleted on " + if (entry.thisDevice) "this phone" else "device ${entry.device}",
+                    "Deleted on " + (if (entry.thisDevice) "this phone" else "device ${entry.device}") +
+                        (entry.deletedAt?.let { " · " + savedTime(it) } ?: ""),
                     style = MaterialTheme.typography.bodySmall,
                 )
                 if (restoresHere(entry.kind)) {

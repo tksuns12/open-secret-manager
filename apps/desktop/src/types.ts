@@ -45,6 +45,8 @@ export type HistoryEntry = {
   changed: string[];
   device: string;
   thisDevice: boolean;
+  /** When it was saved, by that device's clock, in seconds since 1970; null for a version that does not say. */
+  savedAt: number | null;
 };
 
 /** An item deleted on every device, as it was before. No secret. */
@@ -60,6 +62,8 @@ export type DeletedEntry = {
   heads: string[];
   device: string;
   thisDevice: boolean;
+  /** When, by that device's clock, in seconds since 1970; null if its deletion does not say. */
+  deletedAt: number | null;
 };
 
 /** The exports the app imports. */

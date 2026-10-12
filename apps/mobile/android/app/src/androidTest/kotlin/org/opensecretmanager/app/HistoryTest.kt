@@ -15,6 +15,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -67,6 +68,8 @@ class HistoryTest {
         assertEquals("Changed password, notes", text("said-0"))
         assertEquals("Changed password", text("said-1"))
         assertEquals("Made the item", text("said-2"))
+        // The frozen vault's versions were saved before versions said when.
+        for (index in 0..2) assertEquals("Time not recorded", text("time-$index"))
         compose.onAllNodesWithTag("restore-0").assertCountEquals(0)
 
         // Keep leaves it; Restore brings back the first password.
@@ -84,6 +87,10 @@ class HistoryTest {
         compose.onNodeWithTag("history").performScrollTo().performClick()
         waitFor("version-3")
         assertEquals("Changed password, notes", text("said-0"))
+        // The restore was saved here, and says when.
+        val year = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR).toString()
+        assertTrue(text("time-0"), text("time-0").contains(year))
+        assertEquals("Time not recorded", text("time-1"))
     }
 
     @Test

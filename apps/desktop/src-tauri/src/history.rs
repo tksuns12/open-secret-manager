@@ -33,6 +33,9 @@ pub struct HistoryEntry {
     /// Short hex prefix of the device that made it.
     pub(crate) device: String,
     pub(crate) this_device: bool,
+    /// When it was saved, by that device's clock, in seconds since 1970;
+    /// none for a version that does not say.
+    pub(crate) saved_at: Option<u64>,
 }
 
 /// An item deleted on every device that has it, as it was before. No secret.
@@ -51,6 +54,8 @@ pub struct DeletedEntry {
     /// Short hex prefix of the device that deleted it.
     pub(crate) device: String,
     pub(crate) this_device: bool,
+    /// When, by that device's clock, in seconds since 1970, if it says.
+    pub(crate) deleted_at: Option<u64>,
 }
 
 fn locked() -> CommandError {
@@ -91,6 +96,7 @@ pub(crate) fn entries(
                 changed: version.changed.clone(),
                 device: short_device(&version.author_device_id),
                 this_device: Some(version.author_device_id) == this_device,
+                saved_at: version.saved_at,
             }
         })
         .collect()
@@ -130,6 +136,7 @@ pub async fn deleted_entries(
                 last: deleted.last.revision.clone(),
                 device: short_device(&deleted.deleted_by),
                 this_device: Some(deleted.deleted_by) == this_device,
+                deleted_at: deleted.deleted_at,
                 heads: deleted.heads,
             })
         })

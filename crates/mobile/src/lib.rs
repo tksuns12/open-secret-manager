@@ -448,6 +448,9 @@ pub struct HistoryEntry {
     /// The first eight hex digits of the device that made it.
     pub device: String,
     pub this_device: bool,
+    /// When it was saved, by that device's clock, in seconds since 1970;
+    /// none for a version that does not say.
+    pub saved_at: Option<u64>,
 }
 
 /// An item deleted on every device that has it, as it was before. No secret.
@@ -465,6 +468,8 @@ pub struct DeletedEntry {
     /// The first eight hex digits of the device that deleted it.
     pub device: String,
     pub this_device: bool,
+    /// When, by that device's clock, in seconds since 1970, if it says.
+    pub deleted_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

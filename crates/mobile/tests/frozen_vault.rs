@@ -175,6 +175,8 @@ fn an_items_history_shows_its_versions_and_a_login_or_a_note_comes_back() {
         .all(|version| version.title == "Mail" && version.this_device));
     // Which fields changed, never what they held.
     assert!(!format!("{history:?}").contains("first password"));
+    // Saved before versions said when.
+    assert!(history.iter().all(|version| version.saved_at.is_none()));
 
     // The first version comes back, its password with it.
     let heads = vec![history[0].revision.clone()];
@@ -189,7 +191,12 @@ fn an_items_history_shows_its_versions_and_a_login_or_a_note_comes_back() {
         device.password("fixture-mail".into()).unwrap(),
         "first password"
     );
-    assert_eq!(device.history("fixture-mail".into()).unwrap().len(), 4);
+    let after = device.history("fixture-mail".into()).unwrap();
+    assert_eq!(after.len(), 4);
+    // The restore was saved here, and says when.
+    assert!(
+        after[0].saved_at.is_some() && after[1..].iter().all(|version| version.saved_at.is_none())
+    );
     assert!(matches!(
         device.restore("fixture-mail".into(), history[2].revision.clone(), heads),
         Err(MobileError::ChangedElsewhere)
@@ -202,6 +209,7 @@ fn an_items_history_shows_its_versions_and_a_login_or_a_note_comes_back() {
         .find(|item| item.title == "A note that was deleted")
         .unwrap();
     assert_eq!(note.kind, ItemKind::SecureNote);
+    assert_eq!(note.deleted_at, None);
     let note_history = device.history(note.id.clone()).unwrap();
     assert!(note_history[0].deleted && note_history[0].title == "A note that was deleted");
     assert!(matches!(

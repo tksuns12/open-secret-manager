@@ -394,6 +394,7 @@ impl Runtime {
                         .collect(),
                     device: short_device(&version.author_device_id),
                     this_device: Some(version.author_device_id) == this_device,
+                    saved_at: version.saved_at,
                 }
             })
             .collect())
@@ -417,6 +418,7 @@ impl Runtime {
                     last: deleted.last.revision.clone(),
                     device: short_device(&deleted.deleted_by),
                     this_device: Some(deleted.deleted_by) == this_device,
+                    deleted_at: deleted.deleted_at,
                     heads: deleted.heads,
                 })
             })
