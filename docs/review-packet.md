@@ -127,7 +127,7 @@ The full list is the right-hand column of the delivery matrix in
 review until this one; packages signed with a developer identity and
 notarized are waiting on that identity; coverage-guided fuzzing runs on
 request, minutes per parser, not continuously; the native lifecycle locks
-were tried for real on macOS only for a screen lock and a sleep (Phase 14),
+were tried for real on macOS for a screen lock, sleep, screen saver, and user switch (Phases 14 and 15),
 on Linux only in a container; the backup screens and the system's file dialogs
 were driven in the real app only on Linux; the phone apps have run only on
 an emulator and in a simulator, and are not signed for distribution; the iOS app's AutoFill tests pass on the iOS 26.5 simulator only with AutoFill turned on by the script, as neither 26.5 nor 27.0 simulators here show the system's prompts for it reliably.

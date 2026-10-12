@@ -71,5 +71,17 @@ test("when the system says the owner went away, the vault locks, says why, and e
   await page.locator(".toast", { hasText: "Vault locked because the screen locked · the pairing was cancelled" }).waitFor();
   await page.getByLabel("Vault password").waitFor();
   assert.equal(await invitation.count(), 0);
+  // The notice goes in seconds, while the screen saver or another user may
+  // have the screen; the locked screen still says why until the unlock.
+  await page.locator(".toast").waitFor({ state: "detached" });
+  assert.equal(await page.locator(".locked-reason").textContent(), "Locked because the screen locked");
+  // The Devices panel works while locked, so it stays open; closed, the
+  // vault unlocks as ever.
+  await page.locator(".modal-head").getByRole("button", { name: "Close" }).click();
+  await page.getByLabel("Vault password").fill("any password, in the preview");
+  await page.locator(".unlock-form button").click();
+  await page.getByLabel("Vault password").waitFor({ state: "detached" });
+  await page.evaluate(() => globalThis.osmEmit("vault-locked", "screen_saver"));
+  await page.locator(".locked-reason", { hasText: "Locked because the screen saver started" }).waitFor();
   assert.deepEqual(errors, []);
 });
