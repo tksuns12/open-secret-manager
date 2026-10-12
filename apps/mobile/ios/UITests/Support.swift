@@ -60,9 +60,22 @@ func askToFill(file: StaticString = #filePath, line: UInt = #line) {
     fixture.launch()
     fixture.textFields["fixture-username"].waitAndTap(timeout: startTimeout, file: file, line: line)
     let ours = fixture.buttons["Open Secret Manager"]
+    // iOS 27 at times shows the keyboard without its bar of suggestions,
+    // and brings it with the focus moved away and back, as an owner would.
+    if !fixture.buttons["Passwords"].waitForExistence(timeout: 10) {
+        fixture.secureTextFields["fixture-password"].tap()
+        fixture.textFields["fixture-username"].tap()
+    }
     XCTAssert(fixture.buttons["Passwords"].waitForExistence(timeout: 20), "no Passwords key", file: file, line: line)
     capture("fill-1-keyboard")
-    fixture.buttons["Passwords"].settledTap(file: file, line: line) { ours.exists }
+    fixture.buttons["Passwords"].settledTap(file: file, line: line) {
+        // The keyboard's tip about sliding to type, shown once over the
+        // keyboard, takes the tap; scripts/test-mobile-ios.sh says it was
+        // seen, and this sees it off if it shows all the same.
+        let tip = fixture.buttons["Continue"]
+        if tip.exists { tip.tap() }
+        return ours.exists
+    }
     capture("fill-2-providers")
     ours.settledTap(file: file, line: line) { !ours.exists }
     XCTAssert(fixture.staticTexts["asker"].waitForExistence(timeout: startTimeout), "no fill screen", file: file, line: line)

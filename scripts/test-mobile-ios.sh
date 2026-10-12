@@ -12,7 +12,8 @@
 # OSM_TEST_* are passed on to the tests. OSM_IOS_OPTIMIZED=1 builds the apps
 # and the shared code optimized, as a release, keeping only the debug
 # build's hooks for the tests. OSM_IOS_ROOT_CERT names a certificate
-# authority for the simulator to trust. Needs Xcode, an iOS simulator runtime, and
+# authority for the simulator to trust, and OSM_IOS_RUNTIME an iOS runtime
+# other than the newest. Needs Xcode, an iOS simulator runtime, and
 # `rustup target add aarch64-apple-ios-sim aarch64-apple-ios`.
 set -eu
 cd "$(dirname "$0")/.."
@@ -51,11 +52,18 @@ xcrun --sdk iphonesimulator swiftc -target arm64-apple-ios17.0-simulator \
     apps/mobile/ios/Tests/configure-ui-tests.swift -o "$work/configure-ui-tests"
 
 mkdir -p "$set_dir"
-runtime=$(xcrun simctl list runtimes -j | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).runtimes.filter(r=>r.platform==="iOS"&&r.isAvailable);console.log(r[r.length-1].identifier)})')
+# The newest iOS runtime installed, or the one OSM_IOS_RUNTIME names (its
+# identifier, as `xcrun simctl list runtimes` shows it).
+runtime=${OSM_IOS_RUNTIME:-}
+[ -n "$runtime" ] || runtime=$(xcrun simctl list runtimes -j | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).runtimes.filter(r=>r.platform==="iOS"&&r.isAvailable);console.log(r[r.length-1].identifier)})')
 device=$(xcrun simctl --set "$set_dir" create "Open Secret Manager UI tests" \
     com.apple.CoreSimulator.SimDeviceType.iPhone-17 "$runtime")
 xcrun simctl --set "$set_dir" boot "$device"
 xcrun simctl --set "$set_dir" bootstatus "$device" -b >/dev/null
+# The keyboard's tip about sliding to type, which iOS 27 shows once over
+# the keyboard and which takes the tap on its Passwords key, as seen.
+xcrun simctl --set "$set_dir" spawn "$device" defaults write com.apple.keyboard.preferences \
+    DidShowContinuousPathIntroduction -bool true
 # A certificate authority for a test site the tests should trust
 # (scripts/test-mobile-safari.sh).
 if [ -n "${OSM_IOS_ROOT_CERT:-}" ]; then
