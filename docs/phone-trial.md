@@ -90,6 +90,27 @@ phone sold since 2019 is):
   saving battery. Turn the switch off, and the line stops moving while the
   app is closed.
 
+## Away from home, over your VPN (Phase 16)
+
+With a VPN such as Tailscale or WireGuard on both the computer and the
+phone. Pair them with this build of the desktop app (an earlier pairing
+named only the computer's home-network address): the invitation now names
+up to four of the computer's addresses, its VPN address among them.
+
+- At home, pair as above, and make an item on the computer: it reaches the
+  phone.
+- Turn the phone's Wi-Fi off, so that it is on mobile data, with the VPN
+  still on. Open the app and press Sync now: the line under the list says
+  it synced, and an item made on the computer meanwhile is there.
+- Make an item on the phone the same way: it reaches the computer.
+- With the VPN off on the phone and Wi-Fi off, Sync now fails and says so,
+  and nothing else changes.
+- Back on the home Wi-Fi, syncing works as before.
+
+If the phone cannot reach the computer away from home, note which VPN, and
+whether the computer's Devices panel shows the phone's VPN address (its
+`100.` address on Tailscale) after the phone synced over it.
+
 ## Fingerprint and face
 
 - At an unlock, tick "Unlock with a fingerprint next time" (Android) or
