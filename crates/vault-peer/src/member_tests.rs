@@ -107,9 +107,10 @@ impl Host {
         (endpoint, node)
     }
 
-    /// Accepts connections on a new port.
+    /// Accepts connections on a new port, over IPv6 and IPv4 alike, as the
+    /// apps do.
     async fn listen(&mut self) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::listen(0).unwrap();
         self.endpoint
             .set_listen_port(listener.local_addr().unwrap().port());
         let (sync, incoming) = mpsc::channel(4);
@@ -711,6 +712,123 @@ fn the_address_book_survives_a_restart() {
     );
 }
 
+/// An address in a range kept for documentation (RFC 5737), which leads
+/// nowhere: a connection to it fails or never answers.
+const NOWHERE: &str = "192.0.2.1:1";
+
+#[test]
+fn several_addresses_are_kept_for_a_device_best_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("peers.db");
+    let book = AddressBook::open(&path).unwrap();
+    // Where it was reached comes first, then what others said, in turn.
+    book.suggest(1, "192.0.2.5:47820");
+    book.observe(1, "192.0.2.1:47820");
+    book.suggest(1, "[2001:db8::1]:47820");
+    book.suggest(1, "192.0.2.5:47820");
+    assert_eq!(
+        book.all(1),
+        ["192.0.2.1:47820", "192.0.2.5:47820", "[2001:db8::1]:47820"]
+    );
+    // One that failed goes last; reached again, first.
+    book.failed(1, "192.0.2.1:47820");
+    assert_eq!(
+        book.all(1),
+        ["192.0.2.5:47820", "[2001:db8::1]:47820", "192.0.2.1:47820"]
+    );
+    book.observe(1, "[2001:db8::1]:47820");
+    assert_eq!(book.get(1).as_deref(), Some("[2001:db8::1]:47820"));
+    // A suggestion comes before those that failed.
+    book.suggest(1, "192.0.2.6:47820");
+    assert_eq!(
+        book.all(1),
+        [
+            "[2001:db8::1]:47820",
+            "192.0.2.5:47820",
+            "192.0.2.6:47820",
+            "192.0.2.1:47820"
+        ]
+    );
+    // Eight are kept, and suggestions never push out one that works.
+    for n in 10..20 {
+        book.suggest(1, &format!("192.0.2.{n}:47820"));
+    }
+    let kept = book.all(1);
+    assert_eq!(kept.len(), 8);
+    assert!(!kept.contains(&"192.0.2.1:47820".to_owned()));
+    for n in 10..20 {
+        book.observe(2, &format!("192.0.2.{n}:47820"));
+    }
+    book.suggest(2, "192.0.2.99:47820");
+    assert_eq!(book.all(2).len(), 8);
+    assert_eq!(book.get(2).as_deref(), Some("192.0.2.19:47820"));
+    assert!(!book.all(2).contains(&"192.0.2.99:47820".to_owned()));
+    drop(book);
+
+    // They are kept across a restart, in their order.
+    let book = AddressBook::open(&path).unwrap();
+    assert_eq!(book.all(1), kept);
+    assert_eq!(book.all(2).len(), 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_is_reached_past_addresses_that_lead_nowhere_and_over_ipv6() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    let mut b = a.invite(&dir, "b", None).await;
+    let port = b.host.endpoint.listen_port().unwrap();
+    let at = format!("127.0.0.1:{port}");
+    assert_eq!(
+        a.host.addresses.get(b.host.id).as_deref(),
+        Some(at.as_str())
+    );
+
+    // Two addresses that lead nowhere come first: one refuses, one may
+    // never answer. B is reached all the same, without waiting out either,
+    // and the address it was reached at comes first again.
+    a.host.addresses.observe(b.host.id, "127.0.0.1:1");
+    a.host
+        .addresses
+        .observe(b.host.id, &format!("192.0.2.1:{port}"));
+    let started = std::time::Instant::now();
+    sync(&mut a, &mut b).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        a.host.addresses.get(b.host.id).as_deref(),
+        Some(at.as_str())
+    );
+
+    // Over IPv6, where this machine has it: B listens there too.
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        let v6 = format!("[::1]:{port}");
+        a.host.addresses.observe(b.host.id, &v6);
+        sync(&mut a, &mut b).await;
+        assert_eq!(
+            a.host.addresses.get(b.host.id).as_deref(),
+            Some(v6.as_str())
+        );
+    }
+    // A connection over IPv4 is recorded with its IPv4 address, not as the
+    // IPv6 form a listener for both sees it in.
+    sync(&mut b, &mut a).await;
+    assert!(b
+        .host
+        .addresses
+        .all(a.host.id)
+        .iter()
+        .all(|address| !address.starts_with("[::ffff:")));
+    assert!(a
+        .host
+        .addresses
+        .all(b.host.id)
+        .iter()
+        .all(|address| !address.starts_with("[::ffff:")));
+}
+
 /// A device with a vault.
 struct Member {
     host: Host,
@@ -766,11 +884,16 @@ impl Member {
         let pairing = PairingListener::bind("127.0.0.1:0", &mut self.host.peers)
             .await
             .unwrap();
+        // An address that leads nowhere comes first, as one of an
+        // inviter's networks the joiner is not on would.
         let invitation = invite(
             &self.vault,
             &mut self.invitations,
             &mut self.host.peers,
-            vec![pairing.local_addr().unwrap().to_string()],
+            vec![
+                NOWHERE.to_owned(),
+                pairing.local_addr().unwrap().to_string(),
+            ],
             NOW,
             300,
         )
@@ -815,10 +938,17 @@ impl Member {
         sent.unwrap();
         let (joiner, grant) = received.unwrap();
 
-        // The grant names the members; the joiner accepts them and tells
-        // them where it listens.
+        // The grant names the members; the joiner accepts them, with every
+        // address the invitation named for the inviter, and tells them
+        // where it listens.
         let members = joiner.members(&grant).unwrap();
-        host.endpoint.introduce(&members).unwrap();
+        host.endpoint.introduce_grant(&joiner, &grant).unwrap();
+        let inviter = device_id_from_bytes(self.vault.device_id().unwrap());
+        let port = self.host.endpoint.listen_port().unwrap();
+        assert_eq!(
+            host.addresses.all(inviter),
+            [format!("192.0.2.1:{port}"), format!("127.0.0.1:{port}")]
+        );
         until("the joiner reaches a member", || {
             members.iter().any(|member| {
                 host.addresses

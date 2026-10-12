@@ -4,7 +4,7 @@ This document is for contributors deciding whether a change may handle real cred
 
 ## Scope and ownership
 
-The owner keeps an encrypted password vault on their devices. A Rust core owns cryptography and vault state; desktop, browser, and eventual mobile clients are adapters. No provider account, hosted control plane, or third-party recovery service is required. Directly reachable peers exchange ciphertext. Internet discovery, NAT traversal, a relay, and mobile background execution are separate features requiring their own evidence.
+The owner keeps an encrypted password vault on their devices. A Rust core owns cryptography and vault state; desktop, browser, and eventual mobile clients are adapters. No provider account, hosted control plane, or third-party recovery service is required. Directly reachable peers exchange ciphertext. Internet discovery, NAT traversal, a relay, and mobile background execution are separate features requiring their own evidence. Since Phase 16 a device listens over IPv6 as well as IPv4, and an invitation names up to four of its addresses, a VPN's or a global IPv6 one among them: whoever sees an invitation learns them, and where a network lets connections in over IPv6, which many home routers do not, the listener is reachable from the internet. What it takes before a peer is authenticated is unchanged: the TLS handshake with pinned certificates, and frames of at most 64 KiB until then (see the formats).
 
 The owner controls enrollment and recovery. A device is an authorized replica, not a separate human principal. Consensus establishes one membership history; it does not establish that several humans approved an action.
 

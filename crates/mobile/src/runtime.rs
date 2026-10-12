@@ -23,7 +23,6 @@ use osm_vault_peer::{
     PairingConnection, PeerStore, PreparedJoin, SyncReport,
 };
 use tokio::{
-    net::TcpListener,
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
@@ -698,8 +697,7 @@ impl Runtime {
         // The grant names the members: accept them, and keep telling them
         // where this device listens until one of them has brought it up to
         // date and the keys have arrived.
-        let members = joiner.members(&grant)?;
-        control.endpoint.introduce(&members)?;
+        control.endpoint.introduce_grant(&joiner, &grant)?;
         let deadline = tokio::time::Instant::now() + ENROLLMENT_TIMEOUT;
         while !joiner.enrolled(&control.node.state()) {
             if tokio::time::Instant::now() > deadline {
@@ -868,9 +866,10 @@ impl Runtime {
             NodeOptions::default(),
         )
         .await?;
-        let listener = match TcpListener::bind(("0.0.0.0", self.port)).await {
+        // Over IPv6 and IPv4 alike.
+        let listener = match osm_vault_peer::listen(self.port) {
             Ok(listener) => listener,
-            Err(_) => TcpListener::bind(("0.0.0.0", 0)).await?,
+            Err(_) => osm_vault_peer::listen(0)?,
         };
         endpoint.set_listen_port(listener.local_addr()?.port());
         let control = Arc::new(Control {

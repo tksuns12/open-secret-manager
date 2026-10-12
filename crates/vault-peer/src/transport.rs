@@ -79,6 +79,16 @@ pub struct PairingListener {
 impl PairingListener {
     pub async fn bind(address: &str, peers: &mut PeerStore) -> Result<Self> {
         let listener = TcpListener::bind(address).await?;
+        Self::on(listener, peers)
+    }
+
+    /// Listens on `port` (0 for any free one), over IPv6 and IPv4 alike
+    /// (see [`listen`]).
+    pub fn listen(port: u16, peers: &mut PeerStore) -> Result<Self> {
+        Self::on(listen(port)?, peers)
+    }
+
+    fn on(listener: TcpListener, peers: &mut PeerStore) -> Result<Self> {
         let identity = peers.transport_identity()?;
         Ok(Self {
             listener,
@@ -321,7 +331,7 @@ impl PreparedJoin {
             &self.identity,
             joiner.inviter_transport_pin(),
         )?);
-        let tcp = connect_first(joiner.inviter_addresses()).await?;
+        let (tcp, _) = connect_any(joiner.inviter_addresses()).await?;
         let mut stream = with_timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name(), tcp))
             .await?
             .map_err(handshake_error)?;
@@ -524,16 +534,72 @@ async fn read_body<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> Result
     Ok(body)
 }
 
-async fn connect_first(addresses: &[String]) -> Result<TcpStream> {
+/// How long a dial waits on one address before trying the next as well.
+const NEXT_ADDRESS_AFTER: Duration = Duration::from_millis(300);
+
+/// Connects to whichever of `addresses` answers first, trying them in
+/// their order: each is tried a moment after the one before unless that
+/// one has failed already, so that an address that never answers delays
+/// the others little. Returns the stream and the address it reached.
+pub(crate) async fn connect_any(addresses: &[String]) -> Result<(TcpStream, String)> {
+    let mut waiting = addresses.iter();
+    let mut attempts = tokio::task::JoinSet::new();
     let mut last = Error::InvalidAddress;
-    for address in addresses {
-        match with_timeout(CONNECT_TIMEOUT, TcpStream::connect(address.as_str())).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(error)) => last = Error::Io(error),
-            Err(error) => last = error,
+    loop {
+        if let Some(address) = waiting.next() {
+            let address = address.clone();
+            attempts.spawn(async move {
+                let outcome =
+                    with_timeout(CONNECT_TIMEOUT, TcpStream::connect(address.as_str())).await;
+                (address, outcome)
+            });
+        } else if attempts.is_empty() {
+            return Err(last);
+        }
+        let outcome = if waiting.len() > 0 {
+            match tokio::time::timeout(NEXT_ADDRESS_AFTER, attempts.join_next()).await {
+                Ok(outcome) => outcome,
+                // The time to try the next one as well.
+                Err(_) => continue,
+            }
+        } else {
+            attempts.join_next().await
+        };
+        match outcome {
+            // The other attempts end with the set.
+            Some(Ok((address, Ok(Ok(stream))))) => return Ok((stream, address)),
+            Some(Ok((_, Ok(Err(error))))) => last = Error::Io(error),
+            Some(Ok((_, Err(error)))) => last = error,
+            Some(Err(error)) => last = Error::Io(std::io::Error::other(error)),
+            None => {}
         }
     }
-    Err(last)
+}
+
+/// A listener on `port` (0 for any free one) for IPv6 and IPv4 alike, or
+/// for IPv4 alone where the system has no IPv6. A connection over IPv4 then
+/// comes from an IPv4 address written as IPv6 (`::ffff:a.b.c.d`), which
+/// is to be turned back (`IpAddr::to_canonical`).
+pub fn listen(port: u16) -> std::io::Result<TcpListener> {
+    let both = || -> std::io::Result<std::net::TcpListener> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_only_v6(false)?;
+        #[cfg(unix)]
+        socket.set_reuse_address(true)?;
+        socket.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+        socket.listen(1024)?;
+        Ok(socket.into())
+    };
+    let listener = match both() {
+        Ok(listener) => listener,
+        Err(_) => std::net::TcpListener::bind(("0.0.0.0", port))?,
+    };
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener)
 }
 
 pub(crate) async fn with_timeout<T>(limit: Duration, future: impl Future<Output = T>) -> Result<T> {

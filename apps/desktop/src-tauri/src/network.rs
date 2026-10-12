@@ -40,10 +40,7 @@ use osm_vault_peer::{
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use serde::Serialize;
 use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, Manager, Runtime};
-use tokio::{
-    net::TcpListener,
-    sync::{mpsc, oneshot, Mutex},
-};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::{AppState, CommandError};
 
@@ -518,11 +515,10 @@ async fn start_control<R: Runtime>(
     let node = start_node(net.control_path(), device, &endpoint, node_options())
         .await
         .map_err(network_error)?;
-    let listener = match TcpListener::bind(("0.0.0.0", SYNC_PORT)).await {
+    // Over IPv6 and IPv4 alike.
+    let listener = match osm_vault_peer::listen(SYNC_PORT) {
         Ok(listener) => listener,
-        Err(_) => TcpListener::bind(("0.0.0.0", 0))
-            .await
-            .map_err(storage_error)?,
+        Err(_) => osm_vault_peer::listen(0).map_err(storage_error)?,
     };
     endpoint.set_listen_port(listener.local_addr().map_err(storage_error)?.port());
     let control = Arc::new(Control {
@@ -1704,9 +1700,7 @@ pub async fn start_invite<R: Runtime>(
         let vault = state.vault.lock().await;
         let mut invitations = net.invitations.lock().await;
         let mut peers = net.peers.lock().await;
-        let listener = PairingListener::bind("0.0.0.0:0", &mut peers)
-            .await
-            .map_err(network_error)?;
+        let listener = PairingListener::listen(0, &mut peers).map_err(network_error)?;
         let port = listener.local_addr().map_err(network_error)?.port();
         let vault = vault
             .as_ref()
@@ -1716,7 +1710,7 @@ pub async fn start_invite<R: Runtime>(
             vault,
             &mut invitations,
             &mut peers,
-            vec![format!("{}:{port}", primary_ip())],
+            invitation_addresses(port),
             now(),
             MAX_INVITATION_TTL_SECS,
         )
@@ -1993,10 +1987,9 @@ async fn finish_join<R: Runtime>(
         .map_err(network_error)?;
     // The grant names the members: accept them, and keep telling them where
     // this device listens until one of them has brought it up to date.
-    let members = joiner.members(&grant).map_err(network_error)?;
     control
         .endpoint
-        .introduce(&members)
+        .introduce_grant(&joiner, &grant)
         .map_err(network_error)?;
     let deadline = tokio::time::Instant::now() + ENROLLMENT_TIMEOUT;
     while !joiner.enrolled(&control.node.state()) {
@@ -2056,16 +2049,16 @@ pub async fn cancel_join<R: Runtime>(
     Ok(())
 }
 
-/// The address other devices on the local network most likely reach this
-/// one at. Connecting a UDP socket sends nothing; it only selects a route.
-fn primary_ip() -> std::net::IpAddr {
-    std::net::UdpSocket::bind(("0.0.0.0", 0))
-        .and_then(|socket| {
-            socket.connect(("192.0.2.1", 9))?;
-            socket.local_addr()
-        })
-        .map(|address| address.ip())
-        .unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]))
+/// Where an invitation says this device can be reached on `port`: up to
+/// four of its addresses, on its home network, a VPN, or IPv6 (see
+/// [`osm_vault_peer::local_addresses`]), or this computer alone when it has
+/// none.
+fn invitation_addresses(port: u16) -> Vec<String> {
+    let addresses = osm_vault_peer::local_addresses(port);
+    if addresses.is_empty() {
+        return vec![format!("127.0.0.1:{port}")];
+    }
+    addresses
 }
 
 fn now() -> u64 {

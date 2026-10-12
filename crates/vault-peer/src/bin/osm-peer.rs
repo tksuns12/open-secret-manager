@@ -139,7 +139,7 @@ async fn run(args: &[String]) -> CliResult {
             serve(listen, &endpoint, &node, &sync).await?;
             let owner_confirmed = lines.recv().await.as_deref() == Some("y");
             let (joiner, grant) = connection.receive_enrollment().await?;
-            endpoint.introduce(&joiner.members(&grant)?)?;
+            endpoint.introduce_grant(&joiner, &grant)?;
             let deadline = tokio::time::Instant::now() + ENROLLMENT_TIMEOUT;
             while !joiner.enrolled(&node.state()) {
                 if tokio::time::Instant::now() > deadline {

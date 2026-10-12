@@ -53,7 +53,9 @@ pub(crate) fn pin_of(certificate: &[u8]) -> [u8; 32] {
 /// Version 2 (Phase 14) keeps the TLS key sealed by the system's keystore,
 /// in `transport_key`; a build that knows only version 1 would not find it
 /// and would make the device another TLS identity, so it refuses the file.
-pub(crate) const STORE_VERSION: u32 = 2;
+/// Version 3 (Phase 16) keeps several addresses for each device, in
+/// `device_addresses`; version 2 kept one, in `member_addresses`.
+pub(crate) const STORE_VERSION: u32 = 3;
 
 /// How this device's TLS key is kept in the peer store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

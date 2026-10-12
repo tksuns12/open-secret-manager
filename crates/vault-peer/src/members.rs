@@ -61,12 +61,12 @@ use crate::{
     control,
     peers::{pin_of, TransportIdentity},
     transport::{
-        client_config, handshake_error, read_frame_within, read_json_frame, run_session,
-        server_config, server_name, with_timeout, write_frame, write_json_frame, ClientPolicy,
-        PinPolicy, SharedVault, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_FRAME_BYTES,
+        client_config, connect_any, handshake_error, read_frame_within, read_json_frame,
+        run_session, server_config, server_name, with_timeout, write_frame, write_json_frame,
+        ClientPolicy, PinPolicy, SharedVault, HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_FRAME_BYTES,
         NO_VAULT,
     },
-    Error, PeerStore, Result, SyncReport,
+    EnrollmentGrant, Error, Joiner, PeerStore, Result, SyncReport,
 };
 
 /// Version of the protocol between members. Version 1 was sync between two
@@ -105,6 +105,9 @@ pub(crate) fn valid_contacts(contacts: &[MemberContact]) -> bool {
             .all(|contact| contact.address.as_deref().is_none_or(valid_address))
 }
 
+/// Most addresses kept for one device.
+const ADDRESSES_PER_DEVICE: usize = 8;
+
 struct KnownAddress {
     address: String,
     /// The last connection attempt to it failed.
@@ -113,40 +116,100 @@ struct KnownAddress {
 
 #[derive(Default)]
 struct Book {
-    known: BTreeMap<DeviceId, KnownAddress>,
+    /// Each device's addresses, best first: where it was last reached or
+    /// seen from, then those members reported, then those that failed.
+    known: BTreeMap<DeviceId, Vec<KnownAddress>>,
     /// Where addresses are kept across restarts, if anywhere.
     store: Option<Connection>,
 }
 
 impl Book {
-    fn record(&mut self, device: DeviceId, address: &str) {
-        let unchanged = self
-            .known
-            .get(&device)
-            .is_some_and(|known| known.address == address);
-        self.known.insert(
-            device,
+    /// Puts `address` first among `device`'s: it was just reached there,
+    /// or a connection came from there.
+    fn reached(&mut self, device: DeviceId, address: &str) {
+        let list = self.known.entry(device).or_default();
+        if list
+            .first()
+            .is_some_and(|first| first.address == address && !first.failed)
+        {
+            return;
+        }
+        list.retain(|known| known.address != address);
+        list.insert(
+            0,
             KnownAddress {
                 address: address.to_owned(),
                 failed: false,
             },
         );
-        if unchanged {
+        list.truncate(ADDRESSES_PER_DEVICE);
+        self.save(device);
+    }
+
+    /// Adds `address` for `device` after those that work and before those
+    /// that failed, unless it is known already. When the device has as many
+    /// as are kept, an address that works is never pushed out for it.
+    fn add(&mut self, device: DeviceId, address: &str) {
+        let list = self.known.entry(device).or_default();
+        if list.iter().any(|known| known.address == address) {
             return;
         }
-        if let Some(store) = &self.store {
-            // An address is a hint: failing to store one is not an error.
-            let _ = store.execute(
-                "INSERT INTO member_addresses(device_id, address) VALUES (?1, ?2)
-                 ON CONFLICT(device_id) DO UPDATE SET address = excluded.address",
-                params![device_id_to_bytes(device).as_slice(), address],
-            );
-        }
+        let at = list
+            .iter()
+            .position(|known| known.failed)
+            .unwrap_or(list.len());
+        list.insert(
+            at,
+            KnownAddress {
+                address: address.to_owned(),
+                failed: false,
+            },
+        );
+        list.truncate(ADDRESSES_PER_DEVICE);
+        self.save(device);
+    }
+
+    /// Puts `address` behind `device`'s others: an attempt to reach it there
+    /// failed.
+    fn failed(&mut self, device: DeviceId, address: &str) {
+        let Some(list) = self.known.get_mut(&device) else {
+            return;
+        };
+        let Some(at) = list.iter().position(|known| known.address == address) else {
+            return;
+        };
+        let mut known = list.remove(at);
+        known.failed = true;
+        list.push(known);
+        self.save(device);
+    }
+
+    fn save(&self, device: DeviceId) {
+        let (Some(store), Some(list)) = (&self.store, self.known.get(&device)) else {
+            return;
+        };
+        // An address is a hint: failing to store one is not an error.
+        let _ = (|| -> rusqlite::Result<()> {
+            let transaction = store.unchecked_transaction()?;
+            let id = device_id_to_bytes(device);
+            transaction.execute(
+                "DELETE FROM device_addresses WHERE device_id = ?1",
+                [id.as_slice()],
+            )?;
+            for (position, known) in list.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO device_addresses(device_id, position, address) VALUES (?1, ?2, ?3)",
+                    params![id.as_slice(), position as i64, known.address],
+                )?;
+            }
+            transaction.commit()
+        })();
     }
 }
 
-/// Where each device was last reached. Addresses are hints: a connection is
-/// authenticated by the certificate pin, wherever it leads.
+/// Where each device can be reached: several addresses for each, best
+/// first. Addresses are hints: a connection is authenticated by the
+/// certificate pin, wherever it leads.
 #[derive(Clone, Default)]
 pub struct AddressBook {
     book: Arc<Mutex<Book>>,
@@ -155,37 +218,58 @@ pub struct AddressBook {
 impl AddressBook {
     /// Opens the address book kept in the SQLite file at `path`, normally
     /// the device's peer store, so addresses survive a restart.
-    /// `AddressBook::default()` keeps them in memory only.
+    /// `AddressBook::default()` keeps them in memory only. A store of the
+    /// second layout, which kept one address for each device, has it moved
+    /// over.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let store = Connection::open(path)?;
         store.busy_timeout(Duration::from_secs(5))?;
         osm_vault_sync::claim_store_version(&store, crate::peers::STORE_VERSION)?;
-        store.execute_batch(
-            "CREATE TABLE IF NOT EXISTS member_addresses (
-                 device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
-                 address TEXT NOT NULL CHECK(length(address) BETWEEN 1 AND 128)
+        let transaction = store.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS device_addresses (
+                 device_id BLOB NOT NULL CHECK(length(device_id) = 16),
+                 position INTEGER NOT NULL CHECK(position BETWEEN 0 AND 7),
+                 address TEXT NOT NULL CHECK(length(address) BETWEEN 1 AND 128),
+                 PRIMARY KEY (device_id, position)
              ) STRICT;",
         )?;
-        let known = {
-            let mut statement = store.prepare("SELECT device_id, address FROM member_addresses")?;
+        let second_layout: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'member_addresses')",
+            [],
+            |row| row.get(0),
+        )?;
+        if second_layout {
+            transaction.execute_batch(
+                "INSERT OR IGNORE INTO device_addresses(device_id, position, address)
+                     SELECT device_id, 0, address FROM member_addresses;
+                 DROP TABLE member_addresses;",
+            )?;
+        }
+        transaction.commit()?;
+        let mut known: BTreeMap<DeviceId, Vec<KnownAddress>> = BTreeMap::new();
+        {
+            let mut statement = store.prepare(
+                "SELECT device_id, address FROM device_addresses ORDER BY device_id, position",
+            )?;
             let rows = statement
                 .query_map([], |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            rows.into_iter()
-                .filter_map(|(device, address)| {
-                    let device: [u8; 16] = device.try_into().ok()?;
-                    Some((
-                        device_id_from_bytes(device),
-                        KnownAddress {
-                            address,
-                            failed: false,
-                        },
-                    ))
-                })
-                .collect()
-        };
+            for (device, address) in rows {
+                let Ok(device) = <[u8; 16]>::try_from(device) else {
+                    continue;
+                };
+                known
+                    .entry(device_id_from_bytes(device))
+                    .or_default()
+                    .push(KnownAddress {
+                        address,
+                        failed: false,
+                    });
+            }
+        }
         Ok(Self {
             book: Arc::new(Mutex::new(Book {
                 known,
@@ -194,40 +278,55 @@ impl AddressBook {
         })
     }
 
+    /// The address `device` is best tried at first.
     pub fn get(&self, device: DeviceId) -> Option<String> {
         let book = self.book.lock().ok()?;
-        book.known.get(&device).map(|known| known.address.clone())
+        book.known
+            .get(&device)
+            .and_then(|list| list.first())
+            .map(|known| known.address.clone())
+    }
+
+    /// Every address known for `device`, in the order to try them.
+    pub fn all(&self, device: DeviceId) -> Vec<String> {
+        self.book
+            .lock()
+            .ok()
+            .and_then(|book| {
+                book.known
+                    .get(&device)
+                    .map(|list| list.iter().map(|known| known.address.clone()).collect())
+            })
+            .unwrap_or_default()
     }
 
     /// Records an address this device saw for itself: where an
-    /// authenticated connection came from, or where one was made.
+    /// authenticated connection came from, or where one was made. It is
+    /// tried first.
     pub fn observe(&self, device: DeviceId, address: &str) {
         if !valid_address(address) {
             return;
         }
         if let Ok(mut book) = self.book.lock() {
-            book.record(device, address);
+            book.reached(device, address);
         }
     }
 
-    /// Records an address another member reported. It does not replace one
-    /// this device saw for itself, unless that one stopped working.
+    /// Records an address another member reported, or an invitation named.
+    /// It is tried after those this device reached, and pushes none out.
     pub fn suggest(&self, device: DeviceId, address: &str) {
         if !valid_address(address) {
             return;
         }
         if let Ok(mut book) = self.book.lock() {
-            if book.known.get(&device).is_none_or(|known| known.failed) {
-                book.record(device, address);
-            }
+            book.add(device, address);
         }
     }
 
-    fn failed(&self, device: DeviceId, address: &str) {
+    /// Records that an attempt to reach `device` at `address` failed.
+    pub(crate) fn failed(&self, device: DeviceId, address: &str) {
         if let Ok(mut book) = self.book.lock() {
-            if let Some(known) = book.known.get_mut(&device) {
-                known.failed |= known.address == address;
-            }
+            book.failed(device, address);
         }
     }
 }
@@ -426,6 +525,18 @@ impl MemberEndpoint {
     /// Takes in the roster `from` sent, if this device's own state lists
     /// `from` as a member. Anything else is ignored: a device still being
     /// enrolled, for one, cannot vouch for others.
+    /// Accepts the members `grant` names, as [`introduce`](Self::introduce)
+    /// does, and keeps every address the invitation named for the inviter,
+    /// so that this device can reach it on whichever network they share.
+    pub fn introduce_grant(&self, joiner: &Joiner, grant: &EnrollmentGrant) -> Result<()> {
+        self.introduce(&joiner.members(grant)?)?;
+        let inviter = device_id_from_bytes(joiner.inviter_device_id());
+        for address in joiner.inviter_member_addresses(grant) {
+            self.inner.addresses.suggest(inviter, &address);
+        }
+        Ok(())
+    }
+
     fn learn(&self, from: DeviceId, roster: &[MemberContact]) {
         let trusted = self
             .directory()
@@ -439,7 +550,7 @@ impl MemberEndpoint {
     /// connection. A certificate that belongs to no accepted device fails
     /// the handshake; a removed device is told so and refused.
     pub async fn accept(&self, tcp: TcpStream) -> Result<Incoming> {
-        let remote = tcp.peer_addr()?.ip();
+        let remote = tcp.peer_addr()?.ip().to_canonical();
         let mut stream = with_timeout(HANDSHAKE_TIMEOUT, self.inner.acceptor.accept(tcp))
             .await?
             .map_err(handshake_error)?;
@@ -527,8 +638,8 @@ impl MemberEndpoint {
         })
     }
 
-    /// Dials `device` at its last known address, accepting only the
-    /// certificate with `pin`, and completes the opening exchange.
+    /// Dials `device` at the addresses known for it, best first, accepting
+    /// only the certificate with `pin`, and completes the opening exchange.
     async fn open(
         &self,
         device: DeviceId,
@@ -536,15 +647,16 @@ impl MemberEndpoint {
         channel: Channel,
     ) -> Result<client::TlsStream<TcpStream>> {
         let addresses = &self.inner.addresses;
-        let address = addresses.get(device).ok_or(Error::AddressUnknown)?;
-        let tcp = match with_timeout(CONNECT_TIMEOUT, TcpStream::connect(address.as_str())).await {
-            Ok(Ok(tcp)) => tcp,
-            Ok(Err(error)) => {
-                addresses.failed(device, &address);
-                return Err(Error::Io(error));
-            }
+        let candidates = addresses.all(device);
+        if candidates.is_empty() {
+            return Err(Error::AddressUnknown);
+        }
+        let (tcp, address) = match connect_any(&candidates).await {
+            Ok(reached) => reached,
             Err(error) => {
-                addresses.failed(device, &address);
+                for address in &candidates {
+                    addresses.failed(device, address);
+                }
                 return Err(error);
             }
         };

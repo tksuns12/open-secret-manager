@@ -1,0 +1,8 @@
+{
+  "about": "What a reader should find in peers-3.sqlite3 beside this file: the third layout, with the TLS key kept in the file because no keystore sealed it, and two addresses for one member. Its TLS key identifies no real device.",
+  "addresses": [
+    "192.0.2.11:47821",
+    "[2001:db8::11]:47821"
+  ],
+  "transport_pin": "05a679560be54faf75ee6b12a9b686d205c8c07c52168a3aff9c78bb406618cf"
+}

@@ -58,12 +58,13 @@ fn legacy_peer() -> Peer {
 /// its TLS key is kept in the file and any later build can read it: a new
 /// TLS identity, an address seen for a member, and the one device an older
 /// build may have paired with. `peers.sqlite3` was written by this test as
-/// it was before Phase 14, in the first layout; `peers-2.sqlite3` by this
-/// one, in the second.
+/// it was before Phase 14, in the first layout; `peers-2.sqlite3` as it was
+/// in Phase 14, in the second; `peers-3.sqlite3` by this one, in the third,
+/// with a second address for the member.
 #[test]
 #[ignore = "writes a new fixture; it refuses to replace one"]
 fn write_the_peer_store_fixture() {
-    let destination = folder().join("peers-2.sqlite3");
+    let destination = folder().join("peers-3.sqlite3");
     assert!(!destination.exists(), "a frozen file is never made again");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("peers.sqlite3");
@@ -73,13 +74,15 @@ fn write_the_peer_store_fixture() {
     drop(peers);
     let book = AddressBook::open(&path).unwrap();
     book.observe(device_id_from_bytes(counting(0xa0)), "192.0.2.11:47821");
+    book.suggest(device_id_from_bytes(counting(0xa0)), "[2001:db8::11]:47821");
     drop(book);
     std::fs::copy(&path, &destination).unwrap();
     std::fs::write(
-        folder().join("peers-2.json"),
+        folder().join("peers-3.json"),
         serde_json::to_string_pretty(&json!({
-            "about": "What a reader should find in peers-2.sqlite3 beside this file: the second layout, with the TLS key kept in the file because no keystore sealed it. Its TLS key identifies no real device.",
+            "about": "What a reader should find in peers-3.sqlite3 beside this file: the third layout, with the TLS key kept in the file because no keystore sealed it, and two addresses for one member. Its TLS key identifies no real device.",
             "transport_pin": hex(&identity.pin()),
+            "addresses": ["192.0.2.11:47821", "[2001:db8::11]:47821"],
         }))
         .unwrap()
             + "\n",
@@ -87,16 +90,17 @@ fn write_the_peer_store_fixture() {
     .unwrap();
     let mut sums = std::fs::read_to_string(folder().join("SHA256SUMS")).unwrap();
     sums.push_str(&format!(
-        "{}  peers-2.sqlite3\n",
+        "{}  peers-3.sqlite3\n",
         hex(&Sha256::digest(std::fs::read(&destination).unwrap()))
     ));
     std::fs::write(folder().join("SHA256SUMS"), sums).unwrap();
 }
 
 /// The frozen peer stores, each with what a reader should find in it.
-const FROZEN: [(&str, &str); 2] = [
+const FROZEN: [(&str, &str); 3] = [
     ("peers.sqlite3", "peers.json"),
     ("peers-2.sqlite3", "peers-2.json"),
+    ("peers-3.sqlite3", "peers-3.json"),
 ];
 
 /// A copy of a frozen peer store that a test may open.
@@ -195,11 +199,29 @@ async fn the_frozen_peer_stores_still_identify_their_device_over_tls_and_are_sea
         drop(peers);
         assert!(!contains(&std::fs::read(&path).unwrap(), &secret), "{name}");
         let book = AddressBook::open(&path).unwrap();
-        assert_eq!(
-            book.get(device_id_from_bytes(counting(0xa0))).as_deref(),
-            Some("192.0.2.11:47821")
-        );
+        // The second layout's one address is moved over; the third keeps
+        // each, in its order.
+        let member = device_id_from_bytes(counting(0xa0));
+        assert_eq!(book.get(member).as_deref(), Some("192.0.2.11:47821"));
+        if let Some(addresses) = expected.get("addresses") {
+            assert_eq!(
+                serde_json::to_value(book.all(member)).unwrap(),
+                *addresses,
+                "{name}"
+            );
+        }
         drop(book);
+        let tables: Vec<String> = Connection::open(&path)
+            .unwrap()
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%addresses'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(tables, ["device_addresses"], "{name}");
         // Opened again, it is opened by the keystore.
         let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
         assert_eq!(peers.transport_identity().unwrap().pin(), frozen.pin());
@@ -245,7 +267,7 @@ fn a_peer_store_marked_by_a_later_build_is_refused_and_an_unmarked_one_is_the_fi
             .unwrap();
     };
     assert_eq!(version(&path), 1);
-    mark(3);
+    mark(4);
     let before = std::fs::read(&path).unwrap();
     assert!(matches!(
         PeerStore::open(&path, Arc::new(NoKeystore)),
@@ -267,7 +289,7 @@ fn a_peer_store_marked_by_a_later_build_is_refused_and_an_unmarked_one_is_the_fi
         expected["transport_pin"]
     );
     drop(peers);
-    assert_eq!(version(&path), 2);
+    assert_eq!(version(&path), 3);
 }
 
 #[test]

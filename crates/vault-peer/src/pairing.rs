@@ -535,6 +535,24 @@ impl Joiner {
         self.invitation.body.inviter_transport_pin
     }
 
+    /// The addresses the invitation named for the inviter, each with the
+    /// port it accepts its vault's members on, from its grant.
+    pub(crate) fn inviter_member_addresses(&self, grant: &EnrollmentGrant) -> Vec<String> {
+        let body = &self.invitation.body;
+        body.addresses
+            .iter()
+            .filter_map(|address| {
+                grant
+                    .inviter_port
+                    .and_then(|port| sync_address(Some(address), Some(port)))
+            })
+            .collect()
+    }
+
+    pub(crate) fn inviter_device_id(&self) -> [u8; 16] {
+        self.invitation.body.inviter_device_id
+    }
+
     pub(crate) fn inviter_addresses(&self) -> &[String] {
         &self.invitation.body.addresses
     }
