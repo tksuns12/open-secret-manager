@@ -143,10 +143,12 @@ impl From<std::io::Error> for MobileError {
 /// Keychain. The app gives its own to [`Device::open`].
 #[uniffi::export(with_foreign)]
 pub trait PhoneKeystore: Send + Sync {
-    /// Seals `key`; what comes back is given to [`PhoneKeystore::open`].
+    /// Seals `key`; what comes back is given to [`PhoneKeystore::unseal`].
     fn seal(&self, key: Vec<u8>) -> Result<Vec<u8>, KeystoreFailure>;
-    /// Opens what [`PhoneKeystore::seal`] returned.
-    fn open(&self, sealed: Vec<u8>) -> Result<Vec<u8>, KeystoreFailure>;
+    /// Opens what [`PhoneKeystore::seal`] returned. Not named `open`:
+    /// UniFFI writes that name into the C header for Swift as `` `open` ``,
+    /// which does not compile.
+    fn unseal(&self, sealed: Vec<u8>) -> Result<Vec<u8>, KeystoreFailure>;
 }
 
 /// Why the phone's keystore did not seal or open a key.
@@ -178,7 +180,7 @@ impl osm_vault_peer::Keystore for ForeignKeystore {
 
     fn open(&self, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, osm_vault_peer::KeystoreError> {
         self.0
-            .open(sealed.to_vec())
+            .unseal(sealed.to_vec())
             .map(Zeroizing::new)
             .map_err(KeystoreFailure::into_peer)
     }

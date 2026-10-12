@@ -213,6 +213,20 @@ elif [ "$platform" = ios ]; then
         sleep 0.5
     done
     if [ -e "$work/join/phone-made" ]; then
+        # The phone's network key is sealed by the Keychain, not kept in
+        # its file: read from its peer store in the simulator's files
+        # (scripts/test-mobile-ios.sh keeps the simulator in a folder of
+        # its own under the temporary folder), while the app still runs.
+        peers=$(find "${TMPDIR:-/tmp}" -path '*/devices/*/Shared/AppGroup/*' -name peers.sqlite3 \
+            -newer "$work/join/ready" 2>/dev/null | head -1)
+        kept=$([ -n "$peers" ] && sqlite3 -readonly "$peers" \
+            "SELECT private_key IS NULL AND sealed_key IS NOT NULL FROM transport_key" 2>/dev/null || true)
+        if [ "$kept" = 1 ]; then
+            echo "the phone's network key is sealed"
+        else
+            echo "the phone's network key is not sealed (${peers:-no peer store found})" >&2
+            sealed=no
+        fi
         for _ in $(seq 1 120); do
             echo list >&3
             sleep 0.5
@@ -227,6 +241,7 @@ elif [ "$platform" = ios ]; then
     wait "$phone" || status=$?
     cat "$work/ios.log"
     [ "$status" = 0 ] || exit "$status"
+    [ "${sealed:-yes}" = yes ] || exit 1
 else
     echo "invite without-vote" >&3
     invitation=$(expect INVITE)

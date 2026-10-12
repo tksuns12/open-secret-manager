@@ -56,7 +56,7 @@ final class KeychainKeystore: PhoneKeystore {
         return Data([Self.form]) + name + Data(box.nonce) + box.ciphertext + box.tag
     }
 
-    func open(sealed: Data) throws -> Data {
+    func unseal(sealed: Data) throws -> Data {
         let sealed = Data(sealed)
         // Not in this form, or cut short: nothing this keystore sealed.
         guard sealed.count >= 1 + Self.nameLength + Self.nonceLength + 16, sealed.first == Self.form else {

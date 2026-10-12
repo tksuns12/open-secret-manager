@@ -68,9 +68,17 @@ done
 platform="$(xcode-select -p)/Platforms/iPhoneSimulator.platform/Developer"
 runner=$(xcrun simctl --set "$set_dir" get_app_container "$device" org.opensecretmanager.app.uitests.xctrunner app)
 app=$(xcrun simctl --set "$set_dir" get_app_container "$device" org.opensecretmanager.app app)
-SIMCTL_CHILD_XCTEST_FRAMEWORK="$runner/Frameworks/XCTest.framework/XCTest" \
-SIMCTL_CHILD_AUTOMATION_FRAMEWORK="$runner/Frameworks/XCTAutomationSupport.framework" \
-SIMCTL_CHILD_DYLD_FRAMEWORK_PATH="$runner/Frameworks" \
+# Xcode 27 no longer copies XCTest into the runner; it is then the
+# platform's own.
+frameworks="$runner/Frameworks"
+automation="$frameworks/XCTAutomationSupport.framework"
+if [ ! -e "$frameworks/XCTest.framework" ]; then
+    frameworks="$platform/Library/Frameworks"
+    automation="$platform/Library/PrivateFrameworks/XCTAutomationSupport.framework"
+fi
+SIMCTL_CHILD_XCTEST_FRAMEWORK="$frameworks/XCTest.framework/XCTest" \
+SIMCTL_CHILD_AUTOMATION_FRAMEWORK="$automation" \
+SIMCTL_CHILD_DYLD_FRAMEWORK_PATH="$frameworks:$platform/Library/PrivateFrameworks" \
 SIMCTL_CHILD_DYLD_LIBRARY_PATH="$platform/usr/lib" \
     xcrun simctl --set "$set_dir" spawn "$device" "$work/configure-ui-tests" \
     "$runner/PlugIns/UITests.xctest" "$app" org.opensecretmanager.app "$work/tests.xctestconfiguration" "$@"

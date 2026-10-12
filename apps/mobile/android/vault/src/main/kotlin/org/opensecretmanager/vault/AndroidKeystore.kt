@@ -60,7 +60,7 @@ object AndroidKeystore : PhoneKeystore {
         byteArrayOf(FORM) + name + nonce + sealed
     }
 
-    override fun open(sealed: ByteArray): ByteArray {
+    override fun unseal(sealed: ByteArray): ByteArray {
         // Not in this form, or cut short: nothing this keystore sealed.
         if (sealed.size < 1 + NAME + NONCE || sealed[0] != FORM) throw KeystoreFailure.Lost()
         val name = sealed.copyOfRange(1, 1 + NAME)

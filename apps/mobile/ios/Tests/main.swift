@@ -33,7 +33,7 @@ func fails<T>(_ call: () throws -> T, with expected: (MobileError) -> Bool) -> B
 /// keystore (Shared/KeychainKeystore.swift) is used through the app.
 final class NoKeystore: PhoneKeystore {
     func seal(key: Data) throws -> Data { throw KeystoreFailure.Unavailable }
-    func open(sealed: Data) throws -> Data { throw KeystoreFailure.Unavailable }
+    func unseal(sealed: Data) throws -> Data { throw KeystoreFailure.Unavailable }
 }
 
 let folder = CommandLine.arguments[1]

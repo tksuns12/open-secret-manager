@@ -139,16 +139,16 @@ class DeviceTest {
         val sealed = AndroidKeystore.seal(key)
         assertEquals(before + 1, AndroidKeystore.count())
         assertTrue(sealed.toList().windowed(key.size).none { it == key.toList() })
-        assertTrue(AndroidKeystore.open(sealed).contentEquals(key))
+        assertTrue(AndroidKeystore.unseal(sealed).contentEquals(key))
 
         val altered = sealed.copyOf().also { it[it.size - 1] = (it[it.size - 1] + 1).toByte() }
-        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(altered) }
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.unseal(altered) }
         val renamed = sealed.copyOf().also { it[1] = (it[1] + 1).toByte() }
-        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(renamed) }
-        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(byteArrayOf(1, 2, 3)) }
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.unseal(renamed) }
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.unseal(byteArrayOf(1, 2, 3)) }
 
         AndroidKeystore.forgetEverything()
-        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.open(sealed) }
+        keystoreFails<KeystoreFailure.Lost> { AndroidKeystore.unseal(sealed) }
     }
 
     @Test
