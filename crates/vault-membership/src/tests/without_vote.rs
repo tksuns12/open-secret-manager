@@ -393,3 +393,29 @@ async fn a_member_without_a_vote_that_a_stray_entry_made_a_voter_is_still_remove
         })
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_without_a_vote_cannot_remove_the_only_device_that_votes() {
+    let mut cluster = Cluster::new(3);
+    for device in [1, 2] {
+        cluster.start(device, CrashPlan::default()).await;
+    }
+    cluster.bootstrap(&[1]).await;
+    cluster.add_without_vote(1, 2).await;
+
+    // That would leave no voter, which Raft cannot change to: the removal
+    // would stay pending and block every change after it. It is refused.
+    let removal = cluster.remove(2, 2, 1);
+    assert!(invalid(&cluster.running[&2].submit(removal).await.unwrap()));
+    cluster
+        .until(&[1, 2], "the removal refused", |state| {
+            state.pending.is_none() && state.voters() == BTreeSet::from([1])
+        })
+        .await;
+    // Changes go on: the voter enrolls another device.
+    cluster.start(3, CrashPlan::default()).await;
+    cluster.add_without_vote(3, 3).await;
+    let state = cluster.running[&1].state();
+    assert_eq!(state.members(), BTreeSet::from([1, 2, 3]));
+    assert!(state.removed.is_empty());
+}

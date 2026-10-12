@@ -1,5 +1,6 @@
 // The Devices panel, on the preview's sample vault of two devices
-// (`?devices`): this computer, which votes, and a phone, which does not.
+// (`?devices`): this computer, which votes, and a phone, which does not;
+// with `?without-vote`, this device is the one that does not vote.
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
@@ -31,6 +32,19 @@ test("the panel lists this device first and marks the phone that does not vote",
   assert.match(await rows.nth(0).textContent(), /This device/);
   assert.doesNotMatch(await rows.nth(0).textContent(), /does not vote/);
   assert.match(await rows.nth(1).textContent(), /Device 9f8e7d6c.*192\.168\.1\.23:47820 · does not vote/);
+  assert.equal(await rows.nth(1).getByRole("button", { name: "Remove…" }).count(), 1);
+  assert.deepEqual(errors, []);
+});
+
+test("the only device that votes cannot be removed, and the panel says so", async () => {
+  const { page, errors } = await window.open("?devices&without-vote");
+  const panel = await openDevices(page);
+  const rows = panel.locator(".peer-row");
+  await rows.nth(1).waitFor();
+  assert.match(await rows.nth(0).textContent(), /This device.* · does not vote/);
+  assert.match(await rows.nth(1).textContent(), /Device 9f8e7d6c.* · the only device that votes/);
+  assert.equal(await rows.nth(1).getByRole("button", { name: "Remove…" }).count(), 0);
+  await panel.getByText(/It cannot itself be removed while it is the only one: invite a computer that votes first\./).waitFor();
   assert.deepEqual(errors, []);
 });
 

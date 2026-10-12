@@ -349,6 +349,11 @@ proptest! {
                 prop_assert!(!before.removed.contains_key(&by), "{step:?} accepted from a removed device");
                 prop_assert_eq!(Some(by), signer, "a request signed by another device was accepted");
             }
+            // A change in progress leads to a membership with a voter: Raft
+            // makes no change to one without, so it would never complete.
+            if let Some(pending) = &state.pending {
+                prop_assert!(!pending.target_voters.is_empty(), "{step:?} left a change leading to no voter");
+            }
 
             // The epoch only moves on, one at a time, with a check for each.
             prop_assert!(state.epoch == before.epoch || state.epoch == before.epoch + 1 || before.epoch == 0);

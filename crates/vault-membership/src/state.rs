@@ -374,6 +374,13 @@ impl ControlState {
                 if !target.remove(device) && !self.is_enrolled(*device) {
                     return Err(invalid("device is not a member"));
                 }
+                // Raft makes no change to a membership without a voter, so
+                // such a removal would never complete and would block every
+                // change after it. Only a member without a vote can ask for
+                // it, as a device cannot remove itself.
+                if target.is_empty() {
+                    return Err(invalid("the only device that votes cannot be removed"));
+                }
                 // The new key goes to the enrolled members that remain,
                 // voting or not.
                 let remaining = target

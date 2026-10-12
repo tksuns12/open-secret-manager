@@ -802,13 +802,16 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
   const members = [...devices.members.filter((member) => member.thisDevice), ...others];
   const pending = devices.pending;
   const replaced = sync.replaced.filter((id) => others.some((member) => member.id === id));
+  // The vault's only device that votes cannot be removed: no change could
+  // complete without it.
+  const onlyVoter = devices.members.filter((member) => member.votes).length === 1;
   return <div className="device-panel">
     {devices.networkKey === "in_file" && <p className="review-hint">No keystore on this computer sealed this device's network key, so it is kept in a file only your account can read. It is sealed the next time the app starts with a keystore that answers.</p>}
     {replaced.length > 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Device {shortDevice(replaced[0])} answers as a different device</strong><span>Something else now answers at its address, so this device refuses it and cannot sync with it. If you started over as a new vault on that device, this copy was left behind: put it away to join the new vault. If you did not, change nothing here.</span></div><button className="conflict-action" onClick={() => setLeaving(true)}>Put this copy away…</button></div>}
     {members.map((member) => <div key={member.id} className="peer-row">
       <div className="device-icon"><Fingerprint size={18} /></div>
-      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}{member.votes ? "" : " · does not vote"}</span></div>
-      {!member.thisDevice && !pending && (removing === member.id
+      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}{member.votes ? (onlyVoter && !member.thisDevice ? " · the only device that votes" : "") : " · does not vote"}</span></div>
+      {!member.thisDevice && !pending && !(member.votes && onlyVoter) && (removing === member.id
         ? <div className="form-actions"><button className="secondary" onClick={() => setRemoving(null)}>Keep</button><button className="generate-button" onClick={() => { setRemoving(null); onRemove(member.id); }}>Remove</button></div>
         : <button className="secondary" disabled={locked} onClick={() => setRemoving(member.id)}>Remove…</button>)}
     </div>)}
@@ -1218,7 +1221,7 @@ function quorumHint(devices: DevicesInfo): string {
   if (count <= 1) return "Each device keeps a full encrypted copy and they sync directly, with no server. You will compare a six-digit code on both screens.";
   const voting = devices.members.filter((member) => member.votes).length;
   const others = voting < count ? " Devices that do not vote never count toward this." : "";
-  if (voting === 1) return `Adding or removing a device needs only the device that votes to be online.${others}`;
+  if (voting === 1) return `Adding or removing a device needs only the device that votes to be online. It cannot itself be removed while it is the only one: invite a computer that votes first.${others}`;
   if (voting === 2) return `Adding or removing a device needs both devices that vote online. With three that vote, one can be away or lost and still be removed.${others}`;
   return `Adding or removing a device needs ${devices.quorum} of the ${voting} devices that vote online. A locked device still counts while its app is open.${others}`;
 }

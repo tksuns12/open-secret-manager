@@ -72,6 +72,9 @@ evidence in the delivery matrix and the threat model.
 - A vault with two voting devices cannot remove one that is lost; it starts
   over as a new vault instead. A device invited without a vote can always
   be removed by the voting ones.
+- A vault's only voting device cannot be removed, also not by a device
+  without a vote. To retire it, invite another computer that votes first,
+  or start over as a new vault.
 - The membership control plane tolerates crashes and partitions, not a
   malicious member. Whoever copies a device's transport key and control
   database can act as that device in it and stall changes; keys and

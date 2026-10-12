@@ -26,7 +26,7 @@ function previewAsks(what: string): boolean {
   return new URLSearchParams(globalThis.location?.search).has(what);
 }
 
-/** Whether the preview shows a vault of two devices (`?devices`): this one, which votes, and a phone, which does not. */
+/** Whether the preview shows a vault of two devices (`?devices`): this one, which votes, and a phone, which does not. With `?without-vote` as well, this one is the device that does not vote, and the other the only one that does. */
 export function previewHasDevices(): boolean {
   return !native() && previewAsks("devices");
 }
@@ -234,7 +234,9 @@ export const bridge: DesktopBridge = {
   async devices() {
     const invoke = native();
     if (invoke) return (await invoke("devices")) as DevicesInfo;
-    return previewHasDevices() ? { ...previewDevices, relay: previewRelay } : { setup: "none", members: [], epoch: 0, quorum: 0 };
+    if (!previewHasDevices()) return { setup: "none", members: [], epoch: 0, quorum: 0 };
+    const members = previewAsks("without-vote") ? previewDevices.members.map((member) => ({ ...member, votes: !member.votes, leader: !member.leader })) : previewDevices.members;
+    return { ...previewDevices, members, relay: previewRelay };
   },
   // The preview's relay is sample data: no connection is made.
   async setRelay(code) {
