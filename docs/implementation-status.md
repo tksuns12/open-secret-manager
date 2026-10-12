@@ -306,6 +306,22 @@ Its stops:
 3. The tests left behind: the Android Chrome fill tests and the iOS Safari test run again, the desktop test that once ran out of time under load looked at, and a real screen saver and user switch with the packaged app (the owner, at this Mac). **Done**: the packaged app was locked after the screen saver and after a user switch, by what is not known (see Native lifecycle), and Chrome, Safari, and the desktop test (see Real Chrome on Android and Real Safari on iOS in the delivery matrix). The desktop test (`a_removed_device_is_reset_and_joins_again`) did not fail again in 32 runs, eight at a time; what failed in Phase 14 was a wait for an event that "never arrived" within a minute, which five waits in that test share, two of them in a pairing that hashes the joiner's password. The wait now gives two minutes and says which event it was and what had come, so a next failure says where.
 4. Loose ends, at least the review packet's line counts, made one way and said how. **Done:** the review packet now counts each part as the lines of the source files `git ls-files` lists in its folders, tests included, fixtures and generated bindings left out, and says so; the earlier numbers had been counted in a way the packet did not say.
 
+### Phase 16 — Reaching devices on other networks
+
+Planned and approved on 2026-10-12, after the design in [reaching-devices.md](reaching-devices.md). The owner chose its options A and B:
+- A: several addresses per device, and IPv6, so that devices on one VPN (the owner has one) or with open IPv6 reach each other from anywhere. Nothing new is trusted.
+- B: a relay the owner runs, which passes the devices' end-to-end TLS along and can neither read nor pass for them. There is no machine for it yet, so it is built and tried here and set up for real later.
+
+Not in this phase: hole punching, a mailbox for syncing while the computer is off, port mapping on the router, and passkeys and Windows as before.
+
+Its stops:
+
+1. Several addresses per device, and IPv6: the listeners on desktop and phones take IPv6 too; an invitation names up to four of the inviter's addresses (its format has room for four); each device keeps several addresses for each other device, adding what it learns rather than replacing it, and tries them in turn. Tried in process with addresses that do not answer before one that does, and over IPv6.
+2. The owner tries it on the real devices over their VPN, a phone away from home included, if they wish (see [phone-trial.md](phone-trial.md)).
+3. The relay: `osm-relay`, a device's way through it, and the relay token kept in the vault; tried in process.
+4. The relay in the apps: the desktop's setting, the phones' use of it, and a run with the relay in the Linux container; the threat model's section on what a relay sees and can do.
+5. Loose ends.
+
 ## Work that can proceed in parallel
 
 Core persistence/cryptography, sync transport primitives, and frontend shell work can run independently after types and errors are agreed. The UI uses an explicit development adapter until the core bridge exists and labels any demonstration data. The sync layer accepts only encrypted envelopes and signed public control data. Browser filling depends on the desktop session and core origin policy; it cannot be made real by a standalone extension patch.
