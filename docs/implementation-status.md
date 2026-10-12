@@ -291,6 +291,21 @@ Its stops:
 3. Fuzzing that keeps going: a longer run on request in `scripts/check.sh`, and the corpus kept in the repository. **Done** (see Hostile input and crashes in the delivery matrix).
 4. Loose ends, at least a real sleep and a real screen lock of this Mac with the packaged app unlocked, and the lints the clippy of Rust 1.99 adds in `osm-vault-core` and `osm-vault-membership` (the checks pass with the project's Rust, 1.95.0). **The lints done:** with Rust 1.99, `cargo clippy` with warnings as errors passes on the workspace, the desktop app, and the fuzz targets, as it does with 1.95.0: the two largest of the membership crate's errors, openraft's, are boxed, so that every result carrying it is not 320 bytes; a vault's parents are split with `as_chunks`; and the crash test's worker counts up in a loop of its own instead of over an unbounded range. Nothing a user sees changed; the vault and membership tests pass, and the review packet's count of Rust tests is now what runs (306, 5 more ignored, run by their own scripts). **The real lock done:** the owner locked the screen and slept this Mac with the packaged app unlocked, and each time it locked and said why (see Native lifecycle). **Done.**
 
+### Phase 15 — Times in an item's history, the backup reminder shared, and the tests left behind
+
+Planned and approved on 2026-10-12. The owner's "go" adopted the recommendations:
+- A short phase of what is small and known to be open; reaching devices behind NAT is talked through as a design before it is planned, since it adds a server and changes the threat model.
+- Passkeys and Windows stay out, as before.
+
+Not in this phase: reaching devices behind NAT, passkeys, Windows, and what only the owner can do (real phones, signing, two computers, outside review).
+
+Its stops:
+
+1. History times: each version in an item's history says when it was saved, by the clock of the device that saved it. The time goes inside the item's encrypted content, which older builds already keep unread, so no format number changes; it is for display only and orders nothing. A version saved before this has no time.
+2. The backup reminder shared between devices: a backup saved on one device counts on the others, so that they do not remind the owner of what is done.
+3. The tests left behind: the Android Chrome fill tests and the iOS Safari test run again, the desktop test that once ran out of time under load looked at, and a real screen saver and user switch with the packaged app (the owner, at this Mac).
+4. Loose ends, at least the review packet's line counts, made one way and said how.
+
 ## Work that can proceed in parallel
 
 Core persistence/cryptography, sync transport primitives, and frontend shell work can run independently after types and errors are agreed. The UI uses an explicit development adapter until the core bridge exists and labels any demonstration data. The sync layer accepts only encrypted envelopes and signed public control data. Browser filling depends on the desktop session and core origin policy; it cannot be made real by a standalone extension patch.
