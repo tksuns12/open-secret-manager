@@ -50,15 +50,21 @@ pub(crate) fn record(app: &App<MockRuntime>, event: &str) -> Seen {
     seen
 }
 
-/// The `index`th payload of an event, once it has arrived.
+/// The `index`th payload of an event, once it has arrived, failing after
+/// two minutes: a pairing waits on two devices' exchanges and the joiner's
+/// password hashing, which a machine under heavy load slows.
 pub(crate) async fn nth(seen: &Seen, index: usize) -> String {
-    for _ in 0..600 {
+    for _ in 0..1200 {
         if let Some(payload) = seen.lock().unwrap().get(index).cloned() {
             return payload;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("event never arrived");
+    // Which of the waits it was, by what came before.
+    panic!(
+        "payload {index} of an event never arrived; it had {:?}",
+        seen.lock().unwrap()
+    );
 }
 
 pub(crate) async fn titles(app: &AppHandle<MockRuntime>) -> Vec<String> {
