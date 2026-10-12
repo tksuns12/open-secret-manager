@@ -110,3 +110,50 @@ The owner chose A, then B (Phase 16). A VPN is already on the owner's
 devices, so A can be tried on them. There is no machine for a relay yet:
 B is built and tried here (in process, and with the relay in the Linux
 container), and set up for real later.
+
+## Setting up a relay (once there is a machine for it)
+
+Not yet done on a real server: these steps are what the tests did on this
+Mac and in a Linux container, written for one.
+
+1. A machine every device can reach at one address or name: a rented
+   Linux server, or a computer at home with TCP port 47830 forwarded to it
+   on the router. Let TCP 47830 in through its firewall.
+2. Build the relay there from this repository (Rust 1.95):
+   `cargo build --release --locked -p osm-vault-peer --bin osm-relay`, and
+   copy `target/release/osm-relay` to `/usr/local/bin`.
+3. Run it with a folder of its own, where it listens, and where the devices
+   reach it:
+   `osm-relay /var/lib/osm-relay '[::]:47830' relay.example.org:47830`.
+   On its first run it makes its TLS identity and its token in that folder,
+   readable by its user only, and prints `RELAY-CODE OSM-RELAY1-…`. To keep
+   it running, a systemd service such as:
+
+   ```ini
+   [Unit]
+   Description=Open Secret Manager relay
+   After=network-online.target
+
+   [Service]
+   ExecStart=/usr/local/bin/osm-relay /var/lib/osm-relay [::]:47830 relay.example.org:47830
+   DynamicUser=yes
+   StateDirectory=osm-relay
+   Restart=on-failure
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   and `journalctl -u osm-relay` shows the code.
+4. In the desktop app, unlocked: Devices, then "On different networks?
+   Reach your devices through a relay you run…", and paste the code. The
+   panel then says whether this computer is connected to the relay. The
+   other devices take the relay in with their next sync, while they can
+   still reach each other directly, at home; from then on they use it
+   whenever they cannot.
+5. To shut out a device that was removed from the vault, or a code that
+   got out: stop the relay, delete `token` in its folder, start it again,
+   and paste the new code in the desktop app. Devices that have not synced
+   since cannot use the relay until they have, at home.
+6. To stop: Stop using it, in the same panel; the other devices stop with
+   their next sync.
