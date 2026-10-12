@@ -649,7 +649,7 @@ function App() {
       {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
       {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onSaved={loadBackupAge} onNotice={setNotice} /></div></div>}
       {archivesOpen && <div className="modal-backdrop" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">ARCHIVE</p><h2>Copies put away on this device</h2></div><button className="icon-button" aria-label="Close" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><X size={18} /></button></div><ArchivesPanel canCopy={!locked} onCopied={() => { void bridge.listEntries().then(setEntries).catch(() => {}); }} onNotice={setNotice} /></div></div>}
-      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes) => void startInvite(votes)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }} /></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes) => void startInvite(votes)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }}  onRelayChanged={() => { void bridge.devices().then(setDevices).catch(() => {}); }} /></div></div>}
       {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
       {history && !locked && <div className="modal-backdrop" onClick={() => setHistory(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HISTORY</p><h2>{history.title}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHistory(null)}><X size={18} /></button></div><HistoryPanel versions={history.versions} onRestore={(revision) => void restore(history.id, revision, history.versions.filter((version) => version.current).map((version) => version.revision), "Version restored")} /></div></div>}
       {deleted && !locked && <div className="modal-backdrop" onClick={() => setDeleted(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DELETED</p><h2>Recently deleted</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDeleted(null)}><X size={18} /></button></div><DeletedPanel items={deleted} onRestore={(item) => void restore(item.id, item.last, item.heads, `${item.title} restored`)} /></div></div>}
@@ -699,9 +699,46 @@ type DevicesPanelProps = {
   onReset: () => void;
   onNotice: (text: string) => void;
   onCopy: (text: string) => void;
+  /** The relay was set or taken away here. */
+  onRelayChanged: () => void;
 };
 
-function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onUnlock, rejoining, onRejoining: setRejoining, onReset, onNotice, onCopy }: DevicesPanelProps) {
+/** The relay the vault's devices reach each other through when they are on
+ * different networks, which the owner runs and sets up here once. */
+function RelaySection({ relay, locked, onChanged, onNotice }: { relay: DevicesInfo["relay"]; locked: boolean; onChanged: () => void; onNotice: (text: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [code, setCode] = useState("");
+  const [stopping, setStopping] = useState(false);
+  async function save(value: string | null) {
+    try {
+      await bridge.setRelay(value);
+      setEditing(false); setCode(""); setStopping(false);
+      onNotice(value === null ? "Relay no longer used · your other devices stop using it once they sync" : "Relay set · your other devices use it once they sync");
+      onChanged();
+    } catch (error) {
+      onNotice(commandMessage(error, "The relay could not be set"));
+    }
+  }
+  if (editing) {
+    return <div>
+      <p className="review-hint">A relay passes your devices' encrypted connections along when they are on different networks, such as a phone on mobile data and this computer at home. It cannot read them or pass for a device. Run <code>osm-relay</code> on a machine they can all reach, and paste the code it prints.</p>
+      <textarea className="join-code" aria-label="Relay code" rows={3} value={code} onChange={(event) => setCode(event.target.value)} placeholder="OSM-RELAY1-…" />
+      <div className="form-actions"><button className="secondary" onClick={() => { setEditing(false); setCode(""); }}>Cancel</button><button className="generate-button" disabled={!code.trim()} onClick={() => void save(code)}>Use this relay</button></div>
+    </div>;
+  }
+  if (!relay) {
+    return <button className="link-button" disabled={locked} onClick={() => setEditing(true)}>On different networks? Reach your devices through a relay you run…</button>;
+  }
+  return <div className="peer-row relay-row">
+    <div className="device-icon"><Globe size={18} /></div>
+    <div><strong>Relay</strong><span>{relay.address} · {relay.connected ? "connected" : "not connected"}</span></div>
+    {stopping
+      ? <div className="form-actions"><button className="secondary" onClick={() => setStopping(false)}>Keep it</button><button className="generate-button" onClick={() => void save(null)}>Stop using it</button></div>
+      : <div className="form-actions"><button className="secondary" disabled={locked} onClick={() => setEditing(true)}>Change…</button><button className="secondary" disabled={locked} onClick={() => setStopping(true)}>Stop using it…</button></div>}
+  </div>;
+}
+
+function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onUnlock, rejoining, onRejoining: setRejoining, onReset, onNotice, onCopy, onRelayChanged }: DevicesPanelProps) {
   const [removing, setRemoving] = useState<string | null>(null);
   const [choosing, setChoosing] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -778,6 +815,7 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     {removing && <p className="review-hint">Removing a device moves the others to a new key that it never receives. It keeps what it already had, so change any passwords it could have seen. This cannot be undone.</p>}
     {pending && pending.kind === "enroll" && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>{pending.cancelled ? "Cancelling an enrollment" : `Device ${shortDevice(pending.device)} is joining`}</strong><span>{pending.cancelled ? "Your devices are undoing it." : `It becomes a member${pending.votes ? "" : " without a vote"} once it has caught up. Until then no other device can be added or removed. If it never finishes, cancel it; it has received no key.`}</span></div>{!pending.cancelled && <button className="conflict-action" disabled={locked} onClick={onCancelEnrollment}>Cancel enrollment</button>}</div>}
     {pending && pending.kind === "remove" && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Removing device {shortDevice(pending.device)}</strong><span>Waiting for the remaining devices. The new key takes effect only when they have all agreed; bring them online to finish.</span></div></div>}
+    <RelaySection relay={devices.relay} locked={locked} onChanged={onRelayChanged} onNotice={onNotice} />
     <p className="review-hint">{syncDetail(sync)}{sync.pending > 0 ? ` · ${sync.pending} waiting for unlock` : ""}</p>
     <p className="review-hint">{quorumHint(devices)}</p>
     {locked && <p className="review-hint">The vault is locked. This device still syncs and takes part in decisions, but adding or removing a device needs it unlocked.</p>}
@@ -1379,6 +1417,7 @@ function commandMessage(error: unknown, fallback: string): string {
   if (code === "pin_mismatch") return "That device is not the one in the invitation";
   if (code === "invitation_expired") return "The invitation has expired · create a new one";
   if (code === "invalid_invitation") return "That is not a valid invitation";
+  if (code === "invalid_relay_code") return "That is not a relay code · copy the whole code the relay printed";
   if (code === "quorum_unavailable") return "Not enough of your devices are reachable · most of them must be online to add or remove one · nothing was changed";
   if (code === "invalid_credentials") return "That password was rejected · nothing was changed";
   if (code === "no_archive") return `${fallback} · it is no longer there or no longer open`;

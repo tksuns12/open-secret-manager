@@ -842,6 +842,7 @@ pub fn run() {
             network::sync_status,
             network::sync_now,
             network::devices,
+            network::set_relay,
             network::found_control_plane,
             network::remove_device,
             network::cancel_enrollment,

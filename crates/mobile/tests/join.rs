@@ -16,8 +16,9 @@ use osm_mobile::{Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncStat
 use osm_vault_core::{Item, ItemKind as CoreKind, Vault};
 use osm_vault_membership::{device_id_from_bytes, ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
-    control, invite, serve_members, start_node, AddressBook, Keystore, MemberEndpoint,
-    MemoryKeystore, NoKeystore, PairingListener, PeerStore, Voting,
+    control, invite, serve_members, serve_relay, serve_relayed, start_node, AddressBook, Keystore,
+    MemberEndpoint, MemberSync, MemoryKeystore, NoKeystore, PairingListener, PeerStore, Relay,
+    RelayCode, Voting,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -52,6 +53,10 @@ struct Desktop {
     endpoint: MemberEndpoint,
     node: Arc<ControlNode>,
     device: DeviceId,
+    /// Where sync connections go to be run, from the listener or a relay.
+    sync: tokio::sync::mpsc::Sender<MemberSync>,
+    /// The members' listener, until it is stopped.
+    server: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Desktop {
@@ -77,18 +82,25 @@ impl Desktop {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         endpoint.set_listen_port(listener.local_addr().unwrap().port());
         control::found(&vault, &mut peers, &node).await.unwrap();
+        let (sync, mut incoming) = tokio::sync::mpsc::channel(4);
+        let server = tokio::spawn(serve_members(
+            listener,
+            endpoint.clone(),
+            node.clone(),
+            Some(sync.clone()),
+        ));
         let desktop = Arc::new(Self {
             vault: Arc::new(Mutex::new(vault)),
             peers: Mutex::new(peers),
             invitations: Mutex::new(
                 InvitationStore::open_in_memory(InvitationPolicy::default()).unwrap(),
             ),
-            endpoint: endpoint.clone(),
-            node: node.clone(),
+            endpoint,
+            node,
             device,
+            sync,
+            server: std::sync::Mutex::new(Some(server)),
         });
-        let (sync, mut incoming) = tokio::sync::mpsc::channel(4);
-        tokio::spawn(serve_members(listener, endpoint, node, Some(sync)));
         let serving = desktop.clone();
         tokio::spawn(async move {
             while let Some(connection) = incoming.recv().await {
@@ -116,6 +128,36 @@ impl Desktop {
 
     async fn put(&self, item: Item) {
         self.vault.lock().await.put(item).unwrap();
+    }
+
+    /// Sets the relay `code` in the vault, as the owner does in the desktop
+    /// app, and uses it there.
+    async fn use_relay(&self, code: &RelayCode) {
+        let text = code.encode().unwrap();
+        self.vault.lock().await.set_relay(Some(&text)).unwrap();
+        let identity = self.peers.lock().await.transport_identity().unwrap();
+        let (relay, relayed) = Relay::start(code.clone(), identity);
+        self.endpoint.set_relay(Some(relay.clone()));
+        tokio::spawn(serve_relayed(
+            relayed,
+            self.endpoint.clone(),
+            self.node.clone(),
+            Some(self.sync.clone()),
+        ));
+        for _ in 0..100 {
+            if relay.connected() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the desktop never reached the relay");
+    }
+
+    /// Stops the members' listener, as a router that lets nothing in.
+    fn stop_listening(&self) {
+        if let Some(server) = self.server.lock().unwrap().take() {
+            server.abort();
+        }
     }
 
     /// Makes an invitation and waits for the joiner in the background: it
@@ -601,4 +643,87 @@ fn a_locked_phone_away_from_the_screen_syncs_both_ways_and_stays_locked() {
         Err(MobileError::KeystoreLost)
     ));
     assert!(keystore.is_empty());
+}
+
+#[test]
+fn a_phone_takes_the_vaults_relay_and_syncs_through_it_while_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop_runtime = tokio::runtime::Runtime::new().unwrap();
+    let desktop = desktop_runtime.block_on(Desktop::found(dir.path()));
+    let on_desktop = |title: &str| {
+        desktop_runtime.block_on(async {
+            desktop
+                .vault
+                .lock()
+                .await
+                .list()
+                .unwrap()
+                .iter()
+                .any(|item| item.title == title)
+        })
+    };
+    // A relay on this machine, which the owner set up on the desktop.
+    let code = desktop_runtime.block_on(async {
+        let identity = PeerStore::open_in_memory()
+            .unwrap()
+            .transport_identity()
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let code = RelayCode::new(
+            &listener.local_addr().unwrap().to_string(),
+            identity.pin(),
+            [0x5a; 32],
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = serve_relay(listener, identity, [0x5a; 32]).await;
+        });
+        code
+    });
+    desktop_runtime.block_on(desktop.use_relay(&code));
+    desktop_runtime.block_on(desktop.put(login("Before the phone", "before")));
+
+    // At home, the phone joins and syncs as ever, and so takes in the
+    // vault's relay with everything else.
+    let folder = dir.path().join("phone");
+    let phone = joined_phone(&desktop_runtime, &desktop, folder.clone());
+    phone.go_online().unwrap();
+    eventually("the phone has synced at home", || {
+        let _ = phone.sync_now();
+        phone
+            .items()
+            .unwrap()
+            .iter()
+            .any(|item| item.title == "Before the phone")
+    });
+
+    // Away: the desktop cannot be reached directly any more. The phone
+    // writes, and is locked and closed.
+    desktop.stop_listening();
+    phone
+        .create_item(draft("Written away from home", "", Some("away")))
+        .unwrap();
+    phone.go_offline();
+    phone.lock();
+    drop(phone);
+    desktop_runtime.block_on(desktop.put(login("Written at home", "home")));
+
+    // Woken only to sync, locked, it cannot read the vault, and reaches the
+    // desktop through the relay it kept: both ways.
+    let phone = Device::open_listening_on(folder, 0).unwrap();
+    assert_eq!(phone.state(), DeviceState::Locked);
+    let status = phone.sync_in_background().unwrap();
+    assert!(status.pending > 0, "{status:?}");
+    assert!(on_desktop("Written away from home"));
+    // Back in front, unlocked and online, as the app does, the phone
+    // verifies what came through the relay and shows it.
+    phone.unlock(PHONE_PASSWORD.into()).unwrap();
+    phone.go_online().unwrap();
+    let titles: Vec<String> = phone
+        .items()
+        .unwrap()
+        .into_iter()
+        .map(|item| item.title)
+        .collect();
+    assert!(titles.contains(&"Written at home".to_owned()), "{titles:?}");
 }

@@ -1847,3 +1847,94 @@ fn a_removed_devices_writes_passed_on_by_a_member_that_had_not_heard_are_held_on
         }
     });
 }
+
+/// A relay in this process, and the code its devices use.
+async fn relay() -> String {
+    let identity = PeerStore::open_in_memory()
+        .unwrap()
+        .transport_identity()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let code = osm_vault_peer::RelayCode::new(&address, identity.pin(), [0x5a; 32]).unwrap();
+    tokio::spawn(async move {
+        let _ = osm_vault_peer::serve_relay(listener, identity, [0x5a; 32]).await;
+    });
+    code.encode().unwrap().to_string()
+}
+
+#[test]
+fn a_relay_set_on_one_device_is_used_by_every_device_even_while_locked() {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (app_a, app_b) = (shell(dir_a.path()), shell(dir_b.path()));
+    let codes = record(&app_a, "pairing-code");
+    let finished = record(&app_a, "pairing-finished");
+    let (a, b) = (app_a.handle().clone(), app_b.handle().clone());
+
+    tauri::async_runtime::block_on(async move {
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "Shared").await;
+        pair(&a, &codes, &finished, 0, &b, Some("joiner password")).await;
+        eventually(&b, &["Shared"]).await;
+        let code = relay().await;
+
+        // What is not a relay's code is refused, and nothing changes.
+        let refused = network::set_relay(Some("OSM-RELAY1-not-a-code".into()), a.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_relay_code");
+        assert!(devices(&a).await.relay.is_none());
+
+        // Set on A, the relay is used there, and reaches B with the next
+        // sync, where it is used too.
+        network::set_relay(Some(format!("  {code}\n")), a.clone())
+            .await
+            .unwrap();
+        let address = until_devices(&a, "A is connected to the relay", |info| {
+            info.relay.as_ref().is_some_and(|relay| relay.connected)
+        })
+        .await
+        .relay
+        .unwrap()
+        .address;
+        assert!(code.starts_with("OSM-RELAY1-") && address.starts_with("127.0.0.1:"));
+        until_devices(&b, "B is connected to the relay", |info| {
+            info.relay.as_ref().is_some_and(|relay| relay.connected)
+        })
+        .await;
+        network::shutdown(&b).await;
+    });
+    drop(app_b);
+
+    // B starts again and stays locked: it cannot read the vault, and uses
+    // the relay all the same, from what it kept of the vault's last word.
+    let app_b = shell(dir_b.path());
+    let (a, b) = (app_a.handle().clone(), app_b.handle().clone());
+    tauri::async_runtime::block_on(async move {
+        network::start(&b);
+        until_devices(&b, "B, locked, is connected to the relay", |info| {
+            info.relay.as_ref().is_some_and(|relay| relay.connected)
+        })
+        .await;
+        let state = b.state::<AppState>();
+        assert!(!state.vault.lock().await.as_ref().unwrap().is_unlocked());
+
+        // Taken away on A, the relay is used by neither, B once it has
+        // synced unlocked.
+        network::set_relay(None, a.clone()).await.unwrap();
+        assert!(devices(&a).await.relay.is_none());
+        crate::unlock_vault("joiner password".into(), b.state(), b.clone())
+            .await
+            .unwrap();
+        network::sync_now(b.clone()).await.unwrap();
+        until_devices(&b, "B no longer uses the relay", |info| {
+            info.relay.is_none()
+        })
+        .await;
+        for app in [&a, &b] {
+            network::shutdown(app).await;
+        }
+    });
+}

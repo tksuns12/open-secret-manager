@@ -13,6 +13,8 @@ after(async () => {
   await window?.stop();
 });
 
+const toast = (page) => page.locator(".toast");
+
 async function openDevices(page) {
   await page.locator(".footer-bar").getByRole("button", { name: /Devices/ }).click();
   const panel = page.locator(".generator-modal", { hasText: "Devices and sync" });
@@ -71,5 +73,25 @@ test("when the system says the owner went away, the vault locks, says why, and e
   await page.locator(".toast", { hasText: "Vault locked because the screen locked · the pairing was cancelled" }).waitFor();
   await page.getByLabel("Vault password").waitFor();
   assert.equal(await invitation.count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test("a relay is set up from its code, said to be connected, and stopped", async () => {
+  const { page, errors } = await window.open("?devices");
+  const panel = await openDevices(page);
+  await panel.getByRole("button", { name: /through a relay you run/ }).click();
+  const field = panel.getByLabel("Relay code");
+  await field.fill("not a code");
+  await panel.getByRole("button", { name: "Use this relay" }).click();
+  await toast(page).filter({ hasText: "That is not a relay code" }).waitFor();
+  await field.fill("  OSM-RELAY1-PREVIEW-SAMPLE\n");
+  await panel.getByRole("button", { name: "Use this relay" }).click();
+  await toast(page).filter({ hasText: "Relay set · your other devices use it once they sync" }).waitFor();
+  const row = panel.locator(".relay-row");
+  assert.match(await row.textContent(), /Relay.*relay\.example:47830 · connected/);
+  await row.getByRole("button", { name: "Stop using it…" }).click();
+  await row.getByRole("button", { name: "Stop using it", exact: true }).click();
+  await row.waitFor({ state: "detached" });
+  await panel.getByRole("button", { name: /through a relay you run/ }).waitFor();
   assert.deepEqual(errors, []);
 });

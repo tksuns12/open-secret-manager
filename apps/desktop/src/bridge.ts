@@ -43,6 +43,8 @@ const previewDevices: DevicesInfo = {
   quorum: 1,
 };
 
+let previewRelay: DevicesInfo["relay"] = null;
+
 let previewEntries: VaultEntry[] = ([
   { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", favorite: true },
   { id: "2", title: "GitHub", kind: "login", username: "northstar-labs", url: "github.com", favorite: true },
@@ -232,7 +234,14 @@ export const bridge: DesktopBridge = {
   async devices() {
     const invoke = native();
     if (invoke) return (await invoke("devices")) as DevicesInfo;
-    return previewHasDevices() ? previewDevices : { setup: "none", members: [], epoch: 0, quorum: 0 };
+    return previewHasDevices() ? { ...previewDevices, relay: previewRelay } : { setup: "none", members: [], epoch: 0, quorum: 0 };
+  },
+  // The preview's relay is sample data: no connection is made.
+  async setRelay(code) {
+    const invoke = native();
+    if (invoke) { await invoke("set_relay", { code }); return; }
+    if (code !== null && !code.trim().startsWith("OSM-RELAY1-")) throw Object.assign(new Error("invalid_relay_code"), { code: "invalid_relay_code" });
+    previewRelay = code === null ? null : { address: "relay.example:47830", connected: true };
   },
   foundControlPlane: () => nativeOnly("found_control_plane"),
   removeDevice: (device) => nativeOnly("remove_device", { device }),

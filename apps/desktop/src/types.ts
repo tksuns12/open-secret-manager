@@ -217,6 +217,8 @@ export type DevicesInfo = {
   resetReason?: "removed" | "left";
   /** How this device's network key is kept: `sealed` by the system's keystore, or `in_file` where none sealed it. */
   networkKey?: "sealed" | "in_file";
+  /** The relay this device reaches the others through, if the owner set one up. */
+  relay?: { address: string; connected: boolean } | null;
 };
 
 /** What starting over as a new vault produced. */
@@ -349,6 +351,8 @@ export type DesktopBridge = {
   syncStatus: () => Promise<SyncStatus>;
   syncNow: () => Promise<void>;
   devices: () => Promise<DevicesInfo>;
+  /** Sets the relay the vault's devices use, from the code the relay printed, or with `null` stops using one. */
+  setRelay: (code: string | null) => Promise<void>;
   /** For a pair set up by an older build: makes this device the first member. */
   foundControlPlane: () => Promise<void>;
   removeDevice: (device: string) => Promise<void>;

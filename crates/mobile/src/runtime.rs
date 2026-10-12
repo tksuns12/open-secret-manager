@@ -19,8 +19,8 @@ use std::{
 use osm_vault_core::{Item, ItemKind, Origin, Vault, VaultItem};
 use osm_vault_membership::{ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
-    control, serve_members, start_node, AddressBook, Invitation, MemberEndpoint, MemberSync,
-    PairingConnection, PeerStore, PreparedJoin, SyncReport,
+    control, serve_members, serve_relayed, start_node, AddressBook, Invitation, MemberEndpoint,
+    MemberSync, PairingConnection, PeerStore, PreparedJoin, Relay, RelayCode, SyncReport,
 };
 use tokio::{
     sync::{mpsc, Mutex},
@@ -57,10 +57,28 @@ struct Control {
     endpoint: MemberEndpoint,
     node: Arc<ControlNode>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
+    /// Where sync connections are handed to be run against the vault.
+    sync: mpsc::Sender<MemberSync>,
+    /// The relay this device reaches others through, while it uses one: its
+    /// code, and what serves the connections that come through it.
+    relay: StdMutex<Option<(Zeroizing<String>, JoinHandle<()>)>>,
 }
 
 impl Control {
+    fn stop_relay(&self) {
+        if let Some((_, serving)) = self
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            serving.abort();
+        }
+        self.endpoint.set_relay(None);
+    }
+
     async fn stop(&self) {
+        self.stop_relay();
         let tasks = std::mem::take(
             &mut *self
                 .tasks
@@ -872,12 +890,14 @@ impl Runtime {
             Err(_) => osm_vault_peer::listen(0)?,
         };
         endpoint.set_listen_port(listener.local_addr()?.port());
+        let (sync, incoming) = mpsc::channel(4);
         let control = Arc::new(Control {
             endpoint: endpoint.clone(),
             node: node.clone(),
             tasks: StdMutex::new(Vec::new()),
+            sync: sync.clone(),
+            relay: StdMutex::new(None),
         });
-        let (sync, incoming) = mpsc::channel(4);
         let tasks = vec![
             tokio::spawn(serve_members(listener, endpoint, node, Some(sync))),
             tokio::spawn(self.clone().receive(control.clone(), incoming)),
@@ -890,6 +910,9 @@ impl Runtime {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = tasks;
         *slot = Some(control.clone());
         drop(slot);
+        // The relay the vault named when it was last unlocked here, if any.
+        let cached = self.peers.lock().await.relay_code().ok().flatten();
+        self.use_relay(&control, cached).await;
         // Tell the members it knows where it listens now: a phone's
         // address changes from one network to the next.
         let announcer = control.clone();
@@ -911,7 +934,66 @@ impl Runtime {
                 .run_shared(&self.vault, &control.node.state())
                 .await;
             self.finish_sync(&control, result.map(|report| vec![report]));
+            self.refresh_relay(&control).await;
         }
+    }
+
+    /// Uses the relay `code` names, or none. A code that does not read as
+    /// one is not used.
+    async fn use_relay(&self, control: &Control, code: Option<Zeroizing<String>>) {
+        let running = control
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(code, _)| code.clone());
+        if running.as_deref() == code.as_deref() {
+            return;
+        }
+        control.stop_relay();
+        let Some(code) = code else {
+            return;
+        };
+        let Ok(relay_code) = RelayCode::decode(&code) else {
+            return;
+        };
+        let Ok(identity) = self.peers.lock().await.transport_identity() else {
+            return;
+        };
+        let (relay, relayed) = Relay::start(relay_code, identity);
+        control.endpoint.set_relay(Some(relay));
+        let serving = tokio::spawn(serve_relayed(
+            relayed,
+            control.endpoint.clone(),
+            control.node.clone(),
+            Some(control.sync.clone()),
+        ));
+        *control
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((code, serving));
+    }
+
+    /// While the vault is unlocked, brings this device's relay in line with
+    /// the vault's: keeps its code for when the vault is locked, and uses it.
+    async fn refresh_relay(&self, control: &Control) {
+        let wanted = {
+            let vault = self.vault.lock().await;
+            match vault.as_ref().filter(|vault| vault.is_unlocked()) {
+                Some(vault) => match vault.relay() {
+                    Ok(wanted) => wanted,
+                    Err(_) => return,
+                },
+                None => return,
+            }
+        };
+        {
+            let mut peers = self.peers.lock().await;
+            if peers.relay_code().ok().flatten().as_deref() != wanted.as_deref() {
+                let _ = peers.set_relay_code(wanted.as_deref().map(String::as_str));
+            }
+        }
+        self.use_relay(control, wanted).await;
     }
 
     /// Keeps the vault in line with committed membership whenever it
@@ -994,6 +1076,7 @@ impl Runtime {
                 status.message = Some(failure);
             }
         });
+        self.refresh_relay(control).await;
     }
 
     /// Remembers, also across a restart, that this device was removed. It
@@ -1054,6 +1137,7 @@ impl Runtime {
             Ok(_) => Ok(()),
         };
         self.finish_sync(&control, result);
+        self.refresh_relay(&control).await;
         outcome
     }
 

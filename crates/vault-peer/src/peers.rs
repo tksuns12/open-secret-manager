@@ -122,6 +122,10 @@ impl PeerStore {
                  transport_pin BLOB NOT NULL UNIQUE CHECK(length(transport_pin) = 32),
                  address TEXT CHECK(address IS NULL OR length(address) <= 128),
                  paired_at INTEGER NOT NULL
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS relay (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                 code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 1024)
              ) STRICT;",
         )?;
         let mut store = Self {
@@ -265,6 +269,34 @@ impl PeerStore {
 
     /// The device this one was paired with before the vault had a control
     /// plane, if any. Nothing adds to this list any more.
+    /// The code of the relay this device uses, as the vault last said when
+    /// it was unlocked: kept here so that a locked device, which cannot read
+    /// the vault, can still sync through it. It is kept as it is, unsealed:
+    /// its token lets a device onto the relay, which passes bytes it cannot
+    /// read, and opens nothing of the vault.
+    pub fn relay_code(&self) -> Result<Option<Zeroizing<String>>> {
+        Ok(self
+            .connection
+            .query_row("SELECT code FROM relay WHERE singleton = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(Zeroizing::new))
+    }
+
+    /// Keeps `code` as the relay's, or forgets it with `None`.
+    pub fn set_relay_code(&mut self, code: Option<&str>) -> Result<()> {
+        match code {
+            Some(code) => self.connection.execute(
+                "INSERT INTO relay(singleton, code) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET code = excluded.code",
+                [code],
+            )?,
+            None => self.connection.execute("DELETE FROM relay", [])?,
+        };
+        Ok(())
+    }
+
     pub fn legacy_peers(&self) -> Result<Vec<Peer>> {
         let mut statement = self.connection.prepare(
             "SELECT device_id, public_key, transport_pin, address, paired_at

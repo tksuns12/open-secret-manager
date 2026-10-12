@@ -33,14 +33,15 @@ use osm_vault_membership::{
     Rejection,
 };
 use osm_vault_peer::{
-    control, invite, serve_members, start_node, AddressBook, Invitation, KeyKept, Keystore,
-    MemberEndpoint, MemberSync, PairingConnection, PairingListener, PeerStore, PendingJoin,
-    PreparedJoin, Voting, MAX_INVITATION_TTL_SECS,
+    control, invite, serve_members, serve_relayed, start_node, AddressBook, Invitation, KeyKept,
+    Keystore, MemberEndpoint, MemberSync, PairingConnection, PairingListener, PeerStore,
+    PendingJoin, PreparedJoin, Relay, RelayCode, Voting, MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use serde::Serialize;
 use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
+use zeroize::Zeroizing;
 
 use crate::{AppState, CommandError};
 
@@ -82,10 +83,36 @@ struct Control {
     endpoint: MemberEndpoint,
     node: Arc<ControlNode>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
+    /// Where sync connections are handed to be run against the vault.
+    sync: mpsc::Sender<MemberSync>,
+    /// The relay this device reaches others through, while it uses one.
+    relay: StdMutex<Option<RunningRelay>>,
+}
+
+/// A relay in use: its code, its connection, and what serves the
+/// connections that come through it.
+struct RunningRelay {
+    code: Zeroizing<String>,
+    relay: Relay,
+    serving: JoinHandle<()>,
 }
 
 impl Control {
+    /// Stops using the relay, if this device uses one.
+    fn stop_relay(&self) {
+        if let Some(running) = self
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            running.serving.abort();
+        }
+        self.endpoint.set_relay(None);
+    }
+
     fn stop_tasks(&self) {
+        self.stop_relay();
         let tasks = std::mem::take(
             &mut *self
                 .tasks
@@ -521,13 +548,15 @@ async fn start_control<R: Runtime>(
         Err(_) => osm_vault_peer::listen(0).map_err(storage_error)?,
     };
     endpoint.set_listen_port(listener.local_addr().map_err(storage_error)?.port());
+    let (sync, incoming) = mpsc::channel(4);
     let control = Arc::new(Control {
         device,
         endpoint: endpoint.clone(),
         node: node.clone(),
         tasks: StdMutex::new(Vec::new()),
+        sync: sync.clone(),
+        relay: StdMutex::new(None),
     });
-    let (sync, incoming) = mpsc::channel(4);
     let tasks = vec![
         tauri::async_runtime::spawn(serve_members(listener, endpoint, node, Some(sync))),
         tauri::async_runtime::spawn(receive(app.clone(), control.clone(), incoming)),
@@ -539,6 +568,9 @@ async fn start_control<R: Runtime>(
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = tasks;
     *slot = Some(control.clone());
     drop(slot);
+    // The relay the vault named when it was last unlocked here, if any.
+    let cached = net.peers.lock().await.relay_code().ok().flatten();
+    use_relay(app, &control, cached).await;
     // Tell the members this device already knows where it listens now.
     let announcer = control.clone();
     tauri::async_runtime::spawn(async move {
@@ -756,6 +788,110 @@ async fn maintain<R: Runtime>(app: &AppHandle<R>, control: &Control) {
     if vault_changed {
         let _ = app.emit("vault-changed", ());
     }
+    refresh_relay(app, control).await;
+}
+
+/// Uses the relay `code` names, or none: starts, changes, or stops this
+/// device's use of it. A code that does not read as one is not used.
+async fn use_relay<R: Runtime>(
+    app: &AppHandle<R>,
+    control: &Control,
+    code: Option<Zeroizing<String>>,
+) {
+    let running = control
+        .relay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|running| running.code.clone());
+    if running.as_deref() == code.as_deref() {
+        return;
+    }
+    control.stop_relay();
+    let Some(code) = code else {
+        return;
+    };
+    let Ok(relay_code) = RelayCode::decode(&code) else {
+        return;
+    };
+    let Ok(identity) = network(app).peers.lock().await.transport_identity() else {
+        return;
+    };
+    let (relay, relayed) = Relay::start(relay_code, identity);
+    control.endpoint.set_relay(Some(relay.clone()));
+    let serving = tauri::async_runtime::spawn(serve_relayed(
+        relayed,
+        control.endpoint.clone(),
+        control.node.clone(),
+        Some(control.sync.clone()),
+    ));
+    *control
+        .relay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RunningRelay {
+        code,
+        relay,
+        serving,
+    });
+}
+
+/// While the vault is unlocked, brings this device's relay in line with the
+/// vault's: keeps its code in the peer store for when the vault is locked,
+/// and uses it.
+async fn refresh_relay<R: Runtime>(app: &AppHandle<R>, control: &Control) {
+    let wanted = {
+        let state = app.state::<AppState>();
+        let vault = state.vault.lock().await;
+        match vault.as_ref().filter(|vault| vault.is_unlocked()) {
+            Some(vault) => match vault.relay() {
+                Ok(wanted) => wanted,
+                Err(_) => return,
+            },
+            None => return,
+        }
+    };
+    {
+        let mut peers = network(app).peers.lock().await;
+        if peers.relay_code().ok().flatten().as_deref() != wanted.as_deref() {
+            let _ = peers.set_relay_code(wanted.as_deref().map(String::as_str));
+        }
+    }
+    use_relay(app, control, wanted).await;
+}
+
+/// Sets the relay the vault's devices use, from the code `osm-relay`
+/// printed, or with `None` stops them using one. The vault carries it to the
+/// other devices.
+#[tauri::command]
+pub async fn set_relay<R: Runtime>(
+    code: Option<String>,
+    app: AppHandle<R>,
+) -> Result<(), CommandError> {
+    let code = code
+        .map(Zeroizing::new)
+        .map(|code| Zeroizing::new(code.trim().to_owned()))
+        .filter(|code| !code.is_empty());
+    if let Some(code) = &code {
+        RelayCode::decode(code).map_err(|_| CommandError {
+            code: "invalid_relay_code",
+            message: "that is not a relay code: copy the whole code the relay printed".into(),
+        })?;
+    }
+    {
+        let state = app.state::<AppState>();
+        let mut vault = state.vault.lock().await;
+        let vault = vault
+            .as_mut()
+            .filter(|vault| vault.is_unlocked())
+            .ok_or_else(locked)?;
+        vault.set_relay(code.as_deref().map(String::as_str))?;
+    }
+    if let Some(control) = network(&app).control().await {
+        refresh_relay(&app, &control).await;
+    }
+    schedule_sync(&app);
+    let _ = app.emit("devices-changed", ());
+    Ok(())
 }
 
 /// Founds the vault's control plane with this device as its first member.
@@ -884,6 +1020,10 @@ async fn finish_sync<R: Runtime>(
             });
             if changed {
                 let _ = app.emit("vault-changed", ());
+            }
+            // What arrived may have set or changed the vault's relay.
+            if let Some(control) = network(app).control().await {
+                refresh_relay(app, &control).await;
             }
         }
         Err(osm_vault_peer::Error::Removed) => {
@@ -1065,6 +1205,17 @@ pub struct DevicesInfo {
     /// How this device's network (TLS) key is kept: `sealed` by the
     /// system's keystore, or `in_file` where no keystore sealed it.
     pub(crate) network_key: Option<&'static str>,
+    /// The relay this device reaches others through, if it uses one.
+    pub(crate) relay: Option<RelayInfo>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayInfo {
+    /// Where the relay is, as `host:port`.
+    pub(crate) address: String,
+    /// This device is connected to it now.
+    pub(crate) connected: bool,
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -1115,6 +1266,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         reset_reason: note.as_ref().map(|(reason, _)| reason.name()),
         reset_archive: note.as_ref().map(|(_, archive)| archive.clone()),
         network_key,
+        relay: None,
     };
     if has_vault && net.is_removed() {
         return Ok(empty("removed"));
@@ -1156,6 +1308,15 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         },
         cancelled: pending.cancelled,
     });
+    let relay = control
+        .relay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|running| RelayInfo {
+            address: running.relay.address().to_owned(),
+            connected: running.relay.connected(),
+        });
     Ok(DevicesInfo {
         setup: if net.is_removed() { "removed" } else { "ready" },
         this_device: this_device.map(|device| hex(&device)),
@@ -1166,6 +1327,7 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
         reset_archive: None,
         reset_reason: None,
         network_key,
+        relay,
     })
 }
 
