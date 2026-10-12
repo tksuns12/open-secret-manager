@@ -219,9 +219,9 @@ impl Item {
                 "TOTP secret must not be empty".into(),
             ));
         }
-        if self.id == crate::storage::BACKUPS_ID {
+        if crate::storage::RESERVED_IDS.contains(&self.id.as_str()) {
             return Err(crate::Error::InvalidItem(
-                "that ID is the one the vault notes its backups under".into(),
+                "that ID is one the vault keeps notes of its own under".into(),
             ));
         }
         if self

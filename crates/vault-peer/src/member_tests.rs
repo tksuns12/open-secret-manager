@@ -24,12 +24,14 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, sync::mpsc, task::JoinHandle};
 use crate::{
     control,
     control_tests::{titles, until},
-    invite, serve_members, start_node, start_pairing, start_pairing_with_vault,
+    invite, serve_members, serve_relay, serve_relayed, start_node, start_pairing,
+    start_pairing_with_vault,
     tests::login,
     transport::{client_config_for_tests, server_name_for_tests},
     AddressBook, Error, MemberContact, MemberEndpoint, MemberSync, PairingListener, PeerStore,
-    SyncReport, Voting,
+    Relay, RelayCode, SyncReport, Voting,
 };
+use tokio_rustls::TlsConnector;
 
 const VAULT: [u8; 32] = [42; 32];
 const NOW: u64 = 1_800_000_000;
@@ -71,6 +73,10 @@ struct Host {
     server: Option<JoinHandle<()>>,
     /// Sync connections the accept loop took in.
     incoming: Option<mpsc::Receiver<MemberSync>>,
+    /// Where the accept loop sends them, for connections through a relay.
+    sync: Option<mpsc::Sender<MemberSync>>,
+    /// Serving what comes through the relay, once there is one.
+    relayed: Option<JoinHandle<()>>,
 }
 
 impl Host {
@@ -88,6 +94,8 @@ impl Host {
             node,
             server: None,
             incoming: None,
+            sync: None,
+            relayed: None,
         };
         host.listen().await;
         host
@@ -115,12 +123,32 @@ impl Host {
             .set_listen_port(listener.local_addr().unwrap().port());
         let (sync, incoming) = mpsc::channel(4);
         self.incoming = Some(incoming);
+        self.sync = Some(sync.clone());
         self.server = Some(tokio::spawn(serve_members(
             listener,
             self.endpoint.clone(),
             self.node.clone(),
             Some(sync),
         )));
+    }
+
+    /// Uses the relay `code` names, as the apps do once the owner set it
+    /// up: dials through it, and serves what comes through it.
+    async fn use_relay(&mut self, code: &RelayCode) -> Relay {
+        let identity = self.peers.transport_identity().unwrap();
+        let (relay, relayed) = Relay::start(code.clone(), identity);
+        self.endpoint.set_relay(Some(relay.clone()));
+        self.relayed = Some(tokio::spawn(serve_relayed(
+            relayed,
+            self.endpoint.clone(),
+            self.node.clone(),
+            self.sync.clone(),
+        )));
+        until("the device is registered with the relay", || {
+            relay.connected()
+        })
+        .await;
+        relay
     }
 
     /// Stops the device as a crash would. Its database, transport
@@ -827,6 +855,115 @@ async fn a_member_is_reached_past_addresses_that_lead_nowhere_and_over_ipv6() {
         .all(b.host.id)
         .iter()
         .all(|address| !address.starts_with("[::ffff:")));
+}
+
+/// A relay on this machine, and the code its devices use.
+async fn relay() -> (RelayCode, JoinHandle<()>) {
+    let identity = PeerStore::open_in_memory()
+        .unwrap()
+        .transport_identity()
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let code = RelayCode::new(&address, identity.pin(), [0x5a; 32]).unwrap();
+    let task = tokio::spawn(async move {
+        let _ = serve_relay(listener, identity, [0x5a; 32]).await;
+    });
+    (code, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn members_that_cannot_reach_each_other_sync_through_the_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    a.vault.put(login("From A", "a-secret")).unwrap();
+    let mut b = a.invite(&dir, "b", None).await;
+    b.vault.put(login("From B", "b-secret")).unwrap();
+    let (code, _relay) = relay().await;
+    a.host.use_relay(&code).await;
+    b.host.use_relay(&code).await;
+
+    // B's listener goes, as behind a router that lets nothing in: A cannot
+    // reach it at any address, and reaches it through the relay.
+    b.host.server.take().unwrap().abort();
+    let before = a.host.addresses.all(b.host.id);
+    let (sent, received) = sync(&mut a, &mut b).await;
+    assert!(
+        sent.sent >= 1 && received.sent >= 1,
+        "{sent:?} {received:?}"
+    );
+    assert_eq!(titles(&a.vault), ["From A", "From B"]);
+    assert_eq!(titles(&b.vault), ["From A", "From B"]);
+    // The relay's address is not taken for B's, on either side.
+    assert!(a
+        .host
+        .addresses
+        .all(b.host.id)
+        .iter()
+        .all(|address| before.contains(address)));
+    assert!(!b
+        .host
+        .addresses
+        .all(a.host.id)
+        .contains(&code.address().to_owned()));
+
+    // The other way too: A's listener goes as well, and B reaches A
+    // through the relay.
+    a.host.server.take().unwrap().abort();
+    a.vault.put(login("Later on A", "later")).unwrap();
+    sync(&mut b, &mut a).await;
+    assert_eq!(titles(&b.vault), ["From A", "From B", "Later on A"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_relay_refuses_a_wrong_token_and_a_stranger_gets_no_further_than_it_would_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    let (code, _relay) = relay().await;
+    a.host.use_relay(&code).await;
+    let a_pin = a.host.pin();
+
+    // A wrong token: never registered, and nothing can be asked.
+    let stranger = PeerStore::open_in_memory()
+        .unwrap()
+        .transport_identity()
+        .unwrap();
+    let wrong = RelayCode::new(code.address(), code.pin(), [0x11; 32]).unwrap();
+    let (refused, _) = Relay::start(wrong, stranger.clone());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!refused.connected());
+    assert!(matches!(
+        refused.dial(a_pin).await,
+        Err(Error::RelayUnavailable)
+    ));
+    // A relay that is not the code's: its certificate is not the pin.
+    let impostor = RelayCode::new(code.address(), [0x22; 32], [0x5a; 32]).unwrap();
+    let (fooled, _) = Relay::start(impostor, stranger.clone());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!fooled.connected());
+
+    // With the token, a device that is no member: a device the relay does
+    // not have is absent, and a member is reached only to refuse it, as it
+    // would directly.
+    let (with_token, _) = Relay::start(code.clone(), stranger.clone());
+    until("the stranger is registered", || with_token.connected()).await;
+    assert!(matches!(
+        with_token.dial([0x33; 32]).await,
+        Err(Error::RelayAbsent)
+    ));
+    let tcp = with_token.dial(a_pin).await.unwrap();
+    let connector = TlsConnector::from(crate::transport::client_config(&stranger, a_pin).unwrap());
+    let refused = async {
+        let mut stream = connector
+            .connect(crate::transport::server_name(), tcp)
+            .await?;
+        // TLS 1.3: the server judges the client's certificate after the
+        // client's handshake is done, and closes before answering.
+        stream.write_all(b"anything").await?;
+        let mut byte = [0u8; 1];
+        tokio::io::AsyncReadExt::read(&mut stream, &mut byte).await
+    };
+    assert!(!matches!(refused.await, Ok(n) if n > 0));
 }
 
 /// A device with a vault.

@@ -20,6 +20,7 @@ mod local;
 mod members;
 mod pairing;
 mod peers;
+mod relay;
 mod session;
 mod transport;
 pub mod wire;
@@ -29,14 +30,15 @@ pub use error::{Error, Result};
 pub use keystore::{Keystore, KeystoreError, MemoryKeystore, NoKeystore};
 pub use local::{local_addresses, MAX_INVITATION_ADDRESSES};
 pub use members::{
-    serve_members, start_node, AddressBook, ControlConnection, ControlLink, Incoming,
-    MemberContact, MemberEndpoint, MemberSync, MAX_CONTACTS, MEMBER_PROTOCOL_VERSION,
+    serve_members, serve_relayed, start_node, AddressBook, ControlConnection, ControlLink,
+    Incoming, MemberContact, MemberEndpoint, MemberSync, MAX_CONTACTS, MEMBER_PROTOCOL_VERSION,
 };
 pub use pairing::{
     approve_enrollment, invite, review_join, EnrollmentGrant, Invitation, JoinRequest, JoinReview,
     Joiner, MAX_INVITATION_TTL_SECS,
 };
 pub use peers::{KeyKept, Peer, PeerStore, TransportIdentity};
+pub use relay::{serve_relay, Relay, RelayCode, RELAY_PROTOCOL_VERSION};
 pub use session::{SyncMessage, SyncReport, SyncSession, PROTOCOL_VERSION};
 pub use transport::{
     listen, start_pairing, start_pairing_with_vault, ApprovedEnrollment, IncomingJoin,

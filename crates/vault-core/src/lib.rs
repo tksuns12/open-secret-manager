@@ -18,7 +18,7 @@ pub use model::{
 pub use osm_origin::Origin;
 pub use storage::{
     verify_pairing_signature, EncryptedRevision, EnrollmentMaterial, PendingDevice, Vault,
-    BACKUPS_ID, CONTROL_SIGNATURE_DOMAIN, PAIRING_SIGNATURE_DOMAIN,
+    BACKUPS_ID, CONTROL_SIGNATURE_DOMAIN, PAIRING_SIGNATURE_DOMAIN, RELAY_ID,
 };
 pub use util::{generate_password, totp_code};
 

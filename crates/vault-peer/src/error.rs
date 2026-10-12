@@ -64,6 +64,16 @@ pub enum Error {
     Transport(&'static str),
     #[error("{0}")]
     Keystore(crate::KeystoreError),
+    #[error("invalid relay code")]
+    InvalidRelayCode,
+    #[error(
+        "the relay refused this device: its relay code is not the relay's, or the relay is full"
+    )]
+    RelayRefused,
+    #[error("that device is not connected to the relay")]
+    RelayAbsent,
+    #[error("the relay cannot be reached")]
+    RelayUnavailable,
 }
 
 impl From<osm_vault_membership::Error> for Error {

@@ -420,6 +420,74 @@ fn a_backup_noted_on_one_device_is_learned_by_the_others_and_is_no_item() {
 }
 
 #[test]
+fn the_relay_set_on_one_device_is_the_vaults_on_every_device_and_is_no_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, _, _) = two_copies(dir.path());
+    assert_eq!(a.relay().unwrap(), None);
+
+    // Set on A, it reaches B as any change does.
+    let set = a.set_relay(Some("OSM-RELAY1-first")).unwrap();
+    assert_eq!(
+        a.relay().unwrap().as_deref().map(String::as_str),
+        Some("OSM-RELAY1-first")
+    );
+    b.apply_encrypted_revision(wire(&a, &set.revision)).unwrap();
+    assert_eq!(
+        b.relay().unwrap().as_deref().map(String::as_str),
+        Some("OSM-RELAY1-first")
+    );
+
+    // Set again on B, and then taken away there: the latest counts on both.
+    let again = b.set_relay(Some("OSM-RELAY1-second")).unwrap();
+    a.apply_encrypted_revision(wire(&b, &again.revision))
+        .unwrap();
+    assert_eq!(
+        a.relay().unwrap().as_deref().map(String::as_str),
+        Some("OSM-RELAY1-second")
+    );
+    let away = b.set_relay(None).unwrap();
+    a.apply_encrypted_revision(wire(&b, &away.revision))
+        .unwrap();
+    assert_eq!(a.relay().unwrap(), None);
+    assert_eq!(b.relay().unwrap(), None);
+
+    // A note in another form is passed over, not taken for none.
+    a.set_relay(Some("OSM-RELAY1-third")).unwrap();
+    let head = head_set(&a, crate::RELAY_ID);
+    let odd = b
+        .seal_plaintext_for_test(crate::RELAY_ID, head, true, br#"{"relay":7}"#)
+        .unwrap();
+    a.apply_encrypted_revision(odd).unwrap();
+    assert_eq!(
+        a.relay().unwrap().as_deref().map(String::as_str),
+        Some("OSM-RELAY1-third")
+    );
+
+    // Nothing else is a code, and it is no item.
+    assert!(a.set_relay(Some("")).is_err());
+    assert!(a.set_relay(Some(&"x".repeat(1025))).is_err());
+    assert!(a
+        .list()
+        .unwrap()
+        .iter()
+        .all(|item| item.id != crate::RELAY_ID));
+    assert!(a
+        .deleted_items()
+        .unwrap()
+        .iter()
+        .all(|item| item.item_id != crate::RELAY_ID));
+    let path = dir.path().join("relay-check.osmbak");
+    a.export_backup(&path).unwrap();
+    assert_eq!(
+        a.check_backup(&path).unwrap().items,
+        a.list().unwrap().len()
+    );
+    let mut taken = login("Taken");
+    taken.id = crate::RELAY_ID.into();
+    assert!(matches!(a.put(taken), Err(Error::InvalidItem(_))));
+}
+
+#[test]
 fn concurrent_connections_cannot_overwrite_one_head() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.db");

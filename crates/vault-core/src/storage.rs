@@ -103,6 +103,29 @@ const MAX_PARENTS: usize = 16;
 /// neither it nor a deletion with nothing before it, and do not read a
 /// deletion's content.
 pub const BACKUPS_ID: &str = "osm-backups";
+
+/// The item ID under which a vault keeps the code of the relay its devices
+/// use (since Phase 16): one deletion for each time the owner set it or took
+/// it away, whose content is `{"saved_at": <seconds>, "relay": <code or
+/// null>}`; the latest is the vault's. Like [`BACKUPS_ID`], no item may take
+/// it, and it is never listed.
+pub const RELAY_ID: &str = "osm-relay";
+
+/// The item IDs the vault keeps notes of its own under.
+pub(crate) const RESERVED_IDS: [&str; 2] = [BACKUPS_ID, RELAY_ID];
+
+/// A note of the vault's own, opened, and the device that wrote it.
+type Note = (Zeroizing<Vec<u8>>, [u8; DEVICE_ID_LEN]);
+
+/// Longest relay code the vault keeps.
+const MAX_RELAY_CODE: usize = 1024;
+
+/// What a note of the vault's relay holds.
+#[derive(Serialize, Deserialize)]
+struct RelaySetting {
+    saved_at: u64,
+    relay: Option<String>,
+}
 /// Upper bound on held revisions awaiting owner review.
 const MAX_QUARANTINE: i64 = 10_000;
 /// Bounds on received revisions awaiting processing.
@@ -1465,10 +1488,11 @@ impl Vault {
         self.key()?;
         let mut statement = self.connection.prepare(
             "SELECT h.item_id FROM heads h JOIN revisions r ON r.revision=h.revision \
-             WHERE h.item_id!=? GROUP BY h.item_id HAVING MIN(h.tombstone)=1 ORDER BY MAX(r.rowid) DESC",
+             WHERE h.item_id NOT IN (?1, ?2) GROUP BY h.item_id HAVING MIN(h.tombstone)=1 \
+             ORDER BY MAX(r.rowid) DESC",
         )?;
         let ids = statement
-            .query_map([BACKUPS_ID], |row| row.get::<_, String>(0))?
+            .query_map(RESERVED_IDS, |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         let mut deleted = Vec::with_capacity(ids.len());
@@ -1548,10 +1572,11 @@ impl Vault {
     pub fn list(&self) -> Result<Vec<ItemSummary>> {
         self.key()?;
         let mut statement = self.connection.prepare(
-            "SELECT DISTINCT item_id FROM heads WHERE tombstone=0 AND item_id!=? ORDER BY item_id",
+            "SELECT DISTINCT item_id FROM heads WHERE tombstone=0 AND item_id NOT IN (?1, ?2) \
+             ORDER BY item_id",
         )?;
         let ids = statement
-            .query_map([BACKUPS_ID], |row| row.get::<_, String>(0))?
+            .query_map(RESERVED_IDS, |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         ids.iter().map(|id| self.get(id).map(Into::into)).collect()
@@ -1560,39 +1585,88 @@ impl Vault {
     /// Notes in the vault that this device saved a backup now, for its other
     /// devices to learn when they sync (see [`BACKUPS_ID`]).
     pub fn note_backup(&mut self) -> Result<RevisionInfo> {
-        let mut heads = head_ids(&self.connection, BACKUPS_ID)?;
+        let plaintext = version_plaintext(None, Some(now()))?;
+        self.note(BACKUPS_ID, &plaintext)
+    }
+
+    /// When a device of this vault last saved a backup, by that device's
+    /// clock, and which device: the latest the vault has noted.
+    pub fn last_backup(&self) -> Result<Option<(u64, [u8; DEVICE_ID_LEN])>> {
+        let mut latest = None;
+        for (plaintext, author) in self.notes(BACKUPS_ID)? {
+            if let Some(at) = saved_at(&plaintext) {
+                // Of two noted in one second, the one stored last.
+                if latest.is_none_or(|(last, _)| at >= last) {
+                    latest = Some((at, author));
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Keeps `code` in the vault as the code of the relay its devices use,
+    /// or, with `None`, keeps that they use none (see [`RELAY_ID`]). The
+    /// vault does not read the code: the devices do.
+    pub fn set_relay(&mut self, code: Option<&str>) -> Result<RevisionInfo> {
+        if code.is_some_and(|code| code.is_empty() || code.len() > MAX_RELAY_CODE) {
+            return Err(Error::InvalidItem("that is not a relay code".into()));
+        }
+        let plaintext = Zeroizing::new(serde_json::to_vec(&RelaySetting {
+            saved_at: now(),
+            relay: code.map(str::to_owned),
+        })?);
+        self.note(RELAY_ID, &plaintext)
+    }
+
+    /// The code of the relay the vault's devices use, as last set on any of
+    /// them by its clock; `None` if none was set, or it was taken away.
+    pub fn relay(&self) -> Result<Option<Zeroizing<String>>> {
+        let mut latest: Option<RelaySetting> = None;
+        for (plaintext, _) in self.notes(RELAY_ID)? {
+            let Ok(setting) = serde_json::from_slice::<RelaySetting>(&plaintext) else {
+                continue;
+            };
+            // Of two set in one second, the one stored last.
+            if latest
+                .as_ref()
+                .is_none_or(|last| setting.saved_at >= last.saved_at)
+            {
+                latest = Some(setting);
+            }
+        }
+        Ok(latest.and_then(|setting| setting.relay).map(Zeroizing::new))
+    }
+
+    /// Writes a note of the vault's own under the reserved `id`: a deletion
+    /// holding `plaintext`, following the notes there now.
+    fn note(&mut self, id: &str, plaintext: &[u8]) -> Result<RevisionInfo> {
+        self.key()?;
+        let mut heads = head_ids(&self.connection, id)?;
         heads.truncate(MAX_PARENTS);
         let kind = if heads.is_empty() {
             LocalWrite::Create
         } else {
             LocalWrite::Resolve
         };
-        let mut record = Item::new("backups");
-        record.id = BACKUPS_ID.to_owned();
-        self.write_item(record, heads, true, kind)
+        let revision = self.signer()?.seal(id, heads, true, plaintext)?;
+        self.commit_revision(revision, Some(kind), None)
     }
 
-    /// When a device of this vault last saved a backup, by that device's
-    /// clock, and which device: the latest the vault has noted.
-    pub fn last_backup(&self) -> Result<Option<(u64, [u8; DEVICE_ID_LEN])>> {
+    /// Every note under the reserved `id`, verified and opened, in the order
+    /// this device stored them, each with its author.
+    fn notes(&self, id: &str) -> Result<Vec<Note>> {
         self.key()?;
         let mut statement = self.connection.prepare(&format!(
             "SELECT {REVISION_COLUMNS} FROM revisions r WHERE r.item_id=? AND r.tombstone=1 \
              ORDER BY r.rowid"
         ))?;
         let noted = statement
-            .query_map([BACKUPS_ID], row_to_revision)?
+            .query_map([id], row_to_revision)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut latest = None;
-        for revision in &noted {
-            if let (_, Some(at)) = self.open_version(revision)? {
-                // Of two noted in one second, the one stored last.
-                if latest.is_none_or(|(last, _)| at >= last) {
-                    latest = Some((at, revision.author_device_id));
-                }
-            }
-        }
-        Ok(latest)
+        noted
+            .iter()
+            .map(|revision| Ok((self.open_revision(revision)?, revision.author_device_id)))
+            .collect()
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<ItemSummary>> {
@@ -2007,7 +2081,7 @@ impl Vault {
         let revisions: Vec<&EncryptedRevision> = payload
             .revisions
             .iter()
-            .filter(|revision| revision.item_id != BACKUPS_ID)
+            .filter(|revision| !RESERVED_IDS.contains(&revision.item_id.as_str()))
             .collect();
         let items: BTreeSet<&str> = revisions
             .iter()

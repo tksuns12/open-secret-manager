@@ -66,8 +66,12 @@ use crate::{
         ClientPolicy, PinPolicy, SharedVault, HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_FRAME_BYTES,
         NO_VAULT,
     },
-    EnrollmentGrant, Error, Joiner, PeerStore, Result, SyncReport,
+    EnrollmentGrant, Error, Joiner, PeerStore, Relay, Result, SyncReport,
 };
+
+/// How long a dial waits on a device's addresses before trying the relay
+/// as well.
+const RELAY_AFTER: Duration = Duration::from_secs(1);
 
 /// Version of the protocol between members. Version 1 was sync between two
 /// paired devices, without an opening frame.
@@ -398,6 +402,9 @@ struct Inner {
     listen_port: AtomicU16,
     /// A member answered that this device was removed.
     removed: AtomicBool,
+    /// The relay this device reaches others through when their addresses do
+    /// not answer, if the owner set one up.
+    relay: Mutex<Option<Relay>>,
 }
 
 /// This device's end of the connections between a vault's members.
@@ -427,6 +434,7 @@ impl MemberEndpoint {
                 addresses,
                 listen_port: AtomicU16::new(0),
                 removed: AtomicBool::new(false),
+                relay: Mutex::new(None),
             }),
         })
     }
@@ -438,6 +446,72 @@ impl MemberEndpoint {
 
     pub fn addresses(&self) -> &AddressBook {
         &self.inner.addresses
+    }
+
+    /// Reaches other devices through `relay` too, when their addresses do
+    /// not answer; `None` stops. Connections that come through it are served
+    /// by [`serve_relayed`].
+    pub fn set_relay(&self, relay: Option<Relay>) {
+        *self
+            .inner
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = relay;
+    }
+
+    /// The relay this device uses, if any.
+    pub fn relay(&self) -> Option<Relay> {
+        self.inner
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// A connection to `device`: at the addresses known for it, best first,
+    /// and through the relay as well if they have not answered within
+    /// [`RELAY_AFTER`]. The address it was reached at, if not through the
+    /// relay.
+    async fn reach(&self, device: DeviceId, pin: [u8; 32]) -> Result<(TcpStream, Option<String>)> {
+        let addresses = &self.inner.addresses;
+        let candidates = addresses.all(device);
+        let relay = self.relay();
+        let direct = async {
+            if candidates.is_empty() {
+                return Err(Error::AddressUnknown);
+            }
+            let outcome = connect_any(&candidates).await;
+            if outcome.is_err() {
+                for address in &candidates {
+                    addresses.failed(device, address);
+                }
+            }
+            outcome
+        };
+        let Some(relay) = relay else {
+            return direct.await.map(|(tcp, address)| (tcp, Some(address)));
+        };
+        let relayed = async {
+            if !candidates.is_empty() {
+                tokio::time::sleep(RELAY_AFTER).await;
+            }
+            relay.dial(pin).await
+        };
+        tokio::pin!(direct, relayed);
+        // The first that answers; when one fails, the other.
+        tokio::select! {
+            outcome = &mut direct => match outcome {
+                Ok((tcp, address)) => Ok((tcp, Some(address))),
+                Err(_) => relayed.await.map(|tcp| (tcp, None)),
+            },
+            outcome = &mut relayed => match outcome {
+                Ok(tcp) => Ok((tcp, None)),
+                Err(error) => direct
+                    .await
+                    .map(|(tcp, address)| (tcp, Some(address)))
+                    .map_err(|_| error),
+            },
+        }
     }
 
     /// Tells peers where this device accepts connections.
@@ -551,6 +625,20 @@ impl MemberEndpoint {
     /// the handshake; a removed device is told so and refused.
     pub async fn accept(&self, tcp: TcpStream) -> Result<Incoming> {
         let remote = tcp.peer_addr()?.ip().to_canonical();
+        self.accept_from(tcp, Some(remote)).await
+    }
+
+    /// As [`accept`](Self::accept), for a connection that came through the
+    /// relay: where it came from is the relay, not the device.
+    pub async fn accept_relayed(&self, tcp: TcpStream) -> Result<Incoming> {
+        self.accept_from(tcp, None).await
+    }
+
+    async fn accept_from(
+        &self,
+        tcp: TcpStream,
+        remote: Option<std::net::IpAddr>,
+    ) -> Result<Incoming> {
         let mut stream = with_timeout(HANDSHAKE_TIMEOUT, self.inner.acceptor.accept(tcp))
             .await?
             .map_err(handshake_error)?;
@@ -593,7 +681,7 @@ impl MemberEndpoint {
         if open.channel == Channel::Sync && !directory.is_member(device) {
             return refuse(stream, OpenReply::NotAMember, Error::NotAMember).await;
         }
-        if let Some(port) = open.listen_port.filter(|port| *port != 0) {
+        if let (Some(remote), Some(port)) = (remote, open.listen_port.filter(|port| *port != 0)) {
             self.inner
                 .addresses
                 .observe(device, &SocketAddr::new(remote, port).to_string());
@@ -647,19 +735,7 @@ impl MemberEndpoint {
         channel: Channel,
     ) -> Result<client::TlsStream<TcpStream>> {
         let addresses = &self.inner.addresses;
-        let candidates = addresses.all(device);
-        if candidates.is_empty() {
-            return Err(Error::AddressUnknown);
-        }
-        let (tcp, address) = match connect_any(&candidates).await {
-            Ok(reached) => reached,
-            Err(error) => {
-                for address in &candidates {
-                    addresses.failed(device, address);
-                }
-                return Err(error);
-            }
-        };
+        let (tcp, address) = self.reach(device, pin).await?;
         let connector = TlsConnector::from(client_config(&self.inner.identity, pin)?);
         let mut stream = with_timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name(), tcp))
             .await?
@@ -682,7 +758,9 @@ impl MemberEndpoint {
         .await??
         {
             OpenReply::Welcome { roster } => {
-                addresses.observe(device, &address);
+                if let Some(address) = &address {
+                    addresses.observe(device, address);
+                }
                 self.learn(device, &roster);
                 Ok(stream)
             }
@@ -951,21 +1029,53 @@ pub async fn serve_members(
             continue;
         }
         let endpoint = endpoint.clone();
-        let node = node.clone();
-        let sync = sync.clone();
-        connections.spawn(async move {
-            match endpoint.accept(tcp).await {
-                Ok(Incoming::Control(connection)) => {
-                    let _ = connection.serve(&node).await;
-                }
-                Ok(Incoming::Sync(connection)) => {
-                    if let Some(sync) = sync {
-                        let _ = sync.send(connection).await;
-                    }
-                }
-                Err(_) => {}
+        connections.spawn(serve_connection(
+            async move { endpoint.accept(tcp).await },
+            node.clone(),
+            sync.clone(),
+        ));
+    }
+}
+
+/// Serves the connections other devices open to this one through its relay
+/// (see [`Relay::start`]), as [`serve_members`] serves those on its
+/// listener, until the relay stops.
+pub async fn serve_relayed(
+    mut relayed: mpsc::Receiver<TcpStream>,
+    endpoint: MemberEndpoint,
+    node: Arc<ControlNode>,
+    sync: Option<mpsc::Sender<MemberSync>>,
+) {
+    let mut connections = JoinSet::new();
+    while let Some(tcp) = relayed.recv().await {
+        while connections.try_join_next().is_some() {}
+        if connections.len() >= MAX_CONNECTIONS {
+            continue;
+        }
+        let endpoint = endpoint.clone();
+        connections.spawn(serve_connection(
+            async move { endpoint.accept_relayed(tcp).await },
+            node.clone(),
+            sync.clone(),
+        ));
+    }
+}
+
+async fn serve_connection(
+    accepted: impl std::future::Future<Output = Result<Incoming>>,
+    node: Arc<ControlNode>,
+    sync: Option<mpsc::Sender<MemberSync>>,
+) {
+    match accepted.await {
+        Ok(Incoming::Control(connection)) => {
+            let _ = connection.serve(&node).await;
+        }
+        Ok(Incoming::Sync(connection)) => {
+            if let Some(sync) = sync {
+                let _ = sync.send(connection).await;
             }
-        });
+        }
+        Err(_) => {}
     }
 }
 
