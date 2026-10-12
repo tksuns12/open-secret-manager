@@ -13,7 +13,8 @@
 # and the shared code optimized, as a release, keeping only the debug
 # build's hooks for the tests. OSM_IOS_ROOT_CERT names a certificate
 # authority for the simulator to trust, and OSM_IOS_RUNTIME an iOS runtime
-# other than the newest. Needs Xcode, an iOS simulator runtime, and
+# other than the newest; OSM_IOS_AUTOFILL_ON=1 turns AutoFill on before
+# the tests (see below). Needs Xcode, an iOS simulator runtime, and
 # `rustup target add aarch64-apple-ios-sim aarch64-apple-ios`.
 set -eu
 cd "$(dirname "$0")/.."
@@ -72,6 +73,13 @@ fi
 for app in OpenSecretManager LoginFixture UITests-Runner; do
     xcrun simctl --set "$set_dir" install "$device" "$products/$app.app"
 done
+# Where the system cannot show its own offer to turn AutoFill on, as the
+# iOS 26.5 simulator under Xcode 27 cannot (SpringBoard refuses the
+# offer's agent), OSM_IOS_AUTOFILL_ON=1 turns the app's extension on as
+# Settings would, and the tests then find it on.
+if [ "${OSM_IOS_AUTOFILL_ON:-}" = 1 ]; then
+    xcrun simctl --set "$set_dir" spawn "$device" pluginkit -e use -i org.opensecretmanager.app.autofill
+fi
 
 platform="$(xcode-select -p)/Platforms/iPhoneSimulator.platform/Developer"
 runner=$(xcrun simctl --set "$set_dir" get_app_container "$device" org.opensecretmanager.app.uitests.xctrunner app)

@@ -130,4 +130,4 @@ request, minutes per parser, not continuously; the native lifecycle locks
 were tried for real on macOS only for a screen lock and a sleep (Phase 14),
 on Linux only in a container; the backup screens and the system's file dialogs
 were driven in the real app only on Linux; the phone apps have run only on
-an emulator and in a simulator, and are not signed for distribution; three of the iOS app's AutoFill tests cannot pass on the iOS 27.0 simulator, whose system does not start the service that lists AutoFill providers.
+an emulator and in a simulator, and are not signed for distribution; the iOS app's AutoFill tests pass on the iOS 26.5 simulator only with AutoFill turned on by the script, as neither 26.5 nor 27.0 simulators here show the system's prompts for it reliably.
