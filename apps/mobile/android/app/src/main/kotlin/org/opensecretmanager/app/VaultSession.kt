@@ -1,6 +1,7 @@
 package org.opensecretmanager.app
 
 import android.content.Context
+import android.os.SystemClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -19,6 +20,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.AndroidKeystore
 import org.opensecretmanager.vault.Device
@@ -27,6 +29,7 @@ import org.opensecretmanager.vault.FillCredentials
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
 import org.opensecretmanager.vault.ItemDraft
+import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
 import org.opensecretmanager.vault.MobileException
 import org.opensecretmanager.vault.SaveCandidate
@@ -81,6 +84,13 @@ class VaultSession(private val context: Context, private val folder: File) {
     private var foreground: Job? = null
     /** The app is on the screen, where it takes part and syncs anyway. */
     @Volatile private var inFront = false
+    /**
+     * While the vault stays unlocked after the app left the screen: when it
+     * locks, by [SystemClock.elapsedRealtime]. Written under [calls].
+     */
+    @Volatile private var lockAt: Long? = null
+    /** Locks the vault once the time it stays unlocked for has run out. */
+    private var lockLater: Job? = null
 
     init {
         openDevice()
@@ -171,10 +181,36 @@ class VaultSession(private val context: Context, private val folder: File) {
         if (onUnlocked != null) withContext(Dispatchers.Main) { onUnlocked() }
     }
 
-    fun lock() = run(null) {
-        device?.lock()
+    fun lock(): Job {
+        lockLater?.cancel()
+        return run(null) {
+            lockAt = null
+            device?.let(::lockVault)
+            refresh()
+        }
+    }
+
+    /** Locks the vault, and lets go of what the screens held of it. Under [calls]. */
+    private fun lockVault(device: Device) {
+        device.lock()
         _state.update { it.copy(detail = null, editor = null, history = null, deleted = null) }
-        refresh()
+    }
+
+    /** Locks an unlocked vault: not one being joined. Under [calls]. */
+    private fun lockIfUnlocked(device: Device) {
+        if (device.state() == DeviceState.UNLOCKED) lockVault(device)
+    }
+
+    /**
+     * Locks the vault if the time it stays unlocked for after the app left
+     * has run out: [lockLater] may not have run, as its clock stops while
+     * the phone sleeps. Under [calls].
+     */
+    private fun lockIfDue() {
+        val at = lockAt ?: return
+        if (SystemClock.elapsedRealtime() < at) return
+        lockAt = null
+        device?.let(::lockIfUnlocked)
     }
 
     fun joinStart(invitation: String) = run("Reaching the inviting device…") {
@@ -358,7 +394,11 @@ class VaultSession(private val context: Context, private val folder: File) {
      * thread, [done].
      */
     fun fill(id: String, origin: String?, login: Boolean, code: Boolean, done: (FillCredentials?, String?) -> Unit) = run(null) {
-        val device = device!!
+        val (credentials, oneTimeCode) = filling(device!!, id, origin, login, code)
+        withContext(Dispatchers.Main) { done(credentials, oneTimeCode) }
+    }
+
+    private fun filling(device: Device, id: String, origin: String?, login: Boolean, code: Boolean): Pair<FillCredentials?, String?> {
         val credentials = when {
             !login -> null
             origin != null -> device.fillForWeb(id, origin)
@@ -373,7 +413,55 @@ class VaultSession(private val context: Context, private val folder: File) {
                 if (login) null else throw error
             }
         }
-        withContext(Dispatchers.Main) { done(credentials, oneTimeCode) }
+        return credentials to oneTimeCode
+    }
+
+    /**
+     * For the system's list under another app's field, while the vault is
+     * unlocked: the logins a fill would offer, which are those saved for
+     * [origin]'s pages or, without an origin, those in [chosen] (the logins
+     * the owner chose for an app), and of them only those with a one-time
+     * code if [codeOnly]. Null while the vault is locked, or if it does not
+     * answer within a moment, since the system waits only so long for an
+     * answer. Nothing is shown meanwhile. Then, on the main thread, [done].
+     */
+    fun offered(origin: String?, chosen: Set<String>, codeOnly: Boolean, done: (List<ItemSummary>?) -> Unit) {
+        scope.launch {
+            val found = withTimeoutOrNull(OFFER_MILLIS) {
+                calls.withLock {
+                    runCatching {
+                        lockIfDue()
+                        val device = device?.takeIf { it.state() == DeviceState.UNLOCKED } ?: return@runCatching null
+                        val logins = if (origin != null) {
+                            device.loginsForWeb(origin)
+                        } else {
+                            device.items().filter { it.kind == ItemKind.LOGIN && it.id in chosen }
+                        }.sortedBy { it.title.lowercase() }
+                        if (codeOnly) device.withOneTimeCodes(logins.map { it.id }) else logins
+                    }.getOrNull()
+                }
+            }
+            withContext(Dispatchers.Main) { done(found) }
+        }
+    }
+
+    /**
+     * As [fill], for a login the owner chose in the system's list while the
+     * vault was unlocked: [done] with what fills the form, or with null if
+     * the vault is locked by now or the login does not fill this form, for
+     * the fill screen to take over. Nothing is shown meanwhile.
+     */
+    fun fillChosen(id: String, origin: String?, login: Boolean, code: Boolean, done: (Pair<FillCredentials?, String?>?) -> Unit) {
+        scope.launch {
+            val filled = calls.withLock {
+                runCatching {
+                    lockIfDue()
+                    val device = device?.takeIf { it.state() == DeviceState.UNLOCKED } ?: return@runCatching null
+                    filling(device, id, origin, login, code)
+                }.getOrNull()
+            }
+            withContext(Dispatchers.Main) { done(filled) }
+        }
     }
 
     /**
@@ -428,7 +516,11 @@ class VaultSession(private val context: Context, private val folder: File) {
     /** The app came to the front: take part again, and keep the list current. */
     fun onForeground() {
         inFront = true
+        lockLater?.cancel()
+        lockLater = null
         run(null) {
+            lockIfDue()
+            lockAt = null
             device?.let { device ->
                 if (device.state() == DeviceState.LOCKED || device.state() == DeviceState.UNLOCKED) {
                     runCatching { device.goOnline() }
@@ -446,20 +538,52 @@ class VaultSession(private val context: Context, private val folder: File) {
     }
 
     /**
-     * The app left the screen: lock the vault and stop taking part. A join
-     * under way is left alone, since the owner compares the codes on the
-     * other device's screen.
+     * The app left the screen: stop taking part, and lock the vault, at once
+     * or after the time the owner chose ([StayUnlocked]), so that another
+     * app's next field is filled from the system's list without unlocking
+     * again. A join under way is left alone, since the owner compares the
+     * codes on the other device's screen.
      */
     fun onBackground() {
         inFront = false
         foreground?.cancel()
         foreground = null
+        val stay = StayUnlocked.millis(context)
+        lockLater?.cancel()
+        lockLater = if (stay > 0) {
+            scope.launch {
+                delay(stay)
+                run(null) {
+                    if (inFront) return@run
+                    lockAt = null
+                    device?.let(::lockIfUnlocked)
+                    refresh()
+                }
+            }
+        } else {
+            null
+        }
         run(null) {
             val device = device ?: return@run
             if (device.state() == DeviceState.JOINING) return@run
-            device.lock()
+            if (stay > 0 && device.state() == DeviceState.UNLOCKED) {
+                lockAt = SystemClock.elapsedRealtime() + stay
+            } else {
+                lockAt = null
+                lockVault(device)
+            }
             device.goOffline()
-            _state.update { it.copy(detail = null, editor = null, history = null, deleted = null) }
+            refresh()
+        }
+    }
+
+    /** The phone's screen turned off: lock at once, whatever the time the vault would stay unlocked for. */
+    fun onScreenOff() {
+        lockLater?.cancel()
+        lockLater = null
+        run(null) {
+            lockAt = null
+            device?.let(::lockIfUnlocked)
             refresh()
         }
     }
@@ -477,6 +601,11 @@ class VaultSession(private val context: Context, private val folder: File) {
         if (state != DeviceState.LOCKED && state != DeviceState.UNLOCKED) return@run
         runCatching { device.syncInBackground() }
         refresh()
+    }
+
+    private companion object {
+        /** How long the system's list waits for [offered]: the system gives an answer some 5 seconds. */
+        const val OFFER_MILLIS = 3_000L
     }
 
     private fun describe(error: MobileException): String = when (error) {

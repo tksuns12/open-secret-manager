@@ -11,8 +11,9 @@ import android.view.autofill.AutofillId
  * What a fill request found on the screen that asks: the fields a login
  * goes into (a username and a password, or a one-time code, or all three),
  * the app that shows them, and the web page's domain and scheme if the app
- * said it shows a page. Whether to believe the domain is decided elsewhere
- * ([Requester]).
+ * said it shows a page: those of the first view that names a domain, past
+ * any that names an empty one, as the outermost view of a page in Firefox
+ * can. Whether to believe the domain is decided elsewhere ([Requester]).
  */
 data class Form(
     val packageName: String,
@@ -75,7 +76,7 @@ data class Form(
             var webDomain: String? = null
             var webScheme: String? = null
             fun visit(node: AssistStructure.ViewNode) {
-                if (webDomain == null && node.webDomain != null) {
+                if (webDomain == null && !node.webDomain.isNullOrBlank()) {
                     webDomain = node.webDomain
                     if (Build.VERSION.SDK_INT >= 28) webScheme = node.webScheme
                 }
@@ -103,7 +104,7 @@ data class Form(
             var webDomain: String? = null
             var webScheme: String? = null
             fun visit(node: AssistStructure.ViewNode) {
-                if (webDomain == null && node.webDomain != null) {
+                if (webDomain == null && !node.webDomain.isNullOrBlank()) {
                     webDomain = node.webDomain
                     if (Build.VERSION.SDK_INT >= 28) webScheme = node.webScheme
                 }

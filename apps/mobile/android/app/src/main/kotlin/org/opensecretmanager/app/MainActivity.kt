@@ -30,6 +30,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -48,6 +50,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -377,7 +380,43 @@ private fun Items(state: UiState, session: VaultSession) {
         TextButton(onClick = session::openDeleted, modifier = Modifier.testTag("recently-deleted")) { Text("Recently deleted…") }
         AutofillOffer()
         BackgroundSyncSwitch()
+        StayUnlockedChoice()
         SyncLine(state.sync, session)
+    }
+}
+
+/**
+ * How long the vault stays unlocked once the app is left, for filling other
+ * apps' fields from the system's list without unlocking again.
+ */
+@Composable
+private fun StayUnlockedChoice() {
+    val context = LocalContext.current
+    var minutes by remember { mutableIntStateOf(StayUnlocked.minutes(context)) }
+    var choosing by remember { mutableStateOf(false) }
+    fun describe(choice: Int) = when (choice) {
+        0 -> "At once"
+        1 -> "After 1 minute"
+        else -> "After $choice minutes"
+    }
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("Lock once the app is left", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        Box {
+            TextButton(onClick = { choosing = true }, modifier = Modifier.testTag("stay-unlocked")) { Text(describe(minutes)) }
+            DropdownMenu(expanded = choosing, onDismissRequest = { choosing = false }) {
+                StayUnlocked.CHOICES.forEach { choice ->
+                    DropdownMenuItem(
+                        text = { Text(describe(choice)) },
+                        onClick = {
+                            minutes = choice
+                            StayUnlocked.set(context, choice)
+                            choosing = false
+                        },
+                        modifier = Modifier.testTag("stay-unlocked:$choice"),
+                    )
+                }
+            }
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 package org.opensecretmanager.app
 
+import android.app.KeyguardManager
 import android.graphics.Bitmap
+import android.os.PowerManager
 import android.os.ParcelFileDescriptor
 import android.view.KeyEvent
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -20,6 +22,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -38,7 +41,8 @@ import org.opensecretmanager.vault.ItemKind
  * the app's service is made the phone's autofill service, a stand-in app
  * (the `loginfixture` module) shows a login form, and the test chooses
  * "unlock to fill" in it, unlocks the fill screen, and picks a login, as
- * the owner would. A copy of the frozen format 7 vault is the vault.
+ * the owner would. A copy of the frozen format 7 vault is the vault. The
+ * vault locks as soon as the app is left, unless a test says otherwise.
  *
  * In a build made with `-Posm.screenshots=true` and run with the
  * instrumentation argument `screens=true`, it also captures the screens it
@@ -81,6 +85,7 @@ class AutofillTest {
         context.getSharedPreferences("app-logins", 0).edit().clear().commit()
         Requester.trustedForTests.clear()
         PendingSave.forgetForTests()
+        StayUnlocked.millisForTests = 0L
         session.reopenForTests { folder ->
             BiometricUnlock(context).disable()
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
@@ -93,6 +98,7 @@ class AutofillTest {
     fun putTheServiceBack() {
         Requester.trustedForTests.clear()
         PendingSave.forgetForTests()
+        StayUnlocked.millisForTests = null
         shell("am force-stop $FIXTURE")
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")
         animationScales.zip(previousScales).forEach { (name, scale) ->
@@ -139,17 +145,7 @@ class AutofillTest {
      * "unlock to fill" in it, and unlocks.
      */
     private fun askToFill(activity: String, origin: String? = null, name: String? = null, field: String = "username", extras: String = "") {
-        device.wakeUp()
-        shell("am start -W -S -n $FIXTURE/.$activity" + (origin?.let { " --es origin $it" } ?: "") + extras)
-        val form = if (origin == null) By.res(FIXTURE, field) else By.clazz("android.widget.EditText").pkg(FIXTURE)
-        find(form, 30_000).click()
-        // The system asks the service when the field takes the focus, and
-        // on a busy emulator its offer was seen to take over 15 seconds, or
-        // not to come; a field tapped again asks again.
-        val offer = device.wait(Until.findObject(OFFER), 30_000) ?: run {
-            find(form).click()
-            find(OFFER, 30_000)
-        }
+        val offer = openAndFind(OFFER, activity, origin, field, extras)
         name?.let { capture("$it-offer") }
         offer.click()
         // The fill screen's first start can take long on an emulator.
@@ -158,6 +154,24 @@ class AutofillTest {
         find(mine("password")).text = password
         find(mine("unlock")).click()
         find(mine("asker"))
+    }
+
+    /**
+     * Opens a form of the stand-in app (with [extras] for `am start`), taps
+     * its field, and finds [entry] in the list the system shows under it.
+     */
+    private fun openAndFind(entry: BySelector, activity: String, origin: String? = null, field: String = "username", extras: String = ""): UiObject2 {
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.$activity" + (origin?.let { " --es origin $it" } ?: "") + extras)
+        val form = if (origin == null) By.res(FIXTURE, field) else By.clazz("android.widget.EditText").pkg(FIXTURE)
+        find(form, 30_000).click()
+        // The system asks the service when the field takes the focus, and
+        // on a busy emulator its offer was seen to take over 15 seconds, or
+        // not to come; a field tapped again asks again.
+        return device.wait(Until.findObject(entry), 30_000) ?: run {
+            find(form).click()
+            find(entry, 30_000)
+        }
     }
 
     private fun assertFilled(expected: String) {
@@ -170,6 +184,123 @@ class AutofillTest {
         val deadline = System.currentTimeMillis() + 15_000
         while (session.state.value.screen != Screen.LOCKED && System.currentTimeMillis() < deadline) Thread.sleep(100)
         if (session.state.value.screen != Screen.LOCKED) fail("not locked again: ${session.state.value.screen}")
+    }
+
+    /** The fill screen gone a few seconds since, the vault is still unlocked. */
+    private fun assertStillUnlocked() {
+        Thread.sleep(3_000)
+        if (session.state.value.screen != Screen.UNLOCKED) fail("locked: ${session.state.value.screen}")
+    }
+
+    @Test
+    fun whileUnlockedAPagesLoginsAreInTheSystemsListAndFillAtOnce() {
+        StayUnlocked.millisForTests = 60_000L
+        Requester.trustedForTests += FIXTURE
+        askToFill("WebLoginActivity", "https://mail.example.test")
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertStillUnlocked()
+
+        // The next time, the list under the field names the login, and
+        // choosing it fills the form, with no screen of this app's.
+        val mail = openAndFind(By.text("Mail"), "WebLoginActivity", "https://mail.example.test")
+        find(By.text("owner@example.test"))
+        capture("web-unlocked-list")
+        assertNull(device.findObject(By.text("Bank")))
+        assertNull(device.findObject(OFFER))
+        mail.click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertNull(device.findObject(mine("asker")))
+        assertStillUnlocked()
+
+        // A page with no login for it is told so, and offered the fill screen only.
+        openAndFind(By.text("Open Secret Manager · no login for this site"), "WebLoginActivity", "https://bank.example.test")
+        assertNull(device.findObject(By.text("Mail")))
+    }
+
+    @Test
+    fun whileUnlockedAnAppIsListedTheLoginsChosenForItUntilTheTimeRunsOut() {
+        StayUnlocked.millisForTests = 60_000L
+        askToFill("NativeLoginActivity")
+        find(mine("choose-another")).click()
+        find(mine("fill:Bank")).click()
+        assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
+        assertStillUnlocked()
+
+        val bank = openAndFind(By.text("Bank"), "NativeLoginActivity")
+        find(By.text("account 42"))
+        find(By.text("Open Secret Manager…"))
+        capture("app-unlocked-list")
+        assertNull(device.findObject(By.text("Mail")))
+        // Left unlocked for two seconds after this fill only.
+        StayUnlocked.millisForTests = 2_000L
+        bank.click()
+        assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
+        assertLockedAgain()
+        openAndFind(OFFER, "NativeLoginActivity")
+        assertNull(device.findObject(By.text("Bank")))
+    }
+
+    @Test
+    fun turningTheScreenOffLocksAtOnce() {
+        // The screen is unlocked again with the device's PIN, if it has one.
+        val keyguard = context.getSystemService(KeyguardManager::class.java)
+        val pin = InstrumentationRegistry.getArguments().getString("pin")
+        assumeTrue("the device has a PIN, and the run was not given it", !keyguard.isDeviceSecure || pin != null)
+        StayUnlocked.millisForTests = 60_000L
+        Requester.trustedForTests += FIXTURE
+        askToFill("WebLoginActivity", "https://mail.example.test")
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertStillUnlocked()
+        val power = context.getSystemService(PowerManager::class.java)
+        device.sleep()
+        assertLockedAgain()
+        // Woken too soon after, the screen stayed off and locked.
+        waitUntil("the screen turns off") { !power.isInteractive }
+        Thread.sleep(1_000)
+        for (attempt in 1..3) {
+            device.wakeUp()
+            waitUntil("the screen turns on") { power.isInteractive }
+            Thread.sleep(1_000)
+            if (pin != null) {
+                shell("input keyevent KEYCODE_MENU")
+                Thread.sleep(1_000)
+                shell("input text $pin")
+                shell("input keyevent KEYCODE_ENTER")
+            }
+            shell("wm dismiss-keyguard")
+            val deadline = System.currentTimeMillis() + 10_000
+            while (keyguard.isKeyguardLocked && System.currentTimeMillis() < deadline) Thread.sleep(100)
+            if (!keyguard.isKeyguardLocked) break
+            if (attempt == 3) fail("the screen stayed locked")
+        }
+        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+    }
+
+    private fun waitUntil(what: String, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + 15_000
+        while (!condition() && System.currentTimeMillis() < deadline) Thread.sleep(100)
+        if (!condition()) fail("waited for $what")
+    }
+
+    @Test
+    fun aPageWhoseOutermostViewNamesAnEmptyDomainIsKnownByItsFields() {
+        Requester.trustedForTests += FIXTURE
+        askToFill("NestedDomainLoginActivity")
+        assertEquals("For shop.example.test", find(mine("asker")).text)
+        find(mine("no-logins"))
+        find(mine("cancel")).click()
+        assertLockedAgain()
+
+        submitAndSave("NestedDomainLoginActivity", null, "shopper", "shop password")
+        assertEquals("shop.example.test", find(mine("save-title")).text)
+        find(mine("save-new")).click()
+        assertLockedAgain()
+        Device.open(context.filesDir.resolve(VaultApp.DEVICE_FOLDER).path, AndroidKeystore).use { vault ->
+            vault.unlock(password)
+            assertTrue(vault.items().any { it.title == "shop.example.test" && it.url == "https://shop.example.test" })
+        }
     }
 
     @Test

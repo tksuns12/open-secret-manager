@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The entries of the system's list under another app's field
+         (layout/autofill_entry), as Material's light scheme. -->
+    <color name="autofill_background">#FFFFFBFE</color>
+    <color name="autofill_text">#FF1C1B1F</color>
+    <color name="autofill_secondary">#FF49454F</color>
+</resources>

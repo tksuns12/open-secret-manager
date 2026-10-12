@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The same, as Material's dark scheme. -->
+    <color name="autofill_background">#FF2B2930</color>
+    <color name="autofill_text">#FFE6E1E5</color>
+    <color name="autofill_secondary">#FFCAC4D0</color>
+</resources>

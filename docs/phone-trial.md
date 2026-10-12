@@ -72,9 +72,12 @@ phone sold since 2019 is):
 
 ## Leaving and coming back
 
-- Switch to another app and back: the vault is locked.
+- Switch to another app and back within a minute: the vault is still
+  unlocked. Stay away longer than a minute, and come back: it is locked.
+- In the list, set "Lock once the app is left" to "At once": switching to
+  another app and back locks it. Set it back to "After 1 minute".
 - Lock the phone's screen with the app open, and unlock: the vault is
-  locked.
+  locked. The same within the minute with another app in front.
 - Leave the app for an hour, then open it: it is locked, and after unlocking
   it syncs again (the line under the list says when it last did).
 - Restart the phone, then open the app: it opens locked, the vault intact.
@@ -130,14 +133,21 @@ whether the computer's Devices panel shows the phone's VPN address (its
    nothing more.
 3. Open the login page of a site the vault has a login for (https, the same
    host it was saved for). Tap the username field: "Open Secret Manager ·
-   unlock to fill" appears. Choose it, unlock, choose the login: both fields
-   fill. A login saved with an unusual port is not offered (Android does not
-   say a page's port); a login for the usual port is also offered on the same
-   host's other ports.
-4. In another app's login screen, the same entry appears; the first time the
+   unlock to fill" appears, with the app's icon, legible in light and dark
+   mode alike (it was a blank white box on a Galaxy phone before). Choose
+   it, unlock, choose the login: both fields fill. A login saved with an
+   unusual port is not offered (Android does not say a page's port); a
+   login for the usual port is also offered on the same host's other ports.
+4. Within a minute, open the page again (or sign out and back to it) and
+   tap the username field: the list under it names the login, by title and
+   username, above "Open Secret Manager…". Choose it: both fields fill at
+   once, with no screen of the app's. A minute after leaving, or once the
+   screen was off, the list says "unlock to fill" again. Note any field
+   where the login is named but choosing it fills nothing.
+5. In another app's login screen, the same entry appears; the first time the
    owner chooses a login for that app, after a warning, and it is offered
    there again afterwards.
-5. On a site or app that asks for a code from an authenticator app after
+6. On a site or app that asks for a code from an authenticator app after
    the password, tap the code field: the same entry appears, and the fill
    screen lists the logins with a one-time code; the chosen one's code
    fills the field. Note fields where nothing is offered (a field must say
@@ -165,9 +175,11 @@ whether the computer's Devices panel shows the phone's VPN address (its
 **Android:**
 
 1. With Open Secret Manager as the autofill service, sign in to a site in
-   Chrome (https) with an account the vault does not have, typing the
-   username and password. After the page changes, Android asks "Save …
-   to Open Secret Manager?": choose Save, unlock, and Save as a new login.
+   Chrome or Firefox (https) with an account the vault does not have, typing
+   the username and password. After the page changes, Android asks "Save …
+   to Open Secret Manager?": choose Save, and unlock. The title offered is
+   the site's domain (without `www.`), not the browser's name, and the
+   screen says the login is offered on that site only. Save as a new login.
    The next time, the login is offered on that site.
 2. Change that password on the site (or sign in with a new one): the save
    screen offers "Update the password of" the login, and the computer gets

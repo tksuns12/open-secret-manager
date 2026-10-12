@@ -17,13 +17,19 @@ import android.service.autofill.SaveRequest
 import android.view.autofill.AutofillId
 import android.widget.RemoteViews
 import java.util.concurrent.atomic.AtomicInteger
+import org.opensecretmanager.app.VaultApp
+import org.opensecretmanager.vault.ItemSummary
 
 /**
  * Offers to fill a login form or a one-time code field in another app or a
- * browser, and to save what a login form submitted. It never says what the vault holds: the only offer is
- * "unlock to fill", which opens [FillActivity], where the owner unlocks and
- * chooses the login. A save opens [SaveActivity], where the owner unlocks
- * and chooses where it goes.
+ * browser, and to save what a login form submitted. While the vault is
+ * locked it says nothing of what the vault holds: the only offer is "unlock
+ * to fill", which opens [FillActivity], where the owner unlocks and chooses
+ * the login. While it is unlocked (for a while after the app or a fill
+ * screen was left, see [org.opensecretmanager.app.StayUnlocked]), the
+ * system's list names the logins a fill would offer, by title and username,
+ * and choosing one fills it at once. A save opens [SaveActivity], where the
+ * owner unlocks and chooses where it goes.
  */
 class VaultAutofillService : AutofillService() {
     private val requests = AtomicInteger()
@@ -45,7 +51,46 @@ class VaultAutofillService : AutofillService() {
             callback.onSuccess(null)
             return
         }
+        val usernameEarlier = form.username == null && earlierUsername(request.fillContexts, form) != null
+        val requester = Requester.of(this, form)
+        val codeOnly = form.password == null
+        val respond = { logins: List<ItemSummary>? ->
+            val response = FillResponse.Builder()
+            if (logins == null) {
+                response.addDataset(offer(form, entry(this, "Open Secret Manager · unlock to fill")))
+            } else {
+                logins.take(MAX_LOGINS).forEach { response.addDataset(offer(form, entry(this, it.title, it.username), it.id)) }
+                // The fill screen, for the rest, or for choosing a login for an app.
+                val more = when {
+                    logins.isNotEmpty() -> "Open Secret Manager…"
+                    requester is Requester.App -> "Open Secret Manager · choose a login…"
+                    codeOnly -> "Open Secret Manager · no code for this site"
+                    else -> "Open Secret Manager · no login for this site"
+                }
+                response.addDataset(offer(form, entry(this, more)))
+            }
+            saveInfo(form, usernameEarlier)?.let(response::setSaveInfo)
+            callback.onSuccess(response.build())
+        }
+        // What a fill would offer, if the vault is unlocked.
+        when (requester) {
+            null -> respond(null)
+            is Requester.Web -> session().offered(requester.origin, emptySet(), codeOnly, respond)
+            is Requester.App -> session().offered(null, AppLogins(this).chosen(requester), codeOnly, respond)
+        }
+    }
+
+    private fun session() = (application as VaultApp).session
+
+    /**
+     * An entry with no values, locked: choosing it opens the fill screen,
+     * whose result fills the form at once. With [item], the login chosen in
+     * the list, which the screen fills without showing itself if the vault
+     * is still unlocked.
+     */
+    private fun offer(form: Form, presentation: RemoteViews, item: String? = null): Dataset {
         val intent = Intent(this, FillActivity::class.java).putExtras(form.toBundle())
+        item?.let { intent.putExtra(FillActivity.ITEM, it) }
         // Mutable: the system adds the screen's structure to it.
         val sender = PendingIntent.getActivity(
             this,
@@ -53,20 +98,11 @@ class VaultAutofillService : AutofillService() {
             intent,
             PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_MUTABLE,
         ).intentSender
-        val offer = RemoteViews(packageName, android.R.layout.simple_list_item_1).apply {
-            setTextViewText(android.R.id.text1, "Open Secret Manager · unlock to fill")
-        }
-        // One entry with no values, locked: choosing it opens the fill
-        // screen, whose result fills the form at once.
         @Suppress("DEPRECATION")
-        val dataset = Dataset.Builder(offer).apply {
+        return Dataset.Builder(presentation).apply {
             listOfNotNull(form.username, form.password, form.oneTimeCode).forEach { setValue(it, null) }
             setAuthentication(sender)
         }.build()
-        val response = FillResponse.Builder().addDataset(dataset)
-        val usernameEarlier = form.username == null && earlierUsername(request.fillContexts, form) != null
-        saveInfo(form, usernameEarlier)?.let(response::setSaveInfo)
-        callback.onSuccess(response.build())
     }
 
     /**
@@ -147,5 +183,10 @@ class VaultAutofillService : AutofillService() {
             PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         ).intentSender
         callback.onSuccess(sender)
+    }
+
+    private companion object {
+        /** The most logins the list names; the fill screen has the rest. */
+        const val MAX_LOGINS = 10
     }
 }

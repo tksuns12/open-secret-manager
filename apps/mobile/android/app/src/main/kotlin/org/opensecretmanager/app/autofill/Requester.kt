@@ -14,6 +14,17 @@ import org.opensecretmanager.app.R
  */
 sealed interface Requester {
     /**
+     * What a new login from here is called at first: the page's host, or
+     * the domain an app says it shows, without `www.`, or else the app's
+     * name.
+     */
+    val title: String
+        get() = when (this) {
+            is Web -> origin.removePrefix("https://").removePrefix("www.")
+            is App -> claimedDomain?.removePrefix("www.") ?: label
+        }
+
+    /**
      * A page of `origin` (`https://host`), shown by a trusted browser. A
      * browser reports the page's host and scheme only, not its port.
      */

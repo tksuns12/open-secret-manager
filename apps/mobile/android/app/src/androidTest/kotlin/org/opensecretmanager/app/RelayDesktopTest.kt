@@ -15,7 +15,9 @@ import androidx.work.testing.TestListenableWorkerBuilder
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Assume.assumeTrue
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -36,6 +38,17 @@ import org.junit.runner.RunWith
 class RelayDesktopTest {
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
+
+    /** Away from the screen, the vault locks at once. */
+    @Before
+    fun lockingAtOnce() {
+        StayUnlocked.millisForTests = 0L
+    }
+
+    @After
+    fun lockingAsChosen() {
+        StayUnlocked.millisForTests = null
+    }
 
     private fun syncedSince(session: VaultSession, since: Long) =
         (session.state.value.sync?.lastSyncedAt?.toLong() ?: 0) >= since

@@ -1,15 +1,22 @@
 package org.opensecretmanager.app
 
 import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 
 /**
  * The app's process: one device of a vault, in a folder of the app's own,
- * for as long as the process lives. Leaving the app for another one locks
- * the vault and stops taking part; coming back takes part again. While it
- * is closed, it syncs now and then in the background ([BackgroundSync]).
+ * for as long as the process lives. Leaving the app for another one stops
+ * taking part and locks the vault, at once or after the time the owner
+ * chose ([StayUnlocked]); the phone's screen turning off locks it at once.
+ * Coming back takes part again. While it is closed, it syncs now and then
+ * in the background ([BackgroundSync]).
  */
 class VaultApp : Application() {
     lateinit var session: VaultSession
@@ -22,6 +29,14 @@ class VaultApp : Application() {
             override fun onStart(owner: LifecycleOwner) = session.onForeground()
             override fun onStop(owner: LifecycleOwner) = session.onBackground()
         })
+        ContextCompat.registerReceiver(
+            this,
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) = session.onScreenOff()
+            },
+            IntentFilter(Intent.ACTION_SCREEN_OFF),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         BackgroundSync.schedule(this)
     }
 

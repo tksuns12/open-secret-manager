@@ -67,6 +67,8 @@ class ChromeTest {
             .takeIf { it.isNotEmpty() && it != "null" && !it.startsWith("${context.packageName}/") }
         shell("settings put secure autofill_service ${context.packageName}/.autofill.VaultAutofillService")
         if (browser != CHROME) Requester.trustedForTests += browser
+        // Each fill and save is checked to lock the vault again at once.
+        StayUnlocked.millisForTests = 0L
         session.reopenForTests { folder ->
             BiometricUnlock(context).disable()
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
@@ -87,6 +89,7 @@ class ChromeTest {
 
     @After
     fun putTheServiceBack() {
+        StayUnlocked.millisForTests = null
         if (site == null) return
         Requester.trustedForTests.clear()
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")

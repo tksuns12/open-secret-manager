@@ -37,8 +37,9 @@
 
         <!-- Filling logins into other apps and pages, once the owner picks
              this app as the phone's autofill service, and saving what their
-             forms submit. It only offers "unlock to fill" and a save; the
-             fill and save screens do the rest. -->
+             forms submit. It offers "unlock to fill", or while the vault is
+             unlocked the logins a fill would offer, and a save; the fill and
+             save screens do the rest. -->
         <service
             android:name=".autofill.VaultAutofillService"
             android:exported="true"

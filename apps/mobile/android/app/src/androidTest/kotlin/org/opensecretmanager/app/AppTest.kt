@@ -27,7 +27,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Assume.assumeFalse
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -56,6 +58,17 @@ class AppTest {
     }
 
     private fun withoutAVault() = session.reopenForTests { }
+
+    /** Away from the screen, the vault locks at once, unless a test says otherwise. */
+    @Before
+    fun lockingAtOnce() {
+        StayUnlocked.millisForTests = 0L
+    }
+
+    @After
+    fun lockingAsChosen() {
+        StayUnlocked.millisForTests = null
+    }
 
     private fun waitFor(tag: String) = compose.waitUntilAtLeastOneExists(hasTestTag(tag), 30_000)
 
@@ -86,6 +99,39 @@ class AppTest {
         compose.waitUntil(10_000) { session.state.value.screen == Screen.LOCKED }
         compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
         waitFor("locked")
+    }
+
+    @Test
+    fun theVaultStaysUnlockedAfterTheAppIsLeftForTheTimeChosen() {
+        withTheFrozenVault()
+        StayUnlocked.millisForTests = null
+        val context = instrumentation.targetContext
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Bank")
+
+        // A minute: left and back within it, the vault is still unlocked.
+        compose.onNodeWithTag("stay-unlocked").performClick()
+        waitFor("stay-unlocked:1")
+        compose.onNodeWithTag("stay-unlocked:1").performClick()
+        assertEquals(1, StayUnlocked.minutes(context))
+        compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
+        Thread.sleep(3_000)
+        assertEquals(Screen.UNLOCKED, session.state.value.screen)
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        waitFor("item:Bank")
+
+        // At once: leaving locks it.
+        compose.onNodeWithTag("stay-unlocked").performClick()
+        waitFor("stay-unlocked:0")
+        compose.onNodeWithTag("stay-unlocked:0").performClick()
+        assertEquals(0, StayUnlocked.minutes(context))
+        compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
+        compose.waitUntil(10_000) { session.state.value.screen == Screen.LOCKED }
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        waitFor("locked")
+        StayUnlocked.set(context, 1)
     }
 
     @Test

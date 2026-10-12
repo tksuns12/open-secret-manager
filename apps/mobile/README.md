@@ -15,16 +15,19 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   a fingerprint, lists and searches the items, copies a username,
   password, or one-time code, creates, edits, and deletes logins and
   secure notes, and shows an item's history and the items deleted,
-  restoring a login or note from either. It locks and stops taking part
-  when it leaves the screen, and keeps the vault out of screenshots; while
+  restoring a login or note from either. It stops taking part when it
+  leaves the screen and locks then, or after the time the owner chose (a
+  minute unless changed), and at once when the screen turns off; it keeps
+  the vault out of screenshots; while
   it is closed it syncs now and then without unlocking, unless that is
   turned off. Once picked as the phone's autofill service, it fills
   logins into other apps and
   into pages of the browsers it trusts (`res/raw/trusted_browsers.json`,
   made by `android/trusted-browsers.mjs`), after the owner unlocks and
-  chooses the login on its fill screen (and its one-time code into a field
-  that asks for one), and offers to save a login those apps and pages
-  send, where the owner chooses on its save screen.
+  chooses the login on its fill screen, or while the vault is still
+  unlocked from the system's list under the field (and its one-time code
+  into a field that asks for one), and offers to save a login those apps
+  and pages send, where the owner chooses on its save screen.
 - `loginfixture`: a stand-in for another app with login forms, which the
   autofill tests fill and sign in to. Never shipped.
 

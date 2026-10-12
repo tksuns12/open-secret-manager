@@ -30,8 +30,9 @@
 # aarch64-apple-ios-sim aarch64-apple-ios` and Xcode; each simulator is made
 # for the run in a device set of its own and deleted. Android needs `rustup target add
 # aarch64-linux-android` and the Android SDK and NDK. OSM_DEVICE_PIN
-# unlocks a device or emulator that has a screen lock;
-# scripts/make-test-emulator.sh makes the emulator the tests expect.
+# unlocks a device or emulator that has a screen lock, before the tests and
+# in the one that turns the screen off (skipped on such a device without
+# it); scripts/make-test-emulator.sh makes the emulator the tests expect.
 set -eu
 cd "$(dirname "$0")/.."
 root=$PWD
@@ -129,7 +130,9 @@ android)
     toucher=$!
     status=0
     limit=${OSM_ANDROID_TIME_LIMIT:-3600}
-    (cd apps/mobile/android && perl -e 'alarm shift; exec @ARGV' "$limit" ./gradlew --quiet :vault:connectedDebugAndroidTest :app:connectedDebugAndroidTest) || status=$?
+    pin_argument=
+    [ -n "${OSM_DEVICE_PIN:-}" ] && pin_argument="-Pandroid.testInstrumentationRunnerArguments.pin=$OSM_DEVICE_PIN"
+    (cd apps/mobile/android && perl -e 'alarm shift; exec @ARGV' "$limit" ./gradlew --quiet $pin_argument :vault:connectedDebugAndroidTest :app:connectedDebugAndroidTest) || status=$?
     # Stopped by the alarm.
     [ "$status" = 142 ] && echo "The Android tests were stopped after $limit seconds: the emulator may have stopped answering." >&2
     kill "$toucher" 2>/dev/null || true

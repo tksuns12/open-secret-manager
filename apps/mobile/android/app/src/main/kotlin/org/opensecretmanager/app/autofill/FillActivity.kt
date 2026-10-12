@@ -1,12 +1,13 @@
 package org.opensecretmanager.app.autofill
 
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.service.autofill.Dataset
 import android.view.WindowManager
 import android.view.autofill.AutofillManager
 import android.view.autofill.AutofillValue
-import android.widget.RemoteViews
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -62,8 +63,10 @@ import org.opensecretmanager.vault.ItemSummary
  * else; an app is offered the logins the owner chose for it before, or the
  * owner chooses one, warned. A form that asks for a one-time code is offered
  * only logins that have one, and gets the login's current code; a form with
- * a password field and a code field gets both. The vault locks again once
- * this screen goes, as it does when the app is left.
+ * a password field and a code field gets both. A login the owner chose in
+ * the system's list while the vault was unlocked ([ITEM]) is filled without
+ * this screen showing, or once unlocked if the vault locked meanwhile. Once
+ * this screen goes, the vault locks as when the app is left.
  */
 class FillActivity : FragmentActivity() {
     private lateinit var form: Form
@@ -76,17 +79,38 @@ class FillActivity : FragmentActivity() {
         setResult(RESULT_CANCELED)
         form = intent.extras?.let(Form::fromBundle) ?: return finish()
         val session = (application as VaultApp).session
+        val requester = Requester.of(this, form)
+        val appLogins = AppLogins(this)
+        // Chosen in the list: for an app, only a login the owner chose for it.
+        val chosen = intent.getStringExtra(ITEM)?.takeIf { item ->
+            requester is Requester.Web || (requester is Requester.App && item in appLogins.chosen(requester))
+        }
+        if (chosen == null) return show(session, requester, appLogins, null)
+        // Nothing drawn while it fills: the app that asked stays in sight.
+        val background = window.decorView.background
+        window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        session.fillChosen(chosen, (requester as? Requester.Web)?.origin, login = form.password != null, code = form.oneTimeCode != null) { filled ->
+            if (filled != null) {
+                finishWith(filled.first, filled.second)
+            } else {
+                window.setBackgroundDrawable(background)
+                show(session, requester, appLogins, chosen)
+            }
+        }
+    }
+
+    private fun show(session: VaultSession, requester: Requester?, appLogins: AppLogins, chosen: String?) {
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session)
-        val requester = Requester.of(this, form)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 FillScreen(
                     requester = requester,
                     codeOnly = form.password == null,
                     withCode = form.oneTimeCode != null,
+                    chosen = chosen,
                     session = session,
-                    appLogins = AppLogins(this),
+                    appLogins = appLogins,
                     biometric = biometric,
                     prompts = prompts,
                     onFill = ::finishWith,
@@ -98,9 +122,7 @@ class FillActivity : FragmentActivity() {
 
     /** Hands what was chosen to the form that asked, which fills it at once. */
     private fun finishWith(credentials: FillCredentials?, code: String?) {
-        val presentation = RemoteViews(packageName, android.R.layout.simple_list_item_1).apply {
-            setTextViewText(android.R.id.text1, getString(org.opensecretmanager.app.R.string.app_name))
-        }
+        val presentation = entry(this, getString(org.opensecretmanager.app.R.string.app_name), credentials?.username)
         @Suppress("DEPRECATION")
         val dataset = Dataset.Builder(presentation).apply {
             credentials?.let { login ->
@@ -113,6 +135,11 @@ class FillActivity : FragmentActivity() {
         setResult(RESULT_OK, Intent().putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, dataset))
         finish()
     }
+
+    companion object {
+        /** The extra naming the login the owner chose in the system's list. */
+        const val ITEM = "item"
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
@@ -121,6 +148,7 @@ private fun FillScreen(
     requester: Requester?,
     codeOnly: Boolean,
     withCode: Boolean,
+    chosen: String?,
     session: VaultSession,
     appLogins: AppLogins,
     biometric: BiometricUnlock,
@@ -135,6 +163,16 @@ private fun FillScreen(
             snackbar.showSnackbar(it)
             session.dismissNotice()
         }
+    }
+    // A login chosen in the system's list, the vault locked meanwhile:
+    // filled once it is unlocked, or tried once more, with what went wrong
+    // shown, if it was unlocked.
+    var pending by remember { mutableStateOf(chosen) }
+    LaunchedEffect(state.screen, pending) {
+        val item = pending ?: return@LaunchedEffect
+        if (state.screen != Screen.UNLOCKED || requester == null) return@LaunchedEffect
+        pending = null
+        session.fill(item, (requester as? Requester.Web)?.origin, login = !codeOnly, code = withCode, done = onFill)
     }
     // Fills what the form asks for from a login; one chosen for an app from
     // every login is remembered for it.

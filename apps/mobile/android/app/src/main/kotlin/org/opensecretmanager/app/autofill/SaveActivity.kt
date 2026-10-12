@@ -60,8 +60,8 @@ import org.opensecretmanager.vault.SaveCandidate
  * after choosing to save it in the system's offer: unlock, see who sent it,
  * and either update the password of a login that form could be filled with,
  * or save a new login. A new login for a trusted browser's page is saved for
- * its origin; one for an app, for that app. The vault locks again once this
- * screen goes.
+ * its origin; one for an app, for that app. Once this screen goes, the vault
+ * locks as when the app is left.
  */
 class SaveActivity : FragmentActivity() {
     private var id = 0
@@ -195,14 +195,7 @@ private fun SaveChoices(
         session.saveCandidates(origin, chosen, save.username, save.password) { candidates = it }
     }
     val shown = candidates ?: return
-    var title by remember {
-        mutableStateOf(
-            when (requester) {
-                is Requester.Web -> requester.origin.removePrefix("https://")
-                is Requester.App -> requester.label
-            },
-        )
-    }
+    var title by remember { mutableStateOf(requester.title) }
     Column(
         Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
