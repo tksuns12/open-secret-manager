@@ -26,11 +26,15 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   into pages of the browsers it trusts (`res/raw/trusted_browsers.json`,
   made by `android/trusted-browsers.mjs`), after the owner unlocks and
   chooses the login on its fill screen, or while the vault is still
-  unlocked from the system's list under the field (and its one-time code
-  into a field that asks for one), and offers to save a login those apps
-  and pages send, where the owner chooses on its save screen.
+  unlocked from the system's list under the field, or from the keyboard's
+  strip for a keyboard that asks for it (and its one-time code into a
+  field that asks for one), and offers to save a login those apps and
+  pages send, where the owner chooses on its save screen.
 - `loginfixture`: a stand-in for another app with login forms, which the
   autofill tests fill and sign in to. Never shipped.
+- `testkeyboard`: two keyboards for the autofill tests, one that leaves a
+  fill's entries to the system's list and one that asks for them in its
+  strip. Never shipped.
 
 To fill with it, pick Open Secret Manager in the phone's settings (or
 from "Fill logins in other apps…" in the app). Chrome 135 and later uses
@@ -44,8 +48,9 @@ cd android && ./gradlew :app:assembleDebug
 
 `scripts/test-mobile.sh android` runs the bindings' tests and the app's
 screens and autofill on a running emulator or device (it installs the
-stand-in app, and makes this app the autofill service for each autofill
-test, putting the earlier one back after it); `scripts/test-mobile.sh join`
+stand-in app and the test keyboards, and makes this app the autofill
+service and a test keyboard the keyboard for each autofill test, putting
+the earlier ones back after it); `scripts/test-mobile.sh join`
 has the app join a desktop-side device on the same machine;
 `scripts/test-mobile-chrome.sh` has real Chrome fill and save on a test
 site, after a setup by hand that the script describes, or Chromium with

@@ -11,6 +11,7 @@ import android.service.autofill.FillCallback
 import android.service.autofill.FillContext
 import android.service.autofill.FillRequest
 import android.service.autofill.FillResponse
+import android.service.autofill.InlinePresentation
 import android.service.autofill.SaveCallback
 import android.service.autofill.SaveInfo
 import android.service.autofill.SaveRequest
@@ -28,8 +29,10 @@ import org.opensecretmanager.vault.ItemSummary
  * the login. While it is unlocked (for a while after the app or a fill
  * screen was left, see [org.opensecretmanager.app.StayUnlocked]), the
  * system's list names the logins a fill would offer, by title and username,
- * and choosing one fills it at once. A save opens [SaveActivity], where the
- * owner unlocks and chooses where it goes.
+ * and choosing one fills it at once. A keyboard that asks for them gets the
+ * same entries in its strip, and the system's list is not shown (see
+ * [Strip]). A save opens [SaveActivity], where the owner unlocks and
+ * chooses where it goes.
  */
 class VaultAutofillService : AutofillService() {
     private val requests = AtomicInteger()
@@ -54,21 +57,33 @@ class VaultAutofillService : AutofillService() {
         val usernameEarlier = form.username == null && earlierUsername(request.fillContexts, form) != null
         val requester = Requester.of(this, form)
         val codeOnly = form.password == null
+        val strip = if (Build.VERSION.SDK_INT >= 30) request.inlineSuggestionsRequest?.let { Strip(this, it) } else null
         val respond = { logins: List<ItemSummary>? ->
             val response = FillResponse.Builder()
-            if (logins == null) {
-                response.addDataset(offer(form, entry(this, "Open Secret Manager · unlock to fill")))
-            } else {
-                logins.take(MAX_LOGINS).forEach { response.addDataset(offer(form, entry(this, it.title, it.username), it.id)) }
-                // The fill screen, for the rest, or for choosing a login for an app.
-                val more = when {
-                    logins.isNotEmpty() -> "Open Secret Manager…"
-                    requester is Requester.App -> "Open Secret Manager · choose a login…"
-                    codeOnly -> "Open Secret Manager · no code for this site"
-                    else -> "Open Secret Manager · no login for this site"
-                }
-                response.addDataset(offer(form, entry(this, more)))
+            val offers = mutableListOf<Dataset>()
+            // The same entry in the list and, if the keyboard asks, in its
+            // strip, where the app's icon names the app and a short title
+            // ([inStrip]) is not cut off.
+            val add = { title: String, subtitle: String?, inStrip: String, item: String? ->
+                val inline = if (Build.VERSION.SDK_INT >= 30) strip?.entry(offers.size, inStrip, subtitle) else null
+                offers += offer(form, entry(this, title, subtitle), inline, item)
             }
+            if (logins == null) {
+                add("Open Secret Manager · unlock to fill", null, "Unlock to fill", null)
+            } else {
+                // Room left in the strip for the last entry.
+                val listed = if (Build.VERSION.SDK_INT >= 30 && strip != null) minOf(MAX_LOGINS, strip.room - 1) else MAX_LOGINS
+                logins.take(listed.coerceAtLeast(0)).forEach { add(it.title, it.username, it.title, it.id) }
+                // The fill screen, for the rest, or for choosing a login for an app.
+                val (more, inStrip) = when {
+                    logins.isNotEmpty() -> "Open Secret Manager…" to "Open Secret Manager…"
+                    requester is Requester.App -> "Open Secret Manager · choose a login…" to "Choose a login…"
+                    codeOnly -> "Open Secret Manager · no code for this site" to "No code for this site"
+                    else -> "Open Secret Manager · no login for this site" to "No login for this site"
+                }
+                add(more, null, inStrip, null)
+            }
+            offers.forEach(response::addDataset)
             saveInfo(form, usernameEarlier)?.let(response::setSaveInfo)
             callback.onSuccess(response.build())
         }
@@ -86,9 +101,10 @@ class VaultAutofillService : AutofillService() {
      * An entry with no values, locked: choosing it opens the fill screen,
      * whose result fills the form at once. With [item], the login chosen in
      * the list, which the screen fills without showing itself if the vault
-     * is still unlocked.
+     * is still unlocked. [inline]: the entry for the keyboard's strip, if it
+     * has one.
      */
-    private fun offer(form: Form, presentation: RemoteViews, item: String? = null): Dataset {
+    private fun offer(form: Form, presentation: RemoteViews, inline: InlinePresentation?, item: String?): Dataset {
         val intent = Intent(this, FillActivity::class.java).putExtras(form.toBundle())
         item?.let { intent.putExtra(FillActivity.ITEM, it) }
         // Mutable: the system adds the screen's structure to it.
@@ -101,6 +117,7 @@ class VaultAutofillService : AutofillService() {
         @Suppress("DEPRECATION")
         return Dataset.Builder(presentation).apply {
             listOfNotNull(form.username, form.password, form.oneTimeCode).forEach { setValue(it, null) }
+            if (inline != null && Build.VERSION.SDK_INT >= 30) setInlinePresentation(inline)
             setAuthentication(sender)
         }.build()
     }

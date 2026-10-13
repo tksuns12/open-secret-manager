@@ -43,6 +43,8 @@ import org.opensecretmanager.vault.ItemKind
  * "unlock to fill" in it, unlocks the fill screen, and picks a login, as
  * the owner would. A copy of the frozen format 7 vault is the vault. The
  * vault locks as soon as the app is left, unless a test says otherwise.
+ * The keyboard is the stand-in's plain one, which leaves the entries to the
+ * system's list under the field, unless a test says otherwise ([Keyboard]).
  *
  * In a build made with `-Posm.screenshots=true` and run with the
  * instrumentation argument `screens=true`, it also captures the screens it
@@ -63,6 +65,7 @@ class AutofillTest {
     private var previousService: String? = null
     private val animationScales = listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
     private var previousScales = emptyList<String>()
+    private val keyboard = Keyboard(::shell)
 
     @get:Rule
     val test = TestName()
@@ -82,6 +85,7 @@ class AutofillTest {
         // when it is tapped.
         previousScales = animationScales.map { shell("settings get global $it").trim() }
         animationScales.forEach { shell("settings put global $it 0") }
+        keyboard.use("PlainKeyboard")
         context.getSharedPreferences("app-logins", 0).edit().clear().commit()
         Requester.trustedForTests.clear()
         PendingSave.forgetForTests()
@@ -100,6 +104,7 @@ class AutofillTest {
         PendingSave.forgetForTests()
         StayUnlocked.millisForTests = null
         shell("am force-stop $FIXTURE")
+        keyboard.putBack()
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")
         animationScales.zip(previousScales).forEach { (name, scale) ->
             shell(if (scale.isEmpty() || scale == "null") "settings delete global $name" else "settings put global $name $scale")
@@ -239,6 +244,46 @@ class AutofillTest {
         assertLockedAgain()
         openAndFind(OFFER, "NativeLoginActivity")
         assertNull(device.findObject(By.text("Bank")))
+    }
+
+    /** [text] in the strip keyboard's strip. */
+    private fun inStrip(text: String) = By.text(text).hasAncestor(By.desc(Keyboard.STRIP))
+
+    /**
+     * Whether the keyboard is up, and the system's list under the field is
+     * not: on the owner's Galaxy phone, that list took the keyboard away.
+     */
+    private fun assertTheKeyboardIsUpAndNoListIs() {
+        if ("mInputShown=true" !in shell("dumpsys input_method")) fail("the keyboard is down")
+        if ("Autofill UI" in shell("dumpsys window windows")) fail("the system's list shows")
+    }
+
+    @Test
+    fun aKeyboardThatAsksForTheEntriesInItsStripGetsThemThereAndStaysUp() {
+        keyboard.use("StripKeyboard")
+        StayUnlocked.millisForTests = 60_000L
+        val unlock = openAndFind(inStrip("Unlock to fill"), "NativeLoginActivity")
+        assertTheKeyboardIsUpAndNoListIs()
+        capture("strip-locked")
+        unlock.click()
+        find(mine("password"), 60_000).text = password
+        find(mine("unlock")).click()
+        find(mine("choose-another")).click()
+        find(mine("fill:Bank")).click()
+        assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
+        assertStillUnlocked()
+
+        // Unlocked, the strip names the login chosen for the app, which
+        // fills the form with no screen of this app's.
+        val bank = openAndFind(inStrip("Bank"), "NativeLoginActivity")
+        find(inStrip("account 42"))
+        find(inStrip("Open Secret Manager…"))
+        assertNull(device.findObject(By.text("Mail")))
+        assertTheKeyboardIsUpAndNoListIs()
+        capture("strip-unlocked")
+        bank.click()
+        assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
+        assertNull(device.findObject(mine("asker")))
     }
 
     @Test

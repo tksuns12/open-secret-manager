@@ -137,21 +137,25 @@ whether the computer's Devices panel shows the phone's VPN address (its
    "Autofill using another service" (Chrome then restarts). Firefox needs
    nothing more.
 3. Open the login page of a site the vault has a login for (https, the same
-   host it was saved for). Tap the username field: "Open Secret Manager ·
-   unlock to fill" appears, with the app's icon, legible in light and dark
-   mode alike (it was a blank white box on a Galaxy phone before). Choose
-   it, unlock, choose the login: both fields fill. A login saved with an
+   host it was saved for). Tap the username field: with Samsung's keyboard
+   or Gboard, "Unlock to fill" appears in the keyboard's strip, with the
+   app's icon, and the keyboard stays up (the system's list under the
+   field took it away on a Galaxy phone before); with a keyboard that has
+   no such strip, "Open Secret Manager · unlock to fill" appears under the
+   field, legible in light and dark mode alike (it was a blank white box
+   on a Galaxy phone before). Choose it, unlock, choose the login: both
+   fields fill. A login saved with an
    unusual port is not offered (Android does not say a page's port); a
    login for the usual port is also offered on the same host's other ports.
 4. Within a minute, open the page again (or sign out and back to it) and
-   tap the username field: the list under it names the login, by title and
-   username, above "Open Secret Manager…". Choose it: both fields fill at
-   once, with no screen of the app's. A minute after leaving, or once the
-   screen was off, the list says "unlock to fill" again. Note any field
-   where the login is named but choosing it fills nothing.
-5. In another app's login screen, the same entry appears; the first time the
-   owner chooses a login for that app, after a warning, and it is offered
-   there again afterwards.
+   tap the username field: the strip (or the list) names the login, by
+   title and username, before "Open Secret Manager…". Choose it: both
+   fields fill at once, with no screen of the app's. A minute after
+   leaving, or once the screen was off, it says "unlock to fill" again.
+   Note any field where the login is named but choosing it fills nothing.
+5. In another app's login screen, the same entry appears, and the keyboard
+   stays up; the first time the owner chooses a login for that app, after
+   a warning, and it is offered there again afterwards.
 6. On a site or app that asks for a code from an authenticator app after
    the password, tap the code field: the same entry appears, and the fill
    screen lists the logins with a one-time code; the chosen one's code

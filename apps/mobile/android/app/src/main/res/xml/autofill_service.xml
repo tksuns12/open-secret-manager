@@ -1,3 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The autofill service's settings: none beyond the app itself. -->
-<autofill-service xmlns:android="http://schemas.android.com/apk/res/android" />
+<!-- The autofill service's settings: its entries may be shown in the
+     keyboard's own strip, for a keyboard that asks for them there (Android 11
+     and later). Without this, Android shows them in its list under the
+     field, a window of its own, which on a Galaxy phone took the keyboard
+     away. -->
+<autofill-service xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:supportsInlineSuggestions="true"
+    tools:targetApi="30" />

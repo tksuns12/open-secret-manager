@@ -52,6 +52,7 @@ class ChromeTest {
     private val site: String? = InstrumentationRegistry.getArguments().getString("chromeSite")
     private val browser: String = InstrumentationRegistry.getArguments().getString("browser") ?: CHROME
     private var previousService: String? = null
+    private val keyboard = Keyboard(::shell)
 
     private fun shell(command: String): String =
         ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command))
@@ -63,6 +64,8 @@ class ChromeTest {
     @Before
     fun withTheServiceAndALoginForTheSite() {
         assumeTrue("no chromeSite argument", site != null)
+        // A keyboard that leaves the entries to the system's list.
+        keyboard.use("PlainKeyboard")
         previousService = shell("settings get secure autofill_service").trim()
             .takeIf { it.isNotEmpty() && it != "null" && !it.startsWith("${context.packageName}/") }
         shell("settings put secure autofill_service ${context.packageName}/.autofill.VaultAutofillService")
@@ -90,6 +93,7 @@ class ChromeTest {
     @After
     fun putTheServiceBack() {
         StayUnlocked.millisForTests = null
+        keyboard.putBack()
         if (site == null) return
         Requester.trustedForTests.clear()
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")

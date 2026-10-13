@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A keyboard that leaves a fill's entries to the system's list. -->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android" />

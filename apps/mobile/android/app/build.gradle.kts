@@ -91,6 +91,8 @@ dependencies {
     implementation("androidx.compose.foundation:foundation:1.10.5")
     implementation("androidx.compose.material3:material3:1.4.0")
     implementation("androidx.biometric:biometric:1.1.0")
+    // The entries of a fill in the keyboard's strip (autofill/Presentation.kt).
+    implementation("androidx.autofill:autofill:1.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("androidx.work:work-runtime-ktx:2.12.0")
 
@@ -102,7 +104,8 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-test-manifest:1.10.5")
 }
 
-// The autofill tests fill the forms of a stand-in for another app.
+// The autofill tests fill the forms of a stand-in for another app, typed
+// on keyboards of their own.
 tasks.matching { it.name == "connectedDebugAndroidTest" }.configureEach {
-    dependsOn(":loginfixture:installDebug")
+    dependsOn(":loginfixture:installDebug", ":testkeyboard:installDebug")
 }

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="Test keyboards">
+        <!-- One that leaves a fill's entries to the system's list, and one
+             that asks for them in its strip (Keyboards.kt). -->
+        <service
+            android:name=".PlainKeyboard"
+            android:exported="true"
+            android:label="Plain keyboard"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data android:name="android.view.im" android:resource="@xml/plain_keyboard" />
+        </service>
+        <service
+            android:name=".StripKeyboard"
+            android:exported="true"
+            android:label="Strip keyboard"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data android:name="android.view.im" android:resource="@xml/strip_keyboard" />
+        </service>
+    </application>
+</manifest>
