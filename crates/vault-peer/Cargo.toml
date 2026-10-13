@@ -39,3 +39,4 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
 openraft = { version = "0.9.25", default-features = false, features = ["serde", "storage-v2"] }
 tempfile = "3.24.0"
+tokio = { version = "1.53.1", features = ["test-util"] }

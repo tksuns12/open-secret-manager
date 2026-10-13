@@ -46,17 +46,28 @@ use crate::{
     peers::{pin_of, TransportIdentity},
     review_join,
     wire::{decode_body, encode_frame, MAX_FRAME_BYTES},
-    EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, PeerStore, Result, SyncReport,
-    SyncSession, MAX_INVITATION_TTL_SECS,
+    EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, PeerStore, Result, SyncMessage,
+    SyncReport, SyncSession, MAX_INVITATION_TTL_SECS,
 };
+
+mod watched;
+
+use watched::{Moved, Watched};
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Longest wait for one frame from a peer during sync.
+/// Longest a frame outside a sync session takes to write.
 pub(crate) const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+/// A sync session ends once no byte has moved either way for this long. A
+/// large frame on a slow path takes as long as it takes: its bytes move.
+pub(crate) const SYNC_SILENCE: Duration = Duration::from_secs(60);
+/// Frames waiting between a sync session and each direction of its stream.
+const SESSION_FRAMES: usize = 2;
+/// How long a sync session that failed still sends what it had queued and
+/// reads what arrives.
+const LINGER: Duration = Duration::from_secs(2);
 /// The joiner waits this long for the owner to confirm on the inviter.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(MAX_INVITATION_TTL_SECS);
-const OUTGOING_FRAMES: usize = 16;
 
 #[derive(Serialize, Deserialize)]
 enum PairingReply {
@@ -397,9 +408,13 @@ impl SharedVault for Mutex<&mut Vault> {
 pub(crate) const NO_VAULT: Error = Error::Transport("the vault is no longer available");
 
 /// Drives a [`SyncSession`] over a byte stream and returns the report and
-/// the port the peer says it listens on. Reading and writing run
-/// concurrently, so two peers sending large batches at once cannot block
-/// each other on full socket buffers.
+/// the port the peer says it listens on.
+///
+/// A task of its own reads the peer's frames as they come, and the session
+/// takes the next of them or sends its own next message, whichever can go
+/// on first; it never waits to send while the peer's frames are waiting to
+/// be read. Two peers that each have much to send the other thus cannot
+/// leave each other's frames unread, both waiting for room to write.
 pub(crate) async fn run_session<S, V>(
     stream: S,
     vault: &V,
@@ -409,38 +424,111 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     V: SharedVault + ?Sized,
 {
-    let (mut reader, writer) = tokio::io::split(stream);
-    let (outgoing, queued) = mpsc::channel::<Vec<u8>>(OUTGOING_FRAMES);
-    let writer = tokio::spawn(write_frames(writer, queued));
-    let (mut session, opening) = vault
+    let moved = Moved::new();
+    let (reader, writer) = tokio::io::split(Watched::new(stream, moved.clone()));
+    let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SESSION_FRAMES);
+    let mut writer = tokio::spawn(write_frames(writer, queued));
+    let (arrived, mut incoming) = mpsc::channel(SESSION_FRAMES);
+    let reader = tokio::spawn(read_frames(reader, arrived));
+    let result = exchange(vault, listen_port, &outgoing, &mut incoming, &moved).await;
+    // Closing the queue lets the writer send what is left and shut down.
+    drop(outgoing);
+    let closed = if result.is_ok() {
+        tokio::select! {
+            written = &mut writer => written.unwrap_or(Err(Error::ConnectionClosed)),
+            () = moved.stalled(SYNC_SILENCE) => Err(Error::Timeout),
+        }
+    } else {
+        // What was queued still goes out, and what arrives is read, for a
+        // moment: the peer then reads this side's `Hello`, and so learns of
+        // a refusal by version, before the connection closes.
+        let _ = tokio::time::timeout(LINGER, async {
+            let drained = async { while incoming.recv().await.is_some() {} };
+            let _ = tokio::join!(&mut writer, drained);
+        })
+        .await;
+        Ok(())
+    };
+    writer.abort();
+    reader.abort();
+    let report = result?;
+    closed?;
+    Ok(report)
+}
+
+/// The session itself: sends the opening, then handles the peer's messages
+/// and sends this side's, until both sides are finished and nothing is left
+/// to send, or nothing moves for [`SYNC_SILENCE`].
+async fn exchange<V: SharedVault + ?Sized>(
+    vault: &V,
+    listen_port: Option<u16>,
+    outgoing: &mpsc::Sender<Vec<u8>>,
+    incoming: &mut mpsc::Receiver<Result<SyncMessage>>,
+    moved: &Moved,
+) -> Result<(SyncReport, Option<u16>)> {
+    let mut session = vault
         .with(|vault| SyncSession::start(vault, listen_port))
         .await
         .ok_or(NO_VAULT)??;
-    for message in opening {
-        outgoing
-            .send(encode_frame(&message)?)
-            .await
-            .map_err(|_| Error::ConnectionClosed)?;
-    }
-    while !session.is_complete() {
-        let message = with_timeout(FRAME_TIMEOUT, read_frame(&mut reader)).await??;
-        // The vault is held only while this message is handled, never
-        // while waiting for the peer.
-        let replies = vault
-            .with(|vault| session.handle(vault, message))
+    // `Hello` and `Summary` go out before anything the peer sends is
+    // handled, so that the peer learns this side's version even if this
+    // side refuses the peer's.
+    while session.has_outgoing() {
+        let message = vault
+            .with(|vault| session.next_message(vault))
             .await
             .ok_or(NO_VAULT)??;
-        for reply in replies {
+        if let Some(message) = message {
             outgoing
-                .send(encode_frame(&reply)?)
+                .send(encode_frame(&message)?)
                 .await
                 .map_err(|_| Error::ConnectionClosed)?;
         }
     }
-    // Closing the queue lets the writer flush what is left and shut down.
-    drop(outgoing);
-    writer.await.map_err(|_| Error::ConnectionClosed)??;
-    Ok((session.report().clone(), session.peer_listen_port()))
+    loop {
+        if session.is_complete() && !session.has_outgoing() {
+            return Ok((session.report().clone(), session.peer_listen_port()));
+        }
+        // The vault is held only while a message is handled or a batch is
+        // read, never while waiting for the peer. The time that takes counts
+        // as moving: only the peer's silence ends a session.
+        tokio::select! {
+            message = incoming.recv() => {
+                let message = message.ok_or(Error::ConnectionClosed)??;
+                vault
+                    .with(|vault| session.handle(vault, message))
+                    .await
+                    .ok_or(NO_VAULT)??;
+                moved.mark();
+            }
+            room = outgoing.reserve(), if session.has_outgoing() => {
+                let room = room.map_err(|_| Error::ConnectionClosed)?;
+                let message = vault
+                    .with(|vault| session.next_message(vault))
+                    .await
+                    .ok_or(NO_VAULT)??;
+                moved.mark();
+                if let Some(message) = message {
+                    room.send(encode_frame(&message)?);
+                }
+            }
+            () = moved.stalled(SYNC_SILENCE) => return Err(Error::Timeout),
+        }
+    }
+}
+
+/// Reads the peer's frames in order, an error last.
+async fn read_frames<R: AsyncRead + Unpin>(
+    mut reader: R,
+    arrived: mpsc::Sender<Result<SyncMessage>>,
+) {
+    loop {
+        let message = read_frame(&mut reader).await;
+        let failed = message.is_err();
+        if arrived.send(message).await.is_err() || failed {
+            return;
+        }
+    }
 }
 
 async fn write_frames<W: AsyncWrite + Unpin>(
@@ -448,9 +536,7 @@ async fn write_frames<W: AsyncWrite + Unpin>(
     mut queued: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     while let Some(frame) = queued.recv().await {
-        with_timeout(FRAME_TIMEOUT, writer.write_all(&frame))
-            .await?
-            .map_err(io_error)?;
+        writer.write_all(&frame).await.map_err(io_error)?;
     }
     let _ = writer.shutdown().await;
     Ok(())

@@ -75,6 +75,18 @@ evidence in the delivery matrix and the threat model.
 - A vault's only voting device cannot be removed, also not by a device
   without a vote. To retire it, invite another computer that votes first,
   or start over as a new vault.
+- Devices on builds from before 2026-10-13 sync with each other, and so do
+  devices on later builds, but not one kind with the other: the way they
+  compare what they hold changed. Update every device of a vault together.
+  Until then the sync status says the other device runs a version that
+  cannot sync with this one; adding and removing devices still works.
+- A locked device that holds received revisions a peer lacks cannot send
+  them before it has checked them, so the bucket they are in differs at
+  every sync until it is unlocked, and the IDs of that bucket are sent each
+  time.
+- A sync session ends when nothing has moved for a minute. Processing many
+  received revisions at once, as at the first unlock after a long time
+  locked, can take that long; the next session goes on from what was done.
 - The membership control plane tolerates crashes and partitions, not a
   malicious member. Whoever copies a device's transport key and control
   database can act as that device in it and stall changes; keys and

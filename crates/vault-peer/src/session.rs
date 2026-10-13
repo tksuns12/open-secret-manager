@@ -1,9 +1,12 @@
 //! One synchronization exchange between two copies of a vault.
 //!
-//! Both sides open with `Hello` and an `Inventory` of every revision ID they
-//! hold, accepted or staged. Each answers the other's inventory with the
-//! revisions it lacks, parents first, in bounded `Revisions` batches followed
-//! by `Done`.
+//! Both sides open with `Hello` and a `Summary`: a digest of each of 256
+//! buckets of the revision IDs they hold, accepted, staged, or held for
+//! review (see [`inventory`]). Where the digests of a bucket differ, each
+//! side sends its IDs in that bucket, in ascending order and in chunks
+//! (`Ids`), and each answers the other's with the revisions it lacks,
+//! parents first, in bounded `Revisions` batches followed by `Done`. When
+//! no bucket differs, both answer at once with `Done`.
 //!
 //! Every received revision is first staged durably in the vault's ingress
 //! queue, which works while the vault is locked and checks only the
@@ -14,22 +17,34 @@
 //! number of rounds. When a side needs nothing more it sends `Finished`; the
 //! session is complete once both have.
 //!
-//! An interrupted session is resumed by starting a new one: inventories
+//! The session only queues what it sends; [`SyncSession::next_message`]
+//! takes the next message off the queue, reading a batch of revisions from
+//! the vault only then, so that a large answer is never held all at once.
+//!
+//! An interrupted session is resumed by starting a new one: summaries
 //! recompute what is missing, and staged revisions are never re-sent.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use osm_vault_core::{EncryptedRevision, StageOutcome, Vault};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-pub const PROTOCOL_VERSION: u16 = 1;
-const MAX_INVENTORY: usize = 1_000_000;
+pub(crate) mod inventory;
+
+pub use inventory::RevisionId;
+use inventory::{Comparison, Differing};
+
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_BATCH_REVISIONS: usize = 64;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NEED_ROUNDS: u32 = 8;
+/// The most parents asked for in one round; more are asked for in the next.
+const MAX_NEED: usize = 65_536;
 
+/// `Hello` comes first, in the form every version has, so that a device of
+/// another version reads it and refuses the session by its version.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum SyncMessage {
     Hello {
@@ -39,14 +54,19 @@ pub enum SyncMessage {
         /// peer pairs it with the address the connection came from.
         listen_port: Option<u16>,
     },
-    Inventory {
-        revisions: Vec<String>,
+    /// The digest of each bucket of the revision IDs this side holds.
+    Summary {
+        buckets: Vec<[u8; 32]>,
+    },
+    /// The next chunk of this side's IDs in the buckets that differ.
+    Ids {
+        ids: Vec<RevisionId>,
     },
     Revisions {
         revisions: Vec<EncryptedRevision>,
     },
     Need {
-        revisions: Vec<String>,
+        ids: Vec<RevisionId>,
     },
     /// Everything the peer lacked or asked for has been sent.
     Done,
@@ -58,9 +78,10 @@ impl std::fmt::Debug for SyncMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Hello { version, .. } => write!(f, "Hello(v{version})"),
-            Self::Inventory { revisions } => write!(f, "Inventory({})", revisions.len()),
+            Self::Summary { buckets } => write!(f, "Summary({})", buckets.len()),
+            Self::Ids { ids } => write!(f, "Ids({})", ids.len()),
             Self::Revisions { revisions } => write!(f, "Revisions({})", revisions.len()),
-            Self::Need { revisions } => write!(f, "Need({})", revisions.len()),
+            Self::Need { ids } => write!(f, "Need({})", ids.len()),
             Self::Done => f.write_str("Done"),
             Self::Finished => f.write_str("Finished"),
         }
@@ -84,56 +105,92 @@ pub struct SyncReport {
     pub pending: usize,
 }
 
+/// What waits to be sent, in order.
+enum Outgoing {
+    Message(SyncMessage),
+    /// This side's IDs in the differing buckets, from this one on.
+    Ids {
+        from: usize,
+    },
+    /// Stored revisions with the length of each one's ciphertext, parents
+    /// first.
+    Revisions(VecDeque<(RevisionId, usize)>),
+}
+
 pub struct SyncSession {
     vault_id: [u8; 32],
+    /// The IDs this side held when the session started, sorted; once the
+    /// peer's summary has come, only those in the buckets that differ.
+    held: Vec<RevisionId>,
+    summary: Vec<[u8; 32]>,
+    /// Anything staged before the session is processed once its opening
+    /// has gone out, not before.
+    processed_staged: bool,
     hello_received: bool,
     peer_listen_port: Option<u16>,
-    /// Rounds in which this side asked for missing parents.
+    /// The buckets that differ, once the peer's summary has come.
+    differing: Option<Differing>,
+    comparison: Comparison,
+    /// Rounds in which this side asked for missing parents, and what it
+    /// asked for: each parent is asked for once.
     need_rounds: u32,
-    inventory_received: bool,
+    asked: HashSet<RevisionId>,
     /// Rounds in which the peer asked for missing parents.
     peer_need_rounds: u32,
     /// The peer's `Done`s, each the end of an answer to this side.
     dones_received: u32,
     sent_finished: bool,
     peer_finished: bool,
+    outbox: VecDeque<Outgoing>,
     report: SyncReport,
 }
 
 impl SyncSession {
-    /// Starts a session and returns the opening messages. If the vault is
-    /// unlocked, anything staged earlier is processed first.
-    pub fn start(vault: &mut Vault, listen_port: Option<u16>) -> Result<(Self, Vec<SyncMessage>)> {
-        let mut session = Self {
-            vault_id: vault.vault_id(),
+    /// Starts a session with `Hello` and `Summary` waiting to be sent. If
+    /// the vault is unlocked, anything staged earlier is processed when the
+    /// first message from the peer is handled, after those have gone out.
+    pub fn start(vault: &Vault, listen_port: Option<u16>) -> Result<Self> {
+        let held = vault.held_revision_ids()?;
+        let summary = inventory::summary(&held);
+        let vault_id = vault.vault_id();
+        let outbox = VecDeque::from([
+            Outgoing::Message(SyncMessage::Hello {
+                version: PROTOCOL_VERSION,
+                vault_id,
+                listen_port,
+            }),
+            Outgoing::Message(SyncMessage::Summary {
+                buckets: summary.clone(),
+            }),
+        ]);
+        Ok(Self {
+            vault_id,
+            held,
+            summary,
+            processed_staged: false,
             hello_received: false,
             peer_listen_port: None,
+            differing: None,
+            comparison: Comparison::new(),
             need_rounds: 0,
-            inventory_received: false,
+            asked: HashSet::new(),
             peer_need_rounds: 0,
             dones_received: 0,
             sent_finished: false,
             peer_finished: false,
+            outbox,
             report: SyncReport::default(),
-        };
-        session.process(vault)?;
-        let mut inventory = vault.revision_ids()?;
-        inventory.extend(vault.staged_revision_ids()?);
-        let opening = vec![
-            SyncMessage::Hello {
-                version: PROTOCOL_VERSION,
-                vault_id: session.vault_id,
-                listen_port,
-            },
-            SyncMessage::Inventory {
-                revisions: inventory,
-            },
-        ];
-        Ok((session, opening))
+        })
     }
 
+    /// Both sides have said they need nothing more. What this side still
+    /// has to send is in [`Self::has_outgoing`].
     pub fn is_complete(&self) -> bool {
         self.sent_finished && self.peer_finished
+    }
+
+    pub fn has_outgoing(&self) -> bool {
+        !self.outbox.is_empty()
     }
 
     pub fn report(&self) -> &SyncReport {
@@ -145,8 +202,64 @@ impl SyncSession {
         self.peer_listen_port
     }
 
-    /// Handles one message from the peer and returns the replies to send.
-    pub fn handle(&mut self, vault: &mut Vault, message: SyncMessage) -> Result<Vec<SyncMessage>> {
+    /// The next message to send, if any. A batch of revisions is read from
+    /// the vault here, which works while it is locked.
+    pub fn next_message(&mut self, vault: &Vault) -> Result<Option<SyncMessage>> {
+        loop {
+            let Some(next) = self.outbox.front_mut() else {
+                return Ok(None);
+            };
+            match next {
+                Outgoing::Message(_) => {
+                    let Some(Outgoing::Message(message)) = self.outbox.pop_front() else {
+                        unreachable!()
+                    };
+                    return Ok(Some(message));
+                }
+                Outgoing::Ids { from } => {
+                    let (chunk, last) = inventory::chunk(&self.held, *from);
+                    let ids = chunk.to_vec();
+                    *from += ids.len();
+                    if last {
+                        self.outbox.pop_front();
+                    }
+                    return Ok(Some(SyncMessage::Ids { ids }));
+                }
+                Outgoing::Revisions(queued) => {
+                    let mut batch = Vec::new();
+                    let mut bytes = 0;
+                    while let Some((id, size)) = queued.front() {
+                        if !batch.is_empty()
+                            && (batch.len() == MAX_BATCH_REVISIONS
+                                || bytes + size > MAX_BATCH_BYTES)
+                        {
+                            break;
+                        }
+                        bytes += size;
+                        batch.push(inventory::to_hex(id));
+                        queued.pop_front();
+                    }
+                    if queued.is_empty() {
+                        self.outbox.pop_front();
+                    }
+                    // `revisions_by_id` returns them in the order stored.
+                    let revisions = vault.revisions_by_id(&batch)?;
+                    if revisions.is_empty() {
+                        continue;
+                    }
+                    self.report.sent += revisions.len();
+                    return Ok(Some(SyncMessage::Revisions { revisions }));
+                }
+            }
+        }
+    }
+
+    /// Handles one message from the peer, queueing any answer.
+    pub fn handle(&mut self, vault: &mut Vault, message: SyncMessage) -> Result<()> {
+        if !self.processed_staged {
+            self.processed_staged = true;
+            self.process(vault)?;
+        }
         match message {
             SyncMessage::Hello {
                 version,
@@ -164,32 +277,54 @@ impl SyncSession {
                 }
                 self.hello_received = true;
                 self.peer_listen_port = listen_port.filter(|port| *port != 0);
-                Ok(Vec::new())
+                Ok(())
             }
             _ if !self.hello_received => Err(Error::ProtocolViolation),
-            SyncMessage::Inventory { revisions } => {
-                // A peer sends its inventory once; again would have this
-                // side send everything again.
-                if self.inventory_received || revisions.len() > MAX_INVENTORY {
+            SyncMessage::Summary { buckets } => {
+                // A peer sends its summary once; again would have this side
+                // send its IDs again.
+                if self.differing.is_some() {
                     return Err(Error::ProtocolViolation);
                 }
-                self.inventory_received = true;
-                let theirs: HashSet<String> = revisions.into_iter().collect();
-                let missing: Vec<String> = vault
-                    .revision_ids()?
-                    .into_iter()
-                    .filter(|id| !theirs.contains(id))
-                    .collect();
-                self.send_revisions(vault, &missing)
+                let differing =
+                    Differing::between(&self.summary, &buckets).ok_or(Error::ProtocolViolation)?;
+                self.held.retain(|id| differing.contains(id));
+                if differing.is_empty() {
+                    self.outbox.push_back(Outgoing::Message(SyncMessage::Done));
+                } else {
+                    self.outbox.push_back(Outgoing::Ids { from: 0 });
+                }
+                self.differing = Some(differing);
+                Ok(())
             }
-            SyncMessage::Need { revisions } => {
+            _ if self.differing.is_none() => Err(Error::ProtocolViolation),
+            SyncMessage::Ids { ids } => {
+                let differing = self.differing.as_ref().expect("checked above");
+                if differing.is_empty() {
+                    return Err(Error::ProtocolViolation);
+                }
+                let last = self
+                    .comparison
+                    .take(differing, &self.held, &ids)
+                    .map_err(|_| Error::ProtocolViolation)?;
+                if last {
+                    let lacking = self.comparison.take_lacking();
+                    self.answer(vault, &lacking)?;
+                }
+                Ok(())
+            }
+            // The peer answers this side's IDs, or its summary when no
+            // bucket differs, and asks for missing parents, only once it has
+            // sent all of its own IDs.
+            _ if !self.compared() => Err(Error::ProtocolViolation),
+            SyncMessage::Need { ids } => {
                 // A peer asks for missing parents in as many rounds as the
                 // protocol has, as this side does.
                 self.peer_need_rounds += 1;
-                if self.peer_need_rounds > MAX_NEED_ROUNDS || revisions.len() > MAX_INVENTORY {
+                if self.peer_need_rounds > MAX_NEED_ROUNDS || ids.len() > MAX_NEED {
                     return Err(Error::ProtocolViolation);
                 }
-                self.send_revisions(vault, &revisions)
+                self.answer(vault, &ids)
             }
             SyncMessage::Revisions { revisions } => {
                 if revisions.len() > MAX_BATCH_REVISIONS {
@@ -198,12 +333,11 @@ impl SyncSession {
                 for revision in revisions {
                     self.stage(vault, revision)?;
                 }
-                self.process(vault)?;
-                Ok(Vec::new())
+                self.process(vault)
             }
             SyncMessage::Done => {
-                // One for the answer to this side's inventory, and one for
-                // each round in which this side asked for missing parents.
+                // One for the answer to this side's IDs, and one for each
+                // round in which this side asked for missing parents.
                 self.dones_received += 1;
                 if self.dones_received > self.need_rounds + 1 {
                     return Err(Error::ProtocolViolation);
@@ -215,35 +349,27 @@ impl SyncSession {
                     return Err(Error::ProtocolViolation);
                 }
                 self.peer_finished = true;
-                Ok(Vec::new())
+                Ok(())
             }
         }
     }
 
-    fn send_revisions(&mut self, vault: &Vault, ids: &[String]) -> Result<Vec<SyncMessage>> {
-        let mut messages = Vec::new();
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0;
-        // `revisions_by_id` returns parents before children.
-        for revision in vault.revisions_by_id(ids)? {
-            let size = revision.ciphertext.len();
-            if !batch.is_empty()
-                && (batch.len() == MAX_BATCH_REVISIONS || batch_bytes + size > MAX_BATCH_BYTES)
-            {
-                messages.push(SyncMessage::Revisions {
-                    revisions: std::mem::take(&mut batch),
-                });
-                batch_bytes = 0;
-            }
-            batch_bytes += size;
-            batch.push(revision);
-            self.report.sent += 1;
+    /// Whether all of the peer's IDs have come, or none were to come.
+    fn compared(&self) -> bool {
+        self.differing
+            .as_ref()
+            .is_some_and(|differing| differing.is_empty() || self.comparison.is_finished())
+    }
+
+    /// Queues the stored revisions among `ids`, parents first, and `Done`.
+    fn answer(&mut self, vault: &Vault, ids: &[RevisionId]) -> Result<()> {
+        let stored = vault.stored_revision_sizes(ids)?;
+        if !stored.is_empty() {
+            self.outbox
+                .push_back(Outgoing::Revisions(stored.into_iter().collect()));
         }
-        if !batch.is_empty() {
-            messages.push(SyncMessage::Revisions { revisions: batch });
-        }
-        messages.push(SyncMessage::Done);
-        Ok(messages)
+        self.outbox.push_back(Outgoing::Message(SyncMessage::Done));
+        Ok(())
     }
 
     /// Stores a received revision durably before anything else happens to
@@ -283,19 +409,35 @@ impl SyncSession {
         Ok(())
     }
 
-    fn after_done(&mut self, vault: &mut Vault) -> Result<Vec<SyncMessage>> {
+    fn after_done(&mut self, vault: &mut Vault) -> Result<()> {
         self.process(vault)?;
-        let missing = vault.staged_missing_parents()?;
-        if !missing.is_empty() && self.need_rounds < MAX_NEED_ROUNDS {
-            self.need_rounds += 1;
-            return Ok(vec![SyncMessage::Need { revisions: missing }]);
+        if self.need_rounds < MAX_NEED_ROUNDS {
+            // Each parent is asked for once: one the peer could not send,
+            // such as one it holds only staged, is not asked for again in
+            // place of the others.
+            let missing: Vec<RevisionId> = vault
+                .staged_missing_parents()?
+                .iter()
+                .filter_map(|id| inventory::from_hex(id))
+                .filter(|id| !self.asked.contains(id))
+                .take(MAX_NEED)
+                .collect();
+            if !missing.is_empty() {
+                self.need_rounds += 1;
+                self.asked.extend(missing.iter().copied());
+                self.outbox
+                    .push_back(Outgoing::Message(SyncMessage::Need { ids: missing }));
+                return Ok(());
+            }
         }
         if self.sent_finished {
-            return Ok(Vec::new());
+            return Ok(());
         }
         self.report.pending = vault.staged_revision_ids()?.len();
         self.sent_finished = true;
-        Ok(vec![SyncMessage::Finished])
+        self.outbox
+            .push_back(Outgoing::Message(SyncMessage::Finished));
+        Ok(())
     }
 }
 

@@ -30,7 +30,9 @@ pub enum Error {
     VaultMismatch,
     #[error("pairing signature is invalid")]
     InvalidSignature,
-    #[error("unsupported protocol version")]
+    #[error(
+        "the other device runs a version of the app that cannot sync with this one · update both"
+    )]
     UnsupportedVersion,
     #[error("frame exceeds the size limit")]
     FrameTooLarge,

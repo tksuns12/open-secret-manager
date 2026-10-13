@@ -14,9 +14,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     crypto::{
         decrypt, derive_password_key, device_authorization, device_key_aad, device_revocation,
-        encrypt, epoch_key_aad, key_wrap_aad, keys_equal, legacy_record_aad, legacy_revision_id,
-        random_array, recipient_key_aad, record_aad, recovery_check, revision_id,
-        revision_signature_message, row_mark, row_marks, row_seal_aad, row_seal_key,
+        encrypt, epoch_key_aad, hex_encode, key_wrap_aad, keys_equal, legacy_record_aad,
+        legacy_revision_id, random_array, recipient_key_aad, record_aad, recovery_check,
+        revision_id, revision_signature_message, row_mark, row_marks, row_seal_aad, row_seal_key,
         sealed_device_key_aad, verify_device_authorization, verify_device_revocation,
         verify_recovery_check, xor_into, KdfConfig, RowSets, SecretKey, DEVICE_ID_LEN, KEY_LEN,
         NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
@@ -3575,6 +3575,24 @@ fn row_to_revision_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<En
     })
 }
 
+/// A revision ID, 64 lowercase hex digits, as its 32 bytes.
+fn revision_id_bytes(id: &str) -> Option<[u8; 32]> {
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let (pairs, rest) = id.as_bytes().as_chunks::<2>();
+    if pairs.len() != 32 || !rest.is_empty() {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (byte, pair) in bytes.iter_mut().zip(pairs) {
+        *byte = digit(pair[0])? << 4 | digit(pair[1])?;
+    }
+    Some(bytes)
+}
+
 fn split_parents(joined: &str) -> Option<Vec<String>> {
     let (chunks, rest) = joined.as_bytes().as_chunks::<64>();
     if !rest.is_empty() || !joined.is_ascii() {
@@ -4353,6 +4371,50 @@ impl Vault {
         found.sort_by_key(|(rowid, _)| *rowid);
         found.dedup_by_key(|(rowid, _)| *rowid);
         Ok(found.into_iter().map(|(_, revision)| revision).collect())
+    }
+
+    /// IDs of every revision this device holds, as bytes, sorted: the
+    /// accepted ones, the staged ones, and the ones held for review, none
+    /// of which a sync peer need send again. Works while locked.
+    pub fn held_revision_ids(&self) -> Result<Vec<[u8; 32]>> {
+        let mut statement = self.connection.prepare(
+            "SELECT revision FROM revisions UNION SELECT revision FROM ingress \
+             UNION SELECT revision FROM quarantine",
+        )?;
+        let mut ids = statement
+            .query_map([], |row| {
+                revision_id_bytes(row.get_ref(0)?.as_str()?).ok_or(rusqlite::Error::InvalidQuery)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// The accepted revisions among `ids`, each with the length of its
+    /// ciphertext, in the order they were stored, so parents come before
+    /// children. Unknown IDs, and staged or held ones, are skipped. Works
+    /// while locked.
+    pub fn stored_revision_sizes(&self, ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], usize)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT rowid, length(ciphertext) FROM revisions WHERE revision=?")?;
+        let mut found = Vec::new();
+        for id in ids {
+            let row = statement
+                .query_row([hex_encode(id)], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()?;
+            if let Some((rowid, length)) = row {
+                found.push((rowid, *id, usize::try_from(length).unwrap_or(usize::MAX)));
+            }
+        }
+        found.sort_by_key(|(rowid, _, _)| *rowid);
+        found.dedup_by_key(|(rowid, _, _)| *rowid);
+        Ok(found
+            .into_iter()
+            .map(|(_, id, length)| (id, length))
+            .collect())
     }
 }
 

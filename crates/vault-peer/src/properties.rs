@@ -10,6 +10,7 @@ use proptest::{prelude::*, test_runner::TestRunner};
 use tempfile::tempdir;
 
 use crate::{
+    session::inventory::{from_hex, summary, RevisionId},
     wire::{decode_body, encode_frame, FrameDecoder, MAX_FRAME_BYTES},
     EnrollmentGrant, Invitation, JoinRequest, SyncMessage, SyncSession, PROTOCOL_VERSION,
 };
@@ -145,8 +146,20 @@ fn messages(
     vault_id: [u8; 32],
     stored: Vec<EncryptedRevision>,
 ) -> impl Strategy<Value = Vec<SyncMessage>> {
-    let ids: Vec<String> = stored.iter().map(EncryptedRevision::revision_id).collect();
-    let id = prop_oneof![prop::sample::select(ids), "[0-9a-f]{64}", ".{0,8}"];
+    let ids: Vec<RevisionId> = stored
+        .iter()
+        .map(|revision| from_hex(&revision.revision_id()).unwrap())
+        .collect();
+    let id = prop_oneof![prop::sample::select(ids.clone()), any::<[u8; 32]>()];
+    // The summary of none, of some of the stored revisions, of all of them,
+    // or anything, of any length.
+    let summary = prop_oneof![
+        prop::sample::subsequence(ids.clone(), 0..=ids.len()).prop_map(|mut some| {
+            some.sort_unstable();
+            summary(&some)
+        }),
+        prop::collection::vec(any::<[u8; 32]>(), 254..258),
+    ];
     let revision = (prop::sample::select(stored), any::<u8>(), any::<usize>()).prop_map(
         |(mut revision, change, at)| {
             match change % 4 {
@@ -164,8 +177,14 @@ fn messages(
     let message = prop_oneof![
         3 => (prop_oneof![Just(PROTOCOL_VERSION), any::<u16>()], prop_oneof![Just(vault_id), any::<[u8; 32]>()], any::<Option<u16>>())
             .prop_map(|(version, vault_id, listen_port)| SyncMessage::Hello { version, vault_id, listen_port }),
-        3 => prop::collection::vec(id.clone(), 0..8).prop_map(|revisions| SyncMessage::Inventory { revisions }),
-        3 => prop::collection::vec(id, 0..8).prop_map(|revisions| SyncMessage::Need { revisions }),
+        3 => summary.prop_map(|buckets| SyncMessage::Summary { buckets }),
+        3 => (prop::collection::vec(id.clone(), 0..8), any::<bool>()).prop_map(|(mut ids, sorted)| {
+            if sorted {
+                ids.sort_unstable();
+            }
+            SyncMessage::Ids { ids }
+        }),
+        3 => prop::collection::vec(id, 0..8).prop_map(|ids| SyncMessage::Need { ids }),
         2 => prop::collection::vec(revision, 0..4).prop_map(|revisions| SyncMessage::Revisions { revisions }),
         3 => Just(SyncMessage::Done),
         1 => Just(SyncMessage::Finished),
@@ -177,6 +196,20 @@ fn messages(
     });
     (hello, prop::collection::vec(message, 0..40))
         .prop_map(|(hello, rest)| [vec![hello], rest].concat())
+}
+
+/// Hands `message` to the session and takes what it sends in answer.
+fn answer(
+    session: &mut SyncSession,
+    vault: &mut Vault,
+    message: SyncMessage,
+) -> crate::Result<Vec<SyncMessage>> {
+    session.handle(vault, message)?;
+    let mut sent = Vec::new();
+    while let Some(message) = session.next_message(vault)? {
+        sent.push(message);
+    }
+    Ok(sent)
 }
 
 /// However a peer behaves, a session ends in a refusal or goes on within
@@ -198,10 +231,11 @@ fn a_sync_session_does_no_more_than_the_protocol_asks_whatever_the_peer_sends() 
         .run(&messages(vault_id, stored.clone()), |messages| {
             let mut vault = vault.borrow_mut();
             let vault = &mut *vault;
-            let (mut session, _) = SyncSession::start(vault, None).unwrap();
+            let mut session = SyncSession::start(vault, None).unwrap();
+            while session.next_message(vault).unwrap().is_some() {}
             let (mut sent, mut asked) = (0, 0);
             for message in messages {
-                match session.handle(vault, message) {
+                match answer(&mut session, vault, message) {
                     Ok(replies) => {
                         for reply in replies {
                             match reply {
@@ -214,8 +248,8 @@ fn a_sync_session_does_no_more_than_the_protocol_asks_whatever_the_peer_sends() 
                     Err(_) => break,
                 }
             }
-            // One answer to the peer's inventory and one to each of the
-            // rounds in which it may ask for missing parents.
+            // One answer to the peer's IDs and one to each of the rounds in
+            // which it may ask for missing parents.
             prop_assert!(
                 sent <= stored.len() * 9,
                 "sent {sent} revisions of {}",
@@ -235,37 +269,55 @@ fn a_sync_session_does_no_more_than_the_protocol_asks_whatever_the_peer_sends() 
         .unwrap();
 }
 
-/// A peer that sends its inventory again and again, asks for everything
-/// again and again, or says it is done again and again is stopped: the
-/// protocol has one inventory, and as many requests and answers for
-/// missing parents as it has rounds.
+/// A peer that sends its summary or its IDs again and again, asks for
+/// everything again and again, or says it is done again and again is
+/// stopped: the protocol has one summary and one list of IDs, and as many
+/// requests and answers for missing parents as it has rounds.
 #[test]
 fn a_peer_that_repeats_itself_is_stopped() {
     let dir = tempdir().unwrap();
     let mut vault = vault_with_items(dir.path());
-    let ids = vault.revision_ids().unwrap();
+    let ids: Vec<RevisionId> = vault
+        .revision_ids()
+        .unwrap()
+        .iter()
+        .map(|id| from_hex(id).unwrap())
+        .collect();
     let vault_id = vault.vault_id();
-    let hello = || SyncMessage::Hello {
+    let hello = SyncMessage::Hello {
         version: PROTOCOL_VERSION,
         vault_id,
         listen_port: None,
     };
-    for repeated in [
-        SyncMessage::Inventory {
-            revisions: Vec::new(),
-        },
-        SyncMessage::Need {
-            revisions: ids.clone(),
-        },
-        SyncMessage::Done,
+    let held = vault.held_revision_ids().unwrap();
+    // A peer that holds the same, and one that holds nothing.
+    let same = SyncMessage::Summary {
+        buckets: summary(&held),
+    };
+    let nothing = SyncMessage::Summary {
+        buckets: summary(&[]),
+    };
+    for (opening, repeated) in [
+        (vec![hello.clone()], same.clone()),
+        (
+            vec![hello.clone(), nothing.clone()],
+            SyncMessage::Ids { ids: Vec::new() },
+        ),
+        (
+            vec![hello.clone(), same.clone()],
+            SyncMessage::Need { ids: ids.clone() },
+        ),
+        (vec![hello.clone(), same.clone()], SyncMessage::Done),
     ] {
-        let first = hello();
-        let (mut session, _) = SyncSession::start(&mut vault, None).unwrap();
-        session.handle(&mut vault, first).unwrap();
+        let mut session = SyncSession::start(&vault, None).unwrap();
+        while session.next_message(&vault).unwrap().is_some() {}
+        for message in opening {
+            answer(&mut session, &mut vault, message).unwrap();
+        }
         let mut sent = 0;
         let mut refused = false;
         for _ in 0..20 {
-            match session.handle(&mut vault, repeated.clone()) {
+            match answer(&mut session, &mut vault, repeated.clone()) {
                 Ok(replies) => {
                     for reply in replies {
                         if let SyncMessage::Revisions { revisions } = reply {
@@ -279,12 +331,36 @@ fn a_peer_that_repeats_itself_is_stopped() {
                 }
             }
         }
-        assert!(
-            refused,
-            "{:?} was taken twenty times",
-            std::mem::discriminant(&repeated)
-        );
+        assert!(refused, "{repeated:?} was taken twenty times");
         assert!(sent <= ids.len() * 9, "sent {sent}");
+    }
+}
+
+/// A request for more parents than one round may ask for is refused.
+#[test]
+fn a_request_for_more_than_65_536_parents_is_refused() {
+    let dir = tempdir().unwrap();
+    let mut vault = vault_with_items(dir.path());
+    let vault_id = vault.vault_id();
+    let held = vault.held_revision_ids().unwrap();
+    for (count, refused) in [(65_536, false), (65_537, true)] {
+        let mut session = SyncSession::start(&vault, None).unwrap();
+        for message in [
+            SyncMessage::Hello {
+                version: PROTOCOL_VERSION,
+                vault_id,
+                listen_port: None,
+            },
+            SyncMessage::Summary {
+                buckets: summary(&held),
+            },
+        ] {
+            answer(&mut session, &mut vault, message).unwrap();
+        }
+        let need = SyncMessage::Need {
+            ids: vec![[0; 32]; count],
+        };
+        assert_eq!(answer(&mut session, &mut vault, need).is_err(), refused);
     }
 }
 

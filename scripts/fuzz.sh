@@ -31,6 +31,7 @@ def seed(target, name, data):
         out.write(data if isinstance(data, bytes) else data.encode())
 pairing = json.load(open("crates/vault-peer/fixtures/pairing.json"))
 sync = json.load(open("crates/vault-peer/fixtures/sync.json"))
+sync_2 = json.load(open("crates/vault-peer/fixtures/sync-2.json"))
 messages = json.load(open("crates/browser-link/fixtures/messages.json"))
 for index, text in enumerate(["https://example.com", "https://example.com:8443", "https://bücher.example/login?x=1",
                               "https://user@example.com/", "http://example.com", "https://[::1]:8443", "https://127.0.0.1"]):
@@ -42,10 +43,11 @@ seed("invitation", "frozen", pairing["invitation_text"])
 for name in ["join_request", "enrollment_grant", "enrollment_grant_with_nothing_optional"]:
     body = bytes.fromhex(pairing[name]["sent"]["body"])
     seed("peer_messages", name, body)
-for name, value in sync.items():
-    if isinstance(value, dict):
-        seed("peer_messages", name, bytes.fromhex(value["body"]))
-        seed("peer_messages", f"{name}-frame", bytes.fromhex(value["frame"]))
+for prefix, frozen in [("", sync), ("v2-", sync_2)]:
+    for name, value in frozen.items():
+        if isinstance(value, dict):
+            seed("peer_messages", prefix + name, bytes.fromhex(value["body"]))
+            seed("peer_messages", f"{prefix}{name}-frame", bytes.fromhex(value["frame"]))
 for name, text in messages["from_extension"].items():
     seed("browser_messages", name, text)
 seed("import", "bitwarden", b"\x00" + json.dumps({"encrypted": False, "items": [{"type": 1, "name": "Bank", "notes": "n",

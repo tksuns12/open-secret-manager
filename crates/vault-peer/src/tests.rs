@@ -20,13 +20,13 @@ pub(crate) fn address() -> Vec<String> {
     vec!["127.0.0.1:1".to_owned()]
 }
 
-struct Device {
-    vault: Vault,
+pub(crate) struct Device {
+    pub(crate) vault: Vault,
     invitations: InvitationStore,
     peers: PeerStore,
 }
 
-fn inviter(dir: &Path) -> Device {
+pub(crate) fn inviter(dir: &Path) -> Device {
     let (vault, _) = Vault::create(dir.join("a.db"), "inviter password").unwrap();
     Device {
         vault,
@@ -53,7 +53,7 @@ pub(crate) fn over_wire<T: serde::Serialize + serde::de::DeserializeOwned>(messa
 /// Gives `a`'s vault a second device, as a completed enrollment does: the
 /// new device has its own identity, password, and root key, holds the
 /// vault's epoch keys, and each device accepts the other's revisions.
-fn pair(dir: &Path, a: &mut Device) -> Device {
+pub(crate) fn pair(dir: &Path, a: &mut Device) -> Device {
     let device = PendingDevice::generate();
     let material = a.vault.enrollment_material().unwrap();
     a.vault
@@ -77,7 +77,7 @@ fn own_contact(device: &mut Device) -> Vec<MemberContact> {
 }
 
 /// What the in-memory transport does to one framed message.
-enum Fault {
+pub(crate) enum Fault {
     Deliver,
     /// Deliver a modified message.
     Replace(SyncMessage),
@@ -87,23 +87,40 @@ enum Fault {
 
 /// Moves framed messages between two sessions until both complete, the
 /// transport is cut, or a step limit is hit. Returns whether both completed.
-fn run_sync(
+pub(crate) fn run_sync(
     a: &mut Vault,
     b: &mut Vault,
+    fault: impl FnMut(bool, &SyncMessage) -> Fault,
+) -> Result<(bool, SyncReport, SyncReport), Error> {
+    run_sync_after(a, b, |_, _| {}, fault)
+}
+
+/// As [`run_sync`], with `started` run on both vaults once both sessions
+/// have started and before either has received anything.
+fn run_sync_after(
+    a: &mut Vault,
+    b: &mut Vault,
+    started: impl FnOnce(&mut Vault, &mut Vault),
     mut fault: impl FnMut(bool, &SyncMessage) -> Fault,
 ) -> Result<(bool, SyncReport, SyncReport), Error> {
-    let (mut session_a, opening_a) = SyncSession::start(a, None)?;
-    let (mut session_b, opening_b) = SyncSession::start(b, None)?;
     // (to_b, message)
-    let mut queue: std::collections::VecDeque<(bool, Vec<u8>)> = opening_a
-        .iter()
-        .map(|message| (true, encode_frame(message).unwrap()))
-        .chain(
-            opening_b
-                .iter()
-                .map(|message| (false, encode_frame(message).unwrap())),
-        )
-        .collect();
+    let mut queue: std::collections::VecDeque<(bool, Vec<u8>)> = Default::default();
+    // What a side sends, in its order, onto the one queue both share.
+    let send = |session: &mut SyncSession,
+                vault: &Vault,
+                to_b: bool,
+                queue: &mut std::collections::VecDeque<(bool, Vec<u8>)>|
+     -> Result<(), Error> {
+        while let Some(message) = session.next_message(vault)? {
+            queue.push_back((to_b, encode_frame(&message)?));
+        }
+        Ok(())
+    };
+    let mut session_a = SyncSession::start(a, None)?;
+    let mut session_b = SyncSession::start(b, None)?;
+    send(&mut session_a, a, true, &mut queue)?;
+    send(&mut session_b, b, false, &mut queue)?;
+    started(a, b);
     let mut steps = 0;
     while let Some((to_b, frame)) = queue.pop_front() {
         steps += 1;
@@ -122,13 +139,12 @@ fn run_sync(
                 ))
             }
         };
-        let replies = if to_b {
-            session_b.handle(b, message)?
+        if to_b {
+            session_b.handle(b, message)?;
+            send(&mut session_b, b, false, &mut queue)?;
         } else {
-            session_a.handle(a, message)?
-        };
-        for reply in replies {
-            queue.push_back((!to_b, encode_frame(&reply)?));
+            session_a.handle(a, message)?;
+            send(&mut session_a, a, true, &mut queue)?;
         }
         if session_a.is_complete() && session_b.is_complete() && queue.is_empty() {
             break;
@@ -333,10 +349,11 @@ fn revisions_from_a_device_unknown_to_the_receiver_are_quarantined() {
     assert_eq!(b.vault.get(&item.id).unwrap().item.password, "original");
     assert_eq!(b.vault.quarantined().unwrap()[0].revision, from_d);
 
-    // It is offered again by the next session, recognized as already held,
-    // and held only once.
-    let (_, report_b) = sync(&mut a.vault, &mut b.vault);
-    assert_eq!((report_b.duplicates, report_b.quarantined), (1, 0));
+    // B's summary counts it among what B holds, so the next session does
+    // not offer it again, and it is held once.
+    let (to_b, report_b) = sync(&mut a.vault, &mut b.vault);
+    assert_eq!(to_b.sent, 0);
+    assert_eq!((report_b.duplicates, report_b.quarantined), (0, 0));
     assert_eq!(b.vault.quarantined().unwrap().len(), 1);
 }
 
@@ -581,6 +598,169 @@ fn a_locked_receiver_stages_everything_and_applies_it_after_unlock() {
         "sent while B is locked"
     );
     assert_eq!(ids(&a.vault), ids(&b.vault));
+}
+
+/// Each side's messages, in order, by kind.
+fn kinds(messages: &[(bool, SyncMessage)], to_b: bool) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|(towards_b, _)| *towards_b == to_b)
+        .map(|(_, message)| {
+            let kind = format!("{message:?}");
+            kind.split('(').next().unwrap().to_owned()
+        })
+        .collect()
+}
+
+/// Runs a sync that delivers everything and keeps what was sent.
+fn recorded(a: &mut Vault, b: &mut Vault) -> (SyncReport, SyncReport, Vec<(bool, SyncMessage)>) {
+    let mut seen = Vec::new();
+    let (complete, report_a, report_b) = run_sync(a, b, |to_b, message| {
+        seen.push((to_b, message.clone()));
+        Fault::Deliver
+    })
+    .unwrap();
+    assert!(complete);
+    (report_a, report_b, seen)
+}
+
+#[test]
+fn devices_that_hold_the_same_send_only_their_summaries() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    for index in 0..300 {
+        a.vault.put(login(&format!("Item {index}"), "p")).unwrap();
+    }
+    let mut b = pair(dir.path(), &mut a);
+    sync(&mut a.vault, &mut b.vault);
+    let (_, _, seen) = recorded(&mut a.vault, &mut b.vault);
+    for to_b in [true, false] {
+        assert_eq!(kinds(&seen, to_b), ["Hello", "Summary", "Done", "Finished"]);
+    }
+}
+
+#[test]
+fn one_new_revision_sends_one_buckets_ids_and_that_revision() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    for index in 0..300 {
+        a.vault.put(login(&format!("Item {index}"), "p")).unwrap();
+    }
+    let mut b = pair(dir.path(), &mut a);
+    sync(&mut a.vault, &mut b.vault);
+    let new = a.vault.put(login("New", "p")).unwrap().revision;
+    let (to_b, to_a, seen) = recorded(&mut a.vault, &mut b.vault);
+    assert_eq!((to_b.sent, to_a.sent), (1, 0));
+    assert_eq!(
+        kinds(&seen, true),
+        ["Hello", "Summary", "Ids", "Revisions", "Done", "Finished"]
+    );
+    assert_eq!(
+        kinds(&seen, false),
+        ["Hello", "Summary", "Ids", "Done", "Finished"]
+    );
+    let bucket = u8::from_str_radix(&new[..2], 16).unwrap();
+    for (_, message) in &seen {
+        if let SyncMessage::Ids { ids } = message {
+            assert!(ids.iter().all(|id| id[0] == bucket));
+        }
+    }
+}
+
+#[test]
+fn batches_hold_at_most_64_revisions_or_8_mib_and_parents_come_first() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    let item = login("Edited", "v0");
+    let mut head = a.vault.put(item.clone()).unwrap().revision;
+    for index in 0..150 {
+        a.vault.put(login(&format!("Item {index}"), "p")).unwrap();
+        // Edits of one item, each the child of the one before.
+        let mut edited = item.clone();
+        edited.password = format!("v{index}");
+        head = a.vault.update(edited, &head).unwrap().revision;
+    }
+    for index in 0..3 {
+        let mut large = login(&format!("Large {index}"), "p");
+        large.notes = "x".repeat(5 * 1024 * 1024);
+        a.vault.put(large).unwrap();
+    }
+    let mut b = pair(dir.path(), &mut a);
+    let (to_b, _, seen) = recorded(&mut a.vault, &mut b.vault);
+    assert_eq!(to_b.sent, 304);
+    let mut order = Vec::new();
+    for (_, message) in &seen {
+        if let SyncMessage::Revisions { revisions } = message {
+            let bytes: usize = revisions
+                .iter()
+                .map(|revision| revision.ciphertext.len())
+                .sum();
+            assert!(revisions.len() <= 64);
+            assert!(revisions.len() == 1 || bytes <= 8 * 1024 * 1024, "{bytes}");
+            order.extend(revisions.iter().map(|revision| revision.revision_id()));
+        }
+    }
+    // In the order A stored them, which puts each parent first.
+    assert_eq!(order, a.vault.revision_ids().unwrap());
+    assert_eq!(b.vault.get(&item.id).unwrap().item.password, "v149");
+}
+
+#[test]
+fn a_revision_written_while_a_session_runs_waits_for_the_next() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    a.vault.put(login("Before", "p")).unwrap();
+    let mut b = pair(dir.path(), &mut a);
+    let mut later = None;
+    let (complete, to_b, _) = run_sync_after(
+        &mut a.vault,
+        &mut b.vault,
+        |a, _| later = Some(a.put(login("During", "p")).unwrap().revision),
+        |_, _| Fault::Deliver,
+    )
+    .unwrap();
+    assert!(complete);
+    assert_eq!(to_b.sent, 1);
+    let later = later.unwrap();
+    assert!(!ids(&b.vault).contains(&later));
+    let (to_b, _) = sync(&mut a.vault, &mut b.vault);
+    assert_eq!(to_b.sent, 1);
+    assert!(ids(&b.vault).contains(&later));
+}
+
+#[test]
+fn a_parent_the_peer_cannot_send_is_asked_for_once() {
+    let dir = tempdir().unwrap();
+    let mut a = inviter(dir.path());
+    let item = login("Chain", "v1");
+    let first = a.vault.put(item.clone()).unwrap().revision;
+    let mut next = item.clone();
+    next.password = "v2".into();
+    a.vault.update(next, &first).unwrap();
+    let mut b = pair(dir.path(), &mut a);
+
+    // The parent never arrives, however often it is sent.
+    let mut asked = 0;
+    let (complete, _, report_b) = run_sync(&mut a.vault, &mut b.vault, |to_b, message| {
+        match (to_b, message) {
+            (false, SyncMessage::Need { .. }) => asked += 1,
+            (true, SyncMessage::Revisions { revisions }) => {
+                return Fault::Replace(SyncMessage::Revisions {
+                    revisions: revisions
+                        .iter()
+                        .filter(|revision| revision.revision_id() != first)
+                        .cloned()
+                        .collect(),
+                })
+            }
+            _ => {}
+        }
+        Fault::Deliver
+    })
+    .unwrap();
+    assert!(complete);
+    assert_eq!(asked, 1);
+    assert_eq!(report_b.pending, 1);
 }
 
 #[test]

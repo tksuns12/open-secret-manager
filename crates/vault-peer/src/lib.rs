@@ -54,6 +54,8 @@ mod member_tests;
 #[cfg(test)]
 mod properties;
 #[cfg(test)]
+mod sync_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod transport_tests;
