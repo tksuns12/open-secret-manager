@@ -32,6 +32,10 @@ test("the panel lists this device first and marks the phone that does not vote",
   assert.match(await rows.nth(0).textContent(), /This device/);
   assert.doesNotMatch(await rows.nth(0).textContent(), /does not vote/);
   assert.match(await rows.nth(1).textContent(), /Device 9f8e7d6c.*192\.168\.1\.23:47820 · does not vote/);
+  // Where else each is reached: the phone's VPN address, and the addresses
+  // this computer tells the others.
+  assert.match(await rows.nth(1).textContent(), /Also at 100\.101\.102\.103:47820/);
+  assert.match(await rows.nth(0).textContent(), /Tells your other devices it is at 192\.168\.1\.10:47820, 100\.101\.102\.104:47820/);
   assert.equal(await rows.nth(1).getByRole("button", { name: "Remove…" }).count(), 1);
   assert.deepEqual(errors, []);
 });

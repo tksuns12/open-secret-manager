@@ -31,7 +31,8 @@ pub use keystore::{Keystore, KeystoreError, MemoryKeystore, NoKeystore};
 pub use local::{local_addresses, MAX_INVITATION_ADDRESSES};
 pub use members::{
     serve_members, serve_relayed, start_node, AddressBook, ControlConnection, ControlLink,
-    Incoming, MemberContact, MemberEndpoint, MemberSync, MAX_CONTACTS, MEMBER_PROTOCOL_VERSION,
+    Incoming, MemberContact, MemberEndpoint, MemberSync, MAX_CONTACTS, MAX_OWN_ADDRESSES,
+    MEMBER_PROTOCOL_VERSION,
 };
 pub use pairing::{
     approve_enrollment, invite, review_join, EnrollmentGrant, Invitation, JoinRequest, JoinReview,

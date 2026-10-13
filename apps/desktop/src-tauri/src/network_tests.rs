@@ -1377,6 +1377,51 @@ fn a_device_without_a_vote_syncs_and_when_lost_is_removed_by_the_other_alone() {
         network::schedule_sync(&b);
         eventually(&a, &["From A", "From B"]).await;
 
+        // The panel lists every address the phone named for itself, after
+        // where A reaches it first, and for this computer the addresses it
+        // tells the others.
+        let named = |port| osm_vault_peer::local_addresses(port);
+        let info = devices(&a).await;
+        let phone = info
+            .members
+            .iter()
+            .find(|member| !member.this_device)
+            .unwrap();
+        assert_eq!(phone.address.as_ref(), phone.addresses.first());
+        for address in named(network::listen_port(&b).await.unwrap()) {
+            assert!(
+                phone.addresses.contains(&address),
+                "{address} in {:?}",
+                phone.addresses
+            );
+        }
+        let this = info
+            .members
+            .iter()
+            .find(|member| member.this_device)
+            .unwrap();
+        assert_eq!(
+            this.addresses,
+            named(network::listen_port(&a).await.unwrap())
+        );
+        // Seen somewhere new, the phone is tried there first, and at the
+        // others still.
+        network::observe_address(&a, &phone.id, "192.0.2.50:47820").await;
+        let again = devices(&a).await;
+        let moved = again
+            .members
+            .iter()
+            .find(|member| !member.this_device)
+            .unwrap();
+        assert_eq!(
+            moved.addresses.first().map(String::as_str),
+            Some("192.0.2.50:47820")
+        );
+        assert!(phone
+            .addresses
+            .iter()
+            .all(|address| moved.addresses.contains(address)));
+
         // The phone is lost. Two voting devices would need both for any
         // change; here A, the only one that votes, removes it alone.
         let b_id = devices(&b).await.this_device.unwrap();

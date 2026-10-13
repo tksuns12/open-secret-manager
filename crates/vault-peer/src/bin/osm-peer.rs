@@ -37,6 +37,8 @@
 //! listen <addr>         LISTEN <addr>
 //! unlisten              UNLISTENED: the members' listener stops, as behind
 //!                       a router that lets nothing in
+//! addresses <device>    ADDRESSES <device> <addr>...: where this device
+//!                       would try it, best first
 //! relay <code>          RELAY-SET, then RELAY-CONNECTED: the vault keeps the
 //!                       relay's code (`osm-relay`), and this device uses it
 //! quit
@@ -205,7 +207,8 @@ async fn start_control(
 }
 
 /// Binds `address`, serves members on it, and tells them where this device
-/// now listens.
+/// now listens. Bound to one address rather than to every interface, it
+/// names that address alone as its own.
 async fn serve(
     address: &str,
     endpoint: &MemberEndpoint,
@@ -215,6 +218,7 @@ async fn serve(
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     endpoint.set_listen_port(address.port());
+    endpoint.set_own_addresses((!address.ip().is_unspecified()).then(|| vec![address.to_string()]));
     let server = tokio::spawn(serve_members(
         listener,
         endpoint.clone(),
@@ -478,6 +482,11 @@ impl Device {
                 println!("UNLISTENED");
             }
             ["relay", code] => self.relay(code).await?,
+            ["addresses", device] => {
+                let device = device_id_from_bytes(parse_device(device)?);
+                let known = self.endpoint.addresses().all(device);
+                println!("ADDRESSES {} {}", hex(device), known.join(" "));
+            }
             _ => return Err("unknown command".into()),
         }
         Ok(())

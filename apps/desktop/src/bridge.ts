@@ -36,8 +36,8 @@ const previewDevices: DevicesInfo = {
   thisDevice: "a1b2c3d4e5f60718",
   // In the shell's order, by ID: this device is not first.
   members: [
-    { id: "9f8e7d6c5b4a3921", thisDevice: false, leader: false, votes: false, address: "192.168.1.23:47820" },
-    { id: "a1b2c3d4e5f60718", thisDevice: true, leader: true, votes: true },
+    { id: "9f8e7d6c5b4a3921", thisDevice: false, leader: false, votes: false, address: "192.168.1.23:47820", addresses: ["192.168.1.23:47820", "100.101.102.103:47820"] },
+    { id: "a1b2c3d4e5f60718", thisDevice: true, leader: true, votes: true, addresses: ["192.168.1.10:47820", "100.101.102.104:47820"] },
   ],
   epoch: 1,
   quorum: 1,

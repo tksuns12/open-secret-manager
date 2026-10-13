@@ -16,8 +16,8 @@ const LOCAL_ONLY_INTERFACES: [&str; 6] = ["docker", "br-", "virbr", "veth", "bri
 
 /// Up to [`MAX_INVITATION_ADDRESSES`] addresses of this device with `port`,
 /// best first: the one its route to the internet leaves from over IPv4,
-/// then over IPv6, then those of its other interfaces. None is a loopback
-/// or link-local address.
+/// then over IPv6, then those of its other interfaces. None is a loopback,
+/// link-local, or protocol address.
 pub fn local_addresses(port: u16) -> Vec<String> {
     let mut found: Vec<IpAddr> = Vec::new();
     let mut add = |ip: IpAddr| {
@@ -69,11 +69,18 @@ fn route_source(destination: SocketAddr) -> Option<IpAddr> {
 }
 
 /// Whether another device could reach this address: not a loopback,
-/// unspecified, multicast, or link-local one.
+/// unspecified, multicast, or link-local one, nor one of 192.0.0.0/24, set
+/// aside for protocols (RFC 6890). A phone on a mobile network with IPv6
+/// alone has 192.0.0.2 or 192.0.0.4 for its IPv4 through 464XLAT (RFC 7335),
+/// as the owner's did, which only that phone answers.
 fn reachable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            !(ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() || ip.is_multicast())
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.octets()[..3] == [192, 0, 0])
         }
         IpAddr::V6(ip) => {
             !(ip.is_loopback()
@@ -104,12 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn loopback_link_local_and_unspecified_addresses_are_left_out() {
+    fn loopback_link_local_unspecified_and_protocol_addresses_are_left_out() {
         for left_out in [
             "127.0.0.1",
             "0.0.0.0",
             "169.254.10.20",
             "224.0.0.1",
+            "192.0.0.2",
+            "192.0.0.4",
             "::1",
             "::",
             "fe80::1",
@@ -121,6 +130,7 @@ mod tests {
         for kept in [
             "192.168.1.20",
             "10.0.0.5",
+            "192.0.1.5",
             "100.101.102.103",
             "2001:db8::5",
             "fd7a:115c:a1e0::1",

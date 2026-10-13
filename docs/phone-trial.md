@@ -96,12 +96,16 @@ phone sold since 2019 is):
 ## Away from home, over your VPN (Phase 16)
 
 With a VPN such as Tailscale or WireGuard on both the computer and the
-phone. Pair them with this build of the desktop app (an earlier pairing
-named only the computer's home-network address): the invitation now names
-up to four of the computer's addresses, its VPN address among them.
+phone. Since 2026-10-13 each device tells the others its own addresses,
+its VPN address among them, whenever they connect, so a phone paired
+before invitations named the computer's VPN address learns it at its next
+sync at home, with this build of the desktop app and a phone build from
+Phase 16 or later; no new pairing is needed.
 
-- At home, pair as above, and make an item on the computer: it reaches the
-  phone.
+- At home, with both apps updated, press Sync now on the phone once. In
+  the computer's Devices panel the phone's row then lists its other
+  addresses ("Also at …", its `100.` address on Tailscale among them),
+  and the computer's own row says where it tells the others it is.
 - Turn the phone's Wi-Fi off, so that it is on mobile data, with the VPN
   still on. Open the app and press Sync now: the line under the list says
   it synced, and an item made on the computer meanwhile is there.
@@ -110,9 +114,9 @@ up to four of the computer's addresses, its VPN address among them.
   and nothing else changes.
 - Back on the home Wi-Fi, syncing works as before.
 
-If the phone cannot reach the computer away from home, note which VPN, and
-whether the computer's Devices panel shows the phone's VPN address (its
-`100.` address on Tailscale) after the phone synced over it.
+If the phone cannot reach the computer away from home, note which VPN,
+whether the computer's own row in the Devices panel names its VPN address,
+and whether the phone synced at home after both apps were updated.
 
 ## Fingerprint and face
 

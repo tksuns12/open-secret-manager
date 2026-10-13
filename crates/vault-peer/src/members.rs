@@ -12,11 +12,16 @@
 //! A connection opens with an `Open` frame naming the protocol version, the
 //! vault, and the channel, answered by `Welcome` or a refusal. Both carry
 //! the sender's roster: the members in its committed state, each with its
-//! certificate pin and last known address. A roster is believed only when
-//! it comes from a device the receiver's own state lists as a member, and
-//! then only for devices its log does not name yet. This is how a device
-//! that was away while another joined comes to accept that device as
-//! leader. Addresses are advisory: the pin authenticates.
+//! certificate pin and the address the sender tries it at first, and the
+//! sender itself once for each address it has now, on its home network, a
+//! VPN, or IPv6. A roster is believed only when it comes from a device the
+//! receiver's own state lists as a member, and then only for devices its
+//! log does not name yet. This is how a device that was away while another
+//! joined comes to accept that device as leader. The sender's own
+//! addresses are kept ahead of what it says of others
+//! ([`AddressBook::claim`]): this is how a device learns where another can
+//! be reached once that one's addresses change, or a VPN gives it one more,
+//! with no new invitation. Addresses are advisory: the pin authenticates.
 //!
 //! On the control channel each frame is then one JSON-encoded RPC and its
 //! reply, in turn. The receiver checks before every RPC that the
@@ -109,8 +114,53 @@ pub(crate) fn valid_contacts(contacts: &[MemberContact]) -> bool {
             .all(|contact| contact.address.as_deref().is_none_or(valid_address))
 }
 
+/// The roster a device sends as a connection opens, from the members of
+/// its committed state with their pins: each other member once, at the
+/// address it is best tried at (`best`), then this device, whose pin is
+/// `own_pin`, once for each of its `own` addresses, as many as fit in
+/// [`MAX_CONTACTS`] after the others. A device that names none of its own,
+/// as one that does not listen, is named once without an address: what it
+/// has for itself is only what others said.
+pub(crate) fn opening_contacts(
+    members: BTreeMap<DeviceId, [u8; 32]>,
+    own_pin: [u8; 32],
+    own: &[String],
+    best: impl Fn(DeviceId) -> Option<String>,
+) -> Vec<MemberContact> {
+    let contact =
+        |device: DeviceId, transport_pin: [u8; 32], address: Option<String>| MemberContact {
+            device_id: device_id_to_bytes(device),
+            transport_pin,
+            address,
+        };
+    let itself = members
+        .iter()
+        .find(|(_, pin)| **pin == own_pin)
+        .map(|(device, _)| *device);
+    let mut contacts: Vec<MemberContact> = members
+        .iter()
+        .filter(|(_, pin)| **pin != own_pin)
+        .take(MAX_CONTACTS - usize::from(itself.is_some()))
+        .map(|(device, pin)| contact(*device, *pin, best(*device)))
+        .collect();
+    if let Some(device) = itself {
+        let room = MAX_CONTACTS - contacts.len();
+        if own.is_empty() {
+            contacts.push(contact(device, own_pin, None));
+        } else {
+            for address in own.iter().take(room) {
+                contacts.push(contact(device, own_pin, Some(address.clone())));
+            }
+        }
+    }
+    contacts
+}
+
 /// Most addresses kept for one device.
 const ADDRESSES_PER_DEVICE: usize = 8;
+/// Most addresses a device names for itself in a roster: as many as an
+/// invitation names.
+pub const MAX_OWN_ADDRESSES: usize = crate::MAX_INVITATION_ADDRESSES;
 
 struct KnownAddress {
     address: String,
@@ -121,7 +171,8 @@ struct KnownAddress {
 #[derive(Default)]
 struct Book {
     /// Each device's addresses, best first: where it was last reached or
-    /// seen from, then those members reported, then those that failed.
+    /// seen from, then those it named for itself, then those other members
+    /// reported, then those that failed.
     known: BTreeMap<DeviceId, Vec<KnownAddress>>,
     /// Where addresses are kept across restarts, if anywhere.
     store: Option<Connection>,
@@ -169,6 +220,42 @@ impl Book {
                 failed: false,
             },
         );
+        list.truncate(ADDRESSES_PER_DEVICE);
+        self.save(device);
+    }
+
+    /// Puts the addresses `device` named for itself, best first, right after
+    /// the one it was last reached or seen at, unless that one failed. Older
+    /// ones are pushed out for them when the device has as many as are kept:
+    /// a device's addresses change, as an IPv6 address that is replaced each
+    /// day does, and these are the ones it has now. Nothing is written when
+    /// they are in place already.
+    fn claimed(&mut self, device: DeviceId, named: &[&str]) {
+        let list = self.known.entry(device).or_default();
+        let head = usize::from(list.first().is_some_and(|first| !first.failed));
+        let named: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|address| head == 0 || list[0].address != *address)
+            .collect();
+        let in_place = list.len() >= head + named.len()
+            && list[head..head + named.len()]
+                .iter()
+                .zip(&named)
+                .all(|(known, address)| !known.failed && known.address == *address);
+        if named.is_empty() || in_place {
+            return;
+        }
+        list.retain(|known| !named.contains(&known.address.as_str()));
+        for (offset, address) in named.iter().enumerate() {
+            list.insert(
+                head + offset,
+                KnownAddress {
+                    address: (*address).to_owned(),
+                    failed: false,
+                },
+            );
+        }
         list.truncate(ADDRESSES_PER_DEVICE);
         self.save(device);
     }
@@ -327,6 +414,30 @@ impl AddressBook {
         }
     }
 
+    /// Records the addresses `device` named for itself, best first, over a
+    /// connection authenticated as that device: they are tried right after
+    /// where it was last reached, and push older ones out. Only an IP
+    /// address with a port is taken, at most [`MAX_OWN_ADDRESSES`], so that
+    /// a member cannot have names looked up.
+    pub(crate) fn claim(&self, device: DeviceId, addresses: &[String]) {
+        let mut named: Vec<&str> = Vec::new();
+        for address in addresses {
+            if valid_address(address)
+                && address.parse::<SocketAddr>().is_ok()
+                && !named.contains(&address.as_str())
+            {
+                named.push(address);
+            }
+        }
+        named.truncate(MAX_OWN_ADDRESSES);
+        if named.is_empty() {
+            return;
+        }
+        if let Ok(mut book) = self.book.lock() {
+            book.claimed(device, &named);
+        }
+    }
+
     /// Records that an attempt to reach `device` at `address` failed.
     pub(crate) fn failed(&self, device: DeviceId, address: &str) {
         if let Ok(mut book) = self.book.lock() {
@@ -405,6 +516,9 @@ struct Inner {
     /// The relay this device reaches others through when their addresses do
     /// not answer, if the owner set one up.
     relay: Mutex<Option<Relay>>,
+    /// The addresses this device names for itself, if set rather than read
+    /// from its network interfaces.
+    own_addresses: Mutex<Option<Vec<String>>>,
 }
 
 /// This device's end of the connections between a vault's members.
@@ -435,6 +549,7 @@ impl MemberEndpoint {
                 listen_port: AtomicU16::new(0),
                 removed: AtomicBool::new(false),
                 relay: Mutex::new(None),
+                own_addresses: Mutex::new(None),
             }),
         })
     }
@@ -523,6 +638,38 @@ impl MemberEndpoint {
         Some(self.inner.listen_port.load(Ordering::SeqCst)).filter(|port| *port != 0)
     }
 
+    /// Names `addresses` as this device's own from now on, rather than those
+    /// of its network interfaces: for a device that listens on one address
+    /// only, and for tests. `None` goes back to the interfaces.
+    pub fn set_own_addresses(&self, addresses: Option<Vec<String>>) {
+        *self
+            .inner
+            .own_addresses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = addresses;
+    }
+
+    /// Where this device tells the members it talks to that it can be
+    /// reached, best first: up to [`MAX_OWN_ADDRESSES`] of its addresses
+    /// with the port it listens on ([`crate::local_addresses`]), read again
+    /// each time, as they change from one network to the next. None while it
+    /// does not listen.
+    pub fn own_addresses(&self) -> Vec<String> {
+        let Some(port) = self.listen_port() else {
+            return Vec::new();
+        };
+        let set = self
+            .inner
+            .own_addresses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut own = set.unwrap_or_else(|| crate::local_addresses(port));
+        own.retain(|address| valid_address(address));
+        own.truncate(MAX_OWN_ADDRESSES);
+        own
+    }
+
     /// Whether a member has told this device that the vault's devices
     /// removed it. A removed device may never receive the log entry that
     /// completes its removal, so this is how it finds out.
@@ -571,11 +718,39 @@ impl MemberEndpoint {
             .collect()
     }
 
+    /// The roster this device sends as a connection opens: as
+    /// [`roster`](Self::roster), but naming this device once for each of
+    /// its own addresses ([`own_addresses`](Self::own_addresses)).
+    pub(crate) fn opening_roster(&self) -> Vec<MemberContact> {
+        let Ok(directory) = self.directory() else {
+            return Vec::new();
+        };
+        opening_contacts(
+            directory.members(),
+            self.pin(),
+            &self.own_addresses(),
+            |device| self.inner.addresses.get(device),
+        )
+    }
+
     /// Accepts the devices in `contacts` on a member's word, until this
     /// device's own log names them. Only for contacts that came from a
     /// member over an authenticated channel, such as
     /// [`crate::Joiner::members`].
     pub fn introduce(&self, contacts: &[MemberContact]) -> Result<()> {
+        self.take_in(contacts, None)
+    }
+
+    /// As [`introduce`](Self::introduce). With `sender`, the device the
+    /// contacts came from and its pin: the addresses it names for itself are
+    /// its own ([`AddressBook::claim`]), and those it names for others are
+    /// hints. What a contact says of this device is not kept: it knows its
+    /// own addresses.
+    fn take_in(
+        &self,
+        contacts: &[MemberContact],
+        sender: Option<(DeviceId, [u8; 32])>,
+    ) -> Result<()> {
         if !valid_contacts(contacts) {
             return Err(Error::ProtocolViolation);
         }
@@ -586,19 +761,28 @@ impl MemberEndpoint {
                 contact.transport_pin,
             )
         }));
+        let own = self.pin();
+        let mut claimed = Vec::new();
         for contact in contacts {
-            if let Some(address) = &contact.address {
-                self.inner
-                    .addresses
-                    .suggest(device_id_from_bytes(contact.device_id), address);
+            let Some(address) = &contact.address else {
+                continue;
+            };
+            if contact.transport_pin == own {
+                continue;
             }
+            let device = device_id_from_bytes(contact.device_id);
+            if sender == Some((device, contact.transport_pin)) {
+                claimed.push(address.clone());
+            } else {
+                self.inner.addresses.suggest(device, address);
+            }
+        }
+        if let Some((device, _)) = sender {
+            self.inner.addresses.claim(device, &claimed);
         }
         Ok(())
     }
 
-    /// Takes in the roster `from` sent, if this device's own state lists
-    /// `from` as a member. Anything else is ignored: a device still being
-    /// enrolled, for one, cannot vouch for others.
     /// Accepts the members `grant` names, as [`introduce`](Self::introduce)
     /// does, and keeps every address the invitation named for the inviter,
     /// so that this device can reach it on whichever network they share.
@@ -611,12 +795,16 @@ impl MemberEndpoint {
         Ok(())
     }
 
-    fn learn(&self, from: DeviceId, roster: &[MemberContact]) {
+    /// Takes in the roster that `from`, whose certificate has `pin`, sent,
+    /// if this device's own state lists `from` as a member. Anything else is
+    /// ignored: a device still being enrolled, for one, cannot vouch for
+    /// others.
+    fn learn(&self, from: DeviceId, pin: [u8; 32], roster: &[MemberContact]) {
         let trusted = self
             .directory()
             .is_ok_and(|directory| directory.is_member(from));
         if trusted {
-            let _ = self.introduce(roster);
+            let _ = self.take_in(roster, Some((from, pin)));
         }
     }
 
@@ -686,11 +874,11 @@ impl MemberEndpoint {
                 .addresses
                 .observe(device, &SocketAddr::new(remote, port).to_string());
         }
-        self.learn(device, &open.roster);
+        self.learn(device, pin, &open.roster);
         write_frame(
             &mut stream,
             &OpenReply::Welcome {
-                roster: self.roster(),
+                roster: self.opening_roster(),
             },
         )
         .await?;
@@ -747,7 +935,7 @@ impl MemberEndpoint {
                 vault_id: self.inner.vault_id,
                 channel,
                 listen_port: self.listen_port(),
-                roster: self.roster(),
+                roster: self.opening_roster(),
             },
         )
         .await?;
@@ -761,7 +949,7 @@ impl MemberEndpoint {
                 if let Some(address) = &address {
                     addresses.observe(device, address);
                 }
-                self.learn(device, &roster);
+                self.learn(device, pin, &roster);
                 Ok(stream)
             }
             OpenReply::UnsupportedVersion => Err(Error::UnsupportedVersion),

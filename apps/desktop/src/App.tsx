@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, Sparkles, Trash2, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge, previewHasDevices } from "./bridge";
-import type { ArchiveInfo, ArchivedItem, BackupAge, BrowserInfo, BrowserStatus, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, HistoryEntry, ImportFormat, ImportSummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, ArchivedItem, BackupAge, BrowserInfo, BrowserStatus, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, MemberInfo, HistoryEntry, ImportFormat, ImportSummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
 /** How long without input in the window locks the vault, as the owner may set it. */
@@ -810,7 +810,7 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     {replaced.length > 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Device {shortDevice(replaced[0])} answers as a different device</strong><span>Something else now answers at its address, so this device refuses it and cannot sync with it. If you started over as a new vault on that device, this copy was left behind: put it away to join the new vault. If you did not, change nothing here.</span></div><button className="conflict-action" onClick={() => setLeaving(true)}>Put this copy away…</button></div>}
     {members.map((member) => <div key={member.id} className="peer-row">
       <div className="device-icon"><Fingerprint size={18} /></div>
-      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}{member.votes ? (onlyVoter && !member.thisDevice ? " · the only device that votes" : "") : " · does not vote"}</span></div>
+      <div><strong>{member.thisDevice ? "This device" : `Device ${shortDevice(member.id)}`}</strong><span>{member.thisDevice ? shortDevice(member.id) : sync.replaced.includes(member.id) ? `${member.address ?? "Its address"} · answers as a different device` : member.address ?? "Address not known yet"}{member.votes ? (onlyVoter && !member.thisDevice ? " · the only device that votes" : "") : " · does not vote"}</span>{addressLine(member) && <span className="peer-addresses">{addressLine(member)}</span>}</div>
       {!member.thisDevice && !pending && !(member.votes && onlyVoter) && (removing === member.id
         ? <div className="form-actions"><button className="secondary" onClick={() => setRemoving(null)}>Keep</button><button className="generate-button" onClick={() => { setRemoving(null); onRemove(member.id); }}>Remove</button></div>
         : <button className="secondary" disabled={locked} onClick={() => setRemoving(member.id)}>Remove…</button>)}
@@ -831,6 +831,15 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
     {others.length > 0 && <button className="link-button" onClick={() => setRecovering(true)}>Lost devices and cannot remove them? Start over as a new vault…</button>}
     {others.length > 0 && <button className="link-button" onClick={() => setLeaving(true)}>Another device started over? Put this copy away to join it…</button>}
   </div>;
+}
+
+/** The addresses of a device after the one shown first: for this device,
+ * where it tells the others it can be reached, which they learn as they
+ * connect; for another, where else it is tried. */
+function addressLine(member: MemberInfo): string | null {
+  if (member.thisDevice) return member.addresses.length > 0 ? `Tells your other devices it is at ${member.addresses.join(", ")}` : null;
+  const rest = member.addresses.filter((address) => address !== member.address);
+  return rest.length > 0 ? `Also at ${rest.join(", ")}` : null;
 }
 
 /** A request from a browser extension, for the owner to decide: which

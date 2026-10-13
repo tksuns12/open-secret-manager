@@ -6,7 +6,8 @@
 # code, the script answers for the owner on the desktop side only if the two
 # codes match, the test sets the phone's password, and the app shows the
 # item once it has synced. With the debug builds, a login then made on the
-# phone must reach the desktop.
+# phone must reach the desktop. Last, the desktop must hold an address the
+# phone named for itself.
 #
 #   scripts/test-mobile-join.sh [android|android-release|ios]
 #
@@ -317,3 +318,17 @@ case "$line" in
     *members=2*voters=1*) ;;
     *) echo "the desktop does not have the phone as a member without a vote" >&2; exit 1 ;;
 esac
+
+# The phone named addresses of its own as it connected, which the desktop
+# keeps after the one it reached it at on this machine: this is how a
+# computer learns where a phone can be reached on a VPN, and a phone the
+# computer's.
+phone_id=$(expect ENROLLED)
+echo "addresses $phone_id" >&3
+line=$(expect "ADDRESSES $phone_id")
+own=$(printf '%s\n' "$line" | tr ' ' '\n' | grep -v -E '^(127\.|\[::1\]|$)' | head -1 || true)
+if [ -z "$own" ]; then
+    echo "the phone named no address of its own (the desktop has: $line)" >&2
+    exit 1
+fi
+echo "the phone named its own address $own"

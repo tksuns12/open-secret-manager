@@ -116,11 +116,14 @@ impl Host {
     }
 
     /// Accepts connections on a new port, over IPv6 and IPv4 alike, as the
-    /// apps do.
+    /// apps do. The device names its address on this machine as its own,
+    /// not those of the machine's networks.
     async fn listen(&mut self) {
         let listener = crate::listen(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        self.endpoint.set_listen_port(port);
         self.endpoint
-            .set_listen_port(listener.local_addr().unwrap().port());
+            .set_own_addresses(Some(vec![format!("127.0.0.1:{port}")]));
         let (sync, incoming) = mpsc::channel(4);
         self.incoming = Some(incoming);
         self.sync = Some(sync.clone());
@@ -408,6 +411,8 @@ async fn the_control_plane_runs_between_devices_over_pinned_tls() {
         for other in others {
             assert_eq!(device.addresses.get(other.id), other.contact().address);
         }
+        // What the others said of it is not kept: it names its own.
+        assert!(device.addresses.all(device.id).is_empty());
     }
 
     // A follower's request reaches the leader over TLS.
@@ -855,6 +860,209 @@ async fn a_member_is_reached_past_addresses_that_lead_nowhere_and_over_ipv6() {
         .all(b.host.id)
         .iter()
         .all(|address| !address.starts_with("[::ffff:")));
+}
+
+/// An address on this machine that leads to `port`, as a device's address
+/// on a home network does while the device is there: once the task is
+/// stopped, nothing answers at it.
+async fn forward_to(port: u16) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
+                {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (address, task)
+}
+
+/// A phone that knows its computer only by the address it had on the home
+/// network, as one paired before invitations named more did, learns the
+/// computer's other addresses when they sync at home, and reaches it at
+/// one of them once the home address leads nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_known_by_its_home_address_alone_is_reached_away_at_one_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    let mut b = a.invite_without_vote(&dir, "b").await;
+    let a_id = a.host.id;
+    let a_port = a.host.endpoint.listen_port().unwrap();
+    let elsewhere = format!("127.0.0.1:{a_port}");
+
+    // B forgets every address it has for A but the home one.
+    let (home, network) = forward_to(a_port).await;
+    b.host.stop().await;
+    b.host.addresses = AddressBook::default();
+    b.host.restart(b.vault.vault_id()).await;
+    b.host.listen().await;
+    b.host.addresses.observe(a_id, &home);
+    assert_eq!(b.host.addresses.all(a_id), std::slice::from_ref(&home));
+    // B names an address A could not have seen it come from.
+    let (b_named, _b_network) = forward_to(b.host.endpoint.listen_port().unwrap()).await;
+    b.host
+        .endpoint
+        .set_own_addresses(Some(vec![b_named.clone()]));
+
+    // At home: they sync, and each says where else it listens.
+    sync(&mut b, &mut a).await;
+    assert_eq!(
+        b.host.addresses.all(a_id),
+        [home.clone(), elsewhere.clone()]
+    );
+    assert!(a.host.addresses.all(b.host.id).contains(&b_named));
+
+    // Away: the home address leads nowhere, and B reaches A all the same.
+    network.abort();
+    let _ = network.await;
+    a.vault.put(login("Made while B was away", "p")).unwrap();
+    let (received, _) = sync(&mut b, &mut a).await;
+    assert_eq!(received.applied, 1);
+    assert!(titles(&b.vault).contains(&"Made while B was away".to_owned()));
+    assert_eq!(
+        b.host.addresses.get(a_id).as_deref(),
+        Some(elsewhere.as_str())
+    );
+}
+
+/// A device names itself in the roster it opens a connection with once for
+/// each of its own addresses, best first, and every other member once.
+/// The receiver tries them right after where it reached the device. A
+/// receiver of an earlier build, which takes in every address in a roster
+/// as a member's report, takes such a roster too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_names_itself_once_for_each_of_its_addresses_and_the_others_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = three(&dir).await;
+    let named = vec![
+        a.contact().address.unwrap(),
+        "192.0.2.7:47820".to_owned(),
+        "[2001:db8::7]:47820".to_owned(),
+    ];
+    a.endpoint.set_own_addresses(Some(named.clone()));
+    let roster = a.endpoint.opening_roster();
+    let of = |roster: &[MemberContact], id: DeviceId| -> Vec<Option<String>> {
+        roster
+            .iter()
+            .filter(|contact| device_id_from_bytes(contact.device_id) == id)
+            .map(|contact| contact.address.clone())
+            .collect()
+    };
+    assert_eq!(
+        of(&roster, a.id),
+        named.iter().cloned().map(Some).collect::<Vec<_>>()
+    );
+    assert_eq!(of(&roster, b.id), [a.addresses.get(b.id)]);
+    assert_eq!(of(&roster, c.id), [a.addresses.get(c.id)]);
+    // The roster an enrollment grant names is as it was: each member once.
+    assert_eq!(a.endpoint.roster().len(), 3);
+
+    // B, told by A, tries A where it reached it, then where A said.
+    b.endpoint.announce(a.id, a.pin()).await.unwrap();
+    assert_eq!(b.addresses.all(a.id)[..3], named[..]);
+    // As an earlier build takes it in, every address is a member's report.
+    let earlier = Bare::start(&dir, 9).await;
+    earlier.endpoint.introduce(&roster).unwrap();
+    for address in &named {
+        assert!(earlier.addresses.all(a.id).contains(address));
+    }
+
+    // Naming none, or not listening, it is named once without an address.
+    a.endpoint.set_own_addresses(Some(Vec::new()));
+    assert_eq!(of(&a.endpoint.opening_roster(), a.id), [None]);
+    a.endpoint.set_own_addresses(None);
+    a.endpoint.set_listen_port(0);
+    assert_eq!(of(&a.endpoint.opening_roster(), a.id), [None]);
+}
+
+#[test]
+fn the_addresses_a_device_names_for_itself_come_right_after_where_it_was_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("peers.db");
+    let book = AddressBook::open(&path).unwrap();
+    book.observe(1, "192.0.2.1:47820");
+    for n in 10..17 {
+        book.suggest(1, &format!("192.0.2.{n}:47820"));
+    }
+    assert_eq!(book.all(1).len(), 8);
+    // With as many as are kept, what it names pushes the last ones out,
+    // as a suggestion never does.
+    let own = [
+        "[2001:db8::1]:47820".to_owned(),
+        "192.0.2.2:47820".to_owned(),
+    ];
+    book.claim(1, &own);
+    let named = book.all(1);
+    assert_eq!(
+        named[..3],
+        ["192.0.2.1:47820", "[2001:db8::1]:47820", "192.0.2.2:47820"]
+    );
+    assert_eq!(named.len(), 8);
+    assert!(!named.contains(&"192.0.2.15:47820".to_owned()));
+    assert!(!named.contains(&"192.0.2.16:47820".to_owned()));
+    // Named again, nothing changes.
+    book.claim(1, &own);
+    assert_eq!(book.all(1), named);
+
+    // Repeats, what is not an IP address and port, and more than four are
+    // left out.
+    let offered: Vec<String> = [
+        "192.0.2.3:1",
+        "192.0.2.3:1",
+        "",
+        "vault.example:47820",
+        "not an address",
+        "192.0.2.4:1",
+        "192.0.2.5:1",
+        "192.0.2.6:1",
+        "192.0.2.7:1",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    book.claim(2, &offered);
+    assert_eq!(
+        book.all(2),
+        ["192.0.2.3:1", "192.0.2.4:1", "192.0.2.5:1", "192.0.2.6:1"]
+    );
+    // Once where it was reached has failed, what it names comes first.
+    book.observe(3, "192.0.2.1:1");
+    book.failed(3, "192.0.2.1:1");
+    book.claim(3, &["192.0.2.8:1".to_owned()]);
+    assert_eq!(book.all(3), ["192.0.2.8:1", "192.0.2.1:1"]);
+    drop(book);
+
+    // They are kept across a restart, in their order.
+    let book = AddressBook::open(&path).unwrap();
+    assert_eq!(book.all(1), named);
+}
+
+#[test]
+fn a_roster_names_every_other_member_and_never_more_than_it_may() {
+    let own_pin = [0xee; 32];
+    let own: Vec<String> = (1..=4).map(|n| format!("192.0.2.{n}:47820")).collect();
+    let count = |others: u8, own: &[String]| -> (usize, usize) {
+        let mut members: std::collections::BTreeMap<DeviceId, [u8; 32]> =
+            (1..=others).map(|n| (DeviceId::from(n), [n; 32])).collect();
+        members.insert(DeviceId::from(200u8), own_pin);
+        let contacts = crate::members::opening_contacts(members, own_pin, own, |device| {
+            Some(format!("192.0.2.100:{device}"))
+        });
+        assert!(contacts.len() <= crate::MAX_CONTACTS);
+        let itself = contacts
+            .iter()
+            .filter(|contact| contact.transport_pin == own_pin)
+            .count();
+        (contacts.len() - itself, itself)
+    };
+    assert_eq!(count(3, &own), (3, 4));
+    assert_eq!(count(60, &own), (60, 4));
+    assert_eq!(count(62, &own), (62, 2));
+    assert_eq!(count(70, &own), (63, 1));
+    assert_eq!(count(3, &[]), (3, 1));
 }
 
 /// A relay on this machine, and the code its devices use.

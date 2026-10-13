@@ -187,7 +187,10 @@ export type MemberInfo = {
   /** Device ID in hex. */
   id: string;
   thisDevice: boolean;
+  /** Where this device tries it first. */
   address?: string;
+  /** Every address this device would try it at, best first; for this device, the addresses it tells the others it has. */
+  addresses: string[];
   leader: boolean;
   /** Counts toward the majority a change needs. A member without a vote, such as a phone, holds the keys and syncs. */
   votes: boolean;

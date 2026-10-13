@@ -1162,7 +1162,11 @@ pub struct MemberInfo {
     /// The device ID in hex.
     pub(crate) id: String,
     pub(crate) this_device: bool,
-    address: Option<String>,
+    /// Where this device tries it first.
+    pub(crate) address: Option<String>,
+    /// Every address this device would try it at, best first; for this
+    /// device, the addresses it tells the others it has.
+    pub(crate) addresses: Vec<String>,
     leader: bool,
     /// Whether it counts toward the majority a change needs. A member
     /// without a vote, such as a phone, is given the keys and syncs.
@@ -1292,6 +1296,11 @@ pub async fn devices<R: Runtime>(app: AppHandle<R>) -> Result<DevicesInfo, Comma
             id: hex(&device_id_to_bytes(device)),
             this_device: device == control.device,
             address: control.endpoint.addresses().get(device),
+            addresses: if device == control.device {
+                control.endpoint.own_addresses()
+            } else {
+                control.endpoint.addresses().all(device)
+            },
             leader: leader == Some(device),
             votes: state.votes(device),
         })
