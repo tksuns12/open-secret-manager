@@ -23,6 +23,7 @@
         <activity android:name=".CodeActivity" android:exported="true" />
         <activity android:name=".WebLoginActivity" android:exported="true" />
         <activity android:name=".NestedDomainLoginActivity" android:exported="true" />
+        <activity android:name=".NamedLoginActivity" android:exported="true" />
         <activity android:name=".TwoStepUsernameActivity" android:exported="true" />
         <activity android:name=".TwoStepPasswordActivity" android:exported="false" />
     </application>

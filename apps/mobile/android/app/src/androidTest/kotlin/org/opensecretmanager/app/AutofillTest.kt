@@ -430,6 +430,25 @@ class AutofillTest {
     }
 
     @Test
+    fun anIdFieldThatSaysNothingToAutofillIsKnownByItsName() {
+        // Named "user_id" and "아이디…", with a field for a company code
+        // between it and the password: it is offered the fill, and gets the
+        // username; the company code is left alone.
+        askToFill("NamedLoginActivity", field = "user_id")
+        find(mine("choose-another")).click()
+        find(mine("fill:Bank")).click()
+        assertFilled("account 42||p@ss \"quoted\" \\ and 🔑")
+        assertLockedAgain()
+
+        // Typed as a password shown as typed: it is the ID, and the field
+        // that hides what is typed is the password.
+        askToFill("NamedLoginActivity", field = "login_id", extras = " --es form shown")
+        find(mine("fill:Bank")).click()
+        assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
+        assertLockedAgain()
+    }
+
+    @Test
     fun aTrustedBrowsersPageIsOfferedTheLoginsSavedForItsOrigin() {
         Requester.trustedForTests += FIXTURE
         askToFill("WebLoginActivity", "https://mail.example.test", name = "web")

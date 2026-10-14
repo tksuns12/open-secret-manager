@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Nothing said to autofill: the ID field is typed as a password shown as
+     typed, which keeps the keyboard from suggesting words in it. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/form"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true"
+    android:orientation="vertical"
+    android:padding="24dp">
+    <EditText
+        android:id="@+id/login_id"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="ID"
+        android:inputType="textVisiblePassword" />
+    <EditText
+        android:id="@+id/user_pw"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Password"
+        android:inputType="textPassword" />
+    <TextView
+        android:id="@+id/filled"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+</LinearLayout>
