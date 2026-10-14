@@ -16,6 +16,22 @@ final class AppTests: UITestCase {
         XCTAssert(app.staticTexts["notice"].waitForLabel("That is not an invitation · copy it again from your computer"))
     }
 
+    func testAQRCodeThatIsNoInvitationIsSaidSoAndScanningCanBeLeft() {
+        let app = launchApp(vault: nil, scanned: "https://example.com/not-an-invitation")
+        app.buttons["join-scan"].waitAndTap(timeout: startTimeout)
+        XCTAssert(app.staticTexts["scan-not-invitation"].waitForExistence(timeout: 30))
+        XCTAssert(app.staticTexts["Point the camera at the QR code on your computer."].exists)
+        app.buttons["scan-cancel"].tap()
+        XCTAssert(app.descendants(matching: .any)["invitation"].firstMatch.waitForExistence(timeout: 30))
+    }
+
+    func testWithoutACameraThereIsNothingToScan() {
+        // The simulator has no camera; a phone without one only pastes.
+        let app = launchApp(vault: nil)
+        XCTAssert(app.descendants(matching: .any)["invitation"].firstMatch.waitForExistence(timeout: startTimeout))
+        XCTAssertFalse(app.buttons["join-scan"].exists)
+    }
+
     func testRecordsTakenOutOfTheFileAreSaidAfterUnlockingUntilConfirmed() {
         // The format 8 fixture with the first version of Mail taken out
         // (prepare.sh makes it).

@@ -91,12 +91,41 @@ private struct Message: View {
 private struct JoinStart: View {
     @ObservedObject var model: VaultModel
     @State private var invitation = ""
+    @State private var scanning = false
 
     var body: some View {
+        if scanning {
+            ScanInvitation(onInvitation: { text in
+                scanning = false
+                model.joinStart(text)
+            }, onCancel: { scanning = false })
+        } else {
+            asked
+        }
+    }
+
+    private var asked: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Join your vault").font(.title2)
-                Text("On your computer, open Devices, choose Invite a device, and pick a phone. Paste the invitation here.")
+                if InvitationScanner.available {
+                    Text("On your computer, open Devices, choose Invite a device, and pick a phone. Scan the QR code it shows, or paste the invitation here.")
+                    // The camera is asked for only when the owner chooses to scan.
+                    Button("Scan the QR code") {
+                        Task {
+                            if await InvitationScanner.mayUseCamera() {
+                                scanning = true
+                            } else {
+                                model.notice = "Without the camera, paste the invitation instead"
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.busy != nil)
+                    .accessibilityIdentifier("join-scan")
+                } else {
+                    Text("On your computer, open Devices, choose Invite a device, and pick a phone. Paste the invitation here.")
+                }
                 TextField("Invitation", text: $invitation, axis: .vertical)
                     .lineLimit(3...6)
                     .textFieldStyle(.roundedBorder)

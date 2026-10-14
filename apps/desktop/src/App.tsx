@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, Sparkles, Trash2, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge, previewHasDevices } from "./bridge";
-import type { ArchiveInfo, ArchivedItem, BackupAge, BrowserInfo, BrowserStatus, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, MemberInfo, HistoryEntry, ImportFormat, ImportSummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, ArchivedItem, BackupAge, BrowserInfo, BrowserStatus, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, HistoryEntry, ImportFormat, ImportSummary, InviteQr, MemberInfo, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
 /** How long without input in the window locks the vault, as the owner may set it. */
@@ -25,7 +25,7 @@ type Filter = (typeof filters)[number];
 type EditorState = { mode: "create" } | { mode: "edit"; detail: EntryDetail };
 type ReviewState = { id: string; title: string; versions: VersionSummary[] };
 /** An invitation waiting for the other device, for one that votes or not. */
-type InviteState = { code: string; votes: boolean; sas?: string };
+type InviteState = { code: string; votes: boolean; qr: InviteQr; sas?: string };
 
 /** Topbar wording and colour for each sync state. */
 function syncLabel(status: SyncStatus): { tone: SyncState; text: string } {
@@ -406,7 +406,7 @@ function App() {
   async function startInvite(votes: boolean) {
     try {
       const created = await bridge.startInvite(votes);
-      setInvite({ code: created.code, votes });
+      setInvite({ code: created.code, votes, qr: created.qr });
     } catch (error) {
       setNotice(commandMessage(error, "An invitation could not be created"));
     }
@@ -738,6 +738,11 @@ function RelaySection({ relay, locked, onChanged, onNotice }: { relay: DevicesIn
   </div>;
 }
 
+/** A phone's invitation as a QR code, dark on light with its border, as scanners expect whatever the window's colours. */
+function InvitationQr({ qr }: { qr: InviteQr }) {
+  return <svg className="invite-qr" viewBox={`0 0 ${qr.side} ${qr.side}`} shapeRendering="crispEdges" role="img" aria-label="QR code of the invitation"><rect width={qr.side} height={qr.side} fill="#fff" /><path d={qr.path} fill="#000" /></svg>;
+}
+
 function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCancelInvite, onSync, onFound, onRemove, onCancelEnrollment, onRejoined, onRecovered, onUnlock, rejoining, onRejoining: setRejoining, onReset, onNotice, onCopy, onRelayChanged }: DevicesPanelProps) {
   const [removing, setRemoving] = useState<string | null>(null);
   const [choosing, setChoosing] = useState(false);
@@ -765,7 +770,8 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
   }
   if (invite) {
     return <div className="device-panel">
-      <p className="review-hint">For {invite.votes ? "a computer that is usually on: it will vote" : "a phone, or a computer often off: it will not vote"}. On the other device, choose “Join a vault from another device” and paste this invitation. It works once and expires in 15 minutes.</p>
+      <p className="review-hint">For {invite.votes ? "a computer that is usually on: it will vote" : "a phone, or a computer often off: it will not vote"}. {invite.votes ? "On the other device, choose “Join a vault from another device” and paste this invitation." : "On a phone, choose Scan the QR code and point it here; on a computer, choose “Join a vault from another device” and paste this invitation."} It works once and expires in 15 minutes.</p>
+      {!invite.votes && <InvitationQr qr={invite.qr} />}
       <div className="generated-value"><code>{invite.code}</code><button onClick={() => onCopy(invite.code)} title="Copy invitation"><Copy size={16} /></button></div>
       <p className="review-hint">Waiting for the other device… Until this pairing ends, switching to another window does not lock the vault here; it still locks after the time without activity set in Settings.</p>
       <div className="form-actions"><button className="secondary" onClick={onCancelInvite}>Cancel</button></div>

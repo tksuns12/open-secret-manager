@@ -126,6 +126,12 @@ export function hasNativeBridge(): boolean {
   return Boolean((globalThis as { __TAURI__?: { core?: { invoke?: unknown } } }).__TAURI__?.core?.invoke);
 }
 
+/** The preview's sample invitation as a QR code, drawn as the app's `qr_of` (`src-tauri/src/qr.rs`) draws it. */
+const PREVIEW_INVITATION_QR = {
+  side: 37,
+  path: "M4 4h7v1h-7zM12 4h2v1h-2zM16 4h1v1h-1zM18 4h2v1h-2zM21 4h1v1h-1zM26 4h7v1h-7zM4 5h1v1h-1zM10 5h1v1h-1zM14 5h2v1h-2zM17 5h1v1h-1zM19 5h1v1h-1zM21 5h2v1h-2zM24 5h1v1h-1zM26 5h1v1h-1zM32 5h1v1h-1zM4 6h1v1h-1zM6 6h3v1h-3zM10 6h1v1h-1zM12 6h1v1h-1zM20 6h3v1h-3zM26 6h1v1h-1zM28 6h3v1h-3zM32 6h1v1h-1zM4 7h1v1h-1zM6 7h3v1h-3zM10 7h1v1h-1zM12 7h4v1h-4zM17 7h1v1h-1zM19 7h4v1h-4zM24 7h1v1h-1zM26 7h1v1h-1zM28 7h3v1h-3zM32 7h1v1h-1zM4 8h1v1h-1zM6 8h3v1h-3zM10 8h1v1h-1zM13 8h7v1h-7zM21 8h1v1h-1zM23 8h2v1h-2zM26 8h1v1h-1zM28 8h3v1h-3zM32 8h1v1h-1zM4 9h1v1h-1zM10 9h1v1h-1zM12 9h1v1h-1zM15 9h3v1h-3zM22 9h1v1h-1zM26 9h1v1h-1zM32 9h1v1h-1zM4 10h7v1h-7zM12 10h1v1h-1zM14 10h1v1h-1zM16 10h1v1h-1zM18 10h1v1h-1zM20 10h1v1h-1zM22 10h1v1h-1zM24 10h1v1h-1zM26 10h7v1h-7zM12 11h3v1h-3zM16 11h1v1h-1zM20 11h2v1h-2zM24 11h1v1h-1zM5 12h1v1h-1zM7 12h1v1h-1zM9 12h6v1h-6zM20 12h2v1h-2zM25 12h3v1h-3zM29 12h2v1h-2zM32 12h1v1h-1zM8 13h1v1h-1zM11 13h4v1h-4zM16 13h4v1h-4zM24 13h1v1h-1zM26 13h2v1h-2zM30 13h2v1h-2zM4 14h1v1h-1zM6 14h1v1h-1zM9 14h4v1h-4zM15 14h4v1h-4zM24 14h1v1h-1zM26 14h1v1h-1zM29 14h3v1h-3zM4 15h4v1h-4zM9 15h1v1h-1zM12 15h2v1h-2zM15 15h1v1h-1zM18 15h2v1h-2zM21 15h1v1h-1zM23 15h3v1h-3zM28 15h2v1h-2zM5 16h1v1h-1zM8 16h1v1h-1zM10 16h2v1h-2zM13 16h1v1h-1zM16 16h1v1h-1zM18 16h1v1h-1zM20 16h1v1h-1zM22 16h2v1h-2zM25 16h2v1h-2zM30 16h3v1h-3zM4 17h1v1h-1zM7 17h2v1h-2zM11 17h2v1h-2zM14 17h1v1h-1zM16 17h3v1h-3zM20 17h1v1h-1zM22 17h1v1h-1zM24 17h1v1h-1zM26 17h2v1h-2zM30 17h3v1h-3zM5 18h2v1h-2zM8 18h1v1h-1zM10 18h4v1h-4zM15 18h1v1h-1zM19 18h1v1h-1zM25 18h3v1h-3zM31 18h2v1h-2zM5 19h1v1h-1zM8 19h1v1h-1zM11 19h3v1h-3zM15 19h2v1h-2zM18 19h1v1h-1zM20 19h3v1h-3zM25 19h1v1h-1zM27 19h3v1h-3zM32 19h1v1h-1zM4 20h3v1h-3zM8 20h1v1h-1zM10 20h1v1h-1zM13 20h2v1h-2zM22 20h1v1h-1zM24 20h1v1h-1zM27 20h6v1h-6zM5 21h3v1h-3zM9 21h1v1h-1zM11 21h3v1h-3zM15 21h1v1h-1zM19 21h3v1h-3zM23 21h1v1h-1zM29 21h1v1h-1zM31 21h1v1h-1zM4 22h1v1h-1zM6 22h2v1h-2zM9 22h3v1h-3zM13 22h3v1h-3zM17 22h1v1h-1zM19 22h2v1h-2zM22 22h1v1h-1zM25 22h2v1h-2zM31 22h2v1h-2zM6 23h1v1h-1zM8 23h1v1h-1zM11 23h3v1h-3zM15 23h3v1h-3zM22 23h2v1h-2zM25 23h1v1h-1zM28 23h1v1h-1zM30 23h1v1h-1zM32 23h1v1h-1zM4 24h1v1h-1zM7 24h1v1h-1zM9 24h3v1h-3zM13 24h1v1h-1zM16 24h1v1h-1zM19 24h1v1h-1zM23 24h10v1h-10zM12 25h3v1h-3zM16 25h2v1h-2zM19 25h2v1h-2zM23 25h2v1h-2zM28 25h1v1h-1zM30 25h1v1h-1zM32 25h1v1h-1zM4 26h7v1h-7zM12 26h2v1h-2zM16 26h2v1h-2zM19 26h3v1h-3zM23 26h2v1h-2zM26 26h1v1h-1zM28 26h1v1h-1zM31 26h2v1h-2zM4 27h1v1h-1zM10 27h1v1h-1zM12 27h3v1h-3zM17 27h5v1h-5zM23 27h2v1h-2zM28 27h3v1h-3zM4 28h1v1h-1zM6 28h3v1h-3zM10 28h1v1h-1zM14 28h2v1h-2zM18 28h2v1h-2zM24 28h8v1h-8zM4 29h1v1h-1zM6 29h3v1h-3zM10 29h1v1h-1zM12 29h1v1h-1zM14 29h3v1h-3zM18 29h3v1h-3zM25 29h1v1h-1zM29 29h2v1h-2zM32 29h1v1h-1zM4 30h1v1h-1zM6 30h3v1h-3zM10 30h1v1h-1zM13 30h1v1h-1zM15 30h4v1h-4zM21 30h1v1h-1zM25 30h2v1h-2zM32 30h1v1h-1zM4 31h1v1h-1zM10 31h1v1h-1zM12 31h2v1h-2zM15 31h2v1h-2zM18 31h2v1h-2zM23 31h1v1h-1zM25 31h2v1h-2zM28 31h1v1h-1zM30 31h3v1h-3zM4 32h7v1h-7zM14 32h3v1h-3zM20 32h2v1h-2zM23 32h4v1h-4z",
+};
+
 /**
  * The preview keeps the interface useful in a browser. Tauri injects the
  * command bridge in production; no secret is placed in this fallback data.
@@ -332,7 +338,7 @@ export const bridge: DesktopBridge = {
   /** With `?devices`, a sample invitation that pairs nothing. */
   async startInvite(votes) {
     if (native() || !previewHasDevices()) return nativeOnly("start_invite", { votes });
-    return { code: "OSM-PAIR1-PREVIEW-SAMPLE-NOT-AN-INVITATION", expiresAt: Date.now() + 15 * 60_000 };
+    return { code: "OSM-PAIR1-PREVIEW-SAMPLE-NOT-AN-INVITATION", expiresAt: Date.now() + 15 * 60_000, qr: PREVIEW_INVITATION_QR };
   },
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),
   async cancelInvite() {

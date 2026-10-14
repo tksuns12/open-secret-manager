@@ -43,7 +43,10 @@ use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use zeroize::Zeroizing;
 
-use crate::{AppState, CommandError};
+use crate::{
+    qr::{qr_of, QrInfo},
+    AppState, CommandError,
+};
 
 /// Preferred port for the other members; another is used if it is taken.
 const SYNC_PORT: u16 = 47_820;
@@ -1841,6 +1844,8 @@ pub async fn leave_vault<R: Runtime>(
 pub struct InviteInfo {
     pub(crate) code: String,
     expires_at: u64,
+    /// The same invitation as a QR code, which a phone scans.
+    qr: QrInfo,
 }
 
 /// Issues an invitation and waits in the background for the joiner. When
@@ -1889,8 +1894,10 @@ pub async fn start_invite<R: Runtime>(
         .map_err(network_error)?;
         (listener, invitation)
     };
+    let code = invitation.encode().map_err(network_error)?.to_string();
     let info = InviteInfo {
-        code: invitation.encode().map_err(network_error)?.to_string(),
+        qr: qr_of(&code)?,
+        code,
         expires_at: invitation.expires_at(),
     };
     let (decision, decided) = oneshot::channel();

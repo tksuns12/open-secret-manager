@@ -57,6 +57,10 @@ done
 # A peer store from before Phase 14, with its network key unsealed.
 cp crates/vault-peer/fixtures/peers.sqlite3 "$android/vault/src/androidTest/assets/peers-1.sqlite3"
 take_out "$android/app/src/androidTest/assets/sealed-taken-out-vault.sqlite3"
+# The QR code the desktop draws for the frozen invitation, and the
+# invitation, which the scanner's test reads back.
+cp apps/desktop/src-tauri/fixtures/invitation-qr.txt crates/vault-peer/fixtures/pairing.json \
+    "$android/app/src/androidTest/assets/"
 # A vault with a card and an identity, which no frozen vault holds and a
 # phone cannot make, for the screens that show an item's other fields.
 cargo run --locked -q -p osm-mobile --example cards_vault -- \

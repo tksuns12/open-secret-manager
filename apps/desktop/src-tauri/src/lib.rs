@@ -20,6 +20,7 @@ mod keystore;
 mod network;
 #[cfg(test)]
 mod network_tests;
+mod qr;
 mod settings;
 #[cfg(test)]
 mod side_files_tests;

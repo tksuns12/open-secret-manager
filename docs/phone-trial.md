@@ -39,9 +39,10 @@ phone sold since 2019 is):
 
 1. Phone and computer on the same Wi-Fi network. In the desktop app, open
    Devices, choose Invite a device, and pick a phone.
-2. Bring the invitation to the phone by a channel you control (it is good
-   for one join and only together with the code comparison), and paste it in
-   the app's join screen.
+2. In the app's join screen, choose Scan the QR code, allow the camera, and
+   point it at the QR code the desktop shows. Or bring the invitation's text
+   to the phone by a channel you control (it is good for one join and only
+   together with the code comparison), and paste it there.
 3. On iOS, allow the app to find devices on the local network when asked.
    Without it the phone cannot reach the computer.
 4. Both screens show six digits: confirm on the computer only if they are

@@ -74,7 +74,7 @@ Receipt may happen out of order. Deduplicate by a cryptographic revision identit
 
 ## Pairing, transport, and locked receipt
 
-An invitation contains a fresh high-entropy one-use secret, short expiry, inviter identity, and an authenticated pin or transcript binding. Verify the device identities through the transferred invitation or an explicit short-authentication-string comparison. Displaying a QR code is not by itself proof of endpoint authenticity. Never log invitations.
+An invitation contains a fresh high-entropy one-use secret, short expiry, inviter identity, and an authenticated pin or transcript binding. Verify the device identities through the transferred invitation or an explicit short-authentication-string comparison. Displaying a QR code is not by itself proof of endpoint authenticity. Never log invitations. The desktop shows a phone's invitation as a QR code as well as text: the same one-use secret, to whoever can see the screen or a picture of it, as the text is. A phone uses its camera only when the owner chooses to scan, keeps no frame, and checks what it reads as it checks a pasted invitation; the code comparison is still what authenticates the two devices.
 
 TLS must validate proof of possession and the expected peer pin in both directions. Disable broad “accept any certificate” paths. Address discovery is untrusted and cannot replace the identity check. Retry cannot downgrade authentication. Network parsers need size/time limits and rejection before expensive cryptography where possible.
 

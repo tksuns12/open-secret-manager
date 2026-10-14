@@ -1,7 +1,9 @@
 package org.opensecretmanager.app
 
+import android.Manifest
 import android.content.ClipDescription
 import android.content.ClipboardManager
+import android.content.pm.PackageManager
 import android.os.Build
 import android.view.WindowManager
 import androidx.compose.ui.test.ExperimentalTestApi
@@ -15,6 +17,7 @@ import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextClearance
@@ -22,6 +25,9 @@ import androidx.compose.ui.test.performTextInput
 import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.UiDevice
+import androidx.test.uiautomator.Until
 import androidx.work.WorkManager
 import java.io.File
 import org.junit.Assert.assertEquals
@@ -30,6 +36,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.After
 import org.junit.Assume.assumeFalse
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -309,6 +316,34 @@ class AppTest {
         compose.onNodeWithTag("invitation").performTextInput("not an invitation")
         compose.onNodeWithTag("join-continue").performClick()
         compose.waitUntilAtLeastOneExists(hasText("That is not an invitation", substring = true), 30_000)
+        assertEquals(Screen.NO_VAULT, session.state.value.screen)
+    }
+
+    @Test
+    fun theCameraIsAskedForOnlyToScanAnInvitationAndWithoutItPastingIsLeft() {
+        val app = instrumentation.targetContext
+        // As Gradle installs the app for a run: the camera not yet allowed.
+        assumeTrue(app.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
+        withoutAVault()
+        waitFor("join-scan")
+        compose.onNodeWithTag("join-scan").performClick()
+        val device = UiDevice.getInstance(instrumentation)
+        val deny = By.res("com.android.permissioncontroller", "permission_deny_button")
+        val asked = device.wait(Until.findObject(deny), 15_000) ?: error("Android did not ask for the camera")
+        asked.click()
+        compose.waitUntilAtLeastOneExists(hasText("Without the camera, paste the invitation instead"), 15_000)
+        compose.onNodeWithTag("invitation").assertExists()
+
+        instrumentation.uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.CAMERA)
+        compose.onNodeWithTag("join-scan").performClick()
+        waitFor("scan-preview")
+        compose.onNodeWithText("Point the camera at the QR code on your computer.").assertExists()
+        // The emulator's camera starts, and the screen stays until Cancel.
+        Thread.sleep(3_000)
+        compose.onNodeWithTag("scan-cancel").assertExists()
+        assertEquals(0, compose.onAllNodesWithText("The camera could not be started", substring = true).fetchSemanticsNodes().size)
+        compose.onNodeWithTag("scan-cancel").performClick()
+        waitFor("join-scan")
         assertEquals(Screen.NO_VAULT, session.state.value.screen)
     }
 

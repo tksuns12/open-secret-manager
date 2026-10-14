@@ -1,6 +1,8 @@
 package org.opensecretmanager.app
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -8,6 +10,8 @@ import android.text.format.DateUtils
 import android.view.WindowManager
 import android.view.autofill.AutofillManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -67,6 +71,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import org.opensecretmanager.app.autofill.PendingSave
@@ -255,13 +260,48 @@ internal fun Busy(what: String) {
 
 @Composable
 private fun JoinStart(state: UiState, session: VaultSession) {
+    val context = LocalContext.current
     var invitation by remember { mutableStateOf("") }
+    var scanning by remember { mutableStateOf(false) }
+    val hasCamera = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) }
+    // The camera is asked for only when the owner chooses to scan.
+    val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) scanning = true else session.tell("Without the camera, paste the invitation instead")
+    }
+    if (scanning) {
+        ScanInvitation(
+            onInvitation = {
+                scanning = false
+                session.joinStart(it)
+            },
+            onCancel = { scanning = false },
+            onFailed = {
+                scanning = false
+                session.tell("The camera could not be started · paste the invitation instead")
+            },
+        )
+        return
+    }
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Join your vault", style = MaterialTheme.typography.titleLarge)
         Text(
-            "On your computer, open Devices, choose Invite a device, and pick a phone. Paste the invitation here.",
+            if (hasCamera) {
+                "On your computer, open Devices, choose Invite a device, and pick a phone. Scan the QR code it shows, or paste the invitation here."
+            } else {
+                "On your computer, open Devices, choose Invite a device, and pick a phone. Paste the invitation here."
+            },
             style = MaterialTheme.typography.bodyMedium,
         )
+        if (hasCamera) {
+            Button(
+                onClick = {
+                    val allowed = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                    if (allowed) scanning = true else askCamera.launch(Manifest.permission.CAMERA)
+                },
+                enabled = state.busy == null,
+                modifier = Modifier.testTag("join-scan"),
+            ) { Text("Scan the QR code") }
+        }
         OutlinedTextField(
             value = invitation,
             onValueChange = { invitation = it },

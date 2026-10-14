@@ -8,8 +8,12 @@ import Foundation
 /// `OSM_TEST_CHANGE_WHILE_EDITING` (`<item id>|<notes>|<password>`) changes
 /// that item's notes through a second device object on the folder as the
 /// editor opens for it, as a sync could while the owner edits.
+/// `OSM_TEST_SCANNED` is what the camera reads when the owner scans an
+/// invitation, as the simulator has no camera.
 enum TestSupport {
     private static var prepared = false
+
+    static var scanned: String? { ProcessInfo.processInfo.environment["OSM_TEST_SCANNED"] }
 
     static func prepareOnce(_ folder: URL) {
         guard !prepared else { return }

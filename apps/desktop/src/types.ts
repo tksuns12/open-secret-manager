@@ -205,6 +205,9 @@ export type PendingChange = {
   cancelled: boolean;
 };
 
+/** An invitation as a QR code: the side of its square in modules, its light border included, and SVG path data filling the dark ones. */
+export type InviteQr = { side: number; path: string };
+
 /** The vault's devices as its committed membership records them. */
 export type DevicesInfo = {
   setup: "none" | "unmanaged" | "paired-before" | "joining" | "ready" | "removed";
@@ -394,7 +397,7 @@ export type DesktopBridge = {
   /** Deletes the folder and everything in it. */
   deleteArchive: (name: string) => Promise<void>;
   /** Invites a device; `votes` says whether it will count toward the majority a change needs. */
-  startInvite: (votes: boolean) => Promise<{ code: string; expiresAt: number }>;
+  startInvite: (votes: boolean) => Promise<{ code: string; expiresAt: number; qr: InviteQr }>;
   confirmInvite: (accept: boolean) => Promise<void>;
   cancelInvite: () => Promise<void>;
   joinStart: (code: string) => Promise<{ sas: string; keepsVault: boolean }>;

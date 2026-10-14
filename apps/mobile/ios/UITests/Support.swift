@@ -21,11 +21,13 @@ func capture(_ name: String) {
 }
 
 /// Launches the app with `vault` (a vault file, or nil for none) where it
-/// keeps its vault, and nothing kept for Face ID.
-func launchApp(vault: String?) -> XCUIApplication {
+/// keeps its vault, and nothing kept for Face ID; with `scanned`, what its
+/// camera reads when the owner scans an invitation.
+func launchApp(vault: String?, scanned: String? = nil) -> XCUIApplication {
     let app = XCUIApplication()
     app.launchEnvironment["OSM_TEST_VAULT"] = vault ?? "none"
     app.launchEnvironment["OSM_TEST_BIOMETRICS"] = "off"
+    if let scanned { app.launchEnvironment["OSM_TEST_SCANNED"] = scanned }
     app.launch()
     return app
 }

@@ -52,17 +52,28 @@ test("the only device that votes cannot be removed, and the panel says so", asyn
   assert.deepEqual(errors, []);
 });
 
-test("an invitation says which kind of device it is for", async () => {
+test("an invitation says which kind of device it is for, and a phone's is also a QR code", async () => {
   const { page, errors } = await window.open("?devices");
   const panel = await openDevices(page);
-  for (const [choice, said] of [
-    ["A phone, or a computer often off · it does not vote", "For a phone, or a computer often off: it will not vote."],
-    ["A computer that is usually on · it votes", "For a computer that is usually on: it will vote."],
+  for (const [choice, said, scanned] of [
+    ["A phone, or a computer often off · it does not vote", "For a phone, or a computer often off: it will not vote.", true],
+    ["A computer that is usually on · it votes", "For a computer that is usually on: it will vote.", false],
   ]) {
     await panel.getByRole("button", { name: "Invite a device" }).click();
     await panel.getByRole("button", { name: choice }).click();
     await panel.getByText(said, { exact: false }).waitFor();
     await panel.getByText("OSM-PAIR1-PREVIEW-SAMPLE-NOT-AN-INVITATION").waitFor();
+    const qr = panel.getByRole("img", { name: "QR code of the invitation" });
+    if (scanned) {
+      await panel.getByText("On a phone, choose Scan the QR code and point it here", { exact: false }).waitFor();
+      // Large enough for a phone's camera, and inside the panel.
+      const [drawn, around] = [await qr.boundingBox(), await panel.boundingBox()];
+      assert.ok(drawn.width >= 250 && drawn.height === drawn.width, `${drawn.width}×${drawn.height}`);
+      assert.ok(drawn.x >= around.x && drawn.x + drawn.width <= around.x + around.width);
+      assert.ok(await qr.locator("path").getAttribute("d"));
+    } else {
+      assert.equal(await qr.count(), 0);
+    }
     // How long it stays unlocked meanwhile is the owner's setting, not a fixed time.
     await panel.getByText(/the time without activity set in Settings/).waitFor();
     await panel.getByRole("button", { name: "Cancel" }).click();
@@ -83,14 +94,17 @@ test("when the system says the owner went away, the vault locks, says why, and e
   await page.reload();
   const panel = await openDevices(page);
   await panel.getByRole("button", { name: "Invite a device" }).click();
-  await panel.getByRole("button", { name: "A computer that is usually on · it votes" }).click();
+  await panel.getByRole("button", { name: "A phone, or a computer often off · it does not vote" }).click();
   const invitation = panel.getByText("OSM-PAIR1-PREVIEW-SAMPLE-NOT-AN-INVITATION");
+  const qr = panel.getByRole("img", { name: "QR code of the invitation" });
   await invitation.waitFor();
+  await qr.waitFor();
 
   await page.evaluate(() => globalThis.osmEmit("vault-locked", "screen_locked"));
   await page.locator(".toast", { hasText: "Vault locked because the screen locked · the pairing was cancelled" }).waitFor();
   await page.getByLabel("Vault password").waitFor();
   assert.equal(await invitation.count(), 0);
+  assert.equal(await qr.count(), 0);
   assert.deepEqual(errors, []);
 });
 

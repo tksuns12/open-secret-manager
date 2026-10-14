@@ -548,6 +548,11 @@ class VaultSession(private val context: Context, private val folder: File) {
         _state.update { it.copy(notice = null) }
     }
 
+    /** Shows `notice`, as the session's own notices show. */
+    fun tell(notice: String) {
+        _state.update { it.copy(notice = notice) }
+    }
+
     /** The app came to the front: take part again, and keep the list current. */
     fun onForeground() {
         inFront = true
