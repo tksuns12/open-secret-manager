@@ -22,6 +22,15 @@ use crate::{archive, network, AppState};
 pub(crate) const PASSWORD: &str = "device password";
 
 pub(crate) fn shell(dir: &Path) -> App<MockRuntime> {
+    shell_keeping(dir, Arc::new(crate::rows_seen::MemoryRowsSeen::default()))
+}
+
+/// A shell whose counts of what its vault's file held are kept in `rows`,
+/// which outlives it as the system's keystore outlives the app.
+pub(crate) fn shell_keeping(
+    dir: &Path,
+    rows: Arc<dyn crate::rows_seen::RowsSeen>,
+) -> App<MockRuntime> {
     let path = dir.join("vault.sqlite3");
     let network =
         network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
@@ -34,6 +43,7 @@ pub(crate) fn shell(dir: &Path) -> App<MockRuntime> {
             network,
             chosen_backup: std::sync::Mutex::new(None),
             import: Mutex::new(None),
+            rows_seen: crate::rows_seen::Checkpoint::new(rows),
         })
         .build(mock_context(noop_assets()))
         .unwrap()

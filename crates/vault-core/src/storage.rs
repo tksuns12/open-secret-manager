@@ -982,6 +982,36 @@ impl Vault {
         Ok(())
     }
 
+    /// How many rows that are never changed or removed the vault's file
+    /// holds, the rows the seal covers: revisions, authorized and removed
+    /// devices, and epoch keys. Every write that adds one counts it, and
+    /// none is taken out without the next unlock finding it, so an earlier
+    /// copy of the file holds fewer.
+    pub fn sealed_rows(&self) -> Result<u64> {
+        self.key()?;
+        let rows: i64 = self.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM revisions) + (SELECT COUNT(*) FROM devices) \
+             + (SELECT COUNT(*) FROM revoked_devices) + (SELECT COUNT(*) FROM epoch_keys)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(rows).unwrap_or_default())
+    }
+
+    /// Given how many of those rows this device last saw its file hold, as
+    /// kept where the file cannot set it back, whether the file now holds
+    /// fewer: an earlier copy of it was put in its place. That is recorded
+    /// and said as rows taken out are, until the owner confirms it.
+    pub fn note_set_back(&mut self, seen: u64) -> Result<bool> {
+        if self.sealed_rows()? >= seen {
+            return Ok(false);
+        }
+        self.connection
+            .execute("UPDATE vault_meta SET rows_changed=1 WHERE singleton=1", [])?;
+        self.header = read_header(&self.connection)?;
+        Ok(true)
+    }
+
     /// Unwraps this device's recipient secret, creating it for a vault from
     /// before format 7.
     fn recipient_secret_or_create(&mut self, root_key: &SecretKey) -> Result<SecretKey> {

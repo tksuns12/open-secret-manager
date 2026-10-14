@@ -21,6 +21,9 @@ mod network;
 #[cfg(test)]
 mod network_tests;
 mod qr;
+mod rows_seen;
+#[cfg(test)]
+mod rows_seen_tests;
 mod settings;
 #[cfg(test)]
 mod side_files_tests;
@@ -50,6 +53,9 @@ struct AppState {
     /// What an export the owner chose would add, until the import is
     /// confirmed or dropped. Locking drops it.
     import: Mutex<Option<osm_vault_core::ImportPreview>>,
+    /// What this computer last saw the vault's file hold, kept where the
+    /// file cannot set it back.
+    rows_seen: rows_seen::Checkpoint,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +143,9 @@ async fn lock_everything(state: &AppState) -> bool {
     let mut vault = state.vault.lock().await;
     let unlocked = vault.as_ref().is_some_and(Vault::is_unlocked);
     if let Some(vault) = vault.as_mut() {
+        if unlocked {
+            state.rows_seen.keep_up(vault);
+        }
         vault.lock();
     }
     let archive = state.archive.lock().await.take();
@@ -749,8 +758,9 @@ async fn pending_recovery_key(
         .map(|recovery| recovery.to_string()))
 }
 
-/// Whether the last unlock found records taken out of the vault's file
-/// that the owner has not yet been told of.
+/// Whether the last unlock found records taken out of the vault's file,
+/// or the file set back to an earlier copy, that the owner has not yet
+/// been told of.
 #[tauri::command]
 async fn rows_changed(state: tauri::State<'_, AppState>) -> Result<bool, CommandError> {
     let vault = state.vault.lock().await;
@@ -759,12 +769,14 @@ async fn rows_changed(state: tauri::State<'_, AppState>) -> Result<bool, Command
         .is_some_and(|vault| vault.is_unlocked() && vault.rows_changed()))
 }
 
-/// The owner has seen that records were taken out: stop saying so.
+/// The owner has seen that records were taken out: stop saying so. What
+/// the file holds now is what this computer takes it to hold from here on.
 #[tauri::command]
 async fn confirm_rows_changed(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
     let mut vault = state.vault.lock().await;
     if let Some(vault) = vault.as_mut() {
         vault.confirm_rows_changed()?;
+        state.rows_seen.accept(vault);
     }
     Ok(())
 }
@@ -840,6 +852,9 @@ pub fn run() {
             browser,
             chosen_backup: std::sync::Mutex::new(None),
             import: Mutex::new(None),
+            rows_seen: rows_seen::Checkpoint::new(std::sync::Arc::new(
+                rows_seen::KeychainRowsSeen::default(),
+            )),
         })
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

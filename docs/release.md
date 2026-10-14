@@ -52,10 +52,14 @@ evidence in the delivery matrix and the threat model.
 - While a vault is unlocked, whoever controls that device (an
   administrator, a debugger, malware, the operating system) can read it.
   Copies of secrets in the window's JavaScript cannot be wiped.
-- A vault file can be set back to an earlier copy of the whole file by
-  someone who can write it; the app cannot tell. Rows taken out of the
-  file, or an item set back inside it, are found at the next unlock and
-  reported.
+- Rows taken out of a vault file, or an item set back inside it, are found
+  at the next unlock and reported. On the computer, so is the whole file
+  set back to an earlier copy, from a count kept in the Keychain or the
+  Secret Service; not when the copy differs only by writes that add no
+  item version, device, or key (a password change, for one), nor when the
+  keystore was set back with it, as restoring the whole home folder does.
+  On Linux without a Secret Service, and on the phones, a file set back is
+  not found.
 - The vault locks after five minutes without input and when its window is
   hidden; on macOS and Linux also on sleep, screen lock, and user switch.
   Those last locks were checked through the code (on Linux also in a

@@ -2865,8 +2865,9 @@ fn two_openers_of_one_vault_file_keep_its_seal() {
 /// What the seal does not see: the sealed rows set back to an earlier
 /// moment together with the seal of that moment, the heads made to agree.
 /// That is an older copy of the file in part, and like a whole older copy
-/// it shows nothing; what was added since is gone from this device until
-/// a sync brings it back.
+/// it shows nothing by itself; what was added since is gone from this
+/// device until a sync brings it back. Given the rows the device saw last,
+/// kept outside the file, it is found.
 #[test]
 fn rows_set_back_together_with_their_seal_are_not_seen() {
     let dir = tempdir().unwrap();
@@ -2878,6 +2879,7 @@ fn rows_set_back_together_with_their_seal_are_not_seen() {
         .query_row("SELECT row_seal FROM vault_meta", [], |row| row.get(0))
         .unwrap();
     let after = a.put(login("After")).unwrap();
+    let seen = a.sealed_rows().unwrap();
     drop(a);
     crate::fixture_tests::take_out(
         &path,
@@ -2891,9 +2893,90 @@ fn rows_set_back_together_with_their_seal_are_not_seen() {
         .execute("UPDATE vault_meta SET row_seal=?", [seal_then])
         .unwrap();
     drop(connection);
-    let a = reopened(&path, "password");
+    let mut a = reopened(&path, "password");
     assert!(!a.rows_changed());
     assert!(matches!(a.get(&after.item_id), Err(Error::NotFound)));
+    assert!(a.note_set_back(seen).unwrap());
+    assert!(a.rows_changed());
+}
+
+/// A whole earlier copy of the file put in its place holds fewer of the
+/// rows that are never removed than the device last saw, and that is said,
+/// at every unlock, until the owner confirms it; what was added since comes
+/// back from another device. Each write that adds a version, a device, or
+/// a key counts; a revision staged while locked does not, until it is
+/// taken in.
+#[test]
+fn a_whole_earlier_copy_of_the_file_holds_fewer_rows_than_were_seen() {
+    let dir = tempdir().unwrap();
+    let a_path = dir.path().join("a.db");
+    let copy = dir.path().join("copy.db");
+    let (mut a, _) = Vault::create(&a_path, "password").unwrap();
+    let mut b = Vault::join(
+        dir.path().join("b.db"),
+        "password",
+        crate::PendingDevice::generate(),
+        a.enrollment_material().unwrap(),
+    )
+    .unwrap();
+    let made = a.sealed_rows().unwrap();
+    authorize(&mut a, &b);
+    let authorized = a.sealed_rows().unwrap();
+    assert!(authorized > made);
+    let kept = a.put(login("Kept")).unwrap();
+    let rows_then = a.sealed_rows().unwrap();
+    assert_eq!(rows_then, authorized + 1);
+    drop(a);
+    std::fs::copy(&a_path, &copy).unwrap();
+
+    // Later: an edit, a deletion, an item from the other device, and one
+    // staged while locked, which counts only once taken in.
+    let mut a = reopened(&a_path, "password");
+    let mut edited = a.get(&kept.item_id).unwrap().item;
+    edited.notes = "edited".into();
+    let edit = a.update(edited, &kept.revision).unwrap();
+    let gone = a.put(login("Gone later")).unwrap();
+    a.delete(&gone.item_id, &gone.revision).unwrap();
+    deliver(&mut b, &a);
+    b.put(login("From b")).unwrap();
+    deliver(&mut a, &b);
+    assert_eq!(a.sealed_rows().unwrap(), rows_then + 4);
+    let staged = b.put(login("Staged")).unwrap();
+    a.lock();
+    a.stage_revision(wire(&b, &staged.revision)).unwrap();
+    a.unlock("password").unwrap();
+    assert_eq!(a.sealed_rows().unwrap(), rows_then + 4);
+    a.process_staged().unwrap();
+    let seen = a.sealed_rows().unwrap();
+    assert_eq!(seen, rows_then + 5);
+    // The file as the device left it, or one it has seen less of, is not
+    // set back.
+    assert!(!a.note_set_back(seen).unwrap());
+    assert!(!a.note_set_back(rows_then).unwrap());
+    assert!(!a.rows_changed());
+    drop(a);
+
+    // The earlier copy put back: its seal holds, and the count says it.
+    std::fs::copy(&copy, &a_path).unwrap();
+    let mut a = reopened(&a_path, "password");
+    assert!(!a.rows_changed());
+    assert_eq!(a.sealed_rows().unwrap(), rows_then);
+    assert_eq!(a.get(&kept.item_id).unwrap().revision, kept.revision);
+    assert!(a.note_set_back(seen).unwrap());
+    assert!(a.rows_changed());
+    drop(a);
+    assert!(reopened(&a_path, "password").rows_changed());
+
+    // A sync brings back what the copy lacks; the owner confirms.
+    let mut a = reopened(&a_path, "password");
+    deliver(&mut a, &b);
+    assert_eq!(a.get(&kept.item_id).unwrap().revision, edit.revision);
+    assert!(a.sealed_rows().unwrap() >= seen);
+    a.confirm_rows_changed().unwrap();
+    drop(a);
+    assert!(!reopened(&a_path, "password").rows_changed());
+    let locked = Vault::open(&a_path).unwrap();
+    assert!(matches!(locked.sealed_rows(), Err(Error::Locked)));
 }
 
 #[test]

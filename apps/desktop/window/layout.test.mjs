@@ -37,6 +37,7 @@ for (const size of SIZES) {
     await page.getByRole("button", { name: /Unlock/ }).click();
     const rows = page.locator(".rows-changed-card");
     await assertAtBottomRight(page, rows, size);
+    await rows.getByText("Something in this vault's file was taken out, changed, or set back").waitFor();
     // The warning comes first; the recovery key waits behind it.
     assert.equal(await page.locator(".recovery-card").count(), 1);
     await rows.getByRole("button", { name: "I understand" }).click();

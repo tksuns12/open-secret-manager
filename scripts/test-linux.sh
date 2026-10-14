@@ -4,8 +4,9 @@
 # own) and what it puts on the clipboard, as another program reads it on a
 # virtual display, and then as a Wayland program reads it under a headless
 # Sway (which offers the data-control protocol, as wlroots and KDE do); and
-# the keystore that seals the device's TLS key, with no Secret Service and
-# with GNOME Keyring's on a session bus of the test's own.
+# the keystore that seals the device's TLS key and keeps the count of what
+# the vault's file held, with no Secret Service and with GNOME Keyring's on
+# a session bus of the test's own.
 #
 #   scripts/test-linux.sh
 #
@@ -60,9 +61,10 @@ container=$(docker create --platform "$platform" osm-linux-test sh -c '
     done
     env -u DISPLAY XDG_RUNTIME_DIR=/tmp/wayland WAYLAND_DISPLAY=wayland-1 OSM_TEST_WAYLAND=1 \
         cargo test --locked -p osm-desktop-session --test wayland
-    env -u DBUS_SESSION_BUS_ADDRESS cargo test --locked --lib keystore::tests::without -- --ignored
+    env -u DBUS_SESSION_BUS_ADDRESS cargo test --locked --lib -- --ignored \
+        keystore::tests::without rows_seen::tests::without
     dbus-run-session -- sh -c "printf unlock | gnome-keyring-daemon --unlock --components=secrets >/dev/null \
-        && cargo test --locked --lib keystore::tests::the_system -- --ignored"')
+        && cargo test --locked --lib -- --ignored keystore::tests::the_system rows_seen::tests::the_system"')
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
 
 git archive --format=tar "$tree" | docker cp - "$container:/src"

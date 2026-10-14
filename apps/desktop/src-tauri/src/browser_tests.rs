@@ -52,6 +52,9 @@ fn shell(dir: &Path, home: &Path, host: Option<PathBuf>) -> App<MockRuntime> {
             network,
             chosen_backup: std::sync::Mutex::new(None),
             import: Mutex::new(None),
+            rows_seen: crate::rows_seen::Checkpoint::new(std::sync::Arc::new(
+                crate::rows_seen::MemoryRowsSeen::default(),
+            )),
         })
         .build(mock_context(noop_assets()))
         .unwrap()

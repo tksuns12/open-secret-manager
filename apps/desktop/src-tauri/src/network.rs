@@ -754,6 +754,9 @@ async fn maintain<R: Runtime>(app: &AppHandle<R>, control: &Control) {
                     }
                     Err(error) => failure = Some(error.to_string()),
                 }
+                if vault_changed {
+                    app_state.rows_seen.keep_up(vault);
+                }
                 grants = control::grant_requests(vault, &state).unwrap_or_default();
             }
         }
@@ -973,6 +976,15 @@ pub async fn after_create<R: Runtime>(app: &AppHandle<R>) {
 /// membership, only then is what arrived while locked verified, and then
 /// this device catches up with the others.
 pub async fn after_unlock<R: Runtime>(app: &AppHandle<R>) {
+    // Before anything received is taken in, which adds to the file and
+    // would hide an earlier copy put in its place.
+    {
+        let app_state = app.state::<AppState>();
+        let mut vault = app_state.vault.lock().await;
+        if let Some(vault) = vault.as_mut().filter(|vault| vault.is_unlocked()) {
+            app_state.rows_seen.check(vault);
+        }
+    }
     match ensure_control(app).await {
         Some(control) => maintain(app, &control).await,
         None => {
@@ -1140,7 +1152,10 @@ pub fn schedule_sync<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(SYNC_DELAY).await;
         if network(&app).sync_generation.load(Ordering::SeqCst) == generation {
+            // Every write of the owner's, and every unlock, leads here.
+            crate::rows_seen::keep_up(&app).await;
             let _ = sync_with_members(&app).await;
+            crate::rows_seen::keep_up(&app).await;
         }
     });
 }
