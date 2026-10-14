@@ -8,6 +8,7 @@ import android.service.autofill.Dataset
 import android.view.WindowManager
 import android.view.autofill.AutofillManager
 import android.view.autofill.AutofillValue
+import android.widget.Toast
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -21,6 +22,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -37,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
@@ -60,8 +63,9 @@ import org.opensecretmanager.vault.ItemSummary
  * Where the owner fills a login into another app or a page, after choosing
  * "unlock to fill" in it: unlock, see who asks, choose the login. A page of
  * a trusted browser is offered the logins saved for its origin and nothing
- * else; an app is offered the logins the owner chose for it before, or the
- * owner chooses one, warned. A form that asks for a one-time code is offered
+ * else; an app is offered the logins the owner chose for it before, is
+ * suggested those saved for a site that names it as its app ([LinkedSites]),
+ * or the owner chooses one, warned. A form that asks for a one-time code is offered
  * only logins that have one, and gets the login's current code; a form with
  * a password field and a code field gets both. A login the owner chose in
  * the system's list while the vault was unlocked ([ITEM]) is filled without
@@ -175,10 +179,15 @@ private fun FillScreen(
         session.fill(item, (requester as? Requester.Web)?.origin, login = !codeOnly, code = withCode, done = onFill)
     }
     // Fills what the form asks for from a login; one chosen for an app from
-    // every login is remembered for it.
+    // every login is remembered for it, and the owner told so, as nothing
+    // asks to save a login that was filled.
+    val context = LocalContext.current
     val fill: (ItemSummary, String?, Boolean) -> Unit = { item, origin, chosenNow ->
         session.fill(item.id, origin, login = !codeOnly, code = withCode) { credentials, code ->
-            if (chosenNow && requester is Requester.App) appLogins.remember(requester, item.id)
+            if (chosenNow && requester is Requester.App) {
+                appLogins.remember(requester, item.id)
+                Toast.makeText(context.applicationContext, "${item.title} is offered in ${requester.label} from now on", Toast.LENGTH_LONG).show()
+            }
             onFill(credentials, code)
         }
     }
@@ -291,19 +300,43 @@ private fun AppLoginsList(
         val all = items.filter { it.kind == ItemKind.LOGIN }
         if (codeOnly) session.withOneTimeCodes(all) { logins = it } else logins = all
     }
+    val context = LocalContext.current
+    val sites = remember(requester) { LinkedSites.of(context, requester.packageName) }
     val offered = logins ?: return
     val chosen = appLogins.chosen(requester)
     val remembered = offered.filter { it.id in chosen }
+    // Saved for a site that says this app is its own: suggested, and the
+    // app's once the owner chooses one.
+    val linked = offered.filter { it.id !in chosen && LinkedSites.cover(sites, it.url) }
     var choosing by remember(requester) { mutableStateOf(false) }
     if (!choosing) {
         Column {
             LoginRows(remembered, Modifier.weight(1f, fill = false)) { item -> fill(item, null, false) }
+            if (linked.isNotEmpty()) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp)) {
+                    Text(
+                        "For a site that names ${requester.label} as its app",
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.testTag("linked"),
+                    )
+                    Text(
+                        "Android checked with the site that this app is its own. A login you choose here is offered in this app from now on.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                LoginRows(linked, Modifier.weight(1f, fill = false)) { item -> fill(item, null, true) }
+            }
             TextButton(
                 onClick = { choosing = true },
                 modifier = Modifier.padding(horizontal = 12.dp).testTag("choose-another"),
-            ) { Text(if (remembered.isEmpty()) "Choose a login for this app…" else "Choose another login…") }
+            ) { Text(if (remembered.isEmpty() && linked.isEmpty()) "Choose a login for this app…" else "Choose another login…") }
         }
         return
+    }
+    var query by remember(requester) { mutableStateOf("") }
+    val shown = offered.filter {
+        query.isBlank() || it.title.contains(query, ignoreCase = true) || it.username.contains(query, ignoreCase = true) ||
+            it.url.contains(query, ignoreCase = true)
     }
     Column {
         Text(
@@ -313,7 +346,14 @@ private fun AppLoginsList(
             color = MaterialTheme.colorScheme.error,
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp).testTag("warning"),
         )
-        LoginRows(offered) { item -> fill(item, null, true) }
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            label = { Text("Search") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).testTag("fill-search"),
+        )
+        LoginRows(shown) { item -> fill(item, null, true) }
     }
 }
 

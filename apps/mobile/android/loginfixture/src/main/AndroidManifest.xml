@@ -10,6 +10,15 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- The links of a site, as a site's own app declares them. No
+                 site checks it; a test approves it with `pm set-app-links`. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:host="example.test" />
+            </intent-filter>
         </activity>
         <activity android:name=".CodeActivity" android:exported="true" />
         <activity android:name=".WebLoginActivity" android:exported="true" />

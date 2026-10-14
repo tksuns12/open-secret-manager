@@ -84,6 +84,7 @@ private struct Asker: View {
 
 private struct Logins: View {
     @ObservedObject var model: FillModel
+    @State private var query = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -99,7 +100,17 @@ private struct Logins: View {
                 Text(warning)
                     .foregroundStyle(.red)
                     .accessibilityIdentifier("warning")
-                Rows(logins: all, onChoose: model.fill)
+                // Every login, narrowed as the app's list is.
+                TextField("Search", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("fill-search")
+                Rows(logins: all.filter { login in
+                    query.isEmpty || login.title.localizedCaseInsensitiveContains(query)
+                        || login.username.localizedCaseInsensitiveContains(query)
+                        || login.url.localizedCaseInsensitiveContains(query)
+                }, onChoose: model.fill)
             } else if case .app = model.requester {
                 Button(model.offered.isEmpty ? "Choose a login for this app…" : "Choose another login…") {
                     Task { await model.chooseAny() }

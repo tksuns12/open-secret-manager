@@ -2,6 +2,7 @@ package org.opensecretmanager.app
 
 import android.app.KeyguardManager
 import android.graphics.Bitmap
+import android.os.Build
 import android.os.PowerManager
 import android.os.ParcelFileDescriptor
 import android.view.KeyEvent
@@ -88,6 +89,7 @@ class AutofillTest {
         keyboard.use("PlainKeyboard")
         context.getSharedPreferences("app-logins", 0).edit().clear().commit()
         Requester.trustedForTests.clear()
+        forgetLinks()
         PendingSave.forgetForTests()
         StayUnlocked.millisForTests = 0L
         session.reopenForTests { folder ->
@@ -101,6 +103,7 @@ class AutofillTest {
     @After
     fun putTheServiceBack() {
         Requester.trustedForTests.clear()
+        forgetLinks()
         PendingSave.forgetForTests()
         StayUnlocked.millisForTests = null
         shell("am force-stop $FIXTURE")
@@ -109,6 +112,16 @@ class AutofillTest {
         animationScales.zip(previousScales).forEach { (name, scale) ->
             shell(if (scale.isEmpty() || scale == "null") "settings delete global $name" else "settings put global $name $scale")
         }
+    }
+
+    /**
+     * No site says the stand-in app is its own, and the owner set it to open
+     * no site's links: the stand-in declares the links of `example.test`,
+     * which a test approves as if the site had named it.
+     */
+    private fun forgetLinks() {
+        shell("pm set-app-links --package $FIXTURE 0 all")
+        shell("pm set-app-links-user-selection --user cur --package $FIXTURE false all")
     }
 
     /** Fails with [message], leaving what the screen shows, its window tree, and the message in [FAILURES]. */
@@ -358,6 +371,11 @@ class AutofillTest {
         find(mine("choose-another")).click()
         find(mine("warning"))
         capture("app-choose")
+        // Every login is listed, and a search narrows them, as in the app.
+        find(mine("fill:Mail"))
+        find(mine("fill-search")).text = "BAN"
+        device.wait(Until.gone(mine("fill:Mail")), 5_000)
+        assertNull(device.findObject(mine("fill:Mail")))
         find(mine("fill:Bank")).click()
         assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
         // The fill screen let the app be seen beneath it, which only paused
@@ -373,6 +391,41 @@ class AutofillTest {
         find(mine("fill:Bank")).click()
         assertFilled("account 42|p@ss \"quoted\" \\ and 🔑")
         capture("app-filled")
+        assertLockedAgain()
+    }
+
+    @Test
+    fun anAppASiteNamesAsItsOwnIsSuggestedTheLoginsSavedForThatSite() {
+        assumeTrue("app links are verified for each site from Android 12 on", Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+        // The owner set the app to open the site's links: that is not the
+        // site saying the app is its own, and nothing is suggested.
+        shell("pm set-app-links-user-selection --user cur --package $FIXTURE true example.test")
+        askToFill("NativeLoginActivity")
+        find(mine("choose-another"))
+        assertNull(device.findObject(mine("linked")))
+        assertNull(device.findObject(mine("fill:Mail")))
+        find(mine("cancel")).click()
+        assertLockedAgain()
+
+        // Verified for example.test, as Android does once the site names
+        // the app: Mail, saved for mail.example.test, is suggested. Bank,
+        // saved for a port of its own on a host under it, is not.
+        shell("pm set-app-links --package $FIXTURE 2 example.test")
+        askToFill("NativeLoginActivity", name = "linked")
+        find(mine("linked"))
+        capture("app-linked")
+        assertNull(device.findObject(mine("fill:Bank")))
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertLockedAgain()
+
+        // Chosen, it is the app's, offered with the site no longer saying so.
+        forgetLinks()
+        askToFill("NativeLoginActivity")
+        find(mine("fill:Mail"))
+        assertNull(device.findObject(mine("linked")))
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
         assertLockedAgain()
     }
 

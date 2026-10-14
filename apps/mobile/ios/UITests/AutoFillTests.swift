@@ -28,6 +28,12 @@ final class AutoFillTests: UITestCase {
         unlock(in: fixture)
         XCTAssert(fixture.staticTexts["warning"].waitForExistence(timeout: 30))
         capture("fill-4-choose")
+        // Every login is listed, and a search narrows them, as in the app.
+        XCTAssert(fixture.buttons["fill:Mail"].waitForExistence(timeout: 30))
+        let search = fixture.textFields["fill-search"]
+        search.tap()
+        search.typeText("BAN")
+        XCTAssert(fixture.buttons["fill:Mail"].waitForNonExistence(timeout: 10))
         fixture.buttons["fill:Bank"].waitAndTap()
         XCTAssert(fixture.staticTexts["filled"].waitForLabel("account 42|p@ss \"quoted\" \\ and 🔑"))
         capture("fill-5-filled")
