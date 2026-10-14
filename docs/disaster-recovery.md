@@ -22,8 +22,9 @@ what it did not cover.
   key together are the vault) and apart from your devices, for example on a
   USB drive kept elsewhere. Changes made after a backup are not in it, so
   make a new one after important changes. The app never replaces a file: a
-  new backup needs a new name. When this computer has not saved a backup in
-  30 days, a line above the list says so, with *Back up*.
+  new backup needs a new name. When no device of the vault has saved a
+  backup in 30 days, or a day after this computer began with a vault never
+  backed up, a line above the list says so, with *Back up*.
 - **Each device's password.** Each device has its own; forgetting one is
   recoverable with the recovery key (below).
 
@@ -52,8 +53,8 @@ they join.
 
 ## What these steps do not protect against
 
-- A backup is as old as the moment it was made. The app does not remind you
-  to make one and does not keep track of when you last did.
+- A backup is as old as the moment it was made. The computer reminds you
+  only 30 days after the last one, and the phones do not remind you.
 - Losing every device and every backup, or every backup and the recovery
   key, loses the vault. There is no copy anywhere else, by design.
 - Anyone who has the recovery key and a backup, or the key and a device's

@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import net from "node:net";
 import { after, test } from "node:test";
-import { addLogin, By, createVault, device, fill, fillIn, openDevices, press, row, shows, textOf, unlock, waitFor } from "./harness.mjs";
+import { addLogin, By, createVault, device, fill, fillIn, openDevices, PATIENCE_MS, press, row, shows, textOf, unlock, waitFor } from "./harness.mjs";
 
 const running = new Set();
 after(async () => {
@@ -21,11 +21,20 @@ const SYNC_PORT = 47_820;
 /**
  * Keeps the sync port taken while `during` runs, so that a device started
  * then listens elsewhere, as it would beside another device on one
- * address.
+ * address. A device just stopped can hold the port a moment longer, while
+ * its process ends, so the port is asked for until it is free.
  */
 async function offTheSyncPort(during) {
   const holder = net.createServer((socket) => socket.destroy());
-  await new Promise((resolve, reject) => holder.once("error", reject).listen(SYNC_PORT, "0.0.0.0", resolve));
+  for (const asked = Date.now(); ; ) {
+    try {
+      await new Promise((resolve, reject) => holder.once("error", reject).listen(SYNC_PORT, "0.0.0.0", resolve));
+      break;
+    } catch (error) {
+      if (error.code !== "EADDRINUSE" || Date.now() - asked > PATIENCE_MS) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
   try {
     return await during();
   } finally {

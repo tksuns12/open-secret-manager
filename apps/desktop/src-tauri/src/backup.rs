@@ -13,7 +13,8 @@
 //! vault in `backups.json`, and since Phase 15 in the vault itself, which
 //! syncs it to the vault's other devices, so that the window can remind the
 //! owner once [`REMIND_AFTER_DAYS`] have passed without one from any of
-//! them.
+//! them, or [`FIRST_REMIND_AFTER_DAYS`] for a vault none of them has ever
+//! backed up.
 
 use std::path::{Path, PathBuf};
 
@@ -164,6 +165,10 @@ pub(crate) async fn write(state: &AppState, path: &Path) -> Result<Saved, Comman
 
 /// Days without a backup after which the window reminds of one.
 pub const REMIND_AFTER_DAYS: u64 = 30;
+/// The same for a vault never backed up, counted from the device's first
+/// look: until its first backup, the vault is on its devices alone, so the
+/// owner is reminded the day after, not a month after.
+pub const FIRST_REMIND_AFTER_DAYS: u64 = 1;
 const DAY: u64 = 86_400;
 
 /// When this device last saved a backup, kept beside the vault in
@@ -188,7 +193,8 @@ pub struct BackupAge {
     /// as the vault noted it, from another; none if there is none.
     pub(crate) days: Option<u64>,
     /// Whether to remind the owner: [`REMIND_AFTER_DAYS`] or more since that
-    /// backup, or since the device began counting without one.
+    /// backup, or [`FIRST_REMIND_AFTER_DAYS`] since the device began counting
+    /// without one.
     pub(crate) due: bool,
     /// The device that saved the latest backup, as the first eight hex
     /// digits of its ID, when it is another than this one.
@@ -265,9 +271,14 @@ pub(crate) fn backup_age_with(
         .as_ref()
         .map(|(last, _)| at.saturating_sub(*last) / DAY);
     let counted = at.saturating_sub(last.as_ref().map_or(record.since, |(last, _)| *last)) / DAY;
+    let after = if last.is_some() {
+        REMIND_AFTER_DAYS
+    } else {
+        FIRST_REMIND_AFTER_DAYS
+    };
     BackupAge {
         days,
-        due: recovery && counted >= REMIND_AFTER_DAYS,
+        due: recovery && counted >= after,
         device: last.and_then(|(_, device)| device),
     }
 }
@@ -373,7 +384,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_backup_is_due_thirty_days_after_the_last_one_or_after_counting_began() {
+    fn a_backup_is_due_thirty_days_after_the_last_one_or_a_day_after_counting_began() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault.sqlite3");
         let start = 1_800_000_000;
@@ -383,9 +394,11 @@ mod tests {
             (age.days, age.due)
         };
         let age = |at| age_of([1; 32], true, at);
-        // Never backed up here: counting begins at the first look.
+        // Never backed up: counting begins at the first look, and reminds
+        // a day later.
         assert_eq!(age(start), (None, false));
-        assert_eq!(age(start + 30 * DAY - 1), (None, false));
+        assert_eq!(age(start + DAY - 1), (None, false));
+        assert_eq!(age(start + DAY), (None, true));
         assert_eq!(age(start + 30 * DAY), (None, true));
         // A backup starts the count again, by whole days.
         note_backup(&vault, &[1; 32], start + 31 * DAY).unwrap();
@@ -398,7 +411,7 @@ mod tests {
         assert_eq!(age(start), (Some(0), false));
         // Another vault in its place starts again; its first look is noted.
         assert_eq!(age_of([2; 32], true, start + 100 * DAY), (None, false));
-        assert_eq!(age_of([2; 32], true, start + 130 * DAY), (None, true));
+        assert_eq!(age_of([2; 32], true, start + 101 * DAY), (None, true));
         // What another program left there is not taken for a record.
         std::fs::write(dir.path().join("backups.json"), b"not json").unwrap();
         assert_eq!(age_of([2; 32], true, start + 200 * DAY), (None, false));
@@ -417,6 +430,7 @@ mod tests {
         // Counting began here at the first look; another device's later
         // backup puts the reminder off, and says whose it was.
         assert_eq!(age(None, start), (None, false, None));
+        assert_eq!(age(None, start + DAY), (None, true, None));
         assert_eq!(age(None, start + 30 * DAY), (None, true, None));
         let noted = Some((start + 29 * DAY, other.clone()));
         assert_eq!(

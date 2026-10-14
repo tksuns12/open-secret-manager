@@ -52,8 +52,10 @@ evidence in the delivery matrix and the threat model.
 - While a vault is unlocked, whoever controls that device (an
   administrator, a debugger, malware, the operating system) can read it.
   Copies of secrets in the window's JavaScript cannot be wiped.
-- A vault file can be rolled back to an earlier copy, or have rows taken
-  out, by someone who can write it; the app cannot tell.
+- A vault file can be set back to an earlier copy of the whole file by
+  someone who can write it; the app cannot tell. Rows taken out of the
+  file, or an item set back inside it, are found at the next unlock and
+  reported.
 - The vault locks after five minutes without input and when its window is
   hidden; on macOS and Linux also on sleep, screen lock, and user switch.
   Those last locks were checked through the code (on Linux also in a
@@ -105,7 +107,10 @@ evidence in the delivery matrix and the threat model.
 - A backup is as old as the moment it was made, and holds every item's
   history, earlier versions of deleted items included. Whoever has the
   recovery key and a backup has the vault as it was then.
-- The app does not remind the owner to back up.
+- The computer reminds the owner to back up 30 days after the latest
+  backup from any device of the vault, or the day after it began counting
+  for a vault never backed up; the reminder cannot be put off, only
+  answered with a backup. The phones neither save backups nor remind.
 
 ## How to verify a download
 

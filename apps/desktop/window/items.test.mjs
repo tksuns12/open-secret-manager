@@ -170,6 +170,13 @@ test("a vault without a recent backup says so in one quiet line", async () => {
   assert.equal(await line.count(), 0);
   assert.deepEqual(errors, []);
 
+  // A vault never backed up says that instead.
+  const none = await window.open("?no-backup", SMALLEST_SIZE);
+  const first = none.page.locator(".backup-reminder");
+  await first.waitFor();
+  assert.equal((await first.textContent()).trim(), "No backup of this vault yetBack up");
+  assert.deepEqual(none.errors, []);
+
   // A recent backup says nothing.
   const recent = await window.open();
   await recent.page.locator(".entry-row").first().waitFor();

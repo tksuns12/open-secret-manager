@@ -87,7 +87,7 @@ export type ImportSummary = {
 export type BackupAge = {
   /** Whole days since the latest backup of the vault, from this device or, as the vault noted it, from another; `null` if there is none. */
   days: number | null;
-  /** Whether to remind: 30 days or more since that backup, or since this device began counting without one. Never on a device without recovery, which cannot save one. */
+  /** Whether to remind: 30 days or more since that backup, or a day since this device began counting for a vault never backed up. Never on a device without recovery, which cannot save one. */
   due: boolean;
   /** The device that saved the latest backup, when another than this one. */
   device: string | null;

@@ -1,7 +1,7 @@
 // A backup saved through the system's file dialog, and restored from it on
 // another device that has no vault, as the owner would after losing every
 // device: the real app, its real dialogs, its real files. Before it, the
-// window reminds of a backup 30 days without one.
+// window reminds of a backup the day after it began counting without one.
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -20,16 +20,16 @@ test("a backup is saved through the system's dialog and restored on a device wit
   const recoveryKey = await createVault(first.window, "first device password");
   await addLogin(first.window, "Backed up", "someone", "a password kept in the backup");
 
-  // The device began counting at the unlock, with no backup; set 31 days
+  // The device began counting at the unlock, with no backup; set two days
   // back, the next unlock reminds of one, in one line.
   const record = path.join(vaultFolder(first), "backups.json");
   await first.window.wait(async () => existsSync(record), PATIENCE_MS);
   assert.equal((await first.window.findElements(By.css(".backup-reminder"))).length, 0);
   const counted = JSON.parse(readFileSync(record, "utf8"));
   assert.equal(counted.lastBackup, null);
-  writeFileSync(record, JSON.stringify({ ...counted, since: counted.since - 31 * 86_400 }));
+  writeFileSync(record, JSON.stringify({ ...counted, since: counted.since - 2 * 86_400 }));
   await unlockAgain(first.window, "first device password");
-  await shows(first.window, "No backup made on this computer yet");
+  await shows(first.window, "No backup of this vault yet");
 
   await press(first.window, "Back up", { within: '//div[contains(@class, "backup-reminder")]' });
   await press(first.window, "Choose where to save");

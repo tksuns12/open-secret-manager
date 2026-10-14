@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use proptest::prelude::*;
 
 use crate::archive::archived_at;
-use crate::backup::{backup_age_at, note_backup, REMIND_AFTER_DAYS};
+use crate::backup::{backup_age_at, note_backup, FIRST_REMIND_AFTER_DAYS, REMIND_AFTER_DAYS};
 use crate::network::{finish_interrupted_recovery, putting_away_note, PutAway, PUTTING_AWAY};
 use crate::settings::{self, AUTO_LOCK_CHOICES};
 
@@ -343,7 +343,8 @@ proptest! {
                 let last = record["lastBackup"].as_u64();
                 prop_assert_eq!(age.days, last.map(|last| at.saturating_sub(last) / DAY));
                 let counted = at.saturating_sub(last.unwrap_or(record["since"].as_u64().unwrap())) / DAY;
-                prop_assert_eq!(age.due, recovery && counted >= REMIND_AFTER_DAYS);
+                let after = if last.is_some() { REMIND_AFTER_DAYS } else { FIRST_REMIND_AFTER_DAYS };
+                prop_assert_eq!(age.due, recovery && counted >= after);
             }
             None => {
                 prop_assert_eq!((age.days, age.due), (None, false));

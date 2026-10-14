@@ -19,7 +19,7 @@ async function nativeOnly<T>(cmd: string, args?: unknown): Promise<T> {
  * Whether the preview's address asks for a state the browser preview
  * otherwise never has, so that it can be looked at and tested: as in
  * `/?rows-changed`, `/?recovery-key`, `/?held`, `/?conflict`, `/?devices`, or
- * `/?backup-due`.
+ * `/?backup-due` (or `/?no-backup`).
  * Each shows sample data, no secret.
  */
 function previewAsks(what: string): boolean {
@@ -265,10 +265,11 @@ export const bridge: DesktopBridge = {
   },
   putUnreadableAway: () => nativeOnly("put_unreadable_away"),
   saveBackup: () => nativeOnly("save_backup"),
-  /** The preview's last backup was 45 days ago with `?backup-due`, and is recent otherwise. */
+  /** The preview's last backup was 45 days ago with `?backup-due`, there is none with `?no-backup`, and it is recent otherwise. */
   async backupAge() {
     const invoke = native();
     if (invoke) return (await invoke("backup_age")) as BackupAge;
+    if (previewAsks("no-backup")) return { days: null, due: true, device: null };
     return previewAsks("backup-due") ? { days: 45, due: true, device: null } : { days: 2, due: false, device: null };
   },
   chooseBackup: () => nativeOnly("choose_backup"),
