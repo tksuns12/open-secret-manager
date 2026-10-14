@@ -275,6 +275,20 @@ impl Book {
         self.save(device);
     }
 
+    /// Forgets every address of `device`.
+    fn forget(&mut self, device: DeviceId) {
+        if self.known.remove(&device).is_none() {
+            return;
+        }
+        if let Some(store) = &self.store {
+            // As when storing one, failing to forget a hint is not an error.
+            let _ = store.execute(
+                "DELETE FROM device_addresses WHERE device_id = ?1",
+                [device_id_to_bytes(device).as_slice()],
+            );
+        }
+    }
+
     fn save(&self, device: DeviceId) {
         let (Some(store), Some(list)) = (&self.store, self.known.get(&device)) else {
             return;
@@ -442,6 +456,13 @@ impl AddressBook {
     pub(crate) fn failed(&self, device: DeviceId, address: &str) {
         if let Ok(mut book) = self.book.lock() {
             book.failed(device, address);
+        }
+    }
+
+    /// Forgets every address of `device`, here and in the store.
+    pub fn forget(&self, device: DeviceId) {
+        if let Ok(mut book) = self.book.lock() {
+            book.forget(device);
         }
     }
 }
@@ -670,6 +691,23 @@ impl MemberEndpoint {
         own
     }
 
+    /// Forgets the addresses of the devices `state`, this device's committed
+    /// control state, records as removed, which are never dialled again,
+    /// and any kept for this device itself, as builds before 2026-10-13 kept
+    /// what others said of it. Call it whenever the state changes; nothing
+    /// is written when there is nothing to forget.
+    pub fn forget_departed(&self, state: &ControlState) {
+        let own = self.pin();
+        let itself = state.members().into_iter().filter(|device| {
+            state
+                .node(*device)
+                .is_some_and(|node| node.transport_pin == own)
+        });
+        for device in state.removed.keys().copied().chain(itself) {
+            self.inner.addresses.forget(device);
+        }
+    }
+
     /// Whether a member has told this device that the vault's devices
     /// removed it. A removed device may never receive the log entry that
     /// completes its removal, so this is how it finds out.
@@ -745,7 +783,7 @@ impl MemberEndpoint {
     /// contacts came from and its pin: the addresses it names for itself are
     /// its own ([`AddressBook::claim`]), and those it names for others are
     /// hints. What a contact says of this device is not kept: it knows its
-    /// own addresses.
+    /// own addresses; nor of a removed device.
     fn take_in(
         &self,
         contacts: &[MemberContact],
@@ -767,7 +805,13 @@ impl MemberEndpoint {
             let Some(address) = &contact.address else {
                 continue;
             };
-            if contact.transport_pin == own {
+            // Nor what a member that has not yet learned of a removal says
+            // of the removed device, which is never dialled.
+            if contact.transport_pin == own
+                || directory
+                    .removed_device_for_pin(&contact.transport_pin)
+                    .is_some()
+            {
                 continue;
             }
             let device = device_id_from_bytes(contact.device_id);

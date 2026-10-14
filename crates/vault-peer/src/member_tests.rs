@@ -445,6 +445,16 @@ async fn the_control_plane_runs_between_devices_over_pinned_tls() {
     for device in [&b, &c] {
         assert_eq!(device.state().epoch, 2);
         assert_eq!(device.state().removed.get(&1), Some(&survivor.id));
+        // What the apps do when the state changes: the removed device's
+        // addresses go, and any this device kept for itself, as builds
+        // before 2026-10-13 kept what others said of it.
+        assert!(!device.addresses.all(a.id).is_empty());
+        device.addresses.observe(device.id, "192.0.2.50:47820");
+        device.endpoint.forget_departed(&device.state());
+        assert_eq!(device.addresses.all(a.id), Vec::<String>::new());
+        assert_eq!(device.addresses.all(device.id), Vec::<String>::new());
+        let other = if device.id == b.id { &c } else { &b };
+        assert!(!device.addresses.all(other.id).is_empty());
     }
 
     // The removed device comes back: its certificate is no longer accepted,
@@ -464,7 +474,7 @@ async fn the_control_plane_runs_between_devices_over_pinned_tls() {
             None::<DeviceId>
         );
         // Nothing it says is taken in, such as where it now listens.
-        assert_ne!(device.addresses.get(a.id), a.contact().address);
+        assert_eq!(device.addresses.all(a.id), Vec::<String>::new());
     }
     assert!(a.endpoint.told_removed());
     tokio::time::sleep(Duration::from_secs(3)).await;

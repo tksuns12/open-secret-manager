@@ -894,7 +894,7 @@ fn a_removed_device_is_reset_and_joins_again() {
     let finished = record(&app_a, "pairing-finished");
     let resets = record(&app_b, "device-reset");
     let (a, b) = (app_a.handle().clone(), app_b.handle().clone());
-    let b_dir = dir_b.path().to_owned();
+    let (a_dir, b_dir) = (dir_a.path().to_owned(), dir_b.path().to_owned());
 
     tauri::async_runtime::block_on(async move {
         crate::create_vault(PASSWORD.into(), a.state(), a.clone())
@@ -909,6 +909,7 @@ fn a_removed_device_is_reset_and_joins_again() {
         .await;
         let old_b = devices(&b).await.this_device.unwrap();
         let old_vault_on_b = vault_id(&b).await;
+        assert!(addresses_kept(&a_dir, &old_b) > 0);
         // B has an edit that never reaches A.
         put(&b, "Only on B").await;
 
@@ -931,6 +932,9 @@ fn a_removed_device_is_reset_and_joins_again() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         put(&a, "After removal").await;
+        // A removed device is never dialled again, so its addresses go,
+        // from the store too.
+        assert_eq!(addresses_kept(&a_dir, &old_b), 0);
 
         // As soon as B learns of it, B is reset: its copy is moved to an
         // archive folder, untouched, and B is a device without a vault.
@@ -1071,6 +1075,19 @@ fn a_removed_device_is_reset_and_joins_again() {
             network::shutdown(app).await;
         }
     });
+}
+
+/// How many addresses the peer store in `dir` keeps for `device`, as the
+/// panel names it in hex.
+fn addresses_kept(dir: &Path, device: &str) -> i64 {
+    rusqlite::Connection::open(dir.join("peers.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM device_addresses WHERE lower(hex(device_id)) = ?1",
+            [device.to_lowercase()],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 /// Marks a device store as a later version's, as `claim_store_version`

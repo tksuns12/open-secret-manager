@@ -1050,6 +1050,7 @@ impl Runtime {
     /// keys they lack.
     async fn maintain(&self, control: &Control) {
         let state = control.node.state();
+        control.endpoint.forget_departed(&state);
         let mut removed = control.endpoint.told_removed();
         let mut grants = Vec::new();
         let mut pending = None;

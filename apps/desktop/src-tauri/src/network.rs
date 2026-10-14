@@ -726,6 +726,7 @@ async fn watch<R: Runtime>(app: AppHandle<R>, control: Arc<Control>) {
 async fn maintain<R: Runtime>(app: &AppHandle<R>, control: &Control) {
     let net = network(app);
     let state = control.node.state();
+    control.endpoint.forget_departed(&state);
     let app_state = app.state::<AppState>();
     let mut removed = control.endpoint.told_removed();
     let mut grants = Vec::new();
