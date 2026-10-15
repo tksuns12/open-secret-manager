@@ -13,7 +13,9 @@ import android.widget.TextView
 /**
  * A login page of `origin` (an extra, `https://mail.example.test` if none)
  * in a web view, or, with the extra `page` set to `code`, a page that asks
- * for a one-time code. The page is served from here, so no network is needed;
+ * for a one-time code, or set to `split`, a page whose ID and password are
+ * each in a form of their own, which a web view reports to autofill one at
+ * a time. The page is served from here, so no network is needed;
  * the web view still navigates to the address and reports its domain.
  * Signing in posts the form and shows the page again.
  */
@@ -23,7 +25,11 @@ class WebLoginActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.web_login)
         val origin = intent.getStringExtra("origin") ?: "https://mail.example.test"
-        val html = if (intent.getStringExtra("page") == "code") CODE_PAGE else PAGE
+        val html = when (intent.getStringExtra("page")) {
+            "code" -> CODE_PAGE
+            "split" -> SPLIT_PAGE
+            else -> PAGE
+        }
         val filled = findViewById<TextView>(R.id.filled)
         val page = findViewById<WebView>(R.id.page)
         page.settings.javaScriptEnabled = true
@@ -60,6 +66,17 @@ class WebLoginActivity : Activity() {
             </form>
             <script>
               setInterval(() => fixture.report(username.value, password.value), 200);
+            </script>
+        """.trimIndent()
+
+        val SPLIT_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>input { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
+            <form id="id-form"><input id="userId" type="text" name="userId" placeholder="아이디"></form>
+            <form id="pw-form"><input id="userPw" type="password" name="userPw" placeholder="비밀번호"></form>
+            <script>
+              setInterval(() => fixture.report(userId.value, userPw.value), 200);
             </script>
         """.trimIndent()
 

@@ -93,7 +93,7 @@ class FillActivity : FragmentActivity() {
         // Nothing drawn while it fills: the app that asked stays in sight.
         val background = window.decorView.background
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-        session.fillChosen(chosen, (requester as? Requester.Web)?.origin, login = form.password != null, code = form.oneTimeCode != null) { filled ->
+        session.fillChosen(chosen, (requester as? Requester.Web)?.origin, login = !form.codeOnly, code = form.oneTimeCode != null) { filled ->
             if (filled != null) {
                 finishWith(filled.first, filled.second)
             } else {
@@ -110,7 +110,7 @@ class FillActivity : FragmentActivity() {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 FillScreen(
                     requester = requester,
-                    codeOnly = form.password == null,
+                    codeOnly = form.codeOnly,
                     withCode = form.oneTimeCode != null,
                     chosen = chosen,
                     session = session,
@@ -126,15 +126,21 @@ class FillActivity : FragmentActivity() {
 
     /** Hands what was chosen to the form that asked, which fills it at once. */
     private fun finishWith(credentials: FillCredentials?, code: String?) {
+        val values = buildList {
+            credentials?.let { login ->
+                // An empty username leaves what the owner typed there alone.
+                form.username?.takeIf { login.username.isNotEmpty() }?.let { add(it to login.username) }
+                form.password?.let { add(it to login.password) }
+            }
+            code?.let { value -> form.oneTimeCode?.let { add(it to value) } }
+        }
+        // A login with no username, for a field that asks for the username
+        // alone: nothing to fill.
+        if (values.isEmpty()) return finish()
         val presentation = entry(this, getString(org.opensecretmanager.app.R.string.app_name), credentials?.username)
         @Suppress("DEPRECATION")
         val dataset = Dataset.Builder(presentation).apply {
-            credentials?.let { login ->
-                // An empty username leaves what the owner typed there alone.
-                form.username?.takeIf { login.username.isNotEmpty() }?.let { setValue(it, AutofillValue.forText(login.username)) }
-                form.password?.let { setValue(it, AutofillValue.forText(login.password)) }
-            }
-            code?.let { value -> form.oneTimeCode?.let { setValue(it, AutofillValue.forText(value)) } }
+            values.forEach { (id, value) -> setValue(id, AutofillValue.forText(value)) }
         }.build()
         setResult(RESULT_OK, Intent().putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, dataset))
         finish()

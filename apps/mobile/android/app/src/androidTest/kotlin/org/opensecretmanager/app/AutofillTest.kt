@@ -449,6 +449,32 @@ class AutofillTest {
     }
 
     @Test
+    fun aPageThatReportsItsFieldsOneAtATimeIsFilledFieldByField() {
+        // The ID and the password each in a form of their own, as in the web
+        // view of an app the owner signs in to: the system is told only of
+        // the field that has the focus. The ID is offered the fill, and gets
+        // the username alone.
+        StayUnlocked.millisForTests = 60_000L
+        askToFill("WebLoginActivity", "https://mail.example.test", extras = " --es page split")
+        find(mine("choose-another")).click()
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|")
+        assertStillUnlocked()
+
+        // The password then, from the list under it, with the login chosen
+        // for the page.
+        val fields = device.wait(Until.findObjects(By.clazz("android.widget.EditText").pkg(FIXTURE)), 15_000)
+        if (fields == null || fields.size < 2) fail("the page's two fields: ${fields?.size}")
+        fields[1].click()
+        val mail = device.wait(Until.findObject(By.text("Mail")), 30_000) ?: run {
+            fields[1].click()
+            find(By.text("Mail"), 30_000)
+        }
+        mail.click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+    }
+
+    @Test
     fun aTrustedBrowsersPageIsOfferedTheLoginsSavedForItsOrigin() {
         Requester.trustedForTests += FIXTURE
         askToFill("WebLoginActivity", "https://mail.example.test", name = "web")

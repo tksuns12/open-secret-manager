@@ -22,31 +22,31 @@ import org.opensecretmanager.app.VaultApp
 import org.opensecretmanager.vault.ItemSummary
 
 /**
- * Offers to fill a login form or a one-time code field in another app or a
- * browser, and to save what a login form submitted. While the vault is
- * locked it says nothing of what the vault holds: the only offer is "unlock
- * to fill", which opens [FillActivity], where the owner unlocks and chooses
- * the login. While it is unlocked (for a while after the app or a fill
- * screen was left, see [org.opensecretmanager.app.StayUnlocked]), the
- * system's list names the logins a fill would offer, by title and username,
- * and choosing one fills it at once. A keyboard that asks for them gets the
- * same entries in its strip, and the system's list is not shown (see
- * [Strip]). A save opens [SaveActivity], where the owner unlocks and
- * chooses where it goes.
+ * Offers to fill a login form, a username field alone, or a one-time code
+ * field in another app or a browser, and to save what a login form
+ * submitted. While the vault is locked it says nothing of what the vault
+ * holds: the only offer is "unlock to fill", which opens [FillActivity],
+ * where the owner unlocks and chooses the login. While it is unlocked (for a
+ * while after the app or a fill screen was left, see
+ * [org.opensecretmanager.app.StayUnlocked]), the system's list names the
+ * logins a fill would offer, by title and username, and choosing one fills
+ * it at once. A keyboard that asks for them gets the same entries in its
+ * strip, and the system's list is not shown (see [Strip]). A save opens
+ * [SaveActivity], where the owner unlocks and chooses where it goes.
  */
 class VaultAutofillService : AutofillService() {
     private val requests = AtomicInteger()
 
     override fun onFillRequest(request: FillRequest, cancellationSignal: CancellationSignal, callback: FillCallback) {
         val structure = request.fillContexts.lastOrNull()?.structure
-        val form = structure?.let(Form::parse)
+        // A screen with a username field and no password field is offered
+        // the username alone: the first screen of a sign-in on two screens,
+        // or a page whose fields are each in a form of their own, which a web
+        // view reports one at a time. The system keeps what is typed there
+        // for the save the password's screen asks for.
+        val form = structure?.let { Form.parse(it) ?: Form.usernameScreen(it) }
         if (form == null) {
-            // The first screen of a sign-in on two screens offers nothing to
-            // fill, but the system keeps what is typed there for the save
-            // the next screen asks for.
-            val first = structure?.let(Form::usernameScreen)?.takeIf { it.packageName != packageName }
-            val delayed = first?.let(::delayedSave)
-            callback.onSuccess(delayed?.let { FillResponse.Builder().setSaveInfo(it).build() })
+            callback.onSuccess(null)
             return
         }
         // Not this app's own screens.
@@ -56,7 +56,7 @@ class VaultAutofillService : AutofillService() {
         }
         val usernameEarlier = form.username == null && earlierUsername(request.fillContexts, form) != null
         val requester = Requester.of(this, form)
-        val codeOnly = form.password == null
+        val codeOnly = form.codeOnly
         val strip = if (Build.VERSION.SDK_INT >= 30) request.inlineSuggestionsRequest?.let { Strip(this, it) } else null
         val respond = { logins: List<ItemSummary>? ->
             val response = FillResponse.Builder()
@@ -84,7 +84,7 @@ class VaultAutofillService : AutofillService() {
                 add(more, null, inStrip, null)
             }
             offers.forEach(response::addDataset)
-            saveInfo(form, usernameEarlier)?.let(response::setSaveInfo)
+            (saveInfo(form, usernameEarlier) ?: delayedSave(form))?.let(response::setSaveInfo)
             callback.onSuccess(response.build())
         }
         // What a fill would offer, if the vault is unlocked.
@@ -123,8 +123,9 @@ class VaultAutofillService : AutofillService() {
     }
 
     /**
-     * For the first screen of a sign-in on two screens: no offer to save
-     * there, but the screen kept for the next one's (Android 10 and later).
+     * For a screen with a username field and no password field: no offer to
+     * save there, but the screen kept for the next one's (Android 10 and
+     * later).
      */
     private fun delayedSave(first: Form): SaveInfo? {
         if (Build.VERSION.SDK_INT < 29) return null

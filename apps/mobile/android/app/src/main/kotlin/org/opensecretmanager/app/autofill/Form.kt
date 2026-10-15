@@ -9,7 +9,8 @@ import android.view.autofill.AutofillId
 
 /**
  * What a fill request found on the screen that asks: the fields a login
- * goes into (a username and a password, or a one-time code, or all three),
+ * goes into (a username and a password, or a one-time code, or all three,
+ * or a username alone),
  * the app that shows them, and the web page's domain and scheme if the app
  * said it shows a page: those of the first view that names a domain, past
  * any that names an empty one, as the outermost view of a page in Firefox
@@ -23,6 +24,10 @@ data class Form(
     val password: AutofillId?,
     val oneTimeCode: AutofillId?,
 ) {
+    /** Asks for a one-time code, and neither a username nor a password. */
+    val codeOnly: Boolean
+        get() = username == null && password == null
+
     fun toBundle() = Bundle().apply {
         putString(PACKAGE, packageName)
         putString(WEB_DOMAIN, webDomain)
