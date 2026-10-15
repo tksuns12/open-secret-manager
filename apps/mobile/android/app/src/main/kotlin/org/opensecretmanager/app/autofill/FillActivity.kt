@@ -1,8 +1,10 @@
 package org.opensecretmanager.app.autofill
 
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.service.autofill.Dataset
 import android.view.WindowManager
@@ -70,10 +72,13 @@ import org.opensecretmanager.vault.ItemSummary
  * a password field and a code field gets both. A login the owner chose in
  * the system's list while the vault was unlocked ([ITEM]) is filled without
  * this screen showing, or once unlocked if the vault locked meanwhile. Once
- * this screen goes, the vault locks as when the app is left.
+ * this screen goes, the vault locks as when the app is left. A page of an
+ * app that told of the username alone, or the password alone, gets the
+ * other through [OtherFieldService], if the owner turned it on.
  */
 class FillActivity : FragmentActivity() {
     private lateinit var form: Form
+    private var requester: Requester? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,6 +89,7 @@ class FillActivity : FragmentActivity() {
         form = intent.extras?.let(Form::fromBundle) ?: return finish()
         val session = (application as VaultApp).session
         val requester = Requester.of(this, form)
+        this.requester = requester
         val appLogins = AppLogins(this)
         // Chosen in the list: for an app, only a login the owner chose for it.
         val chosen = intent.getStringExtra(ITEM)?.takeIf { item ->
@@ -126,6 +132,7 @@ class FillActivity : FragmentActivity() {
 
     /** Hands what was chosen to the form that asked, which fills it at once. */
     private fun finishWith(credentials: FillCredentials?, code: String?) {
+        credentials?.let(::fillOther)
         val values = buildList {
             credentials?.let { login ->
                 // An empty username leaves what the owner typed there alone.
@@ -144,6 +151,31 @@ class FillActivity : FragmentActivity() {
         }.build()
         setResult(RESULT_OK, Intent().putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, dataset))
         finish()
+    }
+
+    /**
+     * A page of an app that told of a login's username alone, or its
+     * password alone, as a page whose fields are each in a form of their own
+     * does: the other goes into the page's other field once the system has
+     * filled this one. Not a browser's page, trusted or not, whose next page
+     * can be another site's before the other field is filled.
+     */
+    private fun fillOther(login: FillCredentials) {
+        if (!form.page || requester !is Requester.App || form.oneTimeCode != null || opensAnyAddress(form.packageName)) return
+        when {
+            form.username != null && form.password == null && login.password.isNotEmpty() ->
+                OtherFieldService.fillAfter(form.packageName, password = true, value = login.password, filled = login.username)
+            form.password != null && form.username == null && login.username.isNotEmpty() ->
+                OtherFieldService.fillAfter(form.packageName, password = false, value = login.username, filled = login.password)
+        }
+    }
+
+    /** Whether the app opens a link to any site, as a browser does. */
+    private fun opensAnyAddress(packageName: String): Boolean {
+        val link = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.invalid/"))
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+            .setPackage(packageName)
+        return packageManager.queryIntentActivities(link, PackageManager.MATCH_ALL).isNotEmpty()
     }
 
     companion object {

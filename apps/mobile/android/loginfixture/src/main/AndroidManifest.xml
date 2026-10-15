@@ -26,5 +26,20 @@
         <activity android:name=".NamedLoginActivity" android:exported="true" />
         <activity android:name=".TwoStepUsernameActivity" android:exported="true" />
         <activity android:name=".TwoStepPasswordActivity" android:exported="false" />
+        <!-- Off but when a test turns it on (WebLoginActivity): the stand-in
+             then opens a link to any site, as a browser does. -->
+        <activity-alias
+            android:name=".AsBrowser"
+            android:enabled="false"
+            android:exported="true"
+            android:targetActivity=".WebLoginActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+        </activity-alias>
     </application>
 </manifest>

@@ -42,8 +42,10 @@ class VaultAutofillService : AutofillService() {
         // A screen with a username field and no password field is offered
         // the username alone: the first screen of a sign-in on two screens,
         // or a page whose fields are each in a form of their own, which a web
-        // view reports one at a time. The system keeps what is typed there
-        // for the save the password's screen asks for.
+        // view reports one at a time; the password then goes into the
+        // page's own field through OtherFieldService, if the owner turned it
+        // on. The system keeps what is typed there for the save the
+        // password's screen asks for.
         val form = structure?.let { Form.parse(it) ?: Form.usernameScreen(it) }
         if (form == null) {
             callback.onSuccess(null)

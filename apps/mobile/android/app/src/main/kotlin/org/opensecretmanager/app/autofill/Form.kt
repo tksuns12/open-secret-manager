@@ -15,6 +15,9 @@ import android.view.autofill.AutofillId
  * said it shows a page: those of the first view that names a domain, past
  * any that names an empty one, as the outermost view of a page in Firefox
  * can. Whether to believe the domain is decided elsewhere ([Requester]).
+ * [page]: the fields are a page's, in a web view or a browser, which may
+ * have told of one form of the page only, where a screen of an app tells of
+ * all its fields.
  */
 data class Form(
     val packageName: String,
@@ -23,6 +26,7 @@ data class Form(
     val username: AutofillId?,
     val password: AutofillId?,
     val oneTimeCode: AutofillId?,
+    val page: Boolean = false,
 ) {
     /** Asks for a one-time code, and neither a username nor a password. */
     val codeOnly: Boolean
@@ -35,6 +39,7 @@ data class Form(
         putParcelable(USERNAME, username)
         putParcelable(PASSWORD, password)
         putParcelable(ONE_TIME_CODE, oneTimeCode)
+        putBoolean(PAGE, page)
     }
 
     companion object {
@@ -44,6 +49,7 @@ data class Form(
         private const val USERNAME = "form.username"
         private const val PASSWORD = "form.password"
         private const val ONE_TIME_CODE = "form.oneTimeCode"
+        private const val PAGE = "form.page"
 
         @Suppress("DEPRECATION")
         fun fromBundle(extras: Bundle): Form? {
@@ -55,6 +61,7 @@ data class Form(
                 extras.getParcelable(USERNAME),
                 extras.getParcelable(PASSWORD),
                 extras.getParcelable(ONE_TIME_CODE),
+                extras.getBoolean(PAGE),
             )
         }
 
@@ -111,6 +118,7 @@ data class Form(
                 username = username.node.autofillId,
                 password = null,
                 oneTimeCode = null,
+                page = username.node.htmlInfo != null,
             )
         }
 
@@ -133,6 +141,7 @@ data class Form(
                 username = username?.node?.autofillId,
                 password = password?.node?.autofillId,
                 oneTimeCode = code?.node?.autofillId,
+                page = listOfNotNull(username, password, code).any { it.node.htmlInfo != null },
             )
         }
 
@@ -240,14 +249,20 @@ data class Form(
         private fun words(name: String): List<String> =
             name.split(WORD_BREAK).map { it.lowercase() }.filter { it.isNotEmpty() }
 
-        private fun named(node: AssistStructure.ViewNode, parts: List<String>, wholeWords: Set<String>): Boolean =
-            names(node).any { name -> parts.any { it in name.lowercase() } || words(name).any { it in wholeWords } }
+        private fun named(names: List<String>, parts: List<String>, wholeWords: Set<String>): Boolean =
+            names.any { name -> parts.any { it in name.lowercase() } || words(name).any { it in wholeWords } }
 
         /** Named a username, an email address, a phone number, or an ID, and not a password. */
-        private fun namedUsername(node: AssistStructure.ViewNode): Boolean =
-            named(node, USERNAME_PARTS, USERNAME_WORDS) && !named(node, PASSWORD_PARTS, PASSWORD_WORDS)
+        private fun namedUsername(node: AssistStructure.ViewNode): Boolean = namesUsername(names(node))
 
-        private fun namedOtherThanUsername(node: AssistStructure.ViewNode): Boolean = named(node, NOT_USERNAME_PARTS, emptySet())
+        private fun namedOtherThanUsername(node: AssistStructure.ViewNode): Boolean = namesOtherThanUsername(names(node))
+
+        /** Whether a field so named is a username, as [namedUsername] tells, from its names alone. */
+        fun namesUsername(names: List<String>): Boolean =
+            named(names, USERNAME_PARTS, USERNAME_WORDS) && !named(names, PASSWORD_PARTS, PASSWORD_WORDS)
+
+        /** Whether a field so named is a search, a captcha, or the like. */
+        fun namesOtherThanUsername(names: List<String>): Boolean = named(names, NOT_USERNAME_PARTS, emptySet())
 
         private val NAME_ATTRIBUTES = setOf("name", "id", "label", "aria-label", "placeholder")
         private val WORD_BREAK = Regex("[^\\p{L}\\p{N}]+|(?<=\\p{Ll})(?=\\p{Lu})|(?<=\\p{Lu})(?=\\p{Lu}\\p{Ll})|(?<=\\p{L})(?=\\p{N})|(?<=\\p{N})(?=\\p{L})")

@@ -74,6 +74,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import org.opensecretmanager.app.autofill.OtherFieldService
 import org.opensecretmanager.app.autofill.PendingSave
 import org.opensecretmanager.app.autofill.SaveActivity
 import org.opensecretmanager.vault.DeletedEntry
@@ -461,6 +462,7 @@ private fun Items(state: UiState, session: VaultSession) {
         TextButton(onClick = session::openDeleted, modifier = Modifier.testTag("recently-deleted")) { Text("Recently deleted…") }
         TextButton(onClick = session::openPasswordChange, modifier = Modifier.testTag("change-password")) { Text("Change this phone's password…") }
         AutofillOffer()
+        OtherFieldChoice()
         BackgroundSyncSwitch()
         StayUnlockedChoice()
         SyncLine(state.sync, session)
@@ -537,6 +539,47 @@ private fun AutofillOffer() {
         },
         modifier = Modifier.testTag("turn-on-autofill"),
     ) { Text("Fill logins in other apps…") }
+}
+
+/**
+ * Once this app fills logins in other apps: whether a login chosen for one
+ * field of an app's page that tells autofill of one field at a time fills
+ * the other too ([OtherFieldService]). It is turned on and off in Android's
+ * accessibility settings, which open from here.
+ */
+@Composable
+private fun OtherFieldChoice() {
+    val context = LocalContext.current
+    val manager = context.getSystemService(AutofillManager::class.java) ?: return
+    var filling by remember { mutableStateOf(manager.hasEnabledAutofillServices()) }
+    var on by remember { mutableStateOf(OtherFieldService.enabled(context)) }
+    LifecycleResumeEffect(manager) {
+        filling = manager.hasEnabledAutofillServices()
+        on = OtherFieldService.enabled(context)
+        onPauseOrDispose { }
+    }
+    if (!filling) return
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Fill the ID and the password together, in apps that show them to autofill one at a time",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(
+                onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+                modifier = Modifier.testTag("other-field"),
+            ) { Text(if (on) "On" else "Off") }
+        }
+        if (!on) {
+            Text(
+                "Turned on in Android's accessibility settings, as \"${context.getString(R.string.other_field_label)}\". " +
+                    "Android may first say the setting is restricted for an app installed from a file: " +
+                    "allow it in this app's App info, in the ⋮ menu.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
 }
 
 /** An unlock found records taken out of the vault's file or changed in it. */

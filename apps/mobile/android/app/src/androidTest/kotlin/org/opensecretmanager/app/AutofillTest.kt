@@ -1,6 +1,7 @@
 package org.opensecretmanager.app
 
 import android.app.KeyguardManager
+import android.app.UiAutomation
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.PowerManager
@@ -10,6 +11,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.BySelector
+import androidx.test.uiautomator.Configurator
 import androidx.test.uiautomator.StaleObjectException
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.UiObject2
@@ -30,6 +32,7 @@ import org.junit.Test
 import org.junit.rules.TestName
 import org.junit.runner.RunWith
 import org.opensecretmanager.app.autofill.Form
+import org.opensecretmanager.app.autofill.OtherFieldService
 import org.opensecretmanager.app.autofill.PendingSave
 import org.opensecretmanager.app.autofill.Requester
 import org.opensecretmanager.vault.AndroidKeystore
@@ -55,9 +58,17 @@ import org.opensecretmanager.vault.ItemKind
  * tree, and why in [FAILURES] on the device, which `scripts/test-mobile.sh`
  * brings back (in any build; the app's own screens show black unless
  * screenshots are allowed).
+ *
+ * The test's own connection to Android's accessibility leaves accessibility
+ * services running, which it would otherwise turn off while it lasts: a
+ * test turns on the app's own ([OtherFieldService]) as the owner would.
  */
 @RunWith(AndroidJUnit4::class)
 class AutofillTest {
+    init {
+        Configurator.getInstance().uiAutomationFlags = UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES
+    }
+
     private val password = "fixture password, not a secret"
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val context = instrumentation.targetContext
@@ -67,12 +78,17 @@ class AutofillTest {
     private val animationScales = listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
     private var previousScales = emptyList<String>()
     private val keyboard = Keyboard(::shell)
+    private var previousAccessibility: Pair<String, String>? = null
 
     @get:Rule
     val test = TestName()
 
+    /** The same connection as the [device]'s: another set of flags would replace it. */
+    private val automation: UiAutomation
+        get() = instrumentation.getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES)
+
     private fun shell(command: String): String =
-        ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command))
+        ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(command))
             .bufferedReader().use { it.readText() }
 
     @Before
@@ -107,11 +123,14 @@ class AutofillTest {
         PendingSave.forgetForTests()
         StayUnlocked.millisForTests = null
         shell("am force-stop $FIXTURE")
+        turnOffOtherField()
         keyboard.putBack()
         shell(previousService?.let { "settings put secure autofill_service $it" } ?: "settings delete secure autofill_service")
         animationScales.zip(previousScales).forEach { (name, scale) ->
             shell(if (scale.isEmpty() || scale == "null") "settings delete global $name" else "settings put global $name $scale")
         }
+        // The other tests' connection, as before.
+        Configurator.getInstance().uiAutomationFlags = 0
     }
 
     /**
@@ -124,13 +143,33 @@ class AutofillTest {
         shell("pm set-app-links-user-selection --user cur --package $FIXTURE false all")
     }
 
+    /** Turns on [OtherFieldService], as the owner would in Android's accessibility settings, until the test ends. */
+    private fun turnOnOtherField() {
+        if (previousAccessibility == null) {
+            previousAccessibility = shell("settings get secure enabled_accessibility_services").trim() to
+                shell("settings get secure accessibility_enabled").trim()
+        }
+        shell("settings put secure enabled_accessibility_services ${context.packageName}/${OtherFieldService::class.java.name}")
+        shell("settings put secure accessibility_enabled 1")
+        waitUntil("the accessibility service to start") { OtherFieldService.connectedForTests }
+    }
+
+    private fun turnOffOtherField() {
+        val (services, enabled) = previousAccessibility ?: return
+        fun putBack(name: String, value: String) =
+            shell(if (value.isEmpty() || value == "null") "settings delete secure $name" else "settings put secure $name $value")
+        putBack("enabled_accessibility_services", services)
+        putBack("accessibility_enabled", enabled)
+        previousAccessibility = null
+    }
+
     /** Fails with [message], leaving what the screen shows, its window tree, and the message in [FAILURES]. */
     private fun fail(message: String): Nothing {
         val folder = context.getExternalFilesDir("failures")!!
         val name = "${test.methodName}-${System.currentTimeMillis()}"
         runCatching {
             File(folder, "$name.png").outputStream().use { output ->
-                instrumentation.uiAutomation.takeScreenshot()?.compress(Bitmap.CompressFormat.PNG, 100, output)
+                automation.takeScreenshot()?.compress(Bitmap.CompressFormat.PNG, 100, output)
             }
         }
         runCatching { File(folder, "$name.xml").outputStream().use { device.dumpWindowHierarchy(it) } }
@@ -152,7 +191,7 @@ class AutofillTest {
         device.waitForIdle()
         Thread.sleep(500)
         val folder = context.getExternalFilesDir("screens")!!
-        instrumentation.uiAutomation.takeScreenshot()
+        automation.takeScreenshot()
             .compress(Bitmap.CompressFormat.PNG, 100, File(folder, "fill-$name.png").outputStream())
     }
 
@@ -452,8 +491,9 @@ class AutofillTest {
     fun aPageThatReportsItsFieldsOneAtATimeIsFilledFieldByField() {
         // The ID and the password each in a form of their own, as in the web
         // view of an app the owner signs in to: the system is told only of
-        // the field that has the focus. The ID is offered the fill, and gets
-        // the username alone.
+        // the field that has the focus. The ID is offered the fill, and,
+        // unless the owner turned on filling both fields together, gets the
+        // username alone.
         StayUnlocked.millisForTests = 60_000L
         askToFill("WebLoginActivity", "https://mail.example.test", extras = " --es page split")
         find(mine("choose-another")).click()
@@ -472,6 +512,73 @@ class AutofillTest {
         }
         mail.click()
         assertFilled("owner@example.test|third password, with ünïcödé")
+    }
+
+    /** The split page's two fields, the ID and the password, once the page has both. */
+    private fun splitPageFields(): List<UiObject2> {
+        val deadline = System.currentTimeMillis() + 30_000
+        while (System.currentTimeMillis() < deadline) {
+            val fields = device.findObjects(By.clazz("android.widget.EditText").pkg(FIXTURE))
+            if (fields.size >= 2) return fields
+            Thread.sleep(200)
+        }
+        fail("the page's two fields")
+    }
+
+    @Test
+    fun withBothFieldsFilledTogetherALoginChosenForEitherFieldFillsTheOtherToo() {
+        // The owner turned it on: a login chosen for the ID fills the
+        // password too, into the page's own field.
+        turnOnOtherField()
+        askToFill("WebLoginActivity", "https://mail.example.test", extras = " --es page split")
+        find(mine("choose-another")).click()
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertLockedAgain()
+
+        // Chosen for the password, it fills the ID too.
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.WebLoginActivity --es origin https://mail.example.test --es page split")
+        val fields = splitPageFields()
+        fields[1].click()
+        val offer = device.wait(Until.findObject(OFFER), 30_000) ?: run {
+            fields[1].click()
+            find(OFFER, 30_000)
+        }
+        offer.click()
+        find(mine("password"), 60_000).text = password
+        find(mine("unlock")).click()
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertLockedAgain()
+    }
+
+    @Test
+    fun aBrowsersPageThatReportsItsFieldsOneAtATimeGetsOnlyTheFieldThatAsked() {
+        // A browser's next page can be another site's: the password is not
+        // put into the page's own field, the browser trusted or not.
+        turnOnOtherField()
+        Requester.trustedForTests += FIXTURE
+        askToFill("WebLoginActivity", "https://mail.example.test", extras = " --es page split")
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|")
+        Thread.sleep(6_000)
+        assertEquals("owner@example.test|", find(By.res(FIXTURE, "filled")).text)
+        assertLockedAgain()
+
+        // Not trusted, but opening a link to any site.
+        Requester.trustedForTests.clear()
+        try {
+            askToFill("WebLoginActivity", "https://mail.example.test", extras = " --es page split --ez asBrowser true")
+            find(mine("choose-another")).click()
+            find(mine("fill:Mail")).click()
+            assertFilled("owner@example.test|")
+            Thread.sleep(6_000)
+            assertEquals("owner@example.test|", find(By.res(FIXTURE, "filled")).text)
+            assertLockedAgain()
+        } finally {
+            shell("am start -W -S -n $FIXTURE/.WebLoginActivity --ez asBrowser false")
+        }
     }
 
     @Test

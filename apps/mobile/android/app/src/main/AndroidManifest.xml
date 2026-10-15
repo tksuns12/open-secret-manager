@@ -57,6 +57,23 @@
                 android:resource="@xml/autofill_service" />
         </service>
 
+        <!-- Off until the owner turns it on in Android's accessibility
+             settings: the other field of a login chosen for a page that told
+             autofill of one field only. It asks for no events and reads a
+             window only for a few seconds after a login is chosen. -->
+        <service
+            android:name=".autofill.OtherFieldService"
+            android:exported="true"
+            android:label="@string/other_field_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/other_field_service" />
+        </service>
+
         <!-- Opened by the system over the app that asks; a task of its own,
              so the vault's own screens stay where they were. Its window is
              marked translucent, so the app beneath is paused, not stopped

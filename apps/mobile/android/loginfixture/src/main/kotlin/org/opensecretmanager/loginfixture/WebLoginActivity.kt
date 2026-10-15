@@ -2,6 +2,8 @@ package org.opensecretmanager.loginfixture
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ComponentName
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
@@ -17,12 +19,25 @@ import android.widget.TextView
  * each in a form of their own, which a web view reports to autofill one at
  * a time. The page is served from here, so no network is needed;
  * the web view still navigates to the address and reports its domain.
- * Signing in posts the form and shows the page again.
+ * Signing in posts the form and shows the page again. With the extra
+ * `asBrowser` true, the stand-in opens a link to any site from then on, as
+ * a browser does ([AS_BROWSER]); false puts it back.
  */
 class WebLoginActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent.hasExtra("asBrowser")) {
+            packageManager.setComponentEnabledSetting(
+                ComponentName(this, AS_BROWSER),
+                if (intent.getBooleanExtra("asBrowser", false)) {
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                } else {
+                    PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
+                },
+                PackageManager.DONT_KILL_APP,
+            )
+        }
         setContentView(R.layout.web_login)
         val origin = intent.getStringExtra("origin") ?: "https://mail.example.test"
         val html = when (intent.getStringExtra("page")) {
@@ -55,6 +70,9 @@ class WebLoginActivity : Activity() {
     }
 
     private companion object {
+        /** An alias of this page with the links of any site, off in the manifest. */
+        const val AS_BROWSER = "org.opensecretmanager.loginfixture.AsBrowser"
+
         val PAGE = """
             <!doctype html>
             <meta name="viewport" content="width=device-width">
