@@ -2,7 +2,9 @@
 // the cards shown after an unlock sit at the bottom right, inside the window
 // and off the sidebar; every dialog fits the window; and nothing makes the
 // page scroll sideways. Phase 10 found the card about records taken out of
-// the file drawn over the sidebar, which only a look had caught.
+// the file drawn over the sidebar, which only a look had caught. A vault of
+// hundreds of items keeps the window's edges in it too: on the owner's, the
+// page grew with the list, and the ways to Devices went below the window.
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
@@ -46,6 +48,34 @@ for (const size of SIZES) {
     await assertAtBottomRight(page, key, size);
     await key.getByRole("button", { name: "I stored it" }).click();
     await key.waitFor({ state: "detached" });
+    assert.equal(await scrollsSideways(page), false);
+    assert.deepEqual(errors, []);
+  });
+}
+
+for (const size of SIZES) {
+  test(`at ${size.width}×${size.height}, a vault of hundreds of items scrolls its list, not the page`, async () => {
+    const { page, errors } = await window.open("?many", size);
+    const shown = [
+      ["the device card", page.locator(".device-card")],
+      ["the footer's Devices", page.locator(".footer-bar").getByRole("button", { name: /Devices/ })],
+      ["the sync status", page.locator(".sync-status")],
+      ["the search", page.getByLabel("Search vault")],
+    ];
+    for (const [name, locator] of shown) {
+      const drawn = await edges(locator);
+      assert.ok(drawn.top >= 0 && drawn.bottom <= size.height, `${name}: outside the window (${drawn.top} to ${drawn.bottom})`);
+    }
+    assert.equal(await page.evaluate(() => document.documentElement.scrollHeight > window.innerHeight), false, "the page scrolls");
+    // The last item is reached by scrolling the list, and the rest stays.
+    const last = page.locator(".entry-row").last();
+    await last.scrollIntoViewIfNeeded();
+    const drawn = await edges(last);
+    assert.ok(drawn.top >= 0 && drawn.bottom <= size.height, `the last item: outside the window (${drawn.top} to ${drawn.bottom})`);
+    for (const [name, locator] of shown) {
+      const still = await edges(locator);
+      assert.ok(still.top >= 0 && still.bottom <= size.height, `${name}, with the list scrolled: outside the window`);
+    }
     assert.equal(await scrollsSideways(page), false);
     assert.deepEqual(errors, []);
   });

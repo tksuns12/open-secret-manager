@@ -18,8 +18,8 @@ async function nativeOnly<T>(cmd: string, args?: unknown): Promise<T> {
 /**
  * Whether the preview's address asks for a state the browser preview
  * otherwise never has, so that it can be looked at and tested: as in
- * `/?rows-changed`, `/?recovery-key`, `/?held`, `/?conflict`, `/?devices`, or
- * `/?backup-due` (or `/?no-backup`).
+ * `/?rows-changed`, `/?recovery-key`, `/?held`, `/?conflict`, `/?devices`,
+ * `/?many`, or `/?backup-due` (or `/?no-backup`).
  * Each shows sample data, no secret.
  */
 function previewAsks(what: string): boolean {
@@ -51,6 +51,8 @@ let previewEntries: VaultEntry[] = ([
   { id: "3", title: "Banking — checking", kind: "login", username: "•••• 4821", url: "secure.bank.example", favorite: false },
   { id: "4", title: "Recovery codes", kind: "secure_note", favorite: false },
   { id: "5", title: "Studio Wi-Fi", kind: "login", username: "studio", url: "network", favorite: false },
+  // With `?many`: a vault of hundreds of items, longer than any window.
+  ...(previewAsks("many") ? Array.from({ length: 400 }, (_, index) => ({ id: `many-${index + 1}`, title: `Sample login ${index + 1}`, kind: "login" as const, username: `user${index + 1}@example.test`, url: `site${index + 1}.example`, favorite: false })) : []),
 ] satisfies VaultEntry[]).map((entry) => (entry.id === "2" && previewAsks("conflict") ? { ...entry, conflict: true } : entry));
 
 /** With `?conflict`: the two versions of GitHub that were changed independently. */

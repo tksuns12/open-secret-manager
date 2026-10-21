@@ -4,7 +4,7 @@
 // native shell the window runs as its browser preview (src/bridge.ts), on
 // sample data, and its address asks for the states the preview otherwise
 // never has: `?rows-changed`, `?recovery-key`, `?held`, `?conflict`, `?devices`,
-// `?backup-due`, and `?no-backup`.
+// `?many`, `?backup-due`, and `?no-backup`.
 
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
