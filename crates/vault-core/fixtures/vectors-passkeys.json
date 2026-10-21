@@ -1,0 +1,45 @@
+{
+  "about": "Passkeys, from inputs anyone can write down. Bytes are lowercase hexadecimal. The private key is the P-256 scalar given; the credential ID, user handle and challenges count up. Signatures are ECDSA with SHA-256 and RFC 6979 nonces, so they are fixed, DER encoded. The responses are what a site is sent, as WebAuthn's JSON writes them, and are checked by an independent verifier (apps/browser-extension/src/passkey-vectors.test.ts).",
+  "inputs": {
+    "created_at": 1767225600,
+    "credential_id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "imported_sign_count": 7,
+    "now": 1767225600,
+    "origin": "https://www.example.test",
+    "private_key": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "registration_challenge": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+    "rp_id": "example.test",
+    "sign_in_challenge": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+    "user_display_name": "Owner",
+    "user_handle": "303132333435363738393a3b3c3d3e3f",
+    "user_name": "owner@example.test"
+  },
+  "item_plaintext": "{\"id\":\"vector-passkey\",\"title\":\"Example\",\"kind\":\"login\",\"username\":\"owner@example.test\",\"password\":\"\",\"url\":\"https://example.test\",\"notes\":\"\",\"totp_secret\":null,\"custom_fields\":{},\"tags\":[],\"favorite\":false,\"passkeys\":[{\"credential_id\":\"oKGio6SlpqeoqaqrrK2urw\",\"rp_id\":\"example.test\",\"user_handle\":\"MDEyMzQ1Njc4OTo7PD0-Pw\",\"user_name\":\"owner@example.test\",\"user_display_name\":\"Owner\",\"algorithm\":-7,\"key\":\"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj-hRANCAATGVZ1BbftWr3FPFG2RfCSr-Biy-xIWBBKWSYSCMKLSWLKm2C3GxnNM8JL_qp_AEvEPcAjTlSoI1Xl-hf6rpdl3\",\"created_at\":1767225600,\"sign_count\":0}],\"saved_at\":1767225600}",
+  "passkey": {
+    "algorithm": -7,
+    "created_at": 1767225600,
+    "credential_id": "oKGio6SlpqeoqaqrrK2urw",
+    "key": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj-hRANCAATGVZ1BbftWr3FPFG2RfCSr-Biy-xIWBBKWSYSCMKLSWLKm2C3GxnNM8JL_qp_AEvEPcAjTlSoI1Xl-hf6rpdl3",
+    "rp_id": "example.test",
+    "sign_count": 0,
+    "user_display_name": "Owner",
+    "user_handle": "MDEyMzQ1Njc4OTo7PD0-Pw",
+    "user_name": "owner@example.test"
+  },
+  "registration": {
+    "attestation_object": "a363666d74646e6f6e656761747453746d74a068617574684461746158949b263fbcb589853137b33ddcafa5bcc5403464ead4da766d0f819348bf8d472c5d00000000000000000000000000000000000000000010a0a1a2a3a4a5a6a7a8a9aaabacadaeafa5010203262001215820c6559d416dfb56af714f146d917c24abf818b2fb121604129649848230a2d258225820b2a6d82dc6c6734cf092ffaa9fc012f10f7008d3952a08d5797e85feaba5d977",
+    "authenticator_data": "9b263fbcb589853137b33ddcafa5bcc5403464ead4da766d0f819348bf8d472c5d00000000000000000000000000000000000000000010a0a1a2a3a4a5a6a7a8a9aaabacadaeafa5010203262001215820c6559d416dfb56af714f146d917c24abf818b2fb121604129649848230a2d258225820b2a6d82dc6c6734cf092ffaa9fc012f10f7008d3952a08d5797e85feaba5d977",
+    "client_data": "{\"type\":\"webauthn.create\",\"challenge\":\"UFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm8\",\"origin\":\"https://www.example.test\",\"crossOrigin\":false}",
+    "public_key": "3059301306072a8648ce3d020106082a8648ce3d03010703420004c6559d416dfb56af714f146d917c24abf818b2fb121604129649848230a2d258b2a6d82dc6c6734cf092ffaa9fc012f10f7008d3952a08d5797e85feaba5d977",
+    "response_json": "{\"authenticatorAttachment\":\"platform\",\"clientExtensionResults\":{\"credProps\":{\"rk\":true}},\"id\":\"oKGio6SlpqeoqaqrrK2urw\",\"rawId\":\"oKGio6SlpqeoqaqrrK2urw\",\"response\":{\"attestationObject\":\"o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YViUmyY_vLWJhTE3sz3cr6W8xUA0ZOrU2nZtD4GTSL-NRyxdAAAAAAAAAAAAAAAAAAAAAAAAAAAAEKChoqOkpaanqKmqq6ytrq-lAQIDJiABIVggxlWdQW37Vq9xTxRtkXwkq_gYsvsSFgQSlkmEgjCi0lgiWCCyptgtxsZzTPCS_6qfwBLxD3AI05UqCNV5foX-q6XZdw\",\"authenticatorData\":\"myY_vLWJhTE3sz3cr6W8xUA0ZOrU2nZtD4GTSL-NRyxdAAAAAAAAAAAAAAAAAAAAAAAAAAAAEKChoqOkpaanqKmqq6ytrq-lAQIDJiABIVggxlWdQW37Vq9xTxRtkXwkq_gYsvsSFgQSlkmEgjCi0lgiWCCyptgtxsZzTPCS_6qfwBLxD3AI05UqCNV5foX-q6XZdw\",\"clientDataJSON\":\"eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiVUZGU1UxUlZWbGRZV1ZwYlhGMWVYMkJoWW1Oa1pXWm5hR2xxYTJ4dGJtOCIsIm9yaWdpbiI6Imh0dHBzOi8vd3d3LmV4YW1wbGUudGVzdCIsImNyb3NzT3JpZ2luIjpmYWxzZX0\",\"publicKey\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExlWdQW37Vq9xTxRtkXwkq_gYsvsSFgQSlkmEgjCi0liyptgtxsZzTPCS_6qfwBLxD3AI05UqCNV5foX-q6XZdw\",\"publicKeyAlgorithm\":-7,\"transports\":[\"hybrid\",\"internal\"]},\"type\":\"public-key\"}"
+  },
+  "sign_in": {
+    "authenticator_data": "9b263fbcb589853137b33ddcafa5bcc5403464ead4da766d0f819348bf8d472c1d00000000",
+    "authenticator_data_unverified": "9b263fbcb589853137b33ddcafa5bcc5403464ead4da766d0f819348bf8d472c1900000000",
+    "client_data": "{\"type\":\"webauthn.get\",\"challenge\":\"cHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo8\",\"origin\":\"https://www.example.test\",\"crossOrigin\":false}",
+    "client_data_hash": "5bf28b4a774c3cad3599dafacb94e553ae1f0a3a75e32bf11b7bb8931e9aaeb2",
+    "imported_authenticator_data": "9b263fbcb589853137b33ddcafa5bcc5403464ead4da766d0f819348bf8d472c1d6955b900",
+    "response_json": "{\"authenticatorAttachment\":\"platform\",\"clientExtensionResults\":{},\"id\":\"oKGio6SlpqeoqaqrrK2urw\",\"rawId\":\"oKGio6SlpqeoqaqrrK2urw\",\"response\":{\"authenticatorData\":\"myY_vLWJhTE3sz3cr6W8xUA0ZOrU2nZtD4GTSL-NRywdAAAAAA\",\"clientDataJSON\":\"eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiY0hGeWMzUjFkbmQ0ZVhwN2ZIMS1mNENCZ29PRWhZYUhpSW1LaTR5TmpvOCIsIm9yaWdpbiI6Imh0dHBzOi8vd3d3LmV4YW1wbGUudGVzdCIsImNyb3NzT3JpZ2luIjpmYWxzZX0\",\"signature\":\"MEUCIEikJKWeUU3OCgQrgQbLwE_GCj8XbhhpkpMAaw9WUNYMAiEAmZsIXw4ezBCE8zsxBq3Lam-8sT3fPZ0jh_EERqqEJiY\",\"userHandle\":\"MDEyMzQ1Njc4OTo7PD0-Pw\"},\"type\":\"public-key\"}",
+    "signature": "3045022048a424a59e514dce0a042b8106cbc04fc60a3f176e18699293006b0f5650d60c022100999b085f0e1ecc1084f33b3106adcb6a6fbcb13ddf3d9d2387f10446aa842626"
+  }
+}

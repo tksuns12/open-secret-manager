@@ -20,7 +20,7 @@ set -eu
 cd "$(dirname "$0")/.."
 seconds=${1:-60}
 [ $# -gt 0 ] && shift
-targets=${*:-origin recovery_key invitation peer_messages browser_messages import}
+targets=${*:-origin recovery_key invitation peer_messages browser_messages import passkey_options}
 
 python3 - <<'EOF'
 import json, os
@@ -56,6 +56,23 @@ for name, text in messages_2["from_extension"].items():
 seed("import", "bitwarden", b"\x00" + json.dumps({"encrypted": False, "items": [{"type": 1, "name": "Bank", "notes": "n",
     "login": {"username": "a", "password": "p", "totp": "JBSWY3DPEHPK3PXP", "uris": [{"uri": "https://bank.example"}]},
     "fields": [{"name": "PIN", "value": "1234", "type": 1}]}, {"type": 2, "name": "Note", "notes": "text"}]}).encode())
+passkeys = json.load(open("crates/vault-core/fixtures/vectors-passkeys.json"))
+frozen_passkey = passkeys["passkey"]
+seed("import", "bitwarden-passkey", b"\x00" + json.dumps({"items": [{"type": 1, "name": "Site", "login": {"username": "a",
+    "fido2Credentials": [{"credentialId": "1ea5bb16-0f4e-4a35-a7d3-7f8e0c3b1d2a", "keyType": "public-key", "keyAlgorithm": "ECDSA",
+    "keyCurve": "P-256", "keyValue": frozen_passkey["key"], "rpId": "example.test", "userHandle": frozen_passkey["user_handle"],
+    "userName": "a", "counter": "5", "creationDate": "2024-01-31T10:05:33.123Z"}]}}]}).encode())
+creation = {"rp": {"id": "example.test", "name": "Example"}, "user": {"id": "MDEyMzQ1Njc4OTo7PD0-Pw", "name": "a", "displayName": "A"},
+            "challenge": "UFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm8", "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+            "excludeCredentials": [{"type": "public-key", "id": "oKGio6SlpqeoqaqrrK2urw"}],
+            "authenticatorSelection": {"residentKey": "required", "userVerification": "required"}}
+request = {"challenge": "cHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo8", "rpId": "example.test",
+           "allowCredentials": [{"type": "public-key", "id": "oKGio6SlpqeoqaqrrK2urw"}], "userVerification": "preferred"}
+for how in [0, 2]:
+    seed("passkey_options", f"creation-{how}", bytes([how]) + json.dumps(creation).encode())
+for how in [1, 3]:
+    seed("passkey_options", f"request-{how}", bytes([how]) + json.dumps(request).encode())
+seed("passkey_options", "passkey", bytes([4]) + json.dumps(passkeys["passkey"]).encode())
 seed("import", "chrome", b"\x01name,url,username,password,note\nBank,https://bank.example,a,p,\"multi\nline\"\n")
 seed("import", "firefox", b"\x02url,username,password,httpRealm,formActionOrigin,guid,timeCreated,timeLastUsed,timePasswordChanged\n"
      b"https://bank.example,a,p,,https://bank.example,{x},1,2,3\n")

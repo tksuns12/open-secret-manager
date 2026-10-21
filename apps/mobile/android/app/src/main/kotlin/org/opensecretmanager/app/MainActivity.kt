@@ -81,6 +81,7 @@ import org.opensecretmanager.vault.CardDraft
 import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
+import org.opensecretmanager.vault.PasskeyDetail
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
@@ -609,7 +610,7 @@ private fun ItemRow(item: ItemSummary, onClick: () -> Unit) {
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp).testTag("item:${item.title}"),
     ) {
         Text(item.title + if (item.conflict) " · needs a decision on your computer" else "", style = MaterialTheme.typography.titleMedium)
-        val below = if (item.kind == ItemKind.CARD) cardLine(item.brand, item.cardEnding) else item.username
+        val below = if (item.kind == ItemKind.CARD) cardLine(item.brand, item.cardEnding) else loginLine(item.username, item.passkeys)
         if (below.isNotEmpty()) Text(below, style = MaterialTheme.typography.bodySmall)
     }
     HorizontalDivider()
@@ -621,6 +622,17 @@ private fun CopyField(detail: ItemDetail, name: String, session: VaultSession) {
     TextButton(onClick = { session.copyField(detail.id, name) }, modifier = Modifier.testTag("copy-field:$name")) { Text("Copy") }
 }
 
+/** A login as a list names it: its username, and its passkeys if it has any. */
+internal fun loginLine(username: String, passkeys: UInt): String =
+    listOfNotNull(
+        username.takeIf { it.isNotEmpty() },
+        when (passkeys) {
+            0u -> null
+            1u -> "passkey"
+            else -> "$passkeys passkeys"
+        },
+    ).joinToString(" · ")
+
 /** A card as a list names it: its brand and the last four digits of its number, nothing else of it. */
 internal fun cardLine(brand: String?, ending: String?): String =
     listOfNotNull(brand?.takeIf { it.isNotBlank() } ?: "Card", ending?.let { "•••• $it" }).joinToString(" ")
@@ -628,6 +640,7 @@ internal fun cardLine(brand: String?, ending: String?): String =
 @Composable
 private fun Detail(detail: ItemDetail, session: VaultSession) {
     var confirmingDelete by remember(detail.id) { mutableStateOf(false) }
+    var removing by remember(detail.id) { mutableStateOf<PasskeyDetail?>(null) }
     val editable = detail.kind != ItemKind.IDENTITY && !detail.conflict
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
@@ -685,6 +698,16 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
             }
         }
         if (detail.url.isNotEmpty()) Field("Website", detail.url)
+        // A login's passkeys, by site and account; never a key.
+        for (passkey in detail.passkeys) {
+            Field("Passkey for ${passkey.rpId}", passkeyAccount(passkey), "passkey:${passkey.rpId}") {
+                if (!detail.conflict) {
+                    TextButton(onClick = { removing = passkey }, modifier = Modifier.testTag("remove-passkey:${passkey.rpId}")) {
+                        Text("Remove")
+                    }
+                }
+            }
+        }
         // An identity's address, a login's own extras: named, and copied
         // rather than shown, as on the computer.
         for (name in detail.fields) {
@@ -718,6 +741,42 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
             },
         )
     }
+    removing?.let { passkey ->
+        AlertDialog(
+            onDismissRequest = { removing = null },
+            title = { Text("Remove this passkey?") },
+            text = {
+                Text(
+                    "It is removed on all your devices, and you will no longer sign in to ${passkey.rpId} with it. " +
+                        "Its key stays in this item's history and in backups.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        removing = null
+                        session.removePasskey(detail, passkey)
+                    },
+                    modifier = Modifier.testTag("confirm-remove-passkey"),
+                ) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { removing = null }, modifier = Modifier.testTag("keep")) { Text("Keep") }
+            },
+        )
+    }
+}
+
+/** The account a passkey is for, and when it was made, if that is known. */
+private fun passkeyAccount(passkey: PasskeyDetail): String {
+    val account = when {
+        passkey.userName.isEmpty() -> "No account name"
+        passkey.userDisplayName.isNotEmpty() && passkey.userDisplayName != passkey.userName -> "${passkey.userName} (${passkey.userDisplayName})"
+        else -> passkey.userName
+    }
+    if (passkey.createdAt == 0uL) return account
+    val made = java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM).format(java.util.Date(passkey.createdAt.toLong() * 1000))
+    return "$account · made $made"
 }
 
 /** Whether a phone restores items of [kind]: all but identities. */

@@ -148,6 +148,16 @@ One-time codes (Phase 7, stop 5) are filled on Android by the same rules as pass
 
 An Android phone takes an update of the app only if it is signed with the same key as the installed app, so whoever holds the owner's release keystore can make an update every such phone installs; the keystore is kept like the Developer ID. On iOS the app reaches phones only signed through the owner's Apple developer team, and whoever controls that team's account can do the same. Neither exists yet.
 
+## Passkeys
+
+Since Phase 18 a login can hold passkeys. A passkey's private key is kept in the vault with its login, encrypted, synced, and backed up as a password is. Whoever can unlock a device of the vault, or holds the recovery key and a backup, therefore holds the key, and can sign in as the owner wherever the site takes the passkey alone. A passkey here protects against a phishing page, which cannot use it (see below), and against a site's own stored credentials leaking; it does not protect against the vault being compromised, and, unlike a passkey kept in a phone's secure hardware, it can be copied off an unlocked device like any other secret of the vault. Removing a passkey removes it from the login's newest version only: its key stays in the earlier versions and in every backup made since, as a changed password does, so a passkey that must be retired is removed at the site too.
+
+A page may use only the passkeys of its own host or of a domain it is under, never those of a public suffix by the public suffix list, its private section included: a site under a shared domain such as `github.io` cannot claim its neighbours' passkeys, nor a page another site's. The rule is the core's (see Which sites a passkey is for in [formats.md](formats.md)), and the requests it reads are bounded and fuzzed. The origin it is given has to be the page's own, which is the browser's and the app's to tell; stops 5 and 6 of Phase 18 bring the Android provider and the browser extension that ask, and until then no app answers a site's request: passkeys come in only by import, and are shown and removed.
+
+A passkey says the owner was verified only when the owner was verified in that same request; an unlocked vault alone says only that the owner was present. A passkey made here has a counter of 0, as devices that share it cannot agree on one, so a site cannot tell a copy from its counter; one imported with a counter answers with the time, so that a site that kept its counter does not take it for a copy.
+
+Settling a conflict, or restoring an earlier version, keeps the passkeys of every version it follows, so that keeping a version whole, or bringing back one from before a passkey was made, loses no passkey: a passkey that one device removed while another edited the login comes back with the resolution, for the owner to remove again. A passkey of a later build, or a field of one that this build does not know, is kept as it was read and never used.
+
 ## Recovery and imports
 
 Generate recovery material from operating-system randomness and display it deliberately. An encrypted backup must carry enough versioned metadata and wrapped keys to restore without a provider. Restoration authenticates the whole archive before replacing anything and creates a separate destination by default. A recovery secret is as sensitive as the vault it can unlock.

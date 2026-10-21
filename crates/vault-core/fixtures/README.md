@@ -29,6 +29,13 @@ can write down and what the code made of them. Another implementation can
 check itself against it. `vectors-8.json` adds, from the same inputs, what
 format 8 brought: the signing key's new label and the row seal.
 
+`vectors-passkeys.json` (Phase 18) holds a passkey made from fixed inputs:
+the login's version that keeps it, what a site is sent to register it and
+to sign in with it, and the client data, byte for byte. A Rust test makes
+them again (`src/passkey_tests.rs`), and
+`apps/browser-extension/src/passkey-vectors.test.ts` checks the responses
+with a WebAuthn verifier written apart from this code.
+
 `SHA256SUMS` lists the binary files. Opening an older vault where it lies
 upgrades it, so tests copy a file before they open it, and one test checks
 the sums.

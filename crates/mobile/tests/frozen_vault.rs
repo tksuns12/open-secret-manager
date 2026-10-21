@@ -982,6 +982,85 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
 }
 
 #[test]
+fn a_logins_passkeys_are_named_kept_through_an_edit_here_and_removed() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    // A passkey, as a computer or an import makes one.
+    let (login, credential) = {
+        let mut vault = osm_vault_core::Vault::open(folder.join("vault.sqlite3")).unwrap();
+        vault.unlock(PASSWORD).unwrap();
+        let made = osm_vault_core::passkey::Registering {
+            rp_id: "passkeys.example".into(),
+            rp_name: "Passkeys".into(),
+            user_handle: vec![7; 16],
+            user_name: "owner".into(),
+            user_display_name: "Owner".into(),
+            challenge: vec![1; 32],
+            exclude: Vec::new(),
+            user_verification: osm_vault_core::passkey::UserVerification::Preferred,
+        }
+        .create(true, 1_767_225_600)
+        .unwrap();
+        let credential = made.passkey.credential_id.clone();
+        let saved = vault
+            .save_passkey_as_login(made.passkey, "Passkey site")
+            .unwrap();
+        (saved.item_id, credential)
+    };
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    let listed = |device: &Device| {
+        device
+            .items()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == login)
+            .unwrap()
+            .passkeys
+    };
+    assert_eq!(listed(&device), 1);
+    let shown = device.item(login.clone()).unwrap();
+    assert_eq!(
+        shown.passkeys,
+        [osm_mobile::PasskeyDetail {
+            credential_id: credential.clone(),
+            rp_id: "passkeys.example".into(),
+            user_name: "owner".into(),
+            user_display_name: "Owner".into(),
+            created_at: 1_767_225_600,
+        }]
+    );
+    assert_eq!(
+        (shown.username.as_str(), shown.url.as_str()),
+        ("owner", "https://passkeys.example")
+    );
+
+    // An edit here keeps it; a login with one stays a login.
+    let mut edit = draft("Passkey site, renamed", ItemKind::Login);
+    edit.password = None;
+    device
+        .update_item(login.clone(), shown.revision.clone(), edit.clone())
+        .unwrap();
+    let shown = device.item(login.clone()).unwrap();
+    assert_eq!(shown.passkeys.len(), 1);
+    edit.kind = ItemKind::Card;
+    assert!(device
+        .update_item(login.clone(), shown.revision.clone(), edit)
+        .is_err());
+
+    device
+        .remove_passkey(login.clone(), shown.revision, credential.clone())
+        .unwrap();
+    let shown = device.item(login.clone()).unwrap();
+    assert!(shown.passkeys.is_empty());
+    assert_eq!(listed(&device), 0);
+    assert!(matches!(
+        device.remove_passkey(login.clone(), shown.revision, credential),
+        Err(MobileError::NotFound)
+    ));
+    assert_eq!(device.history(login).unwrap()[0].changed, ["passkeys"]);
+}
+
+#[test]
 fn the_password_changes_given_the_current_one_and_a_long_enough_new_one() {
     let (_dir, folder) = copy_of_the_frozen_vault();
     let device = Device::open_listening_on(folder.clone(), 0).unwrap();

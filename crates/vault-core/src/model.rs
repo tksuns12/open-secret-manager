@@ -8,6 +8,8 @@ use serde_json::Value;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::passkey::Passkey;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
@@ -31,6 +33,12 @@ pub struct Item {
     pub custom_fields: BTreeMap<String, String>,
     pub tags: Vec<String>,
     pub favorite: bool,
+    /// A login's passkeys (see [`crate::passkey`]). Written only when there
+    /// is one, so that an item without stays as earlier builds wrote it,
+    /// and read as none when absent: the one field of an item that may be
+    /// left out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passkeys: Vec<Passkey>,
     /// The fields of a later build that this one does not know, as they
     /// were read, so that an edit here writes them back rather than drops
     /// them. Empty in an item this build made. None may have the name of a
@@ -41,7 +49,7 @@ pub struct Item {
 
 /// This build's names for an item's fields, which an unknown field may not
 /// take.
-const KNOWN_FIELDS: [&str; 12] = [
+const KNOWN_FIELDS: [&str; 13] = [
     "id",
     "title",
     "kind",
@@ -53,6 +61,7 @@ const KNOWN_FIELDS: [&str; 12] = [
     "custom_fields",
     "tags",
     "favorite",
+    "passkeys",
     SAVED_AT,
 ];
 
@@ -67,37 +76,50 @@ pub(crate) const SAVED_AT: &str = "saved_at";
 fn unknown_fields<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, Value>, D::Error> {
-    struct Fields;
+    deserializer.deserialize_map(Fields {
+        skipped: Some(SAVED_AT),
+    })
+}
 
-    impl<'de> Visitor<'de> for Fields {
-        type Value = BTreeMap<String, Value>;
+/// The fields a passkey's JSON has besides this build's, each once, as for
+/// an item's.
+pub(crate) fn other_fields<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Value>, D::Error> {
+    deserializer.deserialize_map(Fields { skipped: None })
+}
 
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("an item's fields")
-        }
+/// Fields read once each, but for one that is not kept at all.
+struct Fields {
+    skipped: Option<&'static str>,
+}
 
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut fields = BTreeMap::new();
-            while let Some(name) = map.next_key::<String>()? {
-                if name == SAVED_AT {
-                    map.next_value::<serde::de::IgnoredAny>()?;
-                    continue;
-                }
-                let value = map.next_value()?;
-                if let Some(mut earlier) = fields.insert(name, value) {
-                    zeroize_value(&mut earlier);
-                    return Err(A::Error::custom("an item field is given twice"));
-                }
-            }
-            Ok(fields)
-        }
+impl<'de> Visitor<'de> for Fields {
+    type Value = BTreeMap<String, Value>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an item's fields")
     }
 
-    deserializer.deserialize_map(Fields)
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut fields = BTreeMap::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if Some(name.as_str()) == self.skipped {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
+            let value = map.next_value()?;
+            if let Some(mut earlier) = fields.insert(name, value) {
+                zeroize_value(&mut earlier);
+                return Err(A::Error::custom("an item field is given twice"));
+            }
+        }
+        Ok(fields)
+    }
 }
 
 /// Wipes the text in a value, where whatever secret it holds would be.
-fn zeroize_value(value: &mut Value) {
+pub(crate) fn zeroize_value(value: &mut Value) {
     match value {
         Value::String(text) => text.zeroize(),
         Value::Array(values) => values.iter_mut().for_each(zeroize_value),
@@ -114,8 +136,9 @@ fn zeroize_value(value: &mut Value) {
 impl Item {
     /// The fields this item has changed from `before`, by name: `title`,
     /// `type`, `username`, `password`, `website`, `one-time code`, `notes`,
-    /// `other fields`, `tags`, `favorite`, and `fields of a later version`
-    /// for those this build does not know. Names only, never values.
+    /// `other fields`, `tags`, `favorite`, `passkeys`, and `fields of a
+    /// later version` for those this build does not know. Names only, never
+    /// values.
     pub fn changed_from(&self, before: &Item) -> Vec<&'static str> {
         [
             (before.title != self.title, "title"),
@@ -128,6 +151,7 @@ impl Item {
             (before.custom_fields != self.custom_fields, "other fields"),
             (before.tags != self.tags, "tags"),
             (before.favorite != self.favorite, "favorite"),
+            (before.passkeys != self.passkeys, "passkeys"),
             (
                 before.unknown_fields != self.unknown_fields,
                 "fields of a later version",
@@ -188,6 +212,7 @@ impl Default for Item {
             custom_fields: BTreeMap::new(),
             tags: Vec::new(),
             favorite: false,
+            passkeys: Vec::new(),
             unknown_fields: BTreeMap::new(),
         }
     }
@@ -444,6 +469,8 @@ pub struct ItemSummary {
     pub card_ending: Option<String>,
     /// For a card, its brand as stored, or else as its number names it.
     pub brand: Option<String>,
+    /// How many passkeys it holds.
+    pub passkeys: usize,
 }
 
 impl fmt::Debug for ItemSummary {
@@ -490,6 +517,7 @@ impl From<VaultItem> for ItemSummary {
                         .and_then(|number| crate::card::brand_of(number))
                         .map(str::to_owned)
                 }),
+            passkeys: item.passkeys.len(),
         }
     }
 }

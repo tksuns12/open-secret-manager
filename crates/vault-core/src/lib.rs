@@ -5,6 +5,7 @@ mod crypto;
 mod error;
 mod import;
 mod model;
+pub mod passkey;
 mod storage;
 mod util;
 
@@ -17,6 +18,7 @@ pub use model::{
     PasswordPolicy, QuarantinedRevision, RevisionInfo, StageOutcome, UnlockSession, VaultItem,
 };
 pub use osm_origin::Origin;
+pub use passkey::{Passkey, PasskeySummary};
 pub use storage::{
     verify_pairing_signature, EncryptedRevision, EnrollmentMaterial, PendingDevice, Vault,
     BACKUPS_ID, CONTROL_SIGNATURE_DOMAIN, PAIRING_SIGNATURE_DOMAIN, RELAY_ID,
@@ -50,6 +52,8 @@ mod fixture_tests;
 mod hostile_tests;
 #[cfg(test)]
 mod hygiene_tests;
+#[cfg(test)]
+mod passkey_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

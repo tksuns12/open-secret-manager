@@ -35,6 +35,12 @@ func describe(_ error: Error) -> String {
     }
 }
 
+/// A login as a list names it: its username, and its passkeys if it has any.
+func loginLine(username: String, passkeys: UInt32) -> String {
+    let passkeys = passkeys == 0 ? nil : passkeys == 1 ? "passkey" : "\(passkeys) passkeys"
+    return [username.isEmpty ? nil : username, passkeys].compactMap { $0 }.joined(separator: " · ")
+}
+
 /// A card as a list names it: its brand and the last four digits of its number, nothing else of it.
 func cardLine(brand: String?, ending: String?) -> String {
     let brand = (brand?.trimmingCharacters(in: .whitespaces).isEmpty ?? true) ? "Card" : brand!

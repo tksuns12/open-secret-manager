@@ -13,6 +13,18 @@ export type VaultEntry = {
   cardEnding?: string | null;
   /** For a card, its brand as stored, or else as its number names it. */
   brand?: string | null;
+  /** How many passkeys a login holds. */
+  passkeys?: number;
+};
+
+/** A login's passkey, by site and account: its key is never sent here. */
+export type PasskeySummary = {
+  credentialId: string;
+  rpId: string;
+  userName: string;
+  userDisplayName: string;
+  /** In seconds since 1970; 0 when not known. */
+  createdAt: number;
 };
 
 /** Editable fields; the stored password and TOTP secret are never returned. */
@@ -29,6 +41,7 @@ export type EntryDetail = {
   /** The names of the item's other fields, such as an identity's address; their values are copied, never sent here. A card's own fields are in `card`. */
   fields: string[];
   card?: CardDetail | null;
+  passkeys?: PasskeySummary[];
   revision: string;
 };
 
@@ -377,6 +390,8 @@ export type DesktopBridge = {
   createEntry: (input: EntryInput) => Promise<VaultEntry>;
   updateEntry: (id: string, expectedRevision: string, input: EntryInput) => Promise<VaultEntry>;
   deleteEntry: (id: string, expectedRevision: string) => Promise<void>;
+  /** Removes a login's passkey on every device; its key stays in the item's history and in backups. */
+  removePasskey: (id: string, expectedRevision: string, credentialId: string) => Promise<VaultEntry>;
   listVersions: (id: string) => Promise<VersionSummary[]>;
   resolveEntry: (id: string, keepRevision: string, heads: string[]) => Promise<void>;
   /** Changes held for the owner's review; needs the vault unlocked. */

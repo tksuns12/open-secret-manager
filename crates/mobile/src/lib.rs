@@ -231,6 +231,7 @@ impl From<osm_vault_core::ItemSummary> for ItemSummary {
             conflict: item.conflict,
             card_ending: item.card_ending,
             brand: item.brand,
+            passkeys: item.passkeys as u32,
         }
     }
 }
@@ -263,6 +264,33 @@ pub struct ItemSummary {
     pub card_ending: Option<String>,
     /// For a card, its brand as stored, or else as its number names it.
     pub brand: Option<String>,
+    /// How many passkeys a login holds.
+    pub passkeys: u32,
+}
+
+/// A login's passkey as its page shows it: the site and the account it is
+/// for. Never its key.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PasskeyDetail {
+    /// Names it to [`Device::remove_passkey`].
+    pub credential_id: String,
+    pub rp_id: String,
+    pub user_name: String,
+    pub user_display_name: String,
+    /// In seconds since 1970; 0 when not known.
+    pub created_at: u64,
+}
+
+impl From<osm_vault_core::PasskeySummary> for PasskeyDetail {
+    fn from(passkey: osm_vault_core::PasskeySummary) -> Self {
+        Self {
+            credential_id: passkey.credential_id,
+            rp_id: passkey.rp_id,
+            user_name: passkey.user_name,
+            user_display_name: passkey.user_display_name,
+            created_at: passkey.created_at,
+        }
+    }
 }
 
 /// An item as its page shows it. Its password and one-time code are
@@ -285,6 +313,8 @@ pub struct ItemDetail {
     pub fields: Vec<String>,
     /// For a card, its fields.
     pub card: Option<CardDetail>,
+    /// A login's passkeys.
+    pub passkeys: Vec<PasskeyDetail>,
     pub conflict: bool,
     /// The revision it was read at, which an edit names: an edit of an item
     /// that changed since is refused.
@@ -816,6 +846,19 @@ impl Device {
     /// every device. Its earlier versions stay in the vault's history.
     pub fn delete_item(&self, id: String, revision: String) -> Result<(), MobileError> {
         self.tokio.block_on(self.inner.delete_item(&id, &revision))
+    }
+
+    /// Removes the passkey `credential_id` of the login `id`, as read at
+    /// `revision`, on every device. Its key stays in the login's earlier
+    /// versions, and in backups.
+    pub fn remove_passkey(
+        &self,
+        id: String,
+        revision: String,
+        credential_id: String,
+    ) -> Result<(), MobileError> {
+        self.tokio
+            .block_on(self.inner.remove_passkey(&id, &revision, &credential_id))
     }
 
     /// Every version of an item, newest first.

@@ -45,6 +45,11 @@ impl Origin {
             port: url.port().unwrap_or(HTTPS_PORT),
         })
     }
+
+    /// The host, as the URL standard serializes it.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
 }
 
 impl fmt::Display for Origin {

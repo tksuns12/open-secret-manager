@@ -96,6 +96,27 @@ final class AppTests: UITestCase {
         copies("Passport number")
         app.buttons["back"].tap()
 
+        // A login's passkey: its site and account, never its key, and
+        // removed once the owner is told what that does.
+        let site = app.buttons["item:Passkey site"]
+        for _ in 0..<5 where !site.waitForExistence(timeout: 3) { app.swipeUp() }
+        XCTAssert(site.label.contains("owner · passkey"), site.label)
+        site.tap()
+        let passkey = app.staticTexts["passkey:passkeys.example"]
+        XCTAssert(passkey.waitForExistence(timeout: 15))
+        XCTAssert(passkey.label.hasPrefix("owner (Owner) · made "), passkey.label)
+        // Its buttons are found within the alert, by their labels: more
+        // than one element answered to the identifier "keep".
+        let asked = app.alerts["Remove this passkey?"]
+        app.buttons["remove-passkey:passkeys.example"].tap()
+        asked.buttons["Keep"].firstMatch.waitAndTap()
+        XCTAssert(asked.waitForNonExistence(timeout: 10) && passkey.exists)
+        app.buttons["remove-passkey:passkeys.example"].tap()
+        asked.buttons["Remove"].firstMatch.waitAndTap()
+        XCTAssert(app.staticTexts["notice"].waitForLabel("Passkey removed"))
+        XCTAssert(passkey.waitForNonExistence(timeout: 10))
+        app.buttons["back"].tap()
+
         // A login's own extra fields, beside what it had.
         open("Bank")
         XCTAssert(app.buttons["copy-field:PIN"].waitForExistence(timeout: 15))

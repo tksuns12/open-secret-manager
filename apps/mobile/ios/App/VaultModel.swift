@@ -278,6 +278,19 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    /// Removes `passkey` of the login `item` shows, on every device, and shows the login as it is then.
+    func removePasskey(_ item: ItemDetail, _ passkey: PasskeyDetail) {
+        Task {
+            if let shown = await call(nil, { device -> ItemDetail in
+                try device.removePasskey(id: item.id, revision: item.revision, credentialId: passkey.credentialId)
+                return try device.item(id: item.id)
+            }) {
+                detail = shown
+                notice = "Passkey removed"
+            }
+        }
+    }
+
     func openHistory(_ detail: ItemDetail) {
         Task {
             if let versions = await call(nil, { try $0.history(id: detail.id) }) {

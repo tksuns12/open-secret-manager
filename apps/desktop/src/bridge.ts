@@ -1,5 +1,5 @@
 import { cardBrand, cardDigits } from "./card";
-import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, PasskeySummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -48,7 +48,7 @@ let previewRelay: DevicesInfo["relay"] = null;
 
 let previewEntries: VaultEntry[] = ([
   { id: "1", title: "Proton Mail", kind: "login", username: "hello@northstar.dev", url: "proton.me", favorite: true },
-  { id: "2", title: "GitHub", kind: "login", username: "northstar-labs", url: "github.com", favorite: true },
+  { id: "2", title: "GitHub", kind: "login", username: "northstar-labs", url: "github.com", favorite: true, passkeys: 1 },
   { id: "3", title: "Banking — checking", kind: "login", username: "•••• 4821", url: "secure.bank.example", favorite: false },
   { id: "4", title: "Recovery codes", kind: "secure_note", favorite: false },
   { id: "5", title: "Studio Wi-Fi", kind: "login", username: "studio", url: "network", favorite: false },
@@ -59,8 +59,8 @@ let previewEntries: VaultEntry[] = ([
 
 /** With `?conflict`: the two versions of GitHub that were changed independently. */
 const previewConflict: VersionSummary[] = [
-  { revision: "preview-conflict-here", deleted: false, title: "GitHub", username: "northstar-labs", url: "github.com", device: "preview", thisDevice: true, differs: ["username", "password"] },
-  { revision: "preview-conflict-there", deleted: false, title: "GitHub", username: "northstar-ops", url: "github.com", device: "3f9a1c2e", thisDevice: false, differs: ["username", "password"] },
+  { revision: "preview-conflict-here", deleted: false, title: "GitHub", username: "northstar-labs", url: "github.com", device: "preview", thisDevice: true, differs: ["username", "password", "passkeys"] },
+  { revision: "preview-conflict-there", deleted: false, title: "GitHub", username: "northstar-ops", url: "github.com", device: "3f9a1c2e", thisDevice: false, differs: ["username", "password", "passkeys"] },
 ];
 
 /** With `?card-fill`: a checkout page asking for a card, its number and code in a payment provider's frame. */
@@ -118,11 +118,14 @@ function recordPreviewVersion(entry: VaultEntry, input: EntryInput, previous?: E
   previewHistory.set(entry.id, [{ version, entry }, ...versions.map((older) => ({ ...older, version: { ...older.version, current: false } }))]);
 }
 
+/** The sample login's passkey: a site and an account, and no key. */
+const PREVIEW_PASSKEY: PasskeySummary = { credentialId: "cHJldmlldy1wYXNza2V5", rpId: "github.com", userName: "northstar-labs", userDisplayName: "Northstar Labs", createdAt: 1767225600 };
+
 /** The sample card's fields: no number or code is kept, only its last four digits. */
 const PREVIEW_CARD: CardDetail = { cardholder: "Alex Northstar", expiryMonth: "08", expiryYear: "2029", brand: "Visa", numberEnding: "4242", hasNumber: true, hasSecurityCode: true };
 
 function previewDetail(entry: VaultEntry): EntryDetail {
-  return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, fields: [], card: entry.kind === "card" ? PREVIEW_CARD : null, revision: entry.revision ?? "preview" };
+  return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, fields: [], card: entry.kind === "card" ? PREVIEW_CARD : null, passkeys: entry.passkeys ? [PREVIEW_PASSKEY] : [], revision: entry.revision ?? "preview" };
 }
 
 /** A card's fields after `input`, as the shell would store them, keeping of the number only its last four digits. */
@@ -147,10 +150,11 @@ function savePreview(id: string, input: EntryInput, previous?: EntryDetail): Vau
     hasTotp: input.totpSecret !== undefined ? input.totpSecret.trim().length > 0 : Boolean(previous?.hasTotp),
     fields: previous?.fields ?? [],
     card: input.kind === "card" && input.card ? previewCard(input.card, previous?.card) : input.kind === "card" ? previous?.card ?? null : null,
+    passkeys: previous?.passkeys ?? [],
     revision,
   };
   previewDetails.set(id, detail);
-  const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, favorite: input.favorite, revision, cardEnding: detail.card?.numberEnding ?? null, brand: detail.card?.brand || null };
+  const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, favorite: input.favorite, revision, cardEnding: detail.card?.numberEnding ?? null, brand: detail.card?.brand || null, passkeys: detail.passkeys?.length ?? 0 };
   recordPreviewVersion(entry, input, previous);
   previewEntries = [entry, ...previewEntries.filter((existing) => existing.id !== id)];
   return entry;
@@ -228,6 +232,19 @@ export const bridge: DesktopBridge = {
     const entry = previewEntries.find((existing) => existing.id === id);
     if (!entry) throw new Error("not_found");
     return savePreview(id, input, previewDetail(entry));
+  },
+  async removePasskey(id, expectedRevision, credentialId) {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) return (await invoke("remove_passkey", { id, expectedRevision, credentialId })) as VaultEntry;
+    const entry = previewEntries.find((existing) => existing.id === id);
+    if (!entry) throw new Error("not_found");
+    const detail = previewDetail(entry);
+    const passkeys = (detail.passkeys ?? []).filter((passkey) => passkey.credentialId !== credentialId);
+    const revision = crypto.randomUUID();
+    previewDetails.set(id, { ...detail, passkeys, revision });
+    const updated: VaultEntry = { ...entry, revision, passkeys: passkeys.length };
+    previewEntries = previewEntries.map((existing) => existing.id === id ? updated : existing);
+    return updated;
   },
   async deleteEntry(id, expectedRevision) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;

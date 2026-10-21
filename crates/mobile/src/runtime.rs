@@ -294,6 +294,11 @@ impl Runtime {
                 .cloned()
                 .collect(),
             card: (item.kind == osm_vault_core::ItemKind::Card).then(|| CardDetail::of(item)),
+            passkeys: item
+                .passkeys
+                .iter()
+                .map(|passkey| passkey.summary().into())
+                .collect(),
             conflict: found.conflict,
             revision: found.revision.clone(),
         })
@@ -398,6 +403,24 @@ impl Runtime {
                 return Err(MobileError::NotEditableHere);
             }
             vault.delete(id, revision)?;
+        }
+        self.sync_soon();
+        Ok(())
+    }
+
+    pub(crate) async fn remove_passkey(
+        self: &Arc<Self>,
+        id: &str,
+        revision: &str,
+        credential_id: &str,
+    ) -> Result<(), MobileError> {
+        {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            if vault.get(id)?.conflict {
+                return Err(MobileError::InConflict);
+            }
+            vault.remove_passkey(id, revision, credential_id)?;
         }
         self.sync_soon();
         Ok(())

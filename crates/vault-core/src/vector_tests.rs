@@ -26,11 +26,11 @@ use crate::{
 };
 
 /// `N` bytes counting up from `first`: inputs anyone can write down.
-fn counting<const N: usize>(first: u8) -> [u8; N] {
+pub(crate) fn counting<const N: usize>(first: u8) -> [u8; N] {
     std::array::from_fn(|index| first.wrapping_add(index as u8))
 }
 
-fn unhex(text: &str) -> Vec<u8> {
+pub(crate) fn unhex(text: &str) -> Vec<u8> {
     (0..text.len())
         .step_by(2)
         .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
@@ -302,7 +302,7 @@ fn differences(path: &str, frozen: &Value, made: &Value, found: &mut Vec<String>
 
 /// The frozen file `name` in the fixtures, after checking that `made`
 /// matches it.
-fn frozen(name: &str, made: &Value) -> Value {
+pub(crate) fn frozen(name: &str, made: &Value) -> Value {
     let path = crate::fixture_tests::crate_dir()
         .join("fixtures")
         .join(name);

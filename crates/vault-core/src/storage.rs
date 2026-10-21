@@ -21,9 +21,9 @@ use crate::{
         verify_recovery_check, xor_into, KdfConfig, RowSets, SecretKey, DEVICE_ID_LEN, KEY_LEN,
         NONCE_LEN, PUBLIC_KEY_LEN, SALT_LEN, SIGNATURE_LEN,
     },
-    BackupCheck, DeletedItem, Error, FillCredentials, ForkReport, HistoryVersion, IngressReport,
-    Item, ItemKind, ItemSummary, ItemVersion, Origin, QuarantinedRevision, RecoveryKey, Result,
-    RevisionInfo, StageOutcome, UnlockSession, VaultItem,
+    passkey, BackupCheck, DeletedItem, Error, FillCredentials, ForkReport, HistoryVersion,
+    IngressReport, Item, ItemKind, ItemSummary, ItemVersion, Origin, QuarantinedRevision,
+    RecoveryKey, Result, RevisionInfo, StageOutcome, UnlockSession, VaultItem,
 };
 
 /// What a version holds: the item's fields as JSON, with `saved_at` (the
@@ -1596,7 +1596,9 @@ impl Vault {
             ));
         }
         let item = self.open_item(&stored)?;
-        self.resolve(item_id, Some(item), heads)
+        // What it held is taken as read, as the versions it follows are.
+        let read = item.clone();
+        self.resolve_from(item_id, Some(item), heads, vec![read])
     }
 
     pub fn list(&self) -> Result<Vec<ItemSummary>> {
@@ -1745,6 +1747,7 @@ impl Vault {
 
     pub fn put(&mut self, item: Item) -> Result<RevisionInfo> {
         item.validate()?;
+        passkey::check_written(&item, &[])?;
         if !head_ids(&self.connection, &item.id)?.is_empty() {
             return Err(Error::AlreadyExists);
         }
@@ -1758,6 +1761,7 @@ impl Vault {
         let mut ids = BTreeSet::new();
         for item in &items {
             item.validate()?;
+            passkey::check_written(item, &[])?;
             if version_plaintext(Some(item), Some(saved))?.len() > MAX_ITEM_BYTES {
                 return Err(Error::InvalidItem("serialized item is too large".into()));
             }
@@ -1898,6 +1902,10 @@ impl Vault {
     /// longer the head.
     pub fn update(&mut self, item: Item, expected_revision: &str) -> Result<RevisionInfo> {
         item.validate()?;
+        if !item.passkeys.is_empty() {
+            let followed = self.versions_followed(&item.id, &[expected_revision.to_owned()])?;
+            passkey::check_written(&item, &followed)?;
+        }
         self.write_item(
             item,
             vec![expected_revision.to_owned()],
@@ -1924,11 +1932,27 @@ impl Vault {
     /// that content and `None` deletes the item. Every named head must still
     /// be current. A head that arrived after the owner reviewed the conflict
     /// is not named, so it stays visible and the item stays in conflict.
+    ///
+    /// A version kept whole keeps the passkeys of the others too, so that
+    /// settling a conflict loses none; the owner removes one afterwards if
+    /// that was meant.
     pub fn resolve(
         &mut self,
         item_id: &str,
         resolution: Option<Item>,
         heads: &[String],
+    ) -> Result<RevisionInfo> {
+        self.resolve_from(item_id, resolution, heads, Vec::new())
+    }
+
+    /// Resolves, taking as read the passkeys of the versions it follows and
+    /// of `read`.
+    fn resolve_from(
+        &mut self,
+        item_id: &str,
+        resolution: Option<Item>,
+        heads: &[String],
+        mut read: Vec<Item>,
     ) -> Result<RevisionInfo> {
         let mut parents = heads.to_vec();
         parents.sort();
@@ -1939,11 +1963,15 @@ impl Vault {
             )));
         }
         let (item, tombstone) = match resolution {
-            Some(item) => {
+            Some(mut item) => {
                 item.validate()?;
                 if item.id != item_id {
                     return Err(Error::InvalidItem("resolution is for another item".into()));
                 }
+                let followed = self.versions_followed(item_id, &parents)?;
+                passkey::keep_all(&mut item, &followed);
+                read.extend(followed);
+                passkey::check_written(&item, &read)?;
                 (item, false)
             }
             None => {
@@ -1953,6 +1981,28 @@ impl Vault {
             }
         };
         self.write_item(item, parents, tombstone, LocalWrite::Resolve)
+    }
+
+    /// The items of the versions of an item named in `revisions`, as this
+    /// device has them: what a write that follows them read. A version it
+    /// does not have, or one that deletes, has none.
+    fn versions_followed(&self, item_id: &str, revisions: &[String]) -> Result<Vec<Item>> {
+        let mut items = Vec::new();
+        for revision in revisions {
+            if let Some(stored) = revision_by_id(&self.connection, revision)? {
+                if stored.item_id == item_id && !stored.tombstone {
+                    items.push(self.open_item(&stored)?);
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// Writes an item without checking its passkeys, as a later build
+    /// might have written it.
+    #[cfg(test)]
+    pub(crate) fn put_as_later_build(&mut self, item: Item) -> Result<RevisionInfo> {
+        self.write_item(item, Vec::new(), false, LocalWrite::Create)
     }
 
     fn write_item(

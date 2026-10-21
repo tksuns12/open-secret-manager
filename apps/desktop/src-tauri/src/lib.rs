@@ -30,7 +30,9 @@ mod side_files_tests;
 
 use std::path::{Path, PathBuf};
 
-use osm_vault_core::{card, Item, ItemKind, ItemSummary, PasswordPolicy, Vault, VaultItem};
+use osm_vault_core::{
+    card, Item, ItemKind, ItemSummary, PasskeySummary, PasswordPolicy, Vault, VaultItem,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
@@ -306,6 +308,8 @@ struct EntryDetail {
     /// card's own fields are in `card` instead.
     fields: Vec<String>,
     card: Option<CardDetail>,
+    /// A login's passkeys, by site and account: never a key.
+    passkeys: Vec<PasskeySummary>,
     revision: String,
 }
 
@@ -460,6 +464,11 @@ async fn get_entry(
             .cloned()
             .collect(),
         card: (item.kind == ItemKind::Card).then(|| CardDetail::of(&item)),
+        passkeys: item
+            .passkeys
+            .iter()
+            .map(|passkey| passkey.summary())
+            .collect(),
         revision,
     })
 }
@@ -501,6 +510,27 @@ async fn update_entry<R: tauri::Runtime>(
     let VaultItem { mut item, .. } = vault.get(&id)?;
     input.apply_to(&mut item);
     vault.update(item, &expected_revision)?;
+    network::schedule_sync(&app);
+    Ok(vault.get(&id)?.into())
+}
+
+/// Removes a login's passkey on every device, as read at
+/// `expected_revision`. Its key stays in the login's earlier versions and in
+/// backups.
+#[tauri::command]
+async fn remove_passkey<R: tauri::Runtime>(
+    id: String,
+    expected_revision: String,
+    credential_id: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle<R>,
+) -> Result<ItemSummary, CommandError> {
+    let mut vault = state.vault.lock().await;
+    let vault = vault.as_mut().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    vault.remove_passkey(&id, &expected_revision, &credential_id)?;
     network::schedule_sync(&app);
     Ok(vault.get(&id)?.into())
 }
@@ -671,6 +701,7 @@ fn changed_fields(held: &Item, current: &Item) -> Vec<&'static str> {
     note(held.url != current.url, "website");
     note(held.totp_secret != current.totp_secret, "one-time code");
     note(held.notes != current.notes, "notes");
+    note(held.passkeys != current.passkeys, "passkeys");
     note(
         held.kind != current.kind
             || held.favorite != current.favorite
@@ -967,6 +998,7 @@ pub fn run() {
             get_entry,
             create_entry,
             update_entry,
+            remove_passkey,
             delete_entry,
             list_versions,
             resolve_entry,
@@ -1093,6 +1125,32 @@ mod tests {
         // Names only: no value reaches the window.
         let sent = serde_json::to_string(&summaries).unwrap();
         assert!(!sent.contains("another password") && !sent.contains("a note only there"));
+    }
+
+    #[test]
+    fn an_edit_keeps_a_logins_passkeys_and_a_held_change_names_them() {
+        let request = osm_vault_core::passkey::Registering {
+            rp_id: "example.test".into(),
+            rp_name: "Example".into(),
+            user_handle: vec![1; 16],
+            user_name: "owner".into(),
+            user_display_name: "Owner".into(),
+            challenge: vec![2; 32],
+            exclude: Vec::new(),
+            user_verification: osm_vault_core::passkey::UserVerification::Preferred,
+        };
+        let passkey = request.create(false, 0).unwrap().passkey;
+        let mut item = stored();
+        item.passkeys.push(passkey.clone());
+        input(None, None).apply_to(&mut item);
+        assert_eq!(item.passkeys, [passkey]);
+        let mut held = item.clone();
+        held.passkeys.clear();
+        assert_eq!(changed_fields(&held, &item), ["passkeys"]);
+        // What the window is sent of one: never its key.
+        let sent = serde_json::to_string(&item.passkeys[0].summary()).unwrap();
+        assert!(!sent.contains(&item.passkeys[0].key));
+        assert!(sent.contains(r#""rpId":"example.test""#));
     }
 
     #[test]

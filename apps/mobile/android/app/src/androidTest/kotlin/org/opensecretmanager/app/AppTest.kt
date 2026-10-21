@@ -6,7 +6,9 @@ import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.os.Build
 import android.view.WindowManager
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOff
@@ -271,6 +273,29 @@ class AppTest {
         compose.onNodeWithTag("edit-elsewhere").assertExists()
         compose.onNodeWithTag("edit").assertDoesNotExist()
         copies("Passport number", "X1234567")
+        compose.onNodeWithTag("back").performClick()
+
+        // A login's passkey: its site and account, never its key, and
+        // removed once the owner is told what that does.
+        waitFor("search")
+        compose.onNodeWithTag("search").performTextClearance()
+        compose.onNodeWithTag("search").performTextInput("Passkey site")
+        waitFor("item:Passkey site")
+        compose.onNodeWithTag("item:Passkey site").assert(hasText("owner · passkey"))
+        compose.onNodeWithTag("item:Passkey site").performClick()
+        waitFor("passkey:passkeys.example")
+        val account = compose.onNodeWithTag("passkey:passkeys.example").fetchSemanticsNode()
+            .config[SemanticsProperties.Text].joinToString { it.text }
+        assertTrue(account, account.startsWith("owner (Owner) · made "))
+        compose.onNodeWithTag("remove-passkey:passkeys.example").performScrollTo().performClick()
+        waitFor("confirm-remove-passkey")
+        compose.onNodeWithTag("keep").performClick()
+        compose.onNodeWithTag("passkey:passkeys.example").assertExists()
+        compose.onNodeWithTag("remove-passkey:passkeys.example").performScrollTo().performClick()
+        waitFor("confirm-remove-passkey")
+        compose.onNodeWithTag("confirm-remove-passkey").performClick()
+        compose.waitUntilAtLeastOneExists(hasText("Passkey removed"), 10_000)
+        compose.waitUntilDoesNotExist(hasTestTag("passkey:passkeys.example"), 10_000)
         compose.onNodeWithTag("back").performClick()
 
         // A login's own extra fields, beside what it had.

@@ -12,6 +12,10 @@ csv = "1.4.0"
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
 hmac = "0.12.1"
 osm-origin = { path = "../origin" }
+# Passkeys: ES256 keys and signatures, and the public suffix list for the
+# sites a passkey may be for.
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+psl = "2.1.244"
 rand = "0.8.5"
 rusqlite = { version = "0.40.2", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }

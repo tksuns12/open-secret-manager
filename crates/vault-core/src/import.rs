@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, HashMap};
 
+use base64ct::{Base64UrlUnpadded, Encoding};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    card, crypto::random_array, Error, ImportFormat, ImportPreview, ImportWarning, Item, ItemKind,
-    Result,
+    card, crypto::random_array, passkey, Error, ImportFormat, ImportPreview, ImportWarning, Item,
+    ItemKind, Passkey, Result,
 };
 
 const MAX_IMPORT_BYTES: usize = 128 * 1024 * 1024;
@@ -69,6 +70,142 @@ struct BitwardenLogin {
     totp: Option<String>,
     #[serde(default)]
     uris: Vec<BitwardenUri>,
+    #[serde(default, rename = "fido2Credentials")]
+    passkeys: Option<Vec<BitwardenPasskey>>,
+}
+
+/// A passkey as Bitwarden exports one: every value text.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BitwardenPasskey {
+    /// A GUID, for its 16 bytes, or `b64.` and the bytes in base64url.
+    credential_id: Option<String>,
+    key_type: Option<String>,
+    key_algorithm: Option<String>,
+    key_curve: Option<String>,
+    /// PKCS #8, in base64url.
+    key_value: Option<String>,
+    rp_id: Option<String>,
+    user_handle: Option<String>,
+    user_name: Option<String>,
+    user_display_name: Option<String>,
+    counter: Option<String>,
+    creation_date: Option<String>,
+}
+
+impl BitwardenPasskey {
+    /// The passkey, if it is one this app can use and keep.
+    fn passkey(&self) -> Option<Passkey> {
+        if self.key_type.as_deref().unwrap_or("public-key") != "public-key"
+            || self.key_algorithm.as_deref() != Some("ECDSA")
+            || self.key_curve.as_deref() != Some("P-256")
+        {
+            return None;
+        }
+        let id = self.credential_id.as_deref()?;
+        let credential_id = match id.strip_prefix("b64.") {
+            Some(encoded) => decoded(encoded)?,
+            None => guid_bytes(id)?,
+        };
+        let key = Zeroizing::new(decoded(self.key_value.as_deref()?)?);
+        passkey::imported(
+            &credential_id,
+            self.rp_id.as_deref()?,
+            &decoded(self.user_handle.as_deref()?)?,
+            self.user_name.as_deref().unwrap_or_default(),
+            self.user_display_name.as_deref().unwrap_or_default(),
+            &key,
+            self.creation_date
+                .as_deref()
+                .and_then(seconds_of)
+                .unwrap_or_default(),
+            self.counter
+                .as_deref()
+                .and_then(|counter| counter.trim().parse().ok())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+impl Drop for BitwardenPasskey {
+    fn drop(&mut self) {
+        self.credential_id.zeroize();
+        self.key_value.zeroize();
+        self.rp_id.zeroize();
+        self.user_handle.zeroize();
+        self.user_name.zeroize();
+        self.user_display_name.zeroize();
+    }
+}
+
+/// Bytes in base64url, or in base64, padded or not.
+fn decoded(text: &str) -> Option<Vec<u8>> {
+    let text: Zeroizing<String> = Zeroizing::new(
+        text.trim_end_matches('=')
+            .chars()
+            .map(|char| match char {
+                '+' => '-',
+                '/' => '_',
+                other => other,
+            })
+            .collect(),
+    );
+    Base64UrlUnpadded::decode_vec(&text).ok()
+}
+
+/// The 16 bytes of a GUID, in the order it is written.
+fn guid_bytes(guid: &str) -> Option<Vec<u8>> {
+    let hyphens = [8, 13, 18, 23];
+    if guid.len() != 36
+        || !guid.char_indices().all(|(at, char)| {
+            if hyphens.contains(&at) {
+                char == '-'
+            } else {
+                char.is_ascii_hexdigit()
+            }
+        })
+    {
+        return None;
+    }
+    let digits = guid.replace('-', "");
+    (0..32)
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&digits[at..at + 2], 16).ok())
+        .collect()
+}
+
+/// Seconds since 1970 of a time as an export writes it,
+/// `2024-01-31T10:05:33.123Z`; `None` for any other form.
+fn seconds_of(time: &str) -> Option<u64> {
+    let (date, clock) = time.strip_suffix('Z')?.split_once('T')?;
+    let numbers = |text: &str, separator| {
+        let parts = text
+            .split(separator)
+            .map(|part| {
+                (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+                    .then(|| part.parse::<i64>().ok())
+                    .flatten()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        <[i64; 3]>::try_from(parts).ok()
+    };
+    let [year, month, day] = numbers(date, '-')?;
+    let [hour, minute, second] = numbers(clock.split('.').next()?, ':')?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // Days since 1970 of a date in the Gregorian calendar.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
 }
 
 #[derive(Deserialize)]
@@ -202,6 +339,38 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
                 message: "URL is not absolute; imported unchanged".into(),
             });
         }
+        let mut passkeys = Vec::new();
+        let mut left = 0;
+        let exported = source
+            .login
+            .as_ref()
+            .and_then(|login| login.passkeys.as_ref());
+        for exported in exported.into_iter().flatten() {
+            match exported.passkey() {
+                Some(passkey)
+                    if kind == ItemKind::Login
+                        && passkeys.len() < passkey::MAX_PASSKEYS
+                        && !passkeys.iter().any(|kept: &Passkey| {
+                            kept.rp_id == passkey.rp_id
+                                && kept.credential_id == passkey.credential_id
+                        }) =>
+                {
+                    passkeys.push(passkey)
+                }
+                _ => left += 1,
+            }
+        }
+        if left > 0 {
+            warnings.push(ImportWarning {
+                row,
+                message: format!(
+                    "{left} passkey{} not imported: this app takes P-256 keys for a site's domain, \
+                     at most {} on a login",
+                    if left == 1 { " was" } else { "s were" },
+                    passkey::MAX_PASSKEYS
+                ),
+            });
+        }
         items.push(Item {
             id: Uuid::new_v4().to_string(),
             title: std::mem::take(&mut source.name),
@@ -214,6 +383,7 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
             custom_fields,
             tags: Vec::new(),
             favorite: source.favorite,
+            passkeys,
             unknown_fields: BTreeMap::new(),
         });
     }
@@ -362,6 +532,7 @@ fn parse_csv(bytes: &[u8], flavor: CsvFlavor) -> Result<(Vec<Item>, Vec<ImportWa
             custom_fields: BTreeMap::new(),
             tags: Vec::new(),
             favorite: false,
+            passkeys: Vec::new(),
             unknown_fields: BTreeMap::new(),
         });
     }

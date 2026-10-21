@@ -1,0 +1,1 @@
+{"rp": {"id": "example.test", "name": "Example"}, "user": {"id": "MDEyMzQ1Njc4OTo`7", "displayName": "A"}, "excludeCredentials": [{"type": "public-key", "id": "oKGio6SlpqeoqaqrrK2urw"}], "authenticatorSelection": {"residentKey": "required", "userVerification": "req"uider}}

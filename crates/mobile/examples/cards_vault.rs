@@ -1,6 +1,7 @@
-//! A copy of a frozen vault with a card and an identity added, for the
-//! phone apps' tests of an item's other fields: the frozen vaults hold
-//! neither, and a phone cannot make them.
+//! A copy of a frozen vault with a card, an identity and a login with a
+//! passkey added, for the phone apps' tests of an item's other fields and
+//! passkeys: the frozen vaults hold none of them, and a phone cannot make
+//! an identity or a passkey.
 //!
 //!   cargo run -p osm-mobile --example cards_vault -- <fixture folder> <copy>
 //!
@@ -49,6 +50,21 @@ fn main() {
                 ("Country", "Iceland"),
             ],
         ))
+        .unwrap();
+    let made = osm_vault_core::passkey::Registering {
+        rp_id: "passkeys.example".into(),
+        rp_name: "Passkeys".into(),
+        user_handle: vec![7; 16],
+        user_name: "owner".into(),
+        user_display_name: "Owner".into(),
+        challenge: vec![1; 32],
+        exclude: Vec::new(),
+        user_verification: osm_vault_core::passkey::UserVerification::Preferred,
+    }
+    .create(true, 1_767_225_600)
+    .unwrap();
+    vault
+        .save_passkey_as_login(made.passkey, "Passkey site")
         .unwrap();
 }
 

@@ -210,7 +210,7 @@ private struct Items: View {
                 Button { model.open(item.id) } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(item.title + (item.conflict ? " · needs a decision on your computer" : ""))
-                        let below = item.kind == .card ? cardLine(brand: item.brand, ending: item.cardEnding) : item.username
+                        let below = item.kind == .card ? cardLine(brand: item.brand, ending: item.cardEnding) : loginLine(username: item.username, passkeys: item.passkeys)
                         if !below.isEmpty {
                             Text(below).font(.caption).foregroundStyle(.secondary)
                         }
@@ -258,6 +258,7 @@ private struct Detail: View {
     @ObservedObject var model: VaultModel
     let detail: ItemDetail
     @State private var confirmingDelete = false
+    @State private var removing: PasskeyDetail?
 
     private var editable: Bool {
         detail.kind != .identity && !detail.conflict
@@ -323,6 +324,14 @@ private struct Detail: View {
                     }
                 }
                 if !detail.url.isEmpty { Field(label: "Website", value: detail.url) {} }
+                // A login's passkeys, by site and account; never a key.
+                ForEach(detail.passkeys, id: \.credentialId) { passkey in
+                    Field(label: "Passkey for \(passkey.rpId)", value: passkeyAccount(passkey), identifier: "passkey:\(passkey.rpId)") {
+                        if !detail.conflict {
+                            Button("Remove") { removing = passkey }.accessibilityIdentifier("remove-passkey:\(passkey.rpId)")
+                        }
+                    }
+                }
                 // An identity's address, a login's own extras: named, and
                 // copied rather than shown, as on the computer.
                 ForEach(detail.fields, id: \.self) { name in
@@ -343,7 +352,22 @@ private struct Detail: View {
         } message: {
             Text("It is deleted on all your devices. Its earlier versions stay in the vault's history and in backups.")
         }
+        .alert("Remove this passkey?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), presenting: removing) { passkey in
+            Button("Remove", role: .destructive) { model.removePasskey(detail, passkey) }.accessibilityIdentifier("confirm-remove-passkey")
+            Button("Keep", role: .cancel) {}.accessibilityIdentifier("keep")
+        } message: { passkey in
+            Text("It is removed on all your devices, and you will no longer sign in to \(passkey.rpId) with it. Its key stays in this item's history and in backups.")
+        }
     }
+}
+
+/// The account a passkey is for, and when it was made, if that is known.
+private func passkeyAccount(_ passkey: PasskeyDetail) -> String {
+    let account = passkey.userName.isEmpty ? "No account name"
+        : !passkey.userDisplayName.isEmpty && passkey.userDisplayName != passkey.userName ? "\(passkey.userName) (\(passkey.userDisplayName))"
+        : passkey.userName
+    guard passkey.createdAt > 0 else { return account }
+    return "\(account) · made \(Date(timeIntervalSince1970: TimeInterval(passkey.createdAt)).formatted(date: .abbreviated, time: .omitted))"
 }
 
 /// Whether a phone restores items of `kind`: all but identities.

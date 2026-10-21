@@ -109,6 +109,27 @@ test("an item is made and changed, and its history brings back the first version
   assert.deepEqual(errors, []);
 });
 
+test("a login's passkeys are listed by site and account, and one is removed after saying what that does", async () => {
+  const { page, errors } = await window.open();
+  const github = page.locator(".entry-row", { hasText: "GitHub" });
+  assert.equal(await github.locator(".entry-copy span").textContent(), "northstar-labs · passkey");
+  await github.click();
+  const passkeys = page.locator(".passkey-list");
+  await passkeys.waitFor();
+  assert.match(await passkeys.textContent(), /^Passkey for github\.comnorthstar-labs \(Northstar Labs\) · made /);
+  const remove = passkeys.getByRole("button", { name: "Remove the passkey for github.com" });
+  await remove.click();
+  assert.match(await passkeys.textContent(), /You will no longer sign in to github\.com with it\. Its key stays in this item's history and in backups\./);
+  await passkeys.getByRole("button", { name: "Keep" }).click();
+  assert.equal(await passkeys.locator(".delete-confirm").count(), 0);
+  await remove.click();
+  await passkeys.getByRole("button", { name: "Remove passkey" }).click();
+  await toast(page).filter({ hasText: "Passkey removed" }).waitFor();
+  await passkeys.waitFor({ state: "detached" });
+  assert.equal(await github.locator(".entry-copy span").textContent(), "northstar-labs");
+  assert.deepEqual(errors, []);
+});
+
 test("a deleted item is listed under Recently deleted and comes back from there", async () => {
   const { page, errors } = await window.open();
   await page.locator(".entry-row", { hasText: "Studio Wi-Fi" }).click();

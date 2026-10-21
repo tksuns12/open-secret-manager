@@ -29,6 +29,7 @@ import org.opensecretmanager.vault.DeviceState
 import org.opensecretmanager.vault.FillCredentials
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
+import org.opensecretmanager.vault.PasskeyDetail
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
@@ -303,6 +304,14 @@ class VaultSession(private val context: Context, private val folder: File) {
     fun delete(detail: ItemDetail) = run(null) {
         device!!.deleteItem(detail.id, detail.revision)
         _state.update { it.copy(detail = null, notice = "Item deleted") }
+        refresh()
+    }
+
+    /** Removes [passkey] of the login [detail] shows, on every device, and shows the login as it is then. */
+    fun removePasskey(detail: ItemDetail, passkey: PasskeyDetail) = run(null) {
+        val device = device!!
+        device.removePasskey(detail.id, detail.revision, passkey.credentialId)
+        _state.update { it.copy(detail = device.item(detail.id), notice = "Passkey removed") }
         refresh()
     }
 
