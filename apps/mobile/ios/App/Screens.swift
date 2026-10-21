@@ -210,8 +210,9 @@ private struct Items: View {
                 Button { model.open(item.id) } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(item.title + (item.conflict ? " · needs a decision on your computer" : ""))
-                        if !item.username.isEmpty {
-                            Text(item.username).font(.caption).foregroundStyle(.secondary)
+                        let below = item.kind == .card ? cardLine(brand: item.brand, ending: item.cardEnding) : item.username
+                        if !below.isEmpty {
+                            Text(below).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -259,7 +260,7 @@ private struct Detail: View {
     @State private var confirmingDelete = false
 
     private var editable: Bool {
-        (detail.kind == .login || detail.kind == .secureNote) && !detail.conflict
+        detail.kind != .identity && !detail.conflict
     }
 
     var body: some View {
@@ -280,7 +281,31 @@ private struct Detail: View {
                     }
                     .buttonStyle(.bordered)
                 } else if !detail.conflict {
-                    Text("Identities and cards are edited on your computer.").accessibilityIdentifier("edit-elsewhere")
+                    Text("Identities are edited on your computer.").accessibilityIdentifier("edit-elsewhere")
+                }
+                // A card's own fields: its number by its last four digits
+                // only, and the number and code copied rather than shown,
+                // as on the computer.
+                if let card = detail.card {
+                    if !card.cardholder.isEmpty {
+                        Field(label: "Cardholder name", value: card.cardholder, identifier: "card-cardholder") {
+                            Button("Copy") { model.copyField(detail.id, "Cardholder name") }.accessibilityIdentifier("copy-field:Cardholder name")
+                        }
+                    }
+                    if card.hasNumber {
+                        Field(label: "Number", value: card.numberEnding.map { "•••• \($0)" } ?? "••••••••", identifier: "card-number") {
+                            Button("Copy") { model.copyField(detail.id, "Number") }.accessibilityIdentifier("copy-field:Number")
+                        }
+                    }
+                    if !card.expiryMonth.isEmpty || !card.expiryYear.isEmpty {
+                        Field(label: "Expires", value: "\(card.expiryMonth.isEmpty ? "--" : card.expiryMonth) / \(card.expiryYear.isEmpty ? "----" : card.expiryYear)", identifier: "card-expiry") {}
+                    }
+                    if card.hasSecurityCode {
+                        Field(label: "Security code", value: "•••", identifier: "card-code") {
+                            Button("Copy") { model.copyField(detail.id, "Security code") }.accessibilityIdentifier("copy-field:Security code")
+                        }
+                    }
+                    if !card.brand.isEmpty { Field(label: "Brand", value: card.brand, identifier: "card-brand") {} }
                 }
                 if !detail.username.isEmpty {
                     Field(label: "Username", value: detail.username, identifier: "detail-username") {
@@ -298,9 +323,8 @@ private struct Detail: View {
                     }
                 }
                 if !detail.url.isEmpty { Field(label: "Website", value: detail.url) {} }
-                // A card's number, an identity's address, a login's own
-                // extras: named, and copied rather than shown, as on the
-                // computer.
+                // An identity's address, a login's own extras: named, and
+                // copied rather than shown, as on the computer.
                 ForEach(detail.fields, id: \.self) { name in
                     Field(label: name, value: "••••••••", identifier: "field:\(name)") {
                         Button("Copy") { model.copyField(detail.id, name) }.accessibilityIdentifier("copy-field:\(name)")
@@ -322,9 +346,15 @@ private struct Detail: View {
     }
 }
 
-/// Whether a phone restores items of `kind`: logins and secure notes.
+/// Whether a phone restores items of `kind`: all but identities.
 private func restoresHere(_ kind: ItemKind) -> Bool {
-    kind == .login || kind == .secureNote
+    kind != .identity
+}
+
+/// A card as a list names it: its brand and the last four digits of its number, nothing else of it.
+func cardLine(brand: String?, ending: String?) -> String {
+    let brand = (brand?.trimmingCharacters(in: .whitespaces).isEmpty ?? true) ? "Card" : brand!
+    return [brand, ending.map { "•••• \($0)" }].compactMap { $0 }.joined(separator: " ")
 }
 
 /// A time a device recorded, in seconds since 1970, as this phone writes dates.
@@ -358,7 +388,7 @@ private struct HistoryList: View {
             Section {
                 Text("Newest first. Restoring a version makes it the newest; the others stay. Each time is by the clock of the device that saved the version; versions saved before times were kept have none.")
                 if !restorable {
-                    Text("Identities, cards, and items in conflict are restored on your computer.")
+                    Text("Identities, and items in conflict, are restored on your computer.")
                         .accessibilityIdentifier("restore-elsewhere")
                 }
             }
@@ -461,7 +491,7 @@ private struct DeletedList: View {
                     if restoresHere(entry.kind) {
                         Button("Restore") { model.restoreDeleted(entry) }.accessibilityIdentifier("restore:\(entry.title)")
                     } else {
-                        Text("Identities and cards are restored on your computer.").font(.caption)
+                        Text("Identities are restored on your computer.").font(.caption)
                     }
                 }
             }
@@ -485,6 +515,15 @@ private struct ItemEditor: View {
     @State private var removeCode: Bool
     @State private var notes: String
     @State private var favorite: Bool
+    @State private var cardholder: String
+    @State private var number: String
+    @State private var showNumber = false
+    @State private var expiryMonth: String
+    @State private var expiryYear: String
+    @State private var securityCode: String
+    @State private var removeSecurityCode: Bool
+    /// The brand the owner typed; `nil` until then, for the one the number names.
+    @State private var brand: String?
 
     /// Starts from the editor's draft when it has one, otherwise from the
     /// item as it was read (or empty, for a new item).
@@ -503,6 +542,13 @@ private struct ItemEditor: View {
         _removeCode = State(initialValue: draft?.oneTimeCodeSecret == "")
         _notes = State(initialValue: draft?.notes ?? detail?.notes ?? "")
         _favorite = State(initialValue: draft?.favorite ?? detail?.favorite ?? false)
+        _cardholder = State(initialValue: draft?.card?.cardholder ?? detail?.card?.cardholder ?? "")
+        _number = State(initialValue: draft?.card?.number ?? "")
+        _expiryMonth = State(initialValue: draft?.card?.expiryMonth ?? detail?.card?.expiryMonth ?? "")
+        _expiryYear = State(initialValue: draft?.card?.expiryYear ?? detail?.card?.expiryYear ?? "")
+        _securityCode = State(initialValue: draft?.card?.securityCode ?? "")
+        _removeSecurityCode = State(initialValue: draft?.card?.securityCode == "")
+        _brand = State(initialValue: draft?.card?.brand)
     }
 
     private var draft: ItemDraft {
@@ -515,9 +561,20 @@ private struct ItemEditor: View {
             notes: notes,
             favorite: favorite,
             password: login && !password.isEmpty ? password : nil,
-            oneTimeCodeSecret: !login ? nil : removeCode ? "" : code.trimmingCharacters(in: .whitespaces).isEmpty ? nil : code
+            oneTimeCodeSecret: !login ? nil : removeCode ? "" : code.trimmingCharacters(in: .whitespaces).isEmpty ? nil : code,
+            // Blank, the number and the code stay as they are.
+            card: kind != .card ? nil : CardDraft(
+                cardholder: cardholder,
+                expiryMonth: expiryMonth,
+                expiryYear: expiryYear,
+                brand: brand,
+                number: number.isEmpty ? nil : number,
+                securityCode: removeSecurityCode ? "" : securityCode.trimmingCharacters(in: .whitespaces).isEmpty ? nil : securityCode
+            )
         )
     }
+
+    private var numberCheck: CardNumberCheck { checkCardNumber(number: number) }
 
     var body: some View {
         Form {
@@ -537,6 +594,7 @@ private struct ItemEditor: View {
                 Picker("Kind", selection: $kind) {
                     Text("Login").tag(ItemKind.login)
                     Text("Secure note").tag(ItemKind.secureNote)
+                    Text("Card").tag(ItemKind.card)
                 }
                 .pickerStyle(.segmented)
                 .accessibilityIdentifier("edit-kind")
@@ -599,6 +657,64 @@ private struct ItemEditor: View {
                     }
                 } footer: {
                     if detail?.hasOneTimeCode == true { Text("Left blank, the one-time code stays as it is.") }
+                }
+            }
+            if kind == .card {
+                Section {
+                    LabeledContent("Cardholder name") {
+                        TextField("Cardholder name", text: $cardholder)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("edit-cardholder")
+                    }
+                    // Marked as codes, as the password is, so that iOS
+                    // offers nothing of its own here.
+                    Group {
+                        if showNumber {
+                            TextField("Number", text: $number)
+                        } else {
+                            SecureField(detail?.card?.hasNumber == true ? "Unchanged" + (detail?.card?.numberEnding.map { " (•••• \($0))" } ?? "") : "Number", text: $number)
+                        }
+                    }
+                    .keyboardType(.numberPad)
+                    .textContentType(.oneTimeCode)
+                    .accessibilityIdentifier("edit-number")
+                    Button(showNumber ? "Hide" : "Show") { showNumber.toggle() }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("show-number")
+                    if numberCheck.complete && !numberCheck.passes {
+                        Text("This number fails a card number's check: a digit may be mistyped. It is saved as typed.")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("number-check")
+                    }
+                    HStack {
+                        TextField("MM", text: $expiryMonth)
+                            .keyboardType(.numberPad)
+                            .accessibilityIdentifier("edit-expiry-month")
+                        Text("/")
+                        TextField("YYYY", text: $expiryYear)
+                            .keyboardType(.numberPad)
+                            .accessibilityIdentifier("edit-expiry-year")
+                    }
+                    SecureField(detail?.card?.hasSecurityCode == true ? "Unchanged" : "Security code", text: $securityCode)
+                        .keyboardType(.numberPad)
+                        .textContentType(.oneTimeCode)
+                        .disabled(removeSecurityCode)
+                        .accessibilityIdentifier("edit-security-code")
+                    if detail?.card?.hasSecurityCode == true {
+                        Toggle("Remove the security code", isOn: $removeSecurityCode).accessibilityIdentifier("remove-security-code")
+                    }
+                    // Untouched, the brand is the one a new number names, or else the stored one.
+                    LabeledContent("Brand") {
+                        TextField("From the number", text: Binding(
+                            get: { brand ?? (number.isEmpty ? detail?.card?.brand ?? "" : numberCheck.brand ?? "") },
+                            set: { brand = $0 }
+                        ))
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("edit-brand")
+                    }
+                } footer: {
+                    if detail?.card?.hasNumber == true { Text("Left blank, the number and the security code stay as they are.") }
                 }
             }
             Section {

@@ -669,7 +669,7 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.InvalidItem -> error.reason
         is MobileException.ChangedElsewhere -> "This item changed since you opened it · open it again"
         is MobileException.InConflict -> "Two devices changed this item at once · choose a version on your computer"
-        is MobileException.NotEditableHere -> "Identities and cards are edited on your computer"
+        is MobileException.NotEditableHere -> "Identities are edited on your computer"
         is MobileException.Network -> "Could not reach your other devices · ${error.reason}"
         is MobileException.Storage -> "Something went wrong on this phone · ${error.reason}"
         is MobileException.KeystoreUnavailable -> "This phone's keystore did not answer · try again"

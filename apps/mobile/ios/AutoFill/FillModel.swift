@@ -235,7 +235,7 @@ final class FillModel: ObservableObject {
         if case let .origins(origins) = requester { url = origins.first ?? "" } else { url = "" }
         let draft = ItemDraft(
             title: title, kind: .login, username: saving.username, url: url,
-            notes: "", favorite: false, password: saving.password, oneTimeCodeSecret: nil
+            notes: "", favorite: false, password: saving.password, oneTimeCodeSecret: nil, card: nil
         )
         let requester = requester
         Task {

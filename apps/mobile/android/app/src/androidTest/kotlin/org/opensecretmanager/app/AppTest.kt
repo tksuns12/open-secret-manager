@@ -235,8 +235,8 @@ class AppTest {
             waitFor("item:$title")
             compose.onNodeWithTag("item:$title").performClick()
         }
-        fun copies(name: String, value: String) {
-            compose.onNodeWithTag("field:$name").assertTextEquals("••••••••")
+        fun copies(name: String, value: String, shown: String? = null) {
+            if (shown == null) compose.onNodeWithTag("field:$name").assertTextEquals("••••••••")
             compose.onNodeWithTag("copy-field:$name").performScrollTo().performClick()
             compose.waitUntil(10_000) {
                 instrumentation.runOnMainSync { }
@@ -248,24 +248,28 @@ class AppTest {
             compose.waitUntil(15_000) { session.state.value.notice == null }
         }
 
-        // A card: every field by name, none shown, each copied as a secret.
+        // A card: shown as a card's, its number by its last four digits and
+        // its code not at all, each copied as a secret; edited here.
         open("Visa")
         waitFor("copy-field:Number")
-        for (name in listOf("Cardholder name", "Expiry month", "Expiry year", "Number", "Security code")) {
-            compose.onNodeWithTag("field:$name").assertExists()
-        }
+        compose.onNodeWithTag("card-number").assertTextEquals("•••• 1111")
+        compose.onNodeWithTag("card-expiry").assertExists()
+        compose.onNodeWithTag("card-cardholder").assertExists()
+        compose.onNodeWithTag("card-code").assertTextEquals("•••")
         compose.onAllNodesWithText("4111111111111111", substring = true).assertCountEquals(0)
-        compose.onNodeWithTag("edit-elsewhere").assertExists()
-        compose.onNodeWithTag("edit").assertDoesNotExist()
-        copies("Security code", "123")
-        copies("Number", "4111111111111111")
+        compose.onNodeWithTag("edit").assertExists()
+        compose.onNodeWithTag("edit-elsewhere").assertDoesNotExist()
+        copies("Security code", "123", shown = "•••")
+        copies("Number", "4111111111111111", shown = "•••• 1111")
         compose.onNodeWithTag("back").performClick()
 
-        // An identity, likewise.
+        // An identity: every field by name, none shown, and edited on a computer.
         waitFor("search")
         open("Passport")
         waitFor("copy-field:Passport number")
         compose.onAllNodesWithText("X1234567", substring = true).assertCountEquals(0)
+        compose.onNodeWithTag("edit-elsewhere").assertExists()
+        compose.onNodeWithTag("edit").assertDoesNotExist()
         copies("Passport number", "X1234567")
         compose.onNodeWithTag("back").performClick()
 

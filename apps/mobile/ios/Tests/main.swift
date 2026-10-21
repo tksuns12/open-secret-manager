@@ -88,7 +88,7 @@ do {
     check(fails({ try device.oneTimeCodeForWeb(id: "fixture-bank", origin: "https://bank.example.test") }) { if case .NotForThisPage = $0 { true } else { false } }, "a code fills no other page")
     check(fails({ try device.oneTimeCodeForWeb(id: "fixture-mail", origin: "https://mail.example.test") }) { if case .NoOneTimeCode = $0 { true } else { false } }, "a login without a code fills none")
     // The owner's edits cross the other way, unicode and all.
-    let draft = ItemDraft(title: "Forum", kind: .login, username: "me", url: "https://forum.example.test", notes: "", favorite: false, password: "新しい 🔑 \"pass\"", oneTimeCodeSecret: nil)
+    let draft = ItemDraft(title: "Forum", kind: .login, username: "me", url: "https://forum.example.test", notes: "", favorite: false, password: "新しい 🔑 \"pass\"", oneTimeCodeSecret: nil, card: nil)
     let created = try device.createItem(draft: draft)
     check(try device.password(id: created) == "新しい 🔑 \"pass\"", "a new login keeps its password intact")
     let read = try device.item(id: created)
@@ -102,6 +102,16 @@ do {
     var passport = draft
     passport.kind = .identity
     check(fails({ try device.createItem(draft: passport) }) { if case .NotEditableHere = $0 { true } else { false } }, "an identity is made on a computer")
+    // A card is made here, by its own fields, and listed without its number.
+    var card = draft
+    card.kind = .card
+    card.title = "Travel card"
+    card.card = CardDraft(cardholder: "Owner", expiryMonth: "11", expiryYear: "2030", brand: nil, number: "5555 5555 5555 4444", securityCode: "987")
+    let made = try device.createItem(draft: card)
+    check(try device.item(id: made).card?.numberEnding == "4444", "a card shows the last four digits of its number")
+    check(try device.field(id: made, name: "Number") == "5555555555554444", "a card's number is kept without its spaces")
+    check(try device.items().first { $0.id == made }?.brand == "Mastercard", "a card's brand is the one its number names")
+    check(checkCardNumber(number: "5555 5555 5555 4440").complete && !checkCardNumber(number: "5555 5555 5555 4440").passes, "a mistyped digit fails the check")
     // What a form submitted goes into a login the form could fill, as its password only.
     let forum = try device.loginsForWeb(origin: "https://forum.example.test").map { $0.id }
     let candidates = try device.saveCandidates(ids: forum, username: "someone else", password: "新しい 🔑 \"pass\"")

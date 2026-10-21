@@ -77,6 +77,7 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import org.opensecretmanager.app.autofill.OtherFieldService
 import org.opensecretmanager.app.autofill.PendingSave
 import org.opensecretmanager.app.autofill.SaveActivity
+import org.opensecretmanager.vault.CardDraft
 import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
@@ -85,6 +86,7 @@ import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
 import org.opensecretmanager.vault.SyncState
 import org.opensecretmanager.vault.SyncStatus
+import org.opensecretmanager.vault.checkCardNumber
 
 class MainActivity : FragmentActivity() {
     private lateinit var biometric: BiometricUnlock
@@ -607,15 +609,26 @@ private fun ItemRow(item: ItemSummary, onClick: () -> Unit) {
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp).testTag("item:${item.title}"),
     ) {
         Text(item.title + if (item.conflict) " · needs a decision on your computer" else "", style = MaterialTheme.typography.titleMedium)
-        if (item.username.isNotEmpty()) Text(item.username, style = MaterialTheme.typography.bodySmall)
+        val below = if (item.kind == ItemKind.CARD) cardLine(item.brand, item.cardEnding) else item.username
+        if (below.isNotEmpty()) Text(below, style = MaterialTheme.typography.bodySmall)
     }
     HorizontalDivider()
 }
 
+/** Copies one of an item's other fields, which is not shown. */
+@Composable
+private fun CopyField(detail: ItemDetail, name: String, session: VaultSession) {
+    TextButton(onClick = { session.copyField(detail.id, name) }, modifier = Modifier.testTag("copy-field:$name")) { Text("Copy") }
+}
+
+/** A card as a list names it: its brand and the last four digits of its number, nothing else of it. */
+internal fun cardLine(brand: String?, ending: String?): String =
+    listOfNotNull(brand?.takeIf { it.isNotBlank() } ?: "Card", ending?.let { "•••• $it" }).joinToString(" ")
+
 @Composable
 private fun Detail(detail: ItemDetail, session: VaultSession) {
     var confirmingDelete by remember(detail.id) { mutableStateOf(false) }
-    val editable = (detail.kind == ItemKind.LOGIN || detail.kind == ItemKind.SECURE_NOTE) && !detail.conflict
+    val editable = detail.kind != ItemKind.IDENTITY && !detail.conflict
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -636,10 +649,25 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
             }
         } else if (!detail.conflict) {
             Text(
-                "Identities and cards are edited on your computer.",
+                "Identities are edited on your computer.",
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.testTag("edit-elsewhere"),
             )
+        }
+        // A card's own fields: its number by its last four digits only, and
+        // the number and code copied rather than shown, as on the computer.
+        detail.card?.let { card ->
+            if (card.cardholder.isNotEmpty()) {
+                Field("Cardholder name", card.cardholder, "card-cardholder") { CopyField(detail, "Cardholder name", session) }
+            }
+            if (card.hasNumber) {
+                Field("Number", card.numberEnding?.let { "•••• $it" } ?: "••••••••", "card-number") { CopyField(detail, "Number", session) }
+            }
+            if (card.expiryMonth.isNotEmpty() || card.expiryYear.isNotEmpty()) {
+                Field("Expires", "${card.expiryMonth.ifEmpty { "--" }} / ${card.expiryYear.ifEmpty { "----" }}", "card-expiry")
+            }
+            if (card.hasSecurityCode) Field("Security code", "•••", "card-code") { CopyField(detail, "Security code", session) }
+            if (card.brand.isNotEmpty()) Field("Brand", card.brand, "card-brand")
         }
         if (detail.username.isNotEmpty()) {
             Field("Username", detail.username, "detail-username") {
@@ -657,8 +685,8 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
             }
         }
         if (detail.url.isNotEmpty()) Field("Website", detail.url)
-        // A card's number, an identity's address, a login's own extras:
-        // named, and copied rather than shown, as on the computer.
+        // An identity's address, a login's own extras: named, and copied
+        // rather than shown, as on the computer.
         for (name in detail.fields) {
             Field(name, "••••••••", "field:$name") {
                 TextButton(onClick = { session.copyField(detail.id, name) }, modifier = Modifier.testTag("copy-field:$name")) {
@@ -692,8 +720,8 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
     }
 }
 
-/** Whether a phone restores items of [kind]: logins and secure notes. */
-private fun restoresHere(kind: ItemKind) = kind == ItemKind.LOGIN || kind == ItemKind.SECURE_NOTE
+/** Whether a phone restores items of [kind]: all but identities. */
+private fun restoresHere(kind: ItemKind) = kind != ItemKind.IDENTITY
 
 /** A time a device recorded, in seconds since 1970, as this phone writes dates. */
 private fun savedTime(seconds: ULong): String =
@@ -722,7 +750,7 @@ private fun HistoryList(history: History, session: VaultSession) {
             )
             if (!restorable) {
                 Text(
-                    "Identities, cards, and items in conflict are restored on your computer.",
+                    "Identities, and items in conflict, are restored on your computer.",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(top = 8.dp).testTag("restore-elsewhere"),
                 )
@@ -808,7 +836,7 @@ private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
                         Text("Restore")
                     }
                 } else {
-                    Text("Identities and cards are restored on your computer.", style = MaterialTheme.typography.bodySmall)
+                    Text("Identities are restored on your computer.", style = MaterialTheme.typography.bodySmall)
                 }
             }
             HorizontalDivider()
@@ -833,6 +861,15 @@ class EditorFields(detail: ItemDetail?, draft: ItemDraft? = null) {
     var removeCode by mutableStateOf(draft?.oneTimeCodeSecret == "")
     var notes by mutableStateOf(draft?.notes ?: detail?.notes ?: "")
     var favorite by mutableStateOf(draft?.favorite ?: detail?.favorite ?: false)
+    var cardholder by mutableStateOf(draft?.card?.cardholder ?: detail?.card?.cardholder ?: "")
+    var number by mutableStateOf(draft?.card?.number ?: "")
+    var showNumber by mutableStateOf(false)
+    var expiryMonth by mutableStateOf(draft?.card?.expiryMonth ?: detail?.card?.expiryMonth ?: "")
+    var expiryYear by mutableStateOf(draft?.card?.expiryYear ?: detail?.card?.expiryYear ?: "")
+    var securityCode by mutableStateOf(draft?.card?.securityCode?.takeIf { it.isNotEmpty() } ?: "")
+    var removeSecurityCode by mutableStateOf(draft?.card?.securityCode == "")
+    /** The brand the owner typed; `null` until then, for the one the number names. */
+    var brand by mutableStateOf(draft?.card?.brand)
 
     fun draft(): ItemDraft {
         val login = kind == ItemKind.LOGIN
@@ -849,6 +886,23 @@ class EditorFields(detail: ItemDetail?, draft: ItemDraft? = null) {
                 removeCode -> ""
                 code.isNotBlank() -> code
                 else -> null
+            },
+            // Blank, the number and the code stay as they are.
+            card = if (kind == ItemKind.CARD) {
+                CardDraft(
+                    cardholder = cardholder,
+                    expiryMonth = expiryMonth,
+                    expiryYear = expiryYear,
+                    brand = brand,
+                    number = number.ifEmpty { null },
+                    securityCode = when {
+                        removeSecurityCode -> ""
+                        securityCode.isNotBlank() -> securityCode
+                        else -> null
+                    },
+                )
+            } else {
+                null
             },
         )
     }
@@ -888,6 +942,12 @@ private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, changedElsewhe
                 onClick = { fields.kind = ItemKind.SECURE_NOTE },
                 label = { Text("Secure note") },
                 modifier = Modifier.testTag("kind-note"),
+            )
+            FilterChip(
+                selected = fields.kind == ItemKind.CARD,
+                onClick = { fields.kind = ItemKind.CARD },
+                label = { Text("Card") },
+                modifier = Modifier.testTag("kind-card"),
             )
         }
         EditField(fields.title, { fields.title = it }, "Title", "edit-title")
@@ -939,6 +999,7 @@ private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, changedElsewhe
                 }
             }
         }
+        if (fields.kind == ItemKind.CARD) CardEditor(fields, detail)
         OutlinedTextField(
             value = fields.notes,
             onValueChange = { fields.notes = it },
@@ -951,6 +1012,85 @@ private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, changedElsewhe
             Text("Favorite")
         }
     }
+}
+
+/** A card's own fields in the editor. */
+@Composable
+private fun CardEditor(fields: EditorFields, detail: ItemDetail?) {
+    val stored = detail?.card
+    val check = remember(fields.number) { checkCardNumber(fields.number) }
+    EditField(fields.cardholder, { fields.cardholder = it }, "Cardholder name", "edit-cardholder")
+    OutlinedTextField(
+        value = fields.number,
+        onValueChange = { fields.number = it },
+        label = { Text("Number") },
+        placeholder = { if (stored?.hasNumber == true) Text("Unchanged" + (stored.numberEnding?.let { " (•••• $it)" } ?: "")) },
+        supportingText = { if (stored?.hasNumber == true && fields.number.isEmpty()) Text("Left blank, the number stays as it is") },
+        singleLine = true,
+        visualTransformation = if (fields.showNumber) VisualTransformation.None else PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = if (fields.showNumber) KeyboardType.Number else KeyboardType.NumberPassword),
+        modifier = Modifier.fillMaxWidth().testTag("edit-number"),
+    )
+    if (check.complete && !check.passes) {
+        Text(
+            "This number fails a card number's check: a digit may be mistyped. It is saved as typed.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.testTag("number-check"),
+        )
+    }
+    TextButton(onClick = { fields.showNumber = !fields.showNumber }, modifier = Modifier.testTag("show-number")) {
+        Text(if (fields.showNumber) "Hide" else "Show")
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        OutlinedTextField(
+            value = fields.expiryMonth,
+            onValueChange = { fields.expiryMonth = it },
+            label = { Text("Expiry month") },
+            placeholder = { Text("MM") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.weight(1f).testTag("edit-expiry-month"),
+        )
+        OutlinedTextField(
+            value = fields.expiryYear,
+            onValueChange = { fields.expiryYear = it },
+            label = { Text("Expiry year") },
+            placeholder = { Text("YYYY") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.weight(1f).testTag("edit-expiry-year"),
+        )
+    }
+    OutlinedTextField(
+        value = fields.securityCode,
+        onValueChange = { fields.securityCode = it },
+        label = { Text("Security code") },
+        placeholder = { if (stored?.hasSecurityCode == true) Text("Unchanged") },
+        supportingText = { if (stored?.hasSecurityCode == true) Text("Left blank, the security code stays as it is") },
+        singleLine = true,
+        enabled = !fields.removeSecurityCode,
+        visualTransformation = PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+        modifier = Modifier.fillMaxWidth().testTag("edit-security-code"),
+    )
+    if (stored?.hasSecurityCode == true) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = fields.removeSecurityCode,
+                onCheckedChange = { fields.removeSecurityCode = it },
+                modifier = Modifier.testTag("remove-security-code"),
+            )
+            Text("Remove the security code")
+        }
+    }
+    // Untouched, the brand is the one a new number names, or else the stored one.
+    EditField(
+        fields.brand ?: if (fields.number.isNotEmpty()) check.brand.orEmpty() else stored?.brand.orEmpty(),
+        { fields.brand = it },
+        "Brand",
+        "edit-brand",
+    )
 }
 
 @Composable

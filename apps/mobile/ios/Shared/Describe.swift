@@ -26,7 +26,7 @@ func describe(_ error: Error) -> String {
     case let .InvalidItem(reason): return reason
     case .ChangedElsewhere: return "This item changed since you opened it · open it again"
     case .InConflict: return "Two devices changed this item at once · choose a version on your computer"
-    case .NotEditableHere: return "Identities and cards are edited on your computer"
+    case .NotEditableHere: return "Identities are edited on your computer"
     case let .Network(reason): return "Could not reach your other devices · \(reason)"
     case let .Storage(reason): return "Something went wrong on this phone · \(reason)"
     case .KeystoreUnavailable: return "This phone's keychain did not answer · try again"

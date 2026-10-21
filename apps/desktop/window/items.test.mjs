@@ -17,7 +17,7 @@ const toast = (page) => page.locator(".toast");
 
 test("the list shows the vault's items, and the search and the filters narrow it", async () => {
   const { page, errors } = await window.open();
-  assert.deepEqual(await titles(page), ["Proton Mail", "GitHub", "Banking — checking", "Recovery codes", "Studio Wi-Fi"]);
+  assert.deepEqual(await titles(page), ["Proton Mail", "GitHub", "Banking — checking", "Recovery codes", "Studio Wi-Fi", "Everyday card"]);
   await page.getByLabel("Search vault").fill("git");
   assert.deepEqual(await titles(page), ["GitHub"]);
   await page.getByLabel("Search vault").fill("nothing like it");
@@ -27,6 +27,53 @@ test("the list shows the vault's items, and the search and the filters narrow it
   assert.deepEqual(await titles(page), ["Proton Mail", "GitHub"]);
   await page.getByRole("navigation", { name: "Vault filters" }).getByRole("button", { name: /Secure notes/ }).click();
   assert.deepEqual(await titles(page), ["Recovery codes"]);
+  const cards = page.getByRole("navigation", { name: "Vault filters" }).getByRole("button", { name: /Cards/ });
+  assert.equal(await cards.locator(".nav-count").textContent(), "1");
+  await cards.click();
+  assert.deepEqual(await titles(page), ["Everyday card"]);
+  // A card is listed by its brand and the last four digits of its number.
+  assert.equal(await page.locator(".entry-row .entry-copy span").first().textContent(), "Visa •••• 4242");
+  assert.deepEqual(errors, []);
+});
+
+test("a card is made with a card's fields, shown without its number, and edited keeping what was left blank", async () => {
+  const { page, errors } = await window.open();
+  const editor = page.locator(".entry-editor");
+  await page.getByRole("button", { name: /New item/ }).click();
+  await editor.getByLabel("Title").fill("Travel card");
+  await editor.getByLabel("Type").selectOption("card");
+  // A card asks for a card's fields, not a login's.
+  assert.equal(await editor.getByLabel("Username").count(), 0);
+  await editor.getByLabel("Cardholder name").fill("Alex Northstar");
+  await editor.getByLabel("Number").fill("5555 5555 5555 4440");
+  await editor.getByText("This number fails a card number's check").waitFor();
+  await editor.getByLabel("Number").fill("5555 5555 5555 4444");
+  assert.equal(await editor.getByText("This number fails a card number's check").count(), 0);
+  assert.equal(await editor.getByLabel("Brand").inputValue(), "Mastercard");
+  await editor.getByLabel("Expiry month").selectOption("11");
+  await editor.getByLabel("Expiry year").fill("2030");
+  await editor.getByLabel("Security code").fill("987");
+  await editor.getByRole("button", { name: "Create item" }).click();
+  await page.locator(".entry-row.selected", { hasText: "Travel card" }).waitFor();
+  assert.equal(await page.locator(".entry-row.selected .entry-copy span").textContent(), "Mastercard •••• 4444");
+
+  const record = page.locator(".detail-column .record-card");
+  await record.getByText("•••• 4444").waitFor();
+  await record.getByText("11 / 2030").waitFor();
+  await record.getByText("Alex Northstar").waitFor();
+  for (const label of ["Number", "Security code"]) await record.getByRole("button", { name: `Copy ${label}` }).waitFor();
+  // Neither the number nor the code is in the window once saved.
+  const shown = await page.locator(".detail-column").textContent();
+  assert.ok(!shown.includes("5555") && !shown.includes("987"), shown);
+
+  await page.getByRole("button", { name: /Edit$/ }).click();
+  assert.equal(await editor.getByLabel("Number").inputValue(), "");
+  assert.equal(await editor.getByLabel("Number").getAttribute("placeholder"), "Unchanged (•••• 4444)");
+  await editor.getByLabel("Cardholder name").fill("A. Northstar");
+  await editor.getByRole("button", { name: "Save changes" }).click();
+  await record.getByText("A. Northstar").waitFor();
+  await record.getByText("•••• 4444").waitFor();
+  await record.getByRole("button", { name: "Copy Security code" }).waitFor();
   assert.deepEqual(errors, []);
 });
 
@@ -105,10 +152,10 @@ test("an import says what it would add, and adds it only when asked", async () =
   await summary.getByText("2 items to add: 2 logins").waitFor();
   await summary.getByText(/1 of them looks like an item you already have/).waitFor();
   await summary.getByText("1 entry was skipped").waitFor();
-  assert.equal((await titles(page)).length, 5);
+  assert.equal((await titles(page)).length, 6);
   await page.getByRole("button", { name: "Add 2 items" }).click();
   await page.locator(".entry-row", { hasText: "Sample import two" }).waitFor();
-  assert.equal((await titles(page)).length, 7);
+  assert.equal((await titles(page)).length, 8);
   assert.deepEqual(errors, []);
 });
 
@@ -193,6 +240,6 @@ test("locking hides the items until the vault is unlocked again", async () => {
   await page.getByLabel("Vault password").fill("any password, in the preview");
   await page.getByRole("button", { name: /Unlock/ }).click();
   await page.locator(".entry-row", { hasText: "Proton Mail" }).waitFor();
-  assert.equal((await titles(page)).length, 5);
+  assert.equal((await titles(page)).length, 6);
   assert.deepEqual(errors, []);
 });

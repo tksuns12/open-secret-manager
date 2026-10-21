@@ -1,4 +1,5 @@
-import type { ArchiveInfo, BackupAge, BrowserStatus, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import { cardBrand, cardDigits } from "./card";
+import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -51,6 +52,7 @@ let previewEntries: VaultEntry[] = ([
   { id: "3", title: "Banking — checking", kind: "login", username: "•••• 4821", url: "secure.bank.example", favorite: false },
   { id: "4", title: "Recovery codes", kind: "secure_note", favorite: false },
   { id: "5", title: "Studio Wi-Fi", kind: "login", username: "studio", url: "network", favorite: false },
+  { id: "6", title: "Everyday card", kind: "card", favorite: false, cardEnding: "4242", brand: "Visa" },
   // With `?many`: a vault of hundreds of items, longer than any window.
   ...(previewAsks("many") ? Array.from({ length: 400 }, (_, index) => ({ id: `many-${index + 1}`, title: `Sample login ${index + 1}`, kind: "login" as const, username: `user${index + 1}@example.test`, url: `site${index + 1}.example`, favorite: false })) : []),
 ] satisfies VaultEntry[]).map((entry) => (entry.id === "2" && previewAsks("conflict") ? { ...entry, conflict: true } : entry));
@@ -103,8 +105,24 @@ function recordPreviewVersion(entry: VaultEntry, input: EntryInput, previous?: E
   previewHistory.set(entry.id, [{ version, entry }, ...versions.map((older) => ({ ...older, version: { ...older.version, current: false } }))]);
 }
 
+/** The sample card's fields: no number or code is kept, only its last four digits. */
+const PREVIEW_CARD: CardDetail = { cardholder: "Alex Northstar", expiryMonth: "08", expiryYear: "2029", brand: "Visa", numberEnding: "4242", hasNumber: true, hasSecurityCode: true };
+
 function previewDetail(entry: VaultEntry): EntryDetail {
-  return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, fields: [], revision: entry.revision ?? "preview" };
+  return previewDetails.get(entry.id) ?? { id: entry.id, title: entry.title, kind: entry.kind, username: entry.username ?? "", url: entry.url ?? "", notes: "", favorite: Boolean(entry.favorite), hasPassword: entry.kind === "login", hasTotp: false, fields: [], card: entry.kind === "card" ? PREVIEW_CARD : null, revision: entry.revision ?? "preview" };
+}
+
+/** A card's fields after `input`, as the shell would store them, keeping of the number only its last four digits. */
+function previewCard(input: NonNullable<EntryInput["card"]>, previous?: CardDetail | null): CardDetail {
+  const digits = input.number === undefined ? null : cardDigits(input.number);
+  const numberEnding = input.number === undefined ? previous?.numberEnding ?? null : digits ? digits.slice(-4) : null;
+  return {
+    cardholder: input.cardholder.trim(), expiryMonth: input.expiryMonth, expiryYear: input.expiryYear,
+    brand: input.brand ?? (input.number === undefined ? previous?.brand ?? "" : cardBrand(input.number) ?? previous?.brand ?? ""),
+    numberEnding,
+    hasNumber: input.number === undefined ? Boolean(previous?.hasNumber) : input.number.length > 0,
+    hasSecurityCode: input.securityCode === undefined ? Boolean(previous?.hasSecurityCode) : input.securityCode.length > 0,
+  };
 }
 
 /** Preview writes stay in memory and never retain the password or TOTP secret. */
@@ -115,10 +133,11 @@ function savePreview(id: string, input: EntryInput, previous?: EntryDetail): Vau
     hasPassword: input.password !== undefined ? input.password.length > 0 : Boolean(previous?.hasPassword),
     hasTotp: input.totpSecret !== undefined ? input.totpSecret.trim().length > 0 : Boolean(previous?.hasTotp),
     fields: previous?.fields ?? [],
+    card: input.kind === "card" && input.card ? previewCard(input.card, previous?.card) : input.kind === "card" ? previous?.card ?? null : null,
     revision,
   };
   previewDetails.set(id, detail);
-  const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, favorite: input.favorite, revision };
+  const entry: VaultEntry = { id, title: input.title, kind: input.kind, username: input.username || undefined, url: input.url || undefined, favorite: input.favorite, revision, cardEnding: detail.card?.numberEnding ?? null, brand: detail.card?.brand || null };
   recordPreviewVersion(entry, input, previous);
   previewEntries = [entry, ...previewEntries.filter((existing) => existing.id !== id)];
   return entry;

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use osm_mobile::{Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncState};
+use osm_mobile::{CardDraft, Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncState};
 
 const PASSWORD: &str = "fixture password, not a secret";
 /// The test vector of RFC 6238 as a base32 secret.
@@ -21,6 +21,7 @@ fn draft(title: &str, kind: ItemKind) -> ItemDraft {
         favorite: false,
         password: Some("first password".into()),
         one_time_code_secret: None,
+        card: None,
     }
 }
 
@@ -425,7 +426,7 @@ fn what_a_form_submitted_goes_only_into_a_login_it_could_be_filled_with() {
 }
 
 #[test]
-fn logins_and_notes_are_created_edited_and_deleted_and_the_rest_is_left_to_a_computer() {
+fn logins_notes_and_cards_are_created_edited_and_deleted_and_the_rest_is_left_to_a_computer() {
     let (_dir, folder) = copy_of_the_frozen_vault();
     let device = Device::open_listening_on(folder, 0).unwrap();
     assert!(matches!(
@@ -491,13 +492,32 @@ fn logins_and_notes_are_created_edited_and_deleted_and_the_rest_is_left_to_a_com
         Err(MobileError::InvalidItem { .. })
     ));
 
-    // Identities, cards, and conflicts are for a computer.
-    for kind in [ItemKind::Identity, ItemKind::Card] {
-        assert!(matches!(
-            device.create_item(draft("Passport", kind)),
-            Err(MobileError::NotEditableHere)
-        ));
-    }
+    // A card is made here too, its fields from its own draft.
+    let mut card = draft("Everyday card", ItemKind::Card);
+    card.card = Some(CardDraft {
+        cardholder: "Owner".into(),
+        expiry_month: "12".into(),
+        expiry_year: "2030".into(),
+        brand: None,
+        number: Some("5555 5555 5555 4444".into()),
+        security_code: Some("321".into()),
+    });
+    let card = device.create_item(card).unwrap();
+    let fields = device.item(card.clone()).unwrap().card.unwrap();
+    assert_eq!(
+        (fields.brand.as_str(), fields.number_ending.as_deref()),
+        ("Mastercard", Some("4444"))
+    );
+    assert_eq!(
+        device.field(card, "Number".into()).unwrap(),
+        "5555555555554444"
+    );
+
+    // Identities and conflicts are for a computer.
+    assert!(matches!(
+        device.create_item(draft("Passport", ItemKind::Identity)),
+        Err(MobileError::NotEditableHere)
+    ));
     let conflicted = device
         .items()
         .unwrap()
@@ -558,6 +578,7 @@ fn an_edit_that_met_a_change_made_elsewhere_is_put_on_top_of_it_keeping_what_was
         favorite: read.favorite,
         password: None,
         one_time_code_secret: None,
+        card: None,
     };
     // Meanwhile another device changes its notes and its password.
     device
@@ -612,6 +633,46 @@ fn an_edit_that_met_a_change_made_elsewhere_is_put_on_top_of_it_keeping_what_was
         ),
         Err(MobileError::NotFound)
     ));
+}
+
+#[test]
+fn a_card_edit_that_met_a_change_made_elsewhere_keeps_both_changes() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    device.unlock(PASSWORD.into()).unwrap();
+    let fields = |cardholder: &str, month: &str, number: Option<&str>| CardDraft {
+        cardholder: cardholder.into(),
+        expiry_month: month.into(),
+        expiry_year: "2030".into(),
+        brand: None,
+        number: number.map(Into::into),
+        security_code: None,
+    };
+    let mut card = draft("Card", ItemKind::Card);
+    card.password = None;
+    card.card = Some(fields("Owner", "01", Some("4111111111111111")));
+    let id = device.create_item(card.clone()).unwrap();
+    let read = device.item(id.clone()).unwrap();
+    // Another device renames the cardholder; this one, from what it read,
+    // changes the month and the number.
+    card.card = Some(fields("Owner Renamed", "01", None));
+    device
+        .update_item(id.clone(), read.revision.clone(), card.clone())
+        .unwrap();
+    card.card = Some(fields("Owner", "06", Some("5555555555554444")));
+    let rebased = device.rebase_edit(id.clone(), read.revision, card).unwrap();
+    device
+        .update_item(id.clone(), rebased.revision, rebased.draft)
+        .unwrap();
+    let saved = device.item(id.clone()).unwrap().card.unwrap();
+    assert_eq!(
+        (
+            saved.cardholder.as_str(),
+            saved.expiry_month.as_str(),
+            saved.number_ending.as_deref()
+        ),
+        ("Owner Renamed", "06", Some("4444"))
+    );
 }
 
 #[test]
@@ -722,9 +783,11 @@ fn records_taken_out_of_the_file_are_said_after_unlocking_until_confirmed() {
 }
 
 /// A card's, an identity's, and a login's other fields are named, in the
-/// vault's order, and their values given one at a time to copy. A phone
-/// edits neither a card nor an identity, and its edit of a login keeps the
-/// login's other fields.
+/// vault's order, and their values given one at a time to copy; a card's
+/// own are shown as a card's, its number by its last four digits only. A
+/// phone edits a card, keeping the number and code it leaves alone, and
+/// does not edit an identity; its edit of a login keeps the login's other
+/// fields.
 #[test]
 fn an_items_other_fields_are_named_and_given_one_at_a_time() {
     let (_dir, folder) = copy_of_the_frozen_vault();
@@ -758,7 +821,18 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
 
     let shown = device.item(card.clone()).unwrap();
     assert_eq!(shown.kind, ItemKind::Card);
-    assert_eq!(shown.fields, ["Cardholder name", "Number", "Security code"]);
+    assert!(shown.fields.is_empty());
+    let fields = shown.card.unwrap();
+    assert_eq!(
+        (
+            fields.cardholder.as_str(),
+            fields.number_ending.as_deref(),
+            fields.has_number,
+            fields.has_security_code
+        ),
+        ("Owner", Some("1111"), true, true)
+    );
+    assert!(!format!("{fields:?}").contains("4111111111111111"));
     assert!(!shown.has_password);
     assert_eq!(
         device.field(card.clone(), "Security code".into()).unwrap(),
@@ -772,7 +846,9 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
     assert_eq!(shown.kind, ItemKind::Identity);
     assert_eq!(shown.fields, ["Passport number"]);
     assert_eq!(
-        device.field(identity, "Passport number".into()).unwrap(),
+        device
+            .field(identity.clone(), "Passport number".into())
+            .unwrap(),
         "X1234567"
     );
     assert!(matches!(
@@ -801,6 +877,7 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
                 favorite: bank.favorite,
                 password: None,
                 one_time_code_secret: None,
+                card: None,
             },
         )
         .unwrap();
@@ -812,24 +889,74 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
         device.field("fixture-bank".into(), "PIN".into()).unwrap(),
         "0000"
     );
-    // A card is still not edited here.
+    // A card is edited here: what the draft leaves alone stays.
     let card_now = device.item(card.clone()).unwrap();
-    assert!(device
+    let draft = |title: &str, kind: ItemKind, card: Option<CardDraft>| ItemDraft {
+        title: title.into(),
+        kind,
+        username: String::new(),
+        url: String::new(),
+        notes: String::new(),
+        favorite: false,
+        password: None,
+        one_time_code_secret: None,
+        card,
+    };
+    device
         .update_item(
-            card,
+            card.clone(),
             card_now.revision,
-            ItemDraft {
-                title: "Visa".into(),
-                kind: ItemKind::Card,
-                username: String::new(),
-                url: String::new(),
-                notes: String::new(),
-                favorite: false,
-                password: None,
-                one_time_code_secret: None,
-            },
+            draft(
+                "Visa",
+                ItemKind::Card,
+                Some(CardDraft {
+                    cardholder: "Owner Renamed".into(),
+                    expiry_month: "9".into(),
+                    expiry_year: "2031".into(),
+                    brand: None,
+                    number: None,
+                    security_code: None,
+                }),
+            ),
         )
-        .is_err());
+        .unwrap();
+    let fields = device.item(card.clone()).unwrap().card.unwrap();
+    assert_eq!(
+        (
+            fields.cardholder.as_str(),
+            fields.expiry_month.as_str(),
+            fields.expiry_year.as_str()
+        ),
+        ("Owner Renamed", "09", "2031")
+    );
+    assert_eq!(
+        device.field(card.clone(), "Number".into()).unwrap(),
+        "4111111111111111"
+    );
+    assert_eq!(
+        device.field(card.clone(), "Security code".into()).unwrap(),
+        "123"
+    );
+    let listed = device
+        .items()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == card)
+        .unwrap();
+    assert_eq!(
+        (listed.card_ending.as_deref(), listed.brand.as_deref()),
+        (Some("1111"), Some("Visa"))
+    );
+    // An identity is still not edited here.
+    let identity_now = device.item(identity.clone()).unwrap();
+    assert!(matches!(
+        device.update_item(
+            identity,
+            identity_now.revision,
+            draft("Passport", ItemKind::Identity, None)
+        ),
+        Err(MobileError::NotEditableHere)
+    ));
     device.lock();
     assert!(matches!(
         device.field("fixture-bank".into(), "PIN".into()),

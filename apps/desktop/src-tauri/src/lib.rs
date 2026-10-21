@@ -30,7 +30,7 @@ mod side_files_tests;
 
 use std::path::{Path, PathBuf};
 
-use osm_vault_core::{Item, ItemKind, ItemSummary, PasswordPolicy, Vault, VaultItem};
+use osm_vault_core::{card, Item, ItemKind, ItemSummary, PasswordPolicy, Vault, VaultItem};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
@@ -301,10 +301,44 @@ struct EntryDetail {
     favorite: bool,
     has_password: bool,
     has_totp: bool,
-    /// The names of the item's other fields, such as an imported card's
-    /// number; their values are copied, never sent to the window.
+    /// The names of the item's other fields, such as an identity's
+    /// address; their values are copied, never sent to the window. A
+    /// card's own fields are in `card` instead.
     fields: Vec<String>,
+    card: Option<CardDetail>,
     revision: String,
+}
+
+/// A card's fields as the window shows them. Its number and security code
+/// never cross the bridge: the window learns the number's last four digits
+/// and whether each is set, and copies them through the shell.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CardDetail {
+    cardholder: String,
+    expiry_month: String,
+    expiry_year: String,
+    /// As stored; empty for none.
+    brand: String,
+    number_ending: Option<String>,
+    has_number: bool,
+    has_security_code: bool,
+}
+
+impl CardDetail {
+    fn of(item: &Item) -> Self {
+        let field = |name: &str| item.custom_fields.get(name).cloned().unwrap_or_default();
+        let number = item.custom_fields.get(card::NUMBER);
+        Self {
+            cardholder: field(card::CARDHOLDER),
+            expiry_month: field(card::EXPIRY_MONTH),
+            expiry_year: field(card::EXPIRY_YEAR),
+            brand: field(card::BRAND),
+            number_ending: number.and_then(|number| card::ending(number)),
+            has_number: number.is_some(),
+            has_security_code: item.custom_fields.contains_key(card::SECURITY_CODE),
+        }
+    }
 }
 
 /// Form input for create and edit. `password` and `totp_secret` are `None`
@@ -320,6 +354,9 @@ struct EntryInput {
     favorite: bool,
     password: Option<String>,
     totp_secret: Option<String>,
+    /// A card's fields, for a card only.
+    #[serde(default)]
+    card: Option<CardInput>,
 }
 
 impl Drop for EntryInput {
@@ -328,6 +365,45 @@ impl Drop for EntryInput {
         self.notes.zeroize();
         self.password.zeroize();
         self.totp_secret.zeroize();
+        // A card's change wipes its fields when it goes.
+        drop(self.card.take().map(card::CardChange::from));
+    }
+}
+
+/// A card's fields from the form. A number or security code of `None` keeps
+/// the stored one, as a password does; an empty field removes what it
+/// names. A brand of `None` is the one the number names, when a number is
+/// given.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CardInput {
+    cardholder: String,
+    expiry_month: String,
+    expiry_year: String,
+    brand: Option<String>,
+    number: Option<String>,
+    security_code: Option<String>,
+}
+
+impl From<CardInput> for card::CardChange {
+    fn from(input: CardInput) -> Self {
+        // Moved, not copied: the change wipes them when it goes.
+        let CardInput {
+            cardholder,
+            expiry_month,
+            expiry_year,
+            brand,
+            number,
+            security_code,
+        } = input;
+        Self {
+            cardholder: Some(cardholder),
+            number,
+            expiry_month: Some(expiry_month),
+            expiry_year: Some(expiry_year),
+            security_code,
+            brand,
+        }
     }
 }
 
@@ -345,6 +421,11 @@ impl EntryInput {
         if let Some(secret) = self.totp_secret.take() {
             let secret = Zeroizing::new(secret);
             item.totp_secret = (!secret.trim().is_empty()).then(|| secret.trim().to_owned());
+        }
+        if let Some(change) = self.card.take().map(card::CardChange::from) {
+            if item.kind == ItemKind::Card {
+                change.apply_to(item);
+            }
         }
     }
 }
@@ -370,7 +451,15 @@ async fn get_entry(
         favorite: item.favorite,
         has_password: !item.password.is_empty(),
         has_totp: item.totp_secret.is_some(),
-        fields: item.custom_fields.keys().cloned().collect(),
+        fields: item
+            .custom_fields
+            .keys()
+            .filter(|name| {
+                item.kind != ItemKind::Card || !card::CARD_FIELDS.contains(&name.as_str())
+            })
+            .cloned()
+            .collect(),
+        card: (item.kind == ItemKind::Card).then(|| CardDetail::of(&item)),
         revision,
     })
 }
@@ -958,6 +1047,7 @@ mod tests {
             favorite: true,
             password: password.map(Into::into),
             totp_secret: totp_secret.map(Into::into),
+            card: None,
         }
     }
 
@@ -1040,5 +1130,64 @@ mod tests {
         assert_eq!(parsed.kind, ItemKind::SecureNote);
         assert!(parsed.password.is_none());
         assert_eq!(parsed.totp_secret.as_deref(), Some(""));
+    }
+
+    /// A card's form as the window sends it.
+    fn card_input(json: &str) -> EntryInput {
+        serde_json::from_str(&format!(
+            r#"{{"title":"Everyday card","kind":"card","username":"","url":"","notes":"","favorite":false,"card":{json}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_card_is_written_by_its_fields_and_shown_without_its_number_or_code() {
+        let mut item = Item::new("Old");
+        item.kind = ItemKind::Card;
+        item.custom_fields
+            .insert("Bank's phone".into(), "1588-0000".into());
+        card_input(
+            r#"{"cardholder":"Owner","expiryMonth":"7","expiryYear":"2031","number":"4111 1111 1111 1111","securityCode":"321"}"#,
+        )
+        .apply_to(&mut item);
+        let detail = CardDetail::of(&item);
+        assert_eq!(
+            (
+                detail.brand.as_str(),
+                detail.number_ending.as_deref(),
+                detail.expiry_month.as_str()
+            ),
+            ("Visa", Some("1111"), "07")
+        );
+        let sent = serde_json::to_string(&detail).unwrap();
+        assert!(
+            !sent.contains("4111111111111111") && !sent.contains("321"),
+            "{sent}"
+        );
+
+        // The number and code left out keep what is stored; the rest is as given.
+        card_input(r#"{"cardholder":"Owner Renamed","expiryMonth":"08","expiryYear":"2031","brand":"Visa"}"#)
+            .apply_to(&mut item);
+        assert_eq!(item.custom_fields[card::NUMBER], "4111111111111111");
+        assert_eq!(item.custom_fields[card::SECURITY_CODE], "321");
+        assert_eq!(item.custom_fields[card::CARDHOLDER], "Owner Renamed");
+        assert_eq!(item.custom_fields["Bank's phone"], "1588-0000");
+
+        // An empty code removes it.
+        card_input(r#"{"cardholder":"Owner Renamed","expiryMonth":"08","expiryYear":"2031","brand":"Visa","securityCode":""}"#)
+            .apply_to(&mut item);
+        assert!(!item.custom_fields.contains_key(card::SECURITY_CODE));
+    }
+
+    #[test]
+    fn a_card_form_sent_for_another_kind_changes_no_field() {
+        let mut item = stored();
+        let mut input = card_input(
+            r#"{"cardholder":"Owner","expiryMonth":"","expiryYear":"","number":"4111111111111111"}"#,
+        );
+        input.kind = ItemKind::Login;
+        input.apply_to(&mut item);
+        assert!(!item.custom_fields.contains_key(card::NUMBER));
+        assert!(!item.custom_fields.contains_key(card::CARDHOLDER));
     }
 }

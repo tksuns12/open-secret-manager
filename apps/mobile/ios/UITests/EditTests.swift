@@ -92,6 +92,40 @@ final class EditTests: UITestCase {
         XCTAssert(app.buttons["item:Forum"].waitForNonExistence(timeout: 10))
     }
 
+    func testACardIsMadeAndEditedByItsOwnFieldsKeepingWhatWasLeftBlank() {
+        let app = unlocked()
+        app.buttons["new-item"].tap()
+        XCTAssert(field("edit-title", in: app).waitForExistence(timeout: 10))
+        app.segmentedControls["edit-kind"].buttons["Card"].tap()
+        // A card asks for a card's fields, not a login's.
+        XCTAssertFalse(field("edit-username", in: app).exists)
+        type("Travel card", into: "edit-title", in: app)
+        type("Alex Northstar", into: "edit-cardholder", in: app)
+        type("5555555555554440", into: "edit-number", in: app)
+        XCTAssert(app.staticTexts["number-check"].waitForExistence(timeout: 10))
+        replace("edit-number", with: "5555555555554444", in: app)
+        XCTAssert(app.staticTexts["number-check"].waitForNonExistence(timeout: 10))
+        XCTAssertEqual(field("edit-brand", in: app).value as? String, "Mastercard")
+        type("11", into: "edit-expiry-month", in: app)
+        type("2030", into: "edit-expiry-year", in: app)
+        type("987", into: "edit-security-code", in: app)
+        capture("edit-card")
+        app.buttons["save"].tap()
+        XCTAssert(app.staticTexts["card-number"].waitForLabel("•••• 4444"))
+        XCTAssertEqual(app.staticTexts["card-expiry"].label, "11 / 2030")
+        XCTAssertEqual(app.staticTexts["card-cardholder"].label, "Alex Northstar")
+        XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "5555")).firstMatch.exists)
+
+        // An edit that leaves the number and code blank keeps them.
+        app.buttons["edit"].tap()
+        XCTAssert(field("edit-cardholder", in: app).waitForExistence(timeout: 10))
+        replace("edit-cardholder", with: "A. Northstar", in: app)
+        app.buttons["save"].tap()
+        XCTAssert(app.staticTexts["card-cardholder"].waitForLabel("A. Northstar"))
+        XCTAssertEqual(app.staticTexts["card-number"].label, "•••• 4444")
+        XCTAssert(app.staticTexts["card-code"].exists)
+    }
+
     func testAGeneratedPasswordIsSavedAndASecureNoteHasOnlyItsText() {
         let app = unlocked()
         app.buttons["new-item"].tap()

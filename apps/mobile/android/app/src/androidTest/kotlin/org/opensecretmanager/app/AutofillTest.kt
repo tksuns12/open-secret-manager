@@ -917,6 +917,7 @@ class AutofillTest {
                         title = "Codes", kind = ItemKind.LOGIN, username = "code user",
                         url = "https://codes.example.test", notes = "", favorite = false, password = "x",
                         oneTimeCodeSecret = BANK_CODE_SECRET,
+                        card = null,
                     ),
                 )
             }

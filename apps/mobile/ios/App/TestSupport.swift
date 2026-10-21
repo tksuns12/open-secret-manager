@@ -39,7 +39,7 @@ enum TestSupport {
               let item = try? other.item(id: id) else { return }
         try? other.updateItem(id: id, revision: item.revision, draft: ItemDraft(
             title: item.title, kind: item.kind, username: item.username, url: item.url,
-            notes: parts[1], favorite: item.favorite, password: nil, oneTimeCodeSecret: nil
+            notes: parts[1], favorite: item.favorite, password: nil, oneTimeCodeSecret: nil, card: nil
         ))
         other.lock()
     }

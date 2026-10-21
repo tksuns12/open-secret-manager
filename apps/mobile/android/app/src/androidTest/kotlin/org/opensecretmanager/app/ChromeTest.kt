@@ -84,6 +84,7 @@ class ChromeTest {
                         title = "Test site", kind = ItemKind.LOGIN, username = "site-user",
                         url = origin, notes = "", favorite = false, password = "site-pass-1",
                         oneTimeCodeSecret = CODE_SECRET,
+                        card = null,
                     ),
                 )
             }

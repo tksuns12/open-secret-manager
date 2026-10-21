@@ -30,8 +30,8 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::{
-    DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail, ItemDraft, ItemSummary,
-    MobileError, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
+    CardDetail, DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail, ItemDraft,
+    ItemSummary, MobileError, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
 };
 
 /// The first eight hex digits of a device's ID, as the screens name it.
@@ -284,7 +284,16 @@ impl Runtime {
             favorite: item.favorite,
             has_password: !item.password.is_empty(),
             has_one_time_code: item.totp_secret.is_some(),
-            fields: item.custom_fields.keys().cloned().collect(),
+            fields: item
+                .custom_fields
+                .keys()
+                .filter(|name| {
+                    item.kind != osm_vault_core::ItemKind::Card
+                        || !osm_vault_core::card::CARD_FIELDS.contains(&name.as_str())
+                })
+                .cloned()
+                .collect(),
+            card: (item.kind == osm_vault_core::ItemKind::Card).then(|| CardDetail::of(item)),
             conflict: found.conflict,
             revision: found.revision.clone(),
         })

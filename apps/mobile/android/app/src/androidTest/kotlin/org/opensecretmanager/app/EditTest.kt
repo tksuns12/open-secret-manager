@@ -10,6 +10,7 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -113,6 +114,49 @@ class EditTest {
     }
 
     @Test
+    fun aCardIsMadeAndEditedByItsOwnFieldsKeepingWhatWasLeftBlank() {
+        unlocked()
+        compose.onNodeWithTag("new-item").performClick()
+        waitFor("edit-title")
+        compose.onNodeWithTag("kind-card").performClick()
+        // A card asks for a card's fields, not a login's.
+        compose.onAllNodesWithTag("edit-username").assertCountEquals(0)
+        compose.onNodeWithTag("edit-title").performTextInput("Travel card")
+        compose.onNodeWithTag("edit-cardholder").performTextInput("Alex Northstar")
+        compose.onNodeWithTag("edit-number").performTextInput("5555 5555 5555 4440")
+        waitFor("number-check")
+        compose.onNodeWithTag("edit-number").performTextClearance()
+        compose.onNodeWithTag("edit-number").performTextInput("5555 5555 5555 4444")
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("number-check").fetchSemanticsNodes().isEmpty() }
+        assertEquals("Mastercard", value("edit-brand"))
+        compose.onNodeWithTag("edit-expiry-month").performTextInput("11")
+        compose.onNodeWithTag("edit-expiry-year").performTextInput("2030")
+        compose.onNodeWithTag("edit-security-code").performScrollTo().performTextInput("987")
+        save()
+        waitFor("card-number")
+        assertEquals("•••• 4444", text("card-number"))
+        assertEquals("11 / 2030", text("card-expiry"))
+        assertEquals("Alex Northstar", text("card-cardholder"))
+        compose.onAllNodesWithText("5555", substring = true).assertCountEquals(0)
+
+        // An edit that leaves the number and code blank keeps them.
+        compose.onNodeWithTag("edit").performClick()
+        waitFor("edit-cardholder")
+        assertEquals("", value("edit-number"))
+        compose.onNodeWithTag("edit-cardholder").performTextClearance()
+        compose.onNodeWithTag("edit-cardholder").performTextInput("A. Northstar")
+        save()
+        compose.waitUntil(15_000) { runCatching { text("card-cardholder") }.getOrNull() == "A. Northstar" }
+        assertEquals("•••• 4444", text("card-number"))
+        compose.onNodeWithTag("card-code").assertExists()
+        compose.onNodeWithTag("back").performClick()
+        waitFor("search")
+        compose.onNodeWithTag("search").performTextInput("Travel")
+        waitFor("item:Travel card")
+        compose.onAllNodesWithText("Mastercard •••• 4444").assertCountEquals(1)
+    }
+
+    @Test
     fun aGeneratedPasswordIsSavedAndASecureNoteHasOnlyItsText() {
         unlocked()
         compose.onNodeWithTag("new-item").performClick()
@@ -167,7 +211,7 @@ class EditTest {
                 bank.revision,
                 org.opensecretmanager.vault.ItemDraft(
                     title = "Bank", kind = bank.kind, username = bank.username, url = bank.url,
-                    notes = "changed elsewhere", favorite = bank.favorite, password = null, oneTimeCodeSecret = null,
+                    notes = "changed elsewhere", favorite = bank.favorite, password = null, oneTimeCodeSecret = null, card = null,
                 ),
             )
         }

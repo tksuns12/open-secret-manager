@@ -867,6 +867,116 @@ fn a_bitwarden_card_or_identity_comes_in_with_fields_named_for_people() {
 }
 
 #[test]
+fn a_card_is_changed_by_its_fields_and_listed_by_its_ending_and_brand() {
+    use crate::card::{self, CardChange};
+
+    let dir = tempdir().unwrap();
+    let (mut vault, _) = Vault::create(dir.path().join("vault.db"), "initial password").unwrap();
+    let mut item = Item::new("Everyday card");
+    item.kind = crate::ItemKind::Card;
+    item.custom_fields.insert("PIN hint".into(), "kept".into());
+    CardChange {
+        cardholder: Some("  Owner Name ".into()),
+        number: Some("4111 1111-1111 1111".into()),
+        expiry_month: Some("3".into()),
+        expiry_year: Some("29".into()),
+        security_code: Some("123".into()),
+        brand: None,
+    }
+    .apply_to(&mut item);
+    let fields = |item: &Item| -> Vec<(String, String)> {
+        item.custom_fields
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    };
+    // Stored as the names the owner reads, the number without its spaces
+    // and dashes, the month in two digits and the year in four, and the
+    // brand its digits name; the field that is not the card's is kept.
+    assert_eq!(
+        fields(&item),
+        [
+            ("Brand", "Visa"),
+            ("Cardholder name", "Owner Name"),
+            ("Expiry month", "03"),
+            ("Expiry year", "2029"),
+            ("Number", "4111111111111111"),
+            ("PIN hint", "kept"),
+            ("Security code", "123"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    );
+    let id = item.id.clone();
+    let first = vault.put(item).unwrap();
+    let listed = vault.list().unwrap().remove(0);
+    assert_eq!(
+        (listed.card_ending.as_deref(), listed.brand.as_deref()),
+        (Some("1111"), Some("Visa"))
+    );
+    assert!(!format!("{listed:?}").contains("1111"));
+
+    // Nothing given keeps a field; an empty one removes it; a brand given
+    // is the owner's, whatever the number says.
+    let mut item = vault.get(&id).unwrap().item;
+    CardChange {
+        cardholder: None,
+        number: Some("5555555555554444".into()),
+        expiry_month: None,
+        expiry_year: None,
+        security_code: Some(String::new()),
+        brand: Some("My bank's card".into()),
+    }
+    .apply_to(&mut item);
+    assert_eq!(item.custom_fields[card::NUMBER], "5555555555554444");
+    assert_eq!(item.custom_fields[card::BRAND], "My bank's card");
+    assert_eq!(item.custom_fields[card::CARDHOLDER], "Owner Name");
+    assert!(!item.custom_fields.contains_key(card::SECURITY_CODE));
+    vault.update(item, &first.revision).unwrap();
+    let listed = vault.list().unwrap().remove(0);
+    assert_eq!(
+        (listed.card_ending.as_deref(), listed.brand.as_deref()),
+        (Some("4444"), Some("My bank's card"))
+    );
+
+    // A login's fields of the same names are not a card's.
+    let mut login = login("Not a card");
+    login
+        .custom_fields
+        .insert(card::NUMBER.into(), "4111111111111111".into());
+    vault.put(login).unwrap();
+    let listed = vault.search("Not a card").unwrap().remove(0);
+    assert_eq!((listed.card_ending, listed.brand), (None, None));
+}
+
+#[test]
+fn a_card_number_names_its_brand_and_its_check_digit_catches_a_slip() {
+    use crate::card::{brand_of, ending, passes_check};
+
+    for (number, brand) in [
+        ("4111111111111111", Some("Visa")),
+        ("378282246310005", Some("Amex")),
+        ("5555555555554444", Some("Mastercard")),
+        ("2223003122003222", Some("Mastercard")),
+        ("6011111111111117", Some("Discover")),
+        ("3530111333300000", Some("JCB")),
+        ("36227206271667", Some("Diners Club")),
+        ("6200000000000005", Some("UnionPay")),
+        ("9999999999999995", None),
+        ("4111", None),
+        ("4111-1111-1111-111x", None),
+    ] {
+        assert_eq!(brand_of(number), brand, "{number}");
+    }
+    assert!(passes_check("4111 1111 1111 1111"));
+    assert!(passes_check("378282246310005"));
+    assert!(!passes_check("4111111111111112"));
+    assert!(!passes_check("12345"));
+    assert_eq!(ending("4111-1111-1111-1234").as_deref(), Some("1234"));
+    // Too short for four digits to leave most of it unsaid.
+    assert_eq!(ending("12345678"), None);
+}
+
+#[test]
 fn oversized_import_rolls_back_every_item() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.db");

@@ -9,6 +9,10 @@ export type VaultEntry = {
   favorite?: boolean;
   conflict?: boolean;
   revision?: string;
+  /** For a card, the last four digits of its number: nothing else of it is sent here. */
+  cardEnding?: string | null;
+  /** For a card, its brand as stored, or else as its number names it. */
+  brand?: string | null;
 };
 
 /** Editable fields; the stored password and TOTP secret are never returned. */
@@ -22,9 +26,32 @@ export type EntryDetail = {
   favorite: boolean;
   hasPassword: boolean;
   hasTotp: boolean;
-  /** The names of the item's other fields, such as an imported card's number; their values are copied, never sent here. */
+  /** The names of the item's other fields, such as an identity's address; their values are copied, never sent here. A card's own fields are in `card`. */
   fields: string[];
+  card?: CardDetail | null;
   revision: string;
+};
+
+/** A card's fields. Its number and security code are never sent here: only the number's last four digits, and whether each is set. */
+export type CardDetail = {
+  cardholder: string;
+  expiryMonth: string;
+  expiryYear: string;
+  /** As stored; empty for none. */
+  brand: string;
+  numberEnding: string | null;
+  hasNumber: boolean;
+  hasSecurityCode: boolean;
+};
+
+/** A card's fields from the form. `number` and `securityCode` omitted keep the stored values, and an empty one removes it; `brand` omitted is the one the number names. */
+export type CardInput = {
+  cardholder: string;
+  expiryMonth: string;
+  expiryYear: string;
+  brand?: string;
+  number?: string;
+  securityCode?: string;
 };
 
 /** One version of an item, as its history shows it. No secret. */
@@ -109,6 +136,8 @@ export type EntryInput = {
   favorite: boolean;
   password?: string;
   totpSecret?: string;
+  /** For a card only. */
+  card?: CardInput;
 };
 
 /** One side of a conflict. Secrets are never included. */

@@ -64,8 +64,8 @@ final class AppTests: UITestCase {
             for _ in 0..<5 where !row.waitForExistence(timeout: 3) { app.swipeUp() }
             row.tap()
         }
-        func copies(_ name: String) {
-            XCTAssertEqual(app.staticTexts["field:\(name)"].label, "••••••••", name)
+        func copies(_ name: String, shown: String? = nil) {
+            if shown == nil { XCTAssertEqual(app.staticTexts["field:\(name)"].label, "••••••••", name) }
             app.buttons["copy-field:\(name)"].tap()
             XCTAssert(app.staticTexts["notice"].waitForLabel("\(name) copied · cleared in 30 seconds"), name)
         }
@@ -73,23 +73,26 @@ final class AppTests: UITestCase {
             app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", text)).firstMatch.exists
         }
 
-        // A card: every field by name, none shown, each copied.
+        // A card: shown as a card's, its number by its last four digits and
+        // its code not at all, each copied; edited here.
         open("Visa")
         XCTAssert(app.buttons["copy-field:Number"].waitForExistence(timeout: 15))
-        for name in ["Cardholder name", "Expiry month", "Expiry year", "Number", "Security code"] {
-            XCTAssert(app.staticTexts["field:\(name)"].exists, name)
-        }
+        XCTAssertEqual(app.staticTexts["card-number"].label, "•••• 1111")
+        XCTAssertEqual(app.staticTexts["card-code"].label, "•••")
+        XCTAssert(app.staticTexts["card-cardholder"].exists && app.staticTexts["card-expiry"].exists)
         XCTAssertFalse(shows("4111111111111111"))
-        XCTAssert(app.staticTexts["edit-elsewhere"].exists)
-        XCTAssertFalse(app.buttons["edit"].exists)
+        XCTAssertFalse(app.staticTexts["edit-elsewhere"].exists)
+        XCTAssert(app.buttons["edit"].exists)
         capture("app-card")
-        copies("Number")
+        copies("Number", shown: "•••• 1111")
         app.buttons["back"].tap()
 
-        // An identity, likewise.
+        // An identity: every field by name, none shown, and edited on a computer.
         open("Passport")
         XCTAssert(app.buttons["copy-field:Passport number"].waitForExistence(timeout: 15))
         XCTAssertFalse(shows("X1234567"))
+        XCTAssert(app.staticTexts["edit-elsewhere"].exists)
+        XCTAssertFalse(app.buttons["edit"].exists)
         copies("Passport number")
         app.buttons["back"].tap()
 

@@ -429,6 +429,7 @@ impl fmt::Debug for DeletedItem {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemSummary {
     pub id: String,
     pub title: String,
@@ -438,6 +439,11 @@ pub struct ItemSummary {
     pub favorite: bool,
     pub revision: String,
     pub conflict: bool,
+    /// For a card, the last four digits of its number, which may be shown
+    /// (see [`crate::card::ending`]).
+    pub card_ending: Option<String>,
+    /// For a card, its brand as stored, or else as its number names it.
+    pub brand: Option<String>,
 }
 
 impl fmt::Debug for ItemSummary {
@@ -460,6 +466,12 @@ impl From<VaultItem> for ItemSummary {
             revision,
             conflict,
         } = value;
+        let card = |name| {
+            (item.kind == ItemKind::Card)
+                .then(|| item.custom_fields.get(name))
+                .flatten()
+        };
+        let number = card(crate::card::NUMBER);
         Self {
             id: item.id.clone(),
             title: item.title.clone(),
@@ -469,6 +481,15 @@ impl From<VaultItem> for ItemSummary {
             favorite: item.favorite,
             revision,
             conflict,
+            card_ending: number.and_then(|number| crate::card::ending(number)),
+            brand: card(crate::card::BRAND)
+                .filter(|brand| !brand.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    number
+                        .and_then(|number| crate::card::brand_of(number))
+                        .map(str::to_owned)
+                }),
         }
     }
 }

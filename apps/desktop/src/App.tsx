@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, Sparkles, Trash2, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge, previewHasDevices } from "./bridge";
+import { cardBrand, cardDigits, passesCardCheck } from "./card";
 import type { ArchiveInfo, ArchivedItem, BackupAge, BrowserInfo, BrowserStatus, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillLogin, HeldChange, HistoryEntry, ImportFormat, ImportSummary, InviteQr, MemberInfo, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
-const filters = ["All items", "Favorites", "Logins", "Secure notes"] as const;
+const filters = ["All items", "Favorites", "Logins", "Cards", "Secure notes"] as const;
+/** The sign before each filter in the sidebar. */
+const FILTER_ICONS = { "All items": "⌂", Favorites: "★", Logins: "↗", Cards: "▭", "Secure notes": "▤" } as const;
 /** How long without input in the window locks the vault, as the owner may set it. */
 const AUTO_LOCK_CHOICES = [1, 5, 15, 60];
 function minutesText(minutes: number): string {
@@ -12,6 +15,11 @@ function minutesText(minutes: number): string {
 /** What an item of a kind is called where it has no username to show. */
 function kindLabel(kind: EntryKind): string {
   return kind === "secure_note" ? "Secure note" : kind === "identity" ? "Identity" : kind === "card" ? "Card" : "Login";
+}
+/** The line under an item's title in the list: a card's brand and the last four digits of its number, or else the username. */
+function subtitle(entry: VaultEntry): string {
+  if (entry.kind === "card") return [entry.brand || "Card", entry.cardEnding ? `•••• ${entry.cardEnding}` : ""].filter(Boolean).join(" ");
+  return entry.username || kindLabel(entry.kind);
 }
 /** Why the system said the owner's session went away from the app. */
 const AWAY: Record<string, string> = {
@@ -22,6 +30,15 @@ const AWAY: Record<string, string> = {
   switched_out: "another user took the screen",
 };
 type Filter = (typeof filters)[number];
+function inFilter(entry: VaultEntry, filter: Filter): boolean {
+  switch (filter) {
+    case "All items": return true;
+    case "Favorites": return Boolean(entry.favorite);
+    case "Logins": return entry.kind === "login";
+    case "Cards": return entry.kind === "card";
+    case "Secure notes": return entry.kind === "secure_note";
+  }
+}
 type EditorState = { mode: "create" } | { mode: "edit"; detail: EntryDetail };
 type ReviewState = { id: string; title: string; versions: VersionSummary[] };
 /** An invitation waiting for the other device, for one that votes or not. */
@@ -245,9 +262,8 @@ function App() {
   }, [notice]);
 
   const visible = useMemo(() => entries.filter((entry) => {
-    const matchesQuery = `${entry.title} ${entry.username ?? ""} ${entry.url ?? ""}`.toLowerCase().includes(query.toLowerCase());
-    const matchesFilter = filter === "All items" || (filter === "Favorites" && entry.favorite) || (filter === "Logins" && entry.kind === "login") || (filter === "Secure notes" && entry.kind === "secure_note");
-    return matchesQuery && matchesFilter;
+    const matchesQuery = `${entry.title} ${entry.username ?? ""} ${entry.url ?? ""} ${entry.brand ?? ""}`.toLowerCase().includes(query.toLowerCase());
+    return matchesQuery && inFilter(entry, filter);
   }), [entries, filter, query]);
   const active = entries.find((entry) => entry.id === selected) ?? visible[0];
   // The open item's details, read again when it changes.
@@ -623,7 +639,7 @@ function App() {
         <button className="new-item" onClick={() => { if (!locked) setEditor({ mode: "create" }); }} disabled={locked}><Plus size={17} /> New item <span>⌘ N</span></button>
         <nav className="nav-list" aria-label="Vault filters">
           <p className="nav-caption">YOUR VAULT <span>{entries.length}</span></p>
-          {filters.map((item) => <button key={item} className={`nav-item ${filter === item ? "active" : ""}`} onClick={() => setFilter(item)}><span className={`nav-icon ${item === "Favorites" ? "star" : ""}`}>{item === "All items" ? "⌂" : item === "Favorites" ? "★" : item === "Logins" ? "↗" : "▤"}</span>{item}<span className="nav-count">{item === "All items" ? entries.length : item === "Favorites" ? entries.filter((e) => e.favorite).length : item === "Logins" ? entries.filter((e) => e.kind === "login").length : entries.filter((e) => e.kind === "secure_note").length}</span></button>)}
+          {filters.map((item) => <button key={item} className={`nav-item ${filter === item ? "active" : ""}`} onClick={() => setFilter(item)}><span className={`nav-icon ${item === "Favorites" ? "star" : ""}`}>{FILTER_ICONS[item]}</span>{item}<span className="nav-count">{entries.filter((entry) => inFilter(entry, item)).length}</span></button>)}
         </nav>
         <div className="sidebar-bottom"><button className="utility" onClick={() => setGeneratorOpen(true)}><Sparkles size={16} /> Generator</button><button className="utility" onClick={() => setArchivesOpen(true)} disabled={previewMode}><Archive size={16} /> Archive</button><button className="utility" onClick={() => setBackupOpen(true)} disabled={previewMode || locked}><HardDriveDownload size={16} /> Back up</button><button className="utility" onClick={() => setBrowserOpen(true)} disabled={previewMode}><Globe size={16} /> Browser</button><button className="utility" onClick={() => void openDeleted()} disabled={locked}><Trash2 size={16} /> Recently deleted</button><button className="utility" onClick={() => setSettingsOpen(true)}><SettingsIcon size={16} /> Settings</button><button className="device-card" onClick={() => setDevicesOpen(true)} disabled={devicesUnavailable}><div className="device-icon"><Fingerprint size={18} /></div><div><strong>This device</strong><span>{previewMode ? "Preview data only" : sync.state === "removed" ? "Removed · tap for details" : sync.devices > 0 ? `Syncs with ${sync.devices} other ${sync.devices === 1 ? "device" : "devices"}` : "Only device · tap to add one"}</span></div><span className={`online-dot ${sync.state === "synced" || sync.state === "idle" ? "" : "offline-dot"}`} /></button></div>
       </aside>
@@ -636,7 +652,7 @@ function App() {
             {!locked && backupAge?.due && <div className="backup-reminder"><HardDriveDownload size={13} /><span>{backupAge.days === null ? "No backup of this vault yet" : `Last backup ${backupAge.days} days ago, from ${backupAge.device ? `device ${backupAge.device}` : "this computer"}`}</span><button onClick={() => setBackupOpen(true)} disabled={previewMode}>Back up</button></div>}
             {!locked && held.length > 0 && <div className="conflict-banner held-banner"><CircleAlert size={16} /><div><strong>{held.length} {held.length === 1 ? "change is" : "changes are"} held for review</strong><span>Written by a device that is not one of this vault's devices. Not part of your vault until you decide.</span></div><button className="conflict-action" onClick={() => setHeldOpen(true)}>Review</button></div>}
             <label className="search-box"><Search size={17} /><input ref={searchRef} aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
-            <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{entry.username || kindLabel(entry.kind)}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}</div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
+            <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{subtitle(entry)}</span></div><div className="entry-meta">{entry.favorite && <span className="favorite">★</span>}</div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
           </div>
           <div className="detail-column">{locked && vaultStatus === "missing" && vaultProblem ? <UnreadablePanel problem={vaultProblem} onPutAway={() => void putUnreadableAway()} /> : locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked && vaultStatus === "missing" && restoring ? <RestorePanel onCancel={() => setRestoring(false)} onRestored={(result) => void restored(result)} onNotice={setNotice} /> : locked && vaultStatus === "locked" && resetting ? <ResetPasswordPanel onCancel={() => setResetting(false)} onReset={() => void passwordReset()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{fill && <div className="conflict-banner fill-banner"><CircleAlert size={16} /><div><strong>{fill.browser} asks to fill a login into {fill.origin}</strong><span>{vaultStatus === "missing" ? "This device has no vault to fill from." : "Unlock to choose a login. Nothing is sent until you choose."}</span></div><button className="conflict-action" onClick={() => void denyFill()}>Deny</button></div>}{vaultStatus === "missing" ? devices.resetArchive ? devices.resetReason === "left" ? <><CircleAlert size={25} /><h2>This device's copy was put away</h2><span>You had it moved to {devices.resetArchive}. Nothing was deleted. Join the new vault with an invitation from the device that started it, or create a new vault here.</span></> : <><CircleAlert size={25} /><h2>This device was removed from its vault</h2><span>Your other devices removed it, so its copy was moved to {devices.resetArchive}. Nothing was deleted. Join again with an invitation from one of your other devices, or create a new vault here.</span></> : <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setRestoring(true)}>Restore from a backup instead</button>}{vaultStatus === "locked" && !previewMode && <button className="link-button" onClick={() => setResetting(true)}>Forgot the password? Use the recovery key</button>}{vaultStatus === "missing" && devices.resetArchive && <button className="link-button" onClick={() => setArchivesOpen(true)}>Look into the copy that was put away</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button>{shown?.hasPassword && <button onClick={() => void copySecret("password")}><Copy size={15} /> Copy password</button>}{shown?.hasTotp && <button onClick={() => void copySecret("code")}><Copy size={15} /> Copy one-time code</button>}</div><ItemRecord entry={active} detail={shown?.id === active.id ? shown : null} onCopyUsername={() => { void navigator.clipboard?.writeText(active.username ?? ""); setNotice("Username copied"); }} onCopy={(what, name) => void copySecret(what, name)} /><button className="history-note" onClick={() => void openHistory()}><Clock3 size={15} /><div><strong>History</strong><span>Every version of this item, which device made it, and what it changed</span></div><ChevronRight size={15} /></button>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
         </div>
@@ -1311,7 +1327,15 @@ function JoinPanel({ keepsVault, onCancel, onJoined, onNotice }: { keepsVault?: 
  * is copied by the shell and never shown here.
  */
 function ItemRecord({ entry, detail, onCopyUsername, onCopy }: { entry: VaultEntry; detail: EntryDetail | null; onCopyUsername: () => void; onCopy: (what: "password" | "field", name?: string) => void }) {
+  const card = detail?.card;
   const fields = [
+    ...(card ? [
+      card.cardholder ? <RecordField key="cardholder" label="Cardholder name" value={card.cardholder} onCopy={() => onCopy("field", "Cardholder name")} /> : null,
+      card.hasNumber ? <RecordField key="number" label="Number" value={card.numberEnding ? `•••• ${card.numberEnding}` : "••••••••"} masked onCopy={() => onCopy("field", "Number")} /> : null,
+      card.expiryMonth || card.expiryYear ? <RecordField key="expiry" label="Expires" value={`${card.expiryMonth || "--"} / ${card.expiryYear || "----"}`} /> : null,
+      card.hasSecurityCode ? <RecordField key="code" label="Security code" value="•••" masked onCopy={() => onCopy("field", "Security code")} /> : null,
+      card.brand ? <RecordField key="brand" label="Brand" value={card.brand} /> : null,
+    ] : []),
     entry.username ? <RecordField key="username" label="Username" value={entry.username} onCopy={onCopyUsername} /> : null,
     detail?.hasPassword ? <RecordField key="password" label="Password" value="••••••••••••" masked onCopy={() => onCopy("password")} /> : null,
     entry.url ? <RecordField key="url" label="Website" value={entry.url} /> : null,
@@ -1518,6 +1542,18 @@ function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDet
   const [notes, setNotes] = useState(detail?.notes ?? "");
   const [favorite, setFavorite] = useState(detail?.favorite ?? false);
   const [saving, setSaving] = useState(false);
+  const stored = detail?.card;
+  const [cardholder, setCardholder] = useState(stored?.cardholder ?? "");
+  const [number, setNumber] = useState("");
+  const [showNumber, setShowNumber] = useState(false);
+  const [expiryMonth, setExpiryMonth] = useState(stored?.expiryMonth ?? "");
+  const [expiryYear, setExpiryYear] = useState(stored?.expiryYear ?? "");
+  const [securityCode, setSecurityCode] = useState("");
+  const [removeCode, setRemoveCode] = useState(false);
+  // Untouched, the brand is the one a new number names, or else the stored one.
+  const [brand, setBrand] = useState<string | null>(null);
+  const detected = cardBrand(number);
+  const numberSlip = cardDigits(number) !== null && !passesCardCheck(number);
 
   async function generate() { setPassword(await bridge.generatePassword(20)); setShowPassword(true); }
   async function submit(event: React.FormEvent) {
@@ -1529,6 +1565,13 @@ function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDet
       // Blank password/TOTP fields keep the stored value.
       password: password ? password : undefined,
       totpSecret: removeTotp ? "" : totpSecret.trim() ? totpSecret : undefined,
+      // Blank number and code keep the stored ones too.
+      card: kind === "card" ? {
+        cardholder, expiryMonth, expiryYear,
+        brand: brand ?? undefined,
+        number: number.trim() ? number : undefined,
+        securityCode: removeCode ? "" : securityCode.trim() ? securityCode : undefined,
+      } : undefined,
     });
     setSaving(false);
   }
@@ -1536,7 +1579,20 @@ function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDet
   return <form className="entry-form" onSubmit={submit}>
     <label>Title<input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. GitHub" /></label>
     <label>Type<select value={kind} onChange={(event) => setKind(event.target.value as EntryKind)}>{entryKinds.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-    {kind !== "secure_note" && <>
+    {kind === "card" && <>
+      <label>Cardholder name<input value={cardholder} onChange={(event) => setCardholder(event.target.value)} autoComplete="off" /></label>
+      <label>Number<div className="field-row"><input type={showNumber ? "text" : "password"} inputMode="numeric" value={number} onChange={(event) => setNumber(event.target.value)} placeholder={stored?.hasNumber ? `Unchanged${stored.numberEnding ? ` (•••• ${stored.numberEnding})` : ""}` : ""} autoComplete="off" /><button type="button" className="icon-button" title={showNumber ? "Hide" : "Show"} onClick={() => setShowNumber(!showNumber)}>{showNumber ? <EyeOff size={15} /> : <Eye size={15} />}</button></div></label>
+      {numberSlip && <p className="field-hint">This number fails a card number's check: a digit may be mistyped. It is saved as typed.</p>}
+      <div className="field-pair">
+        <label>Expiry month<select value={expiryMonth} onChange={(event) => setExpiryMonth(event.target.value)}><option value="">--</option>{Array.from({ length: 12 }, (_, index) => String(index + 1).padStart(2, "0")).map((month) => <option key={month} value={month}>{month}</option>)}{expiryMonth && !/^(0[1-9]|1[0-2])$/.test(expiryMonth) && <option value={expiryMonth}>{expiryMonth}</option>}</select></label>
+        <label>Expiry year<input value={expiryYear} onChange={(event) => setExpiryYear(event.target.value)} inputMode="numeric" placeholder="YYYY" autoComplete="off" /></label>
+      </div>
+      <label>Security code<input type="password" inputMode="numeric" value={securityCode} disabled={removeCode} onChange={(event) => setSecurityCode(event.target.value)} placeholder={stored?.hasSecurityCode ? "Unchanged" : ""} autoComplete="off" /></label>
+      {stored?.hasSecurityCode && <label className="check-row"><input type="checkbox" checked={removeCode} onChange={(event) => setRemoveCode(event.target.checked)} /> Remove security code</label>}
+      <label>Brand<input value={brand ?? (number.trim() ? detected ?? "" : stored?.brand ?? "")} onChange={(event) => setBrand(event.target.value)} placeholder="From the number" list="card-brands" autoComplete="off" /></label>
+      <datalist id="card-brands">{["Visa", "Mastercard", "Amex", "JCB", "UnionPay", "Discover", "Diners Club"].map((name) => <option key={name} value={name} />)}</datalist>
+    </>}
+    {kind !== "secure_note" && kind !== "card" && <>
       <label>Username<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="off" /></label>
       <label>Website<input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://" autoComplete="off" /></label>
       <label>Password<div className="field-row"><input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={detail?.hasPassword ? "Unchanged" : ""} autoComplete="new-password" /><button type="button" className="icon-button" title={showPassword ? "Hide" : "Show"} onClick={() => setShowPassword(!showPassword)}>{showPassword ? <EyeOff size={15} /> : <Eye size={15} />}</button><button type="button" className="icon-button" title="Generate" onClick={() => void generate()}><Sparkles size={15} /></button></div></label>

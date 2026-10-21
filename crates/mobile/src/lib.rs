@@ -78,7 +78,7 @@ pub enum MobileError {
     /// Two devices changed the item at once; a computer resolves that.
     #[error("two devices changed the item at once")]
     InConflict,
-    /// Identities and cards are edited on a computer.
+    /// Identities are edited on a computer.
     #[error("that kind of item is edited on a computer")]
     NotEditableHere,
     // Not `message`: in Kotlin every exception has one already.
@@ -227,6 +227,8 @@ impl From<osm_vault_core::ItemSummary> for ItemSummary {
             url: item.url,
             favorite: item.favorite,
             conflict: item.conflict,
+            card_ending: item.card_ending,
+            brand: item.brand,
         }
     }
 }
@@ -254,6 +256,11 @@ pub struct ItemSummary {
     pub favorite: bool,
     /// Two devices changed it at once; a computer resolves that.
     pub conflict: bool,
+    /// For a card, the last four digits of its number, which may be shown:
+    /// nothing else of the number is here.
+    pub card_ending: Option<String>,
+    /// For a card, its brand as stored, or else as its number names it.
+    pub brand: Option<String>,
 }
 
 /// An item as its page shows it. Its password and one-time code are
@@ -270,10 +277,12 @@ pub struct ItemDetail {
     pub has_password: bool,
     pub has_one_time_code: bool,
     /// The names of the item's other fields, in the vault's order (by
-    /// name): a card's number and security code, an identity's name and
-    /// address, or a login's own extra fields. Their values are not here;
-    /// `Device::field` gives one to copy.
+    /// name): an identity's name and address, or a login's own extra
+    /// fields. Their values are not here; `Device::field` gives one to
+    /// copy. A card's own fields are in `card` instead.
     pub fields: Vec<String>,
+    /// For a card, its fields.
+    pub card: Option<CardDetail>,
     pub conflict: bool,
     /// The revision it was read at, which an edit names: an edit of an item
     /// that changed since is refused.
@@ -292,9 +301,96 @@ pub struct RebasedEdit {
     pub changed_elsewhere: Vec<String>,
 }
 
-/// What the owner writes into a login or a secure note. A password or a
-/// one-time code secret of `None` keeps what the item has; an empty one
-/// removes it.
+/// A card's fields as its page shows them. Its number and security code
+/// are not here: only the number's last four digits and whether each is
+/// set. `Device::field` gives one to copy, by its name (`Number`,
+/// `Security code`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CardDetail {
+    pub cardholder: String,
+    pub expiry_month: String,
+    pub expiry_year: String,
+    /// As stored; empty for none.
+    pub brand: String,
+    pub number_ending: Option<String>,
+    pub has_number: bool,
+    pub has_security_code: bool,
+}
+
+impl CardDetail {
+    fn of(item: &osm_vault_core::Item) -> Self {
+        use osm_vault_core::card;
+        let field = |name: &str| item.custom_fields.get(name).cloned().unwrap_or_default();
+        let number = item.custom_fields.get(card::NUMBER);
+        Self {
+            cardholder: field(card::CARDHOLDER),
+            expiry_month: field(card::EXPIRY_MONTH),
+            expiry_year: field(card::EXPIRY_YEAR),
+            brand: field(card::BRAND),
+            number_ending: number.and_then(|number| card::ending(number)),
+            has_number: number.is_some(),
+            has_security_code: item.custom_fields.contains_key(card::SECURITY_CODE),
+        }
+    }
+}
+
+/// What the owner writes into a card's fields. A number or a security code
+/// of `None` keeps what the card has, and an empty one removes it. A brand
+/// of `None` is the one a new number names, or else the one the card has.
+/// The card's other fields are left as they are.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CardDraft {
+    pub cardholder: String,
+    pub expiry_month: String,
+    pub expiry_year: String,
+    pub brand: Option<String>,
+    pub number: Option<String>,
+    pub security_code: Option<String>,
+}
+
+impl CardDraft {
+    /// This draft, made from the card as it was at `read`, put on top of
+    /// the card as it is now, as [`ItemDraft::rebased`] does.
+    fn rebased(self, read: &osm_vault_core::Item, now: &osm_vault_core::Item) -> CardDraft {
+        use osm_vault_core::card;
+        let field = |item: &osm_vault_core::Item, name: &str| {
+            item.custom_fields.get(name).cloned().unwrap_or_default()
+        };
+        let pick = |mine: String, name: &str| {
+            if mine != field(read, name) {
+                mine
+            } else {
+                field(now, name)
+            }
+        };
+        CardDraft {
+            cardholder: pick(self.cardholder.trim().to_owned(), card::CARDHOLDER),
+            expiry_month: pick(self.expiry_month, card::EXPIRY_MONTH),
+            expiry_year: pick(self.expiry_year, card::EXPIRY_YEAR),
+            brand: self.brand,
+            number: self.number,
+            security_code: self.security_code,
+        }
+    }
+}
+
+impl From<CardDraft> for osm_vault_core::card::CardChange {
+    fn from(draft: CardDraft) -> Self {
+        // Moved, not copied: the change wipes them when it goes.
+        Self {
+            cardholder: Some(draft.cardholder),
+            number: draft.number,
+            expiry_month: Some(draft.expiry_month),
+            expiry_year: Some(draft.expiry_year),
+            security_code: draft.security_code,
+            brand: draft.brand,
+        }
+    }
+}
+
+/// What the owner writes into a login, a secure note, or a card. A password
+/// or a one-time code secret of `None` keeps what the item has; an empty
+/// one removes it. A card's fields are in `card`, for a card only.
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ItemDraft {
     pub title: String,
@@ -305,6 +401,7 @@ pub struct ItemDraft {
     pub favorite: bool,
     pub password: Option<String>,
     pub one_time_code_secret: Option<String>,
+    pub card: Option<CardDraft>,
 }
 
 impl std::fmt::Debug for ItemDraft {
@@ -348,6 +445,7 @@ impl ItemDraft {
             favorite: pick(self.favorite, read.favorite, now.favorite),
             password: self.password,
             one_time_code_secret: self.one_time_code_secret,
+            card: self.card.map(|card| card.rebased(read, now)),
         }
     }
 
@@ -367,13 +465,18 @@ impl ItemDraft {
             let secret = Zeroizing::new(secret);
             item.totp_secret = (!secret.trim().is_empty()).then(|| secret.trim().to_owned());
         }
+        if let Some(change) = self.card.map(osm_vault_core::card::CardChange::from) {
+            if item.kind == osm_vault_core::ItemKind::Card {
+                change.apply_to(item);
+            }
+        }
     }
 }
 
 impl ItemKind {
     /// Whether a phone edits items of this kind.
     fn editable_here(self) -> bool {
-        matches!(self, Self::Login | Self::SecureNote)
+        matches!(self, Self::Login | Self::SecureNote | Self::Card)
     }
 }
 
@@ -385,6 +488,29 @@ impl From<ItemKind> for osm_vault_core::ItemKind {
             ItemKind::Identity => Self::Identity,
             ItemKind::Card => Self::Card,
         }
+    }
+}
+
+/// What a card's number says while it is typed, for the editor: the brand
+/// its digits name, and whether it passes the check its last digit is for
+/// (Luhn), which catches a mistyped digit. Which brand is stored is decided
+/// when the card is saved.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CardNumberCheck {
+    pub brand: Option<String>,
+    /// It has the length of a card's number, so the check means something.
+    pub complete: bool,
+    pub passes: bool,
+}
+
+#[uniffi::export]
+pub fn check_card_number(number: String) -> CardNumberCheck {
+    use osm_vault_core::card;
+    let number = Zeroizing::new(number);
+    CardNumberCheck {
+        brand: card::brand_of(&number).map(str::to_owned),
+        complete: card::has_card_length(&number),
+        passes: card::passes_check(&number),
     }
 }
 

@@ -415,6 +415,7 @@ fn draft(title: &str, username: &str, password: Option<&str>) -> ItemDraft {
         favorite: false,
         password: password.map(Into::into),
         one_time_code_secret: None,
+        card: None,
     }
 }
 

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod card;
 mod crypto;
 mod error;
 mod import;

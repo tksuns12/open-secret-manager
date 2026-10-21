@@ -6,7 +6,8 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::{
-    crypto::random_array, Error, ImportFormat, ImportPreview, ImportWarning, Item, ItemKind, Result,
+    card, crypto::random_array, Error, ImportFormat, ImportPreview, ImportWarning, Item, ItemKind,
+    Result,
 };
 
 const MAX_IMPORT_BYTES: usize = 128 * 1024 * 1024;
@@ -223,12 +224,12 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
 /// this build does not know keeps the export's own.
 fn readable(name: &str) -> String {
     match name {
-        "cardholderName" => "Cardholder name",
-        "brand" => "Brand",
-        "number" => "Number",
-        "expMonth" => "Expiry month",
-        "expYear" => "Expiry year",
-        "code" => "Security code",
+        "cardholderName" => card::CARDHOLDER,
+        "brand" => card::BRAND,
+        "number" => card::NUMBER,
+        "expMonth" => card::EXPIRY_MONTH,
+        "expYear" => card::EXPIRY_YEAR,
+        "code" => card::SECURITY_CODE,
         "title" => "Title",
         "firstName" => "First name",
         "middleName" => "Middle name",

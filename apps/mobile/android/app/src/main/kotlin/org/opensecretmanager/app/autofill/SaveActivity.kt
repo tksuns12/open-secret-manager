@@ -256,6 +256,7 @@ private fun SaveChoices(
                         favorite = false,
                         password = save.password,
                         oneTimeCodeSecret = null,
+                        card = null,
                     )
                     session.saveNew(draft) { id ->
                         if (requester is Requester.App) appLogins.remember(requester, id)
