@@ -1,6 +1,7 @@
 //! What a browser extension sends the native host, and the frames it comes
-//! in. A message is refused, naming its request only by an ID of the
-//! allowed form, or is one whose every check passed.
+//! in: a login's request, a card's (version 2), or a withdrawal. A message
+//! is refused, naming its request only by an ID of the allowed form, or is
+//! one whose every check passed.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -23,6 +24,16 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(request.frame_id, 0);
         }
         Ok(Request::Cancel(cancel)) => assert!(is_id(&cancel.request_id)),
+        Ok(Request::CardRequest(card)) => {
+            let origin = card.check().expect("a request read is a valid one");
+            assert_eq!(origin.to_string(), card.top_origin);
+            assert!(is_id(&card.request_id));
+            assert!((1..=8).contains(&card.frames.len()));
+            for frame in &card.frames {
+                assert!(is_id(&frame.document_id) && !frame.fields.is_empty());
+                assert!(frame.frame_id != 0 || frame.origin == card.top_origin);
+            }
+        }
         Err(failure) => {
             if let Some(id) = &failure.request_id {
                 assert!(is_id(id));

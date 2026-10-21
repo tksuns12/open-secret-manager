@@ -122,7 +122,7 @@ describe("with the desktop session and the real host", () => {
     const framing = await browser.open("https://framing.test/framing");
     assert.deepEqual(await framing.innerForm(), ["", ""]);
     await browser.press(framing);
-    await browser.until(framing, "!", { says: /No login form was found on this page/ });
+    await browser.until(framing, "!", { says: /No login form or card form was found on this page/ });
     await browser.app.quiet();
     assert.deepEqual(await framing.innerForm(), ["", ""]);
     await framing.close();

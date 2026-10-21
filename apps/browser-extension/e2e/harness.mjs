@@ -49,6 +49,19 @@ const loginForm = (title) => `<!doctype html><meta charset="utf-8"><title>${titl
   document.getElementById("login").addEventListener("submit", () => { window.seen.submitted = true; });
 </script>`;
 
+/** A card form's fields, with the ids the tests read them by. */
+const cardFields = {
+  holder: `<input id="cc-name" autocomplete="cc-name" placeholder="Name on card">`,
+  number: `<input id="cc-number" autocomplete="cc-number" inputmode="numeric" placeholder="Card number">`,
+  split: [1, 2, 3, 4].map((part) => `<input id="cc-number-${part}" autocomplete="cc-number" maxlength="4" inputmode="numeric" size="4">`).join(""),
+  month: `<select id="cc-month" autocomplete="cc-exp-month"><option value="">MM</option>${Array.from({ length: 12 }, (_, index) => `<option>${String(index + 1).padStart(2, "0")}</option>`).join("")}</select>`,
+  year: `<select id="cc-year" autocomplete="cc-exp-year"><option value="">YYYY</option>${[2026, 2027, 2028, 2029, 2030, 2031].map((year) => `<option>${year}</option>`).join("")}</select>`,
+  code: `<input id="cc-code" autocomplete="cc-csc" inputmode="numeric" placeholder="CVC">`,
+  // A second code field drawn with no size, which the owner cannot see.
+  hidden: `<input id="cc-hidden" autocomplete="cc-csc" style="width:0;height:0;padding:0;border:0;margin:0">`,
+};
+const cardPage = (title, body) => `<!doctype html><meta charset="utf-8"><title>${title}</title><form id="pay">${body}</form>`;
+
 function respond(request, response) {
   const url = new URL(request.url, "https://placeholder.test");
   const send = (body, headers = {}) => { response.writeHead(200, { "content-type": "text/html; charset=utf-8", ...headers }); response.end(body); };
@@ -67,6 +80,13 @@ function respond(request, response) {
     // A form that asks for the user name only.
     case "/name-first": return send(`<!doctype html><title>Name first</title><form id="login"><input id="username" name="email" type="email" autocomplete="username"><button type="submit">Next</button></form><script>window.seen = { submitted: false }; document.getElementById("login").addEventListener("submit", () => { window.seen.submitted = true; });</script>`);
     case "/submitted": return send(`<!doctype html><title>Submitted</title>`);
+    // A checkout page with its card form in the page itself.
+    case "/checkout": return send(cardPage("Checkout", Object.entries(cardFields).filter(([name]) => name !== "split").map(([, field]) => field).join("")));
+    // One whose number and code are in a frame of its own origin.
+    case "/checkout-framed": return send(cardPage("Checkout, framed", cardFields.holder + cardFields.month + cardFields.year) + `<iframe id="card-frame" src="/card-frame" width="400" height="120"></iframe>`);
+    case "/card-frame": return send(cardPage("Card frame", cardFields.split + cardFields.code));
+    // One whose number and code are in a frame of a payment provider, another site.
+    case "/checkout-elsewhere": return send(cardPage("Checkout, elsewhere", cardFields.holder + cardFields.month + cardFields.year) + `<iframe id="card-frame" src="https://other.test/card-frame" width="400" height="120"></iframe>`);
     default: response.writeHead(404); response.end();
   }
 }
@@ -141,7 +161,7 @@ export async function start(options = {}) {
   }
 }
 
-async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null, hostProgram = null }) {
+async function prepare(closers, { logins = [], cards = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null, hostProgram = null }) {
   // Short, because a socket's path has to fit in about a hundred bytes.
   const home = mkdtempSync("/tmp/osm");
   closers.push(() => {
@@ -166,6 +186,10 @@ async function prepare(closers, { logins = [], fakeHost = false, standIn = ["ask
   const items = {};
   for (const [title, address] of logins) {
     items[title] = fill("add", vault, title, `${title}@example.test`, `${title} password`, address).split(" ")[1];
+  }
+  // Cards: [title, cardholder, number, month, year, code].
+  for (const [title, ...card] of cards) {
+    items[title] = fill("add-card", vault, title, ...card).split(" ")[1];
   }
   let app = null;
   if (standIn) {
@@ -282,6 +306,15 @@ const FORM = `({
 })`;
 
 /** Run in a frame: what its form holds, once it is the login page. */
+/** What a checkout page's card form holds, the page's own fields and those of a frame of its origin. */
+const CARD = `(() => {
+  const frame = document.getElementById("card-frame");
+  const inFrame = (() => { try { return frame?.contentDocument ?? null; } catch { return null; } })();
+  const value = (id) => (document.getElementById(id) ?? inFrame?.getElementById(id))?.value ?? null;
+  const split = [1, 2, 3, 4].map((part) => value("cc-number-" + part));
+  return { holder: value("cc-name"), number: value("cc-number") ?? (split.every((part) => part !== null) ? split.join("") : null),
+    month: value("cc-month"), year: value("cc-year"), code: value("cc-code"), hidden: value("cc-hidden") };
+})()`;
 const INNER = `(location.href === "https://login.test/login" && document.getElementById("password")) ? [document.getElementById("username").value, document.getElementById("password").value] : null`;
 
 async function eventually(what, attempt) {
@@ -373,6 +406,7 @@ async function chromiumWith({ home, accountHome, closers, host, registerHost, fo
         close: () => page.close(),
         isClosed: () => page.isClosed(),
         form: () => page.evaluate(FORM),
+        card: () => page.evaluate(CARD),
         innerForm: () => eventually("the frame shows the login page", async () => {
           const frame = page.frames().find((candidate) => candidate !== page.mainFrame());
           return frame ? frame.evaluate(INNER).catch(() => null) : null;
@@ -516,6 +550,7 @@ async function firefoxWith({ home, accountHome, closers, host, registerHost, for
         async close() { await here(); await driver.close(); closed = true; await driver.switchTo().window(first); },
         isClosed: () => closed,
         async form() { await here(); return driver.executeScript(`return ${FORM};`); },
+        async card() { await here(); return driver.executeScript(`return ${CARD};`); },
         innerForm: () => eventually("the frame shows the login page", async () => {
           await here();
           await driver.switchTo().frame(await driver.findElement(By.id("inner")));

@@ -243,3 +243,24 @@ test("locking hides the items until the vault is unlocked again", async () => {
   assert.equal((await titles(page)).length, 6);
   assert.deepEqual(errors, []);
 });
+
+test("a card's fill says where each of its fields goes and sends the card chosen", async () => {
+  const { page, errors } = await window.open("?card-fill");
+  const dialog = page.getByRole("dialog", { name: "Fill a card" });
+  await dialog.getByRole("heading", { name: "Fill a card into https://shop.example" }).waitFor();
+  const documents = await dialog.locator(".card-document").allTextContents();
+  assert.deepEqual(documents, [
+    "The cardholder's name, the expiry month, and the expiry year go to https://shop.example, the page itself.",
+    "The number and the security code go to https://pay.example.net, a frame in the page.",
+  ]);
+  // Every card, by its brand and the last four digits of its number; the
+  // only one is chosen already.
+  const choice = dialog.locator(".fill-choice");
+  assert.equal(await choice.count(), 1);
+  assert.equal(await choice.getAttribute("aria-pressed"), "true");
+  await choice.getByText("Visa •••• 4242").waitFor();
+  await dialog.getByRole("button", { name: "Fill Everyday card" }).click();
+  await dialog.waitFor({ state: "detached" });
+  await toast(page).filter({ hasText: "Everyday card was sent to the page · the form was not submitted" }).waitFor();
+  assert.deepEqual(errors, []);
+});

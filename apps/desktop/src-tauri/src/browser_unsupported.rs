@@ -63,6 +63,15 @@ pub async fn approve_fill(
 }
 
 #[tauri::command]
+pub async fn approve_card(
+    _request_id: String,
+    _item_id: String,
+    _session: String,
+) -> Result<(), CommandError> {
+    Err(unsupported())
+}
+
+#[tauri::command]
 pub async fn deny_fill(_request_id: String) -> Result<(), CommandError> {
     Err(unsupported())
 }

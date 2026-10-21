@@ -3,11 +3,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use osm_browser_link::{Failure, FillReply, Forwarded, Refusal, Response};
-use osm_vault_core::{ItemSummary, UnlockSession, Vault};
+use osm_browser_link::{
+    Caller, CardField, CardFrame, CardReply, CardValues, Failure, FillReply, Refusal, Response,
+};
+use osm_vault_core::{card, ItemKind, ItemSummary, UnlockSession, Vault};
 use tokio::sync::{oneshot, watch};
 
-use crate::broker::Broker;
+use crate::broker::{Asked, Broker};
 
 /// The time limits of a request.
 #[derive(Clone, Copy, Debug)]
@@ -44,8 +46,22 @@ pub struct Choices {
     /// The unlock the logins were listed under. `None` while the vault is
     /// locked or there is none: the owner has to unlock it to choose.
     pub session: Option<UnlockSession>,
-    /// The logins stored for exactly that origin. Empty while locked.
+    /// The logins stored for exactly that origin. Empty while locked, and
+    /// for a card's request.
     pub logins: Vec<ItemSummary>,
+    /// For a card's request: what it asks of a card.
+    pub card: Option<CardChoices>,
+}
+
+/// What a card's request asks, and what may answer it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardChoices {
+    /// The documents to be filled, each with its origin and fields: the
+    /// page itself, and frames in it of the same origin or another.
+    pub frames: Vec<CardFrame>,
+    /// Every card the vault holds, which any page may be given, but those
+    /// two devices changed at once. Empty while locked.
+    pub cards: Vec<ItemSummary>,
 }
 
 /// Why the owner's choice released nothing.
@@ -57,8 +73,9 @@ pub enum Refused {
     /// The vault is locked, or was locked since the owner was shown the
     /// logins. The request keeps waiting.
     Locked,
-    /// The chosen item is not a login for the page's origin. The request
-    /// keeps waiting.
+    /// The chosen item is not a login for the page's origin, or, for a
+    /// card's request, not a card that may be filled. The request keeps
+    /// waiting.
     NotForThisPage,
     /// The vault could not be read. The request keeps waiting.
     Vault(osm_vault_core::Error),
@@ -120,17 +137,31 @@ impl Desk {
             return Ok(None);
         };
         let session = vault.and_then(Vault::unlock_session);
-        let logins = match (vault, session) {
-            (Some(vault), Some(_)) => vault.logins_for_origin(&pending.origin)?,
-            _ => Vec::new(),
+        let unlocked = vault.filter(|_| session.is_some());
+        let (logins, card) = match (&pending.asked, unlocked) {
+            (Asked::Login(_), Some(vault)) => (vault.logins_for_origin(&pending.origin)?, None),
+            (Asked::Login(_), None) => (Vec::new(), None),
+            (Asked::Card(request), vault) => {
+                let cards = match vault {
+                    Some(vault) => vault
+                        .list()?
+                        .into_iter()
+                        .filter(|item| item.kind == ItemKind::Card && !item.conflict)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let frames = request.frames.clone();
+                (Vec::new(), Some(CardChoices { frames, cards }))
+            }
         };
         Ok(Some(Choices {
-            request_id: pending.request.request_id.clone(),
+            request_id: pending.asked.request_id().to_owned(),
             origin: pending.origin.to_string(),
             browser: pending.caller.browser(),
             seconds_left: pending.deadline.saturating_duration_since(now).as_secs(),
             session,
             logins,
+            card,
         }))
     }
 
@@ -171,9 +202,12 @@ impl Desk {
         let origin = state
             .broker
             .pending(now)
-            .filter(|pending| pending.request.request_id == request_id)
-            .map(|pending| pending.origin.clone())
-            .ok_or(Refused::NotPending)?;
+            .filter(|pending| pending.asked.request_id() == request_id)
+            .map(|pending| match pending.asked {
+                Asked::Login(_) => Ok(pending.origin.clone()),
+                Asked::Card(_) => Err(Refused::NotForThisPage),
+            })
+            .ok_or(Refused::NotPending)??;
         // The vault decides whether the item is a login for this origin,
         // whatever the owner was shown.
         let credentials = vault
@@ -189,20 +223,101 @@ impl Desk {
             .broker
             .take(request_id, now)
             .ok_or(Refused::NotPending)?;
+        let Asked::Login(request) = &pending.asked else {
+            return Err(Refused::NotPending);
+        };
         let reply = Response::FillReply(FillReply {
-            request_id: pending.request.request_id.clone(),
-            tab_id: pending.request.tab_id,
-            frame_id: pending.request.frame_id,
-            document_id: pending.request.document_id.clone(),
-            origin: pending.request.origin.clone(),
+            request_id: request.request_id.clone(),
+            tab_id: request.tab_id,
+            frame_id: request.frame_id,
+            document_id: request.document_id.clone(),
+            origin: request.origin.clone(),
             username: credentials.username.clone(),
             password: credentials.password.clone(),
         });
-        // Sent while the state is held, so that a connection ending its
-        // request at this instant either finds the answer or prevents it.
+        self.answer(state, pending.ticket, reply)
+    }
+
+    /// The owner chose a card for the waiting card's request, under
+    /// `session`. If the vault is still in that unlock and the item is a
+    /// card no two devices changed at once, its fields go as the answer:
+    /// only those some document of the request asks for. The request is
+    /// then over.
+    pub fn approve_card(
+        &self,
+        request_id: &str,
+        item_id: &str,
+        session: UnlockSession,
+        vault: &Vault,
+    ) -> Result<(), Refused> {
+        if vault.unlock_session() != Some(session) {
+            return Err(Refused::Locked);
+        }
+        let now = Instant::now();
+        let mut state = self.state();
+        let asks = state
+            .broker
+            .pending(now)
+            .filter(|pending| pending.asked.request_id() == request_id)
+            .map(|pending| match &pending.asked {
+                Asked::Card(request) => Ok(move |field| request.asks(field)),
+                Asked::Login(_) => Err(Refused::NotForThisPage),
+            })
+            .ok_or(Refused::NotPending)??;
+        let found = vault.get(item_id).map_err(|error| match error {
+            osm_vault_core::Error::Locked => Refused::Locked,
+            osm_vault_core::Error::NotFound => Refused::NotForThisPage,
+            other => Refused::Vault(other),
+        })?;
+        if found.item.kind != ItemKind::Card || found.conflict {
+            return Err(Refused::NotForThisPage);
+        }
+        let field = |name: &str, wanted: bool| {
+            wanted
+                .then(|| found.item.custom_fields.get(name).cloned())
+                .flatten()
+                .unwrap_or_default()
+        };
+        let month = asks(CardField::ExpiryMonth) || asks(CardField::Expiry);
+        let year = asks(CardField::ExpiryYear) || asks(CardField::Expiry);
+        let mut number = field(card::NUMBER, asks(CardField::Number));
+        let card = CardValues {
+            cardholder: field(card::CARDHOLDER, asks(CardField::Cardholder)),
+            number: number.chars().filter(char::is_ascii_digit).collect(),
+            expiry_month: field(card::EXPIRY_MONTH, month),
+            expiry_year: field(card::EXPIRY_YEAR, year),
+            security_code: field(card::SECURITY_CODE, asks(CardField::SecurityCode)),
+        };
+        zeroize::Zeroize::zeroize(&mut number);
+        let pending = state
+            .broker
+            .take(request_id, now)
+            .ok_or(Refused::NotPending)?;
+        let Asked::Card(request) = &pending.asked else {
+            return Err(Refused::NotPending);
+        };
+        let reply = Response::CardReply(CardReply {
+            request_id: request.request_id.clone(),
+            tab_id: request.tab_id,
+            top_origin: request.top_origin.clone(),
+            frames: request.frames.clone(),
+            card,
+        });
+        self.answer(state, pending.ticket, reply)
+    }
+
+    /// Sends the owner's decision to the connection that brought request
+    /// `ticket`. Sent while the state is held, so that a connection ending
+    /// its request at this instant either finds the answer or prevents it.
+    fn answer(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        ticket: u64,
+        reply: Response,
+    ) -> Result<(), Refused> {
         let sent = match state.answer.take() {
             // If the connection is gone the reply is dropped here, unsent.
-            Some((ticket, _, answer)) if ticket == pending.ticket => answer.send(reply).is_ok(),
+            Some((waiting, _, answer)) if waiting == ticket => answer.send(reply).is_ok(),
             _ => false,
         };
         drop(state);
@@ -214,11 +329,12 @@ impl Desk {
     /// when its time is up, and where its answer will arrive.
     pub(crate) fn submit(
         &self,
-        forwarded: Forwarded,
+        caller: Caller,
+        asked: Asked,
     ) -> Result<(u64, Instant, oneshot::Receiver<Response>), Failure> {
-        let request_id = forwarded.request.request_id.clone();
+        let request_id = asked.request_id().to_owned();
         let mut state = self.state();
-        let (ticket, deadline) = match state.broker.submit(forwarded, Instant::now()) {
+        let (ticket, deadline) = match state.broker.submit(caller, asked, Instant::now()) {
             Ok(pending) => (pending.ticket, pending.deadline),
             // An ID that is not a plain one is not repeated back.
             Err(Refusal::InvalidMessage) => return Err(Failure::unnamed(Refusal::InvalidMessage)),

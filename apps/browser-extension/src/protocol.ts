@@ -2,8 +2,19 @@
 // the checks the extension makes on what comes back. Nothing here touches a
 // browser API, so it can be tested on its own.
 
-/** The protocol version every message to the host names. */
+/** The protocol version of a login's request and a withdrawal. */
 export const VERSION = 1;
+
+/** The protocol version of a card's request, which came later: an older app refuses it. */
+export const CARD_VERSION = 2;
+
+/** What a field of a card form asks for. */
+export type CardField = "number" | "cardholder" | "expiry" | "expiry_month" | "expiry_year" | "security_code";
+
+export const CARD_FIELDS: readonly CardField[] = ["number", "cardholder", "expiry", "expiry_month", "expiry_year", "security_code"];
+
+/** The most documents of a tab one card request names. */
+export const MAX_CARD_FRAMES = 8;
 
 /** The name the browser knows the native messaging host by. */
 export const NATIVE_HOST = "org.opensecretmanager.native";
@@ -31,6 +42,18 @@ export type FillRequest = {
 
 export type Cancel = { type: "cancel"; version: number; requestId: string };
 
+/** A document of the tab with a card's fields: the page itself (frame 0) or a frame in it. */
+export type CardFrame = { frameId: number; documentId: string; origin: string; fields: CardField[] };
+
+/** Asks for a card to be filled into the documents of one tab that have a card's fields. */
+export type CardRequest = { type: "card_request"; version: number; requestId: string; tabId: number; topOrigin: string; frames: CardFrame[] };
+
+/** A card's fields: only those some document asked for, the others empty. */
+export type CardValues = { cardholder: string; number: string; expiryMonth: string; expiryYear: string; securityCode: string };
+
+/** The card the owner chose, for the one request it answers. */
+export type CardReply = { type: "card_reply"; requestId: string; tabId: number; topOrigin: string; frames: CardFrame[]; card: CardValues };
+
 /** The owner has not decided yet. */
 export type Waiting = { type: "waiting"; requestId: string };
 
@@ -49,7 +72,7 @@ export type FillReply = {
 /** The request ended without a login. */
 export type Failure = { type: "error"; requestId: string | null; code: string };
 
-export type Response = Waiting | FillReply | Failure;
+export type Response = Waiting | FillReply | Failure | CardReply;
 
 /** The origin of a tab's address, if that address is an https page. Any
  * other page, and a tab whose address the browser does not tell, has none. */
@@ -68,6 +91,10 @@ export function fillRequest(requestId: string, tabId: number, documentId: string
   return { type: "fill_request", version: VERSION, requestId, tabId, frameId: 0, documentId, origin };
 }
 
+export function cardRequest(requestId: string, tabId: number, topOrigin: string, frames: CardFrame[]): CardRequest {
+  return { type: "card_request", version: CARD_VERSION, requestId, tabId, topOrigin, frames };
+}
+
 /** Withdraws a request whose page went away. */
 export function cancel(requestId: string): Cancel {
   return { type: "cancel", version: VERSION, requestId };
@@ -83,8 +110,23 @@ function hasExactly(value: Record<string, unknown>, fields: Record<string, "stri
   return Object.keys(value).length === names.length + 1 && names.every((name) => typeof value[name] === fields[name]);
 }
 
+/** Whether `fields` names fields of a card form, each at most once, and at least one. */
+export function areCardFields(fields: unknown): fields is CardField[] {
+  return Array.isArray(fields) && fields.length > 0 && fields.every((field) => CARD_FIELDS.includes(field)) && new Set(fields).size === fields.length;
+}
+
+function isCardFrame(value: unknown): value is CardFrame {
+  return isRecord(value) && Object.keys(value).length === 4 && typeof value.frameId === "number" && typeof value.documentId === "string"
+    && typeof value.origin === "string" && areCardFields(value.fields);
+}
+
+function isCardValues(value: unknown): value is CardValues {
+  return isRecord(value) && Object.keys(value).length === 5
+    && ["cardholder", "number", "expiryMonth", "expiryYear", "securityCode"].every((name) => typeof value[name] === "string");
+}
+
 /** Reads a message from the host. Anything that is not exactly one of the
- * three responses, or is larger than a message may be, is not one. */
+ * responses, or is larger than a message may be, is not one. */
 export function readResponse(message: unknown): Response | null {
   if (!isRecord(message)) return null;
   let size: number;
@@ -97,6 +139,9 @@ export function readResponse(message: unknown): Response | null {
       return hasExactly(message, { requestId: "string", tabId: "number", frameId: "number", documentId: "string", origin: "string", username: "string", password: "string" }) ? (message as FillReply) : null;
     case "error":
       return Object.keys(message).length === 3 && typeof message.code === "string" && (message.requestId === null || typeof message.requestId === "string") ? (message as Failure) : null;
+    case "card_reply":
+      return Object.keys(message).length === 6 && typeof message.requestId === "string" && typeof message.tabId === "number" && typeof message.topOrigin === "string"
+        && Array.isArray(message.frames) && message.frames.every(isCardFrame) && isCardValues(message.card) ? (message as CardReply) : null;
     default:
       return null;
   }
@@ -112,6 +157,19 @@ export function answers(reply: FillReply, request: FillRequest): boolean {
     && reply.origin === request.origin;
 }
 
+/** Whether a card's reply answers exactly this request: the same request, tab, page, and documents, each with the same fields. */
+export function answersCard(reply: CardReply, request: CardRequest): boolean {
+  return reply.requestId === request.requestId
+    && reply.tabId === request.tabId
+    && reply.topOrigin === request.topOrigin
+    && reply.frames.length === request.frames.length
+    && reply.frames.every((frame, index) => {
+      const asked = request.frames[index];
+      return frame.frameId === asked.frameId && frame.documentId === asked.documentId && frame.origin === asked.origin
+        && frame.fields.length === asked.fields.length && frame.fields.every((field, at) => field === asked.fields[at]);
+    });
+}
+
 /** What to tell the owner when a request ended without a login. */
 export function explain(code: string): string {
   switch (code) {
@@ -123,6 +181,8 @@ export function explain(code: string): string {
     case "extension_not_allowed": return "Open Secret Manager does not accept this extension.";
     case "origin_rejected":
     case "frame_rejected": return "This page cannot be filled.";
+    case "unsupported_message":
+    case "unsupported_version": return "Open Secret Manager on this computer does not fill cards yet. Update the app.";
     default: return "Open Secret Manager refused the request. Nothing was filled.";
   }
 }

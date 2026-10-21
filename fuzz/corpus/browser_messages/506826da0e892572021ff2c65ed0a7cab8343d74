@@ -1,0 +1,1 @@
+{"type":"card_request","version":2,"requestId":"c0a1e7f6","frames":[{"fraorigin":"https://pay.example.n@t","fields":["number","expiry","security_code"]}]}

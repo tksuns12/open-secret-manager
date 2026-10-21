@@ -311,6 +311,15 @@ export type FillNotOffered = {
   reason: "no_scheme" | "not_https";
 };
 
+/** What a field of a card form asks for, as the extension names it. */
+export type CardFieldName = "number" | "cardholder" | "expiry" | "expiry_month" | "expiry_year" | "security_code";
+
+/** A card the owner may choose for a browser fill: of its number only the last four digits are included. */
+export type FillCardChoice = { id: string; title: string; brand: string | null; ending: string | null };
+
+/** A document of the page that a card's fields would go to: the page itself, or a frame in it. */
+export type FillCardDocument = { origin: string; page: boolean; fields: CardFieldName[] };
+
 /** A request from a browser extension that waits for the owner. */
 export type FillAsked = {
   requestId: string;
@@ -324,6 +333,8 @@ export type FillAsked = {
   /** The logins stored for exactly that origin. */
   logins: FillLogin[];
   notOffered: FillNotOffered[];
+  /** For a card form: where each of the card's fields would go, and every card. */
+  card?: { documents: FillCardDocument[]; cards: FillCardChoice[] } | null;
 };
 
 export type BrowserInfo = {
@@ -437,6 +448,7 @@ export type DesktopBridge = {
   fillRequest: () => Promise<FillAsked | null>;
   /** Sends the chosen login's user name and password to the page that asked. `session` is the one the request was shown with. */
   approveFill: (requestId: string, itemId: string, session: string) => Promise<void>;
+  approveCard: (requestId: string, itemId: string, session: string) => Promise<void>;
   denyFill: (requestId: string) => Promise<void>;
   browserStatus: () => Promise<BrowserStatus>;
   /** Tells a browser where to find this app; resolves to the new status. */

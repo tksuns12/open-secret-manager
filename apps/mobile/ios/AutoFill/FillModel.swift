@@ -11,7 +11,8 @@ struct Saving {
 /// The fill or save screen's state: the device opened on the vault the app
 /// shares, never online, unlocked for this one fill or save and dropped when
 /// it ends. A fill is of a login's username and password or, for a field
-/// that asks for one, of its current one-time code.
+/// that asks for one, of its current one-time code; for text to insert, of
+/// one field of any item.
 @MainActor
 final class FillModel: ObservableObject {
     enum Stage: Equatable { case opening, locked, unlocked, noVault, removed, unreadable(String), nothingToFill }
@@ -21,6 +22,10 @@ final class FillModel: ObservableObject {
     let saving: Saving?
     /// Set when the screen fills a one-time code.
     let oneTimeCode: Bool
+    /// Set when the screen gives the text of one field of any item.
+    let inserting: Bool
+    /// For text to insert: the item chosen, and what of it can be inserted.
+    @Published private(set) var insertingFrom: (item: ItemSummary, fields: [InsertField])?
     @Published private(set) var stage: Stage = .opening
     /// What may be filled: the logins for the origins, or those chosen for the app.
     @Published private(set) var offered: [ItemSummary] = []
@@ -41,23 +46,28 @@ final class FillModel: ObservableObject {
     private let onFill: (FillCredentials) -> Void
     private let onCode: (String) -> Void
     private let onSaved: () -> Void
+    private let onText: (String) -> Void
     private let onCancel: () -> Void
 
     init(
         requester: FillRequester,
         saving: Saving? = nil,
         oneTimeCode: Bool = false,
+        inserting: Bool = false,
         onFill: @escaping (FillCredentials) -> Void = { _ in },
         onCode: @escaping (String) -> Void = { _ in },
         onSaved: @escaping () -> Void = {},
+        onText: @escaping (String) -> Void = { _ in },
         onCancel: @escaping () -> Void
     ) {
         self.requester = requester
         self.saving = saving
         self.oneTimeCode = oneTimeCode
+        self.inserting = inserting
         self.onFill = onFill
         self.onCode = onCode
         self.onSaved = onSaved
+        self.onText = onText
         self.onCancel = onCancel
         if case .notHTTPS = requester {
             stage = .nothingToFill
@@ -114,7 +124,7 @@ final class FillModel: ObservableObject {
     func unlockWithBiometrics() {
         Task {
             let biometric = biometric
-            let reason = saving == nil ? "Unlock the vault to fill a login" : "Unlock the vault to save a login"
+            let reason = saving != nil ? "Unlock the vault to save a login" : inserting ? "Unlock the vault to insert text" : "Unlock the vault to fill a login"
             let outcome = await withCheckedContinuation { continuation in
                 DispatchQueue.global().async { continuation.resume(returning: biometric.read(reason: reason)) }
             }
@@ -132,6 +142,14 @@ final class FillModel: ObservableObject {
     }
 
     private func listOffered() async {
+        if inserting {
+            // Any item's field, for the field the owner chose.
+            offered = await call { device in
+                try device.items().sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+            } ?? []
+            stage = .unlocked
+            return
+        }
         let requester = requester
         let oneTimeCode = oneTimeCode
         let found: ([ItemSummary], [String: String])? = await call { device in
@@ -217,6 +235,29 @@ final class FillModel: ObservableObject {
         }
     }
 
+    /// What of `item` can be inserted, once the owner chose it.
+    func chooseToInsert(_ item: ItemSummary) {
+        Task {
+            guard let detail = await call(nil, { try $0.item(id: item.id) }) else { return }
+            insertingFrom = (item, InsertField.of(detail))
+        }
+    }
+
+    /// Back to the list of items.
+    func chooseAnotherToInsert() {
+        insertingFrom = nil
+    }
+
+    /// Gives the text of `field` of the item chosen, and ends the request.
+    func insert(_ field: InsertField) {
+        guard let item = insertingFrom?.item else { return }
+        Task {
+            guard let text = await call(nil, { try field.text(of: item.id, in: $0) }) else { return }
+            close()
+            onText(text)
+        }
+    }
+
     /// The title a new login from this save starts with.
     var suggestedTitle: String {
         if let title = saving?.title?.trimmingCharacters(in: .whitespaces), !title.isEmpty { return title }
@@ -288,5 +329,60 @@ final class FillModel: ObservableObject {
         let device = device
         self.device = nil
         queue.async { device?.lock() }
+    }
+}
+
+/// A field of an item that can be inserted as text, by how its value is
+/// had: some from what the item shows, the secrets only when chosen.
+struct InsertField: Identifiable, Equatable {
+    enum Source: Equatable {
+        case shown(String)
+        case password
+        case oneTimeCode
+        case field(String)
+    }
+
+    let label: String
+    let source: Source
+    var id: String { label }
+
+    /// What of `detail` can be inserted: for a login its username, password,
+    /// code, and website; for a card its number, security code, cardholder,
+    /// and expiry; then any other field, and the notes.
+    static func of(_ detail: ItemDetail) -> [InsertField] {
+        var fields: [InsertField] = []
+        if let card = detail.card {
+            if card.hasNumber { fields.append(InsertField(label: "Number", source: .field("Number"))) }
+            if card.hasSecurityCode { fields.append(InsertField(label: "Security code", source: .field("Security code"))) }
+            if !card.cardholder.isEmpty { fields.append(InsertField(label: "Cardholder name", source: .shown(card.cardholder))) }
+            if !card.expiryMonth.isEmpty && !card.expiryYear.isEmpty {
+                let year = card.expiryYear.count == 4 ? String(card.expiryYear.suffix(2)) : card.expiryYear
+                fields.append(InsertField(label: "Expiry (MM/YY)", source: .shown("\(card.expiryMonth)/\(year)")))
+            }
+            if !card.expiryMonth.isEmpty { fields.append(InsertField(label: "Expiry month", source: .shown(card.expiryMonth))) }
+            if !card.expiryYear.isEmpty { fields.append(InsertField(label: "Expiry year", source: .shown(card.expiryYear))) }
+        }
+        if !detail.username.isEmpty { fields.append(InsertField(label: "Username", source: .shown(detail.username))) }
+        if detail.hasPassword { fields.append(InsertField(label: "Password", source: .password)) }
+        if detail.hasOneTimeCode { fields.append(InsertField(label: "One-time code", source: .oneTimeCode)) }
+        if !detail.url.isEmpty { fields.append(InsertField(label: "Website", source: .shown(detail.url))) }
+        fields += detail.fields.map { InsertField(label: $0, source: .field($0)) }
+        if !detail.notes.isEmpty { fields.append(InsertField(label: "Notes", source: .shown(detail.notes))) }
+        return fields
+    }
+
+    /// Whether its value is a secret, which the screen does not show.
+    var isSecret: Bool {
+        if case .shown = source { return false }
+        return true
+    }
+
+    func text(of id: String, in device: Device) throws -> String {
+        switch source {
+        case let .shown(text): text
+        case .password: try device.password(id: id)
+        case .oneTimeCode: try device.oneTimeCode(id: id)
+        case let .field(name): try device.field(id: id, name: name)
+        }
     }
 }

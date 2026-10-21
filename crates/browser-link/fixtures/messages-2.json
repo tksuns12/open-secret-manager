@@ -1,0 +1,22 @@
+{
+  "about": "The messages of a card's fill, which came with version 2 of the protocol (Phase 17), as the Rust code wrote them when they were frozen. A login's fill and a withdrawal stay at version 1 (messages.json); the refusals and `waiting` are the same messages for either.",
+  "card_fields": [
+    "number",
+    "cardholder",
+    "expiry",
+    "expiry_month",
+    "expiry_year",
+    "security_code"
+  ],
+  "from_extension": {
+    "card_request": "{\"type\":\"card_request\",\"version\":2,\"requestId\":\"c0a1e7f6-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"topOrigin\":\"https://shop.example\",\"frames\":[{\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://shop.example\",\"fields\":[\"cardholder\",\"expiry_month\",\"expiry_year\"]},{\"frameId\":3,\"documentId\":\"a7d6c1b2-6b1c-4c0e-8a6e-0d3b6a522e3f\",\"origin\":\"https://pay.example.net\",\"fields\":[\"number\",\"expiry\",\"security_code\"]}]}"
+  },
+  "host_to_session": {
+    "from_chromium": "{\"caller\":{\"browser\":\"chromium\",\"extension\":\"chrome-extension://hjgekjgkjnakgmiopldddikdkcjhnmge/\"},\"card\":{\"version\":2,\"requestId\":\"c0a1e7f6-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"topOrigin\":\"https://shop.example\",\"frames\":[{\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://shop.example\",\"fields\":[\"cardholder\",\"expiry_month\",\"expiry_year\"]},{\"frameId\":3,\"documentId\":\"a7d6c1b2-6b1c-4c0e-8a6e-0d3b6a522e3f\",\"origin\":\"https://pay.example.net\",\"fields\":[\"number\",\"expiry\",\"security_code\"]}]}}",
+    "from_firefox": "{\"caller\":{\"browser\":\"firefox\",\"extension\":\"extension@opensecretmanager.org\"},\"card\":{\"version\":2,\"requestId\":\"c0a1e7f6-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"topOrigin\":\"https://shop.example\",\"frames\":[{\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://shop.example\",\"fields\":[\"cardholder\",\"expiry_month\",\"expiry_year\"]},{\"frameId\":3,\"documentId\":\"a7d6c1b2-6b1c-4c0e-8a6e-0d3b6a522e3f\",\"origin\":\"https://pay.example.net\",\"fields\":[\"number\",\"expiry\",\"security_code\"]}]}}"
+  },
+  "to_extension": {
+    "card_reply": "{\"type\":\"card_reply\",\"requestId\":\"c0a1e7f6-0b9c-4f5d-9a57-2f1f8f3f9d11\",\"tabId\":12,\"topOrigin\":\"https://shop.example\",\"frames\":[{\"frameId\":0,\"documentId\":\"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f\",\"origin\":\"https://shop.example\",\"fields\":[\"cardholder\",\"expiry_month\",\"expiry_year\"]},{\"frameId\":3,\"documentId\":\"a7d6c1b2-6b1c-4c0e-8a6e-0d3b6a522e3f\",\"origin\":\"https://pay.example.net\",\"fields\":[\"number\",\"expiry\",\"security_code\"]}],\"card\":{\"cardholder\":\"Owner Ünïcödé\",\"number\":\"4111111111111111\",\"expiryMonth\":\"03\",\"expiryYear\":\"2030\",\"securityCode\":\"123\"}}"
+  },
+  "version": 2
+}

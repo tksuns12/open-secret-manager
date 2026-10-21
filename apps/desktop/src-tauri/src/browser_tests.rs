@@ -11,8 +11,8 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{self, Prefix},
-    Caller, FillRequest, Forwarded, Refusal, Response, Waiting, CHROMIUM_EXTENSION_ID,
-    FIREFOX_EXTENSION_ID, VERSION,
+    Caller, CardField, CardFrame, CardRequest, FillRequest, Forwarded, ForwardedCard, Refusal,
+    Response, Waiting, CARD_VERSION, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, VERSION,
 };
 use osm_vault_core::{Item, ItemKind, Vault};
 use tauri::{
@@ -92,8 +92,8 @@ fn request(id: &str, origin: &str) -> Forwarded {
 struct Host(UnixStream);
 
 impl Host {
-    /// Connects and brings one request.
-    async fn bring(dir: &Path, forwarded: &Forwarded) -> Self {
+    /// Connects and brings one request: a login's, or a card's.
+    async fn bring(dir: &Path, forwarded: &impl serde::Serialize) -> Self {
         let mut stream = UnixStream::connect(endpoint::socket_in(dir)).await.unwrap();
         let body = frame::encode(forwarded).unwrap();
         stream
@@ -376,6 +376,121 @@ fn a_request_from_the_browser_waits_in_the_app_for_the_owners_choice() {
             .await
             .unwrap()
             .is_none());
+    });
+}
+
+#[test]
+fn a_card_request_shows_its_documents_and_cards_and_sends_the_card_chosen() {
+    let dir = folder();
+    let mut visa = Item::new("Visa");
+    visa.kind = ItemKind::Card;
+    osm_vault_core::card::CardChange {
+        cardholder: Some("Owner".into()),
+        number: Some("4111111111111111".into()),
+        expiry_month: Some("03".into()),
+        expiry_year: Some("2030".into()),
+        security_code: Some("123".into()),
+        brand: None,
+    }
+    .apply_to(&mut visa);
+    let bank = login("bank", "https://shop.example/");
+    {
+        let (mut vault, _) = Vault::create(dir.path().join("vault.sqlite3"), PASSWORD).unwrap();
+        vault.put(visa.clone()).unwrap();
+        vault.put(bank.clone()).unwrap();
+    }
+    let app = shell(dir.path(), dir.path(), None);
+    let handle = app.handle().clone();
+    let folder = dir.path().to_owned();
+    tauri::async_runtime::block_on(async move {
+        browser::start(&handle);
+        unlock(&handle).await;
+        let wanted = ForwardedCard {
+            caller: Caller::Chromium(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")),
+            card: CardRequest {
+                version: CARD_VERSION,
+                request_id: "card".into(),
+                tab_id: 4,
+                top_origin: "https://shop.example".into(),
+                frames: vec![
+                    CardFrame {
+                        frame_id: 0,
+                        document_id: "page".into(),
+                        origin: "https://shop.example".into(),
+                        fields: vec![CardField::Cardholder],
+                    },
+                    CardFrame {
+                        frame_id: 5,
+                        document_id: "frame".into(),
+                        origin: "https://pay.example.net".into(),
+                        fields: vec![CardField::Number, CardField::SecurityCode],
+                    },
+                ],
+            },
+        };
+        let mut host = Host::bring(&folder, &wanted).await;
+        assert_eq!(host.next().await, waiting("card"));
+        let shown = asked(&handle, "card").await;
+        assert!(shown.logins.is_empty());
+        let card = shown.card.as_ref().unwrap();
+        assert_eq!(card.cards.len(), 1);
+        // The window learns each document, the brand, and the last four
+        // digits, and nothing more of the card.
+        let sent = serde_json::to_value(&shown).unwrap();
+        assert_eq!(
+            sent["card"]["documents"],
+            serde_json::json!([
+                { "origin": "https://shop.example", "page": true, "fields": ["cardholder"] },
+                { "origin": "https://pay.example.net", "page": false, "fields": ["number", "security_code"] },
+            ])
+        );
+        assert_eq!(
+            sent["card"]["cards"],
+            serde_json::json!([{ "id": visa.id, "title": "Visa", "brand": "Visa", "ending": "1111" }])
+        );
+        let text = sent.to_string();
+        assert!(
+            !text.contains("4111111111111111") && !text.contains("\"123\""),
+            "{text}"
+        );
+
+        let unlock = shown.session.clone().unwrap();
+        assert_eq!(
+            code(
+                browser::approve_card(
+                    "card".into(),
+                    bank.id.clone(),
+                    unlock.clone(),
+                    handle.state(),
+                    handle.clone()
+                )
+                .await
+            ),
+            "not_a_card"
+        );
+        browser::approve_card(
+            "card".into(),
+            visa.id.clone(),
+            unlock,
+            handle.state(),
+            handle.clone(),
+        )
+        .await
+        .unwrap();
+        let Some(Response::CardReply(reply)) = host.answer().await else {
+            panic!("a card")
+        };
+        assert!(reply.answers(&wanted.card));
+        assert_eq!(
+            (
+                reply.card.cardholder.as_str(),
+                reply.card.number.as_str(),
+                reply.card.security_code.as_str(),
+                reply.card.expiry_month.as_str()
+            ),
+            ("Owner", "4111111111111111", "123", "")
+        );
+        until_idle(&handle).await;
     });
 }
 

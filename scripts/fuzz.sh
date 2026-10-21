@@ -33,6 +33,7 @@ pairing = json.load(open("crates/vault-peer/fixtures/pairing.json"))
 sync = json.load(open("crates/vault-peer/fixtures/sync.json"))
 sync_2 = json.load(open("crates/vault-peer/fixtures/sync-2.json"))
 messages = json.load(open("crates/browser-link/fixtures/messages.json"))
+messages_2 = json.load(open("crates/browser-link/fixtures/messages-2.json"))
 for index, text in enumerate(["https://example.com", "https://example.com:8443", "https://bücher.example/login?x=1",
                               "https://user@example.com/", "http://example.com", "https://[::1]:8443", "https://127.0.0.1"]):
     seed("origin", str(index), text)
@@ -49,6 +50,8 @@ for prefix, frozen in [("", sync), ("v2-", sync_2)]:
             seed("peer_messages", prefix + name, bytes.fromhex(value["body"]))
             seed("peer_messages", f"{prefix}{name}-frame", bytes.fromhex(value["frame"]))
 for name, text in messages["from_extension"].items():
+    seed("browser_messages", name, text)
+for name, text in messages_2["from_extension"].items():
     seed("browser_messages", name, text)
 seed("import", "bitwarden", b"\x00" + json.dumps({"encrypted": False, "items": [{"type": 1, "name": "Bank", "notes": "n",
     "login": {"username": "a", "password": "p", "totp": "JBSWY3DPEHPK3PXP", "uris": [{"uri": "https://bank.example"}]},

@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { isFilled, isPrepared } from "./page.ts";
-import { answers, fillRequest, MAX_MESSAGE_BYTES, pageOrigin, readResponse, type FillReply } from "./protocol.ts";
+import { answers, CARD_FIELDS, fillRequest, MAX_MESSAGE_BYTES, pageOrigin, readResponse, type FillReply } from "./protocol.ts";
 
 const SEEDS = process.env.OSM_SEED ? [Number(process.env.OSM_SEED)] : Array.from({ length: 16 }, (_, index) => 0x5eed + index);
 const CASES = 400;
@@ -93,8 +93,8 @@ const fieldsOnceEach = (fields: unknown) => Array.isArray(fields) && fields.ever
 
 each("the page's script is believed only when it says what a page's script says", (g) => {
   const message = g.int(3) === 0 ? anything(g) : changed(g, [
-    { type: "prepared", documentId: "8c5ad2a4-0f7c-4e7e-9a53-1f0e8a4e3b11", origin: "https://example.com", fields: ["username", "password"] },
-    { type: "prepared", documentId: "d1", origin: "https://example.com", fields: [] },
+    { type: "prepared", documentId: "8c5ad2a4-0f7c-4e7e-9a53-1f0e8a4e3b11", origin: "https://example.com", fields: ["username", "password"], card: [] },
+    { type: "prepared", documentId: "d1", origin: "https://example.com", fields: [], card: ["number", "security_code"] },
     { type: "filled", fields: ["password"] },
     { type: "filled", fields: ["username", "password"] },
   ]);
@@ -103,6 +103,8 @@ each("the page's script is believed only when it says what a page's script says"
     assert.match(message.documentId, /^[A-Za-z0-9-]{1,64}$/);
     assert.equal(typeof message.origin, "string");
     assert.ok(fieldsOnceEach(message.fields), JSON.stringify(message.fields));
+    assert.ok(Array.isArray(message.card) && message.card.every((field) => CARD_FIELDS.includes(field)) && new Set(message.card).size === message.card.length, JSON.stringify(message.card));
+    assert.ok(keysAre(message, ["type", "documentId", "origin", "fields", "card"]), JSON.stringify(message));
   }
   if (isFilled(message)) {
     assert.ok(isObject(message) && message.type === "filled", JSON.stringify(message));
@@ -121,6 +123,7 @@ each("only a response exactly as specified is read from the host, and nothing in
     { type: "waiting", requestId: "request-1" },
     { type: "error", requestId: "request-1", code: "denied" },
     { type: "error", requestId: null, code: "invalid_message" },
+    { type: "card_reply", requestId: "request-1", tabId: 12, topOrigin: "https://example.com", frames: [{ frameId: 0, documentId: "document-1", origin: "https://example.com", fields: ["number"] }], card: { cardholder: "", number: "4111111111111111", expiryMonth: "", expiryYear: "", securityCode: "" } },
   ]);
   const read = readResponse(message);
   if (read === null) return;
@@ -138,6 +141,11 @@ each("only a response exactly as specified is read from the host, and nothing in
       break;
     case "error":
       assert.ok(keysAre(read, ["type", "requestId", "code"]) && strings("code") && (read.requestId === null || strings("requestId")), JSON.stringify(read));
+      break;
+    case "card_reply":
+      assert.ok(keysAre(read, ["type", "requestId", "tabId", "topOrigin", "frames", "card"]) && strings("requestId", "topOrigin") && typeof read.tabId === "number", JSON.stringify(read));
+      assert.ok(read.frames.every((frame) => keysAre(frame, ["frameId", "documentId", "origin", "fields"]) && frame.fields.length > 0 && frame.fields.every((field) => CARD_FIELDS.includes(field))), JSON.stringify(read));
+      assert.ok(keysAre(read.card, ["cardholder", "number", "expiryMonth", "expiryYear", "securityCode"]) && Object.values(read.card).every((value) => typeof value === "string"));
       break;
     default:
       assert.fail(`read a response of type ${JSON.stringify((read as { type: unknown }).type)}`);

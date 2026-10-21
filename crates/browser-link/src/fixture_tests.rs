@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 
 use crate::{
     frame::{encode, Prefix},
-    Caller, Cancel, Failure, FillReply, FillRequest, Forwarded, Refusal, Request, Response,
-    Waiting, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME, VERSION,
+    Caller, Cancel, CardField, CardFrame, CardReply, CardRequest, CardValues, Failure, FillReply,
+    FillRequest, Forwarded, ForwardedCard, Refusal, Request, Response, Waiting, CARD_VERSION,
+    CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME, VERSION,
 };
 
 const REFUSALS: [Refusal; 12] = [
@@ -213,6 +214,137 @@ fn the_messages_of_a_fill_are_the_frozen_ones() {
         Request::read(later.as_bytes()),
         Err(Failure::new(
             &request().request_id,
+            Refusal::UnsupportedVersion
+        ))
+    );
+}
+
+fn card_request() -> CardRequest {
+    CardRequest {
+        version: CARD_VERSION,
+        request_id: "c0a1e7f6-0b9c-4f5d-9a57-2f1f8f3f9d11".into(),
+        tab_id: 12,
+        top_origin: "https://shop.example".into(),
+        frames: vec![
+            CardFrame {
+                frame_id: 0,
+                document_id: "0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f".into(),
+                origin: "https://shop.example".into(),
+                fields: vec![
+                    CardField::Cardholder,
+                    CardField::ExpiryMonth,
+                    CardField::ExpiryYear,
+                ],
+            },
+            CardFrame {
+                frame_id: 3,
+                document_id: "a7d6c1b2-6b1c-4c0e-8a6e-0d3b6a522e3f".into(),
+                origin: "https://pay.example.net".into(),
+                fields: vec![
+                    CardField::Number,
+                    CardField::Expiry,
+                    CardField::SecurityCode,
+                ],
+            },
+        ],
+    }
+}
+
+fn card_reply() -> CardReply {
+    let request = card_request();
+    CardReply {
+        request_id: request.request_id,
+        tab_id: request.tab_id,
+        top_origin: request.top_origin,
+        frames: request.frames,
+        card: CardValues {
+            cardholder: "Owner Ünïcödé".into(),
+            number: "4111111111111111".into(),
+            expiry_month: "03".into(),
+            expiry_year: "2030".into(),
+            security_code: "123".into(),
+        },
+    }
+}
+
+fn card_messages() -> Value {
+    let request = card_request();
+    json!({
+        "about": "The messages of a card's fill, which came with version 2 of the protocol (Phase 17), as the Rust code wrote them when they were frozen. A login's fill and a withdrawal stay at version 1 (messages.json); the refusals and `waiting` are the same messages for either.",
+        "version": CARD_VERSION,
+        "card_fields": [
+            CardField::Number,
+            CardField::Cardholder,
+            CardField::Expiry,
+            CardField::ExpiryMonth,
+            CardField::ExpiryYear,
+            CardField::SecurityCode,
+        ],
+        "from_extension": {
+            "card_request": text(&Request::CardRequest(request.clone())),
+        },
+        "to_extension": {
+            "card_reply": text(&Response::CardReply(card_reply())),
+        },
+        "host_to_session": {
+            "from_chromium": text(&ForwardedCard {
+                caller: Caller::Chromium(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")),
+                card: request.clone(),
+            }),
+            "from_firefox": text(&ForwardedCard {
+                caller: Caller::Firefox(FIREFOX_EXTENSION_ID.into()),
+                card: request,
+            }),
+        },
+    })
+}
+
+#[test]
+fn the_messages_of_a_card_fill_are_the_frozen_ones() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/messages-2.json");
+    let made = card_messages();
+    if !path.exists() && std::env::var_os("OSM_WRITE_NEW_FIXTURES").is_some() {
+        std::fs::write(&path, serde_json::to_string_pretty(&made).unwrap() + "\n").unwrap();
+    }
+    let frozen: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut found = Vec::new();
+    differences("messages-2", &frozen, &made, &mut found);
+    found.sort();
+    found.dedup();
+    assert!(
+        found.is_empty(),
+        "these no longer match the frozen values: {found:#?}"
+    );
+
+    let frozen_text =
+        |section: &str, name: &str| frozen[section][name].as_str().unwrap().as_bytes().to_vec();
+    assert_eq!(
+        Request::read(&frozen_text("from_extension", "card_request")).unwrap(),
+        Request::CardRequest(card_request())
+    );
+    let reply: Response =
+        serde_json::from_slice(&frozen_text("to_extension", "card_reply")).unwrap();
+    assert_eq!(reply, Response::CardReply(card_reply()));
+    assert!(reply.answers_card(&card_request()) && !reply.answers(&request()));
+    for (name, browser) in [("from_chromium", "Chromium"), ("from_firefox", "Firefox")] {
+        let forwarded: ForwardedCard =
+            serde_json::from_slice(&frozen_text("host_to_session", name)).unwrap();
+        assert!(forwarded.caller.is_allowed());
+        assert_eq!(forwarded.caller.browser(), browser);
+        assert_eq!(forwarded.card, card_request());
+        // Not taken for a login's.
+        assert!(
+            serde_json::from_slice::<Forwarded>(&frozen_text("host_to_session", name)).is_err()
+        );
+    }
+    // A card's request at a login's version is refused by its version.
+    let earlier = String::from_utf8(frozen_text("from_extension", "card_request"))
+        .unwrap()
+        .replace("\"version\":2", "\"version\":1");
+    assert_eq!(
+        Request::read(earlier.as_bytes()),
+        Err(Failure::new(
+            &card_request().request_id,
             Refusal::UnsupportedVersion
         ))
     );

@@ -37,6 +37,23 @@ async fn run(args: &[String]) -> CliResult {
             vault.put(item)?;
             Ok(())
         }
+        ["add-card", vault, title, cardholder, number, month, year, code] => {
+            let mut vault = unlock(vault)?;
+            let mut item = Item::new(*title);
+            item.kind = osm_vault_core::ItemKind::Card;
+            osm_vault_core::card::CardChange {
+                cardholder: Some((*cardholder).into()),
+                number: Some((*number).into()),
+                expiry_month: Some((*month).into()),
+                expiry_year: Some((*year).into()),
+                security_code: Some((*code).into()),
+                brand: None,
+            }
+            .apply_to(&mut item);
+            println!("ADDED {}", item.id);
+            vault.put(item)?;
+            Ok(())
+        }
         ["serve", vault, socket, options @ ..] => {
             let socket = match *socket {
                 "-" => endpoint::socket_path().ok_or("this account has no data folder")?,
@@ -44,7 +61,7 @@ async fn run(args: &[String]) -> CliResult {
             };
             Owner::new(vault, options)?.serve(socket).await
         }
-        _ => Err("usage: osm-fill create|add|serve ... (see the source header)".into()),
+        _ => Err("usage: osm-fill create|add|add-card|serve ... (see the source header)".into()),
     }
 }
 
@@ -157,24 +174,63 @@ impl Owner {
             }
             return Ok(());
         };
+        let offered = match &choices.card {
+            Some(card) => card.cards.len(),
+            None => choices.logins.len(),
+        };
         println!(
-            "REQUEST {} {} {} {}",
+            "REQUEST {} {} {} {}{}",
             choices.request_id,
             choices.origin,
             choices.browser,
             match choices.session {
-                Some(_) => choices.logins.len().to_string(),
+                Some(_) => offered.to_string(),
                 None => "locked".into(),
+            },
+            match &choices.card {
+                Some(card) => format!(" card {}", card.frames.len()),
+                None => String::new(),
             }
         );
         for login in &choices.logins {
             println!("LOGIN {} {}", login.id, login.title);
         }
+        if let Some(card) = &choices.card {
+            for frame in &card.frames {
+                let fields: Vec<String> = frame
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        serde_json::to_value(field)
+                            .unwrap_or_default()
+                            .as_str()
+                            .unwrap_or("?")
+                            .to_owned()
+                    })
+                    .collect();
+                println!(
+                    "FRAME {} {} {}",
+                    frame.frame_id,
+                    frame.origin,
+                    fields.join(",")
+                );
+            }
+            for item in &card.cards {
+                println!("CARD {} {}", item.id, item.title);
+            }
+        }
         self.shown = now;
+        let first = match &choices.card {
+            Some(card) => card.cards.first().map(|item| (item.id.clone(), true)),
+            None => choices
+                .logins
+                .first()
+                .map(|login| (login.id.clone(), false)),
+        };
         match (self.decide, choices.session) {
             (Decide::Deny, _) => self.deny(desk),
-            (Decide::First, Some(_)) => match choices.logins.first() {
-                Some(login) => self.approve(desk, &choices, &login.id),
+            (Decide::First, Some(_)) => match first {
+                Some((item, card)) => self.approve(desk, &choices, &item, card),
                 None => self.deny(desk),
             },
             _ => {}
@@ -184,15 +240,17 @@ impl Owner {
 
     fn command(&mut self, desk: &Arc<Desk>, line: &str) -> CliResult {
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["approve", item] => match desk.choices(Some(&self.vault))? {
-                // The choice is made under the unlock the request was last
-                // printed under, as the owner's would be.
-                Some(mut choices) => {
-                    choices.session = self.shown.as_ref().and_then(|(_, session)| *session);
-                    self.approve(desk, &choices, item);
+            [command @ ("approve" | "approve-card"), item] => {
+                match desk.choices(Some(&self.vault))? {
+                    // The choice is made under the unlock the request was last
+                    // printed under, as the owner's would be.
+                    Some(mut choices) => {
+                        choices.session = self.shown.as_ref().and_then(|(_, session)| *session);
+                        self.approve(desk, &choices, item, *command == "approve-card");
+                    }
+                    None => println!("REFUSED not-pending"),
                 }
-                None => println!("REFUSED not-pending"),
-            },
+            }
             ["deny"] => self.deny(desk),
             ["lock"] => {
                 self.vault.lock();
@@ -208,9 +266,10 @@ impl Owner {
         Ok(())
     }
 
-    fn approve(&mut self, desk: &Arc<Desk>, choices: &Choices, item: &str) {
+    fn approve(&mut self, desk: &Arc<Desk>, choices: &Choices, item: &str, card: bool) {
         let request = &choices.request_id;
         let outcome = match choices.session {
+            Some(session) if card => desk.approve_card(request, item, session, &self.vault),
             Some(session) => desk.approve(request, item, session, &self.vault),
             None => Err(Refused::Locked),
         };

@@ -351,11 +351,6 @@ private func restoresHere(_ kind: ItemKind) -> Bool {
     kind != .identity
 }
 
-/// A card as a list names it: its brand and the last four digits of its number, nothing else of it.
-func cardLine(brand: String?, ending: String?) -> String {
-    let brand = (brand?.trimmingCharacters(in: .whitespaces).isEmpty ?? true) ? "Card" : brand!
-    return [brand, ending.map { "•••• \($0)" }].compactMap { $0 }.joined(separator: " ")
-}
 
 /// A time a device recorded, in seconds since 1970, as this phone writes dates.
 private func savedTime(_ seconds: UInt64) -> String {

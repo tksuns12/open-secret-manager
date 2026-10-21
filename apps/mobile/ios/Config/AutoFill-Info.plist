@@ -4,9 +4,11 @@
 <dict>
 	<!-- The AutoFill extension: it provides passwords, chosen in its own
 	     screen, and from iOS 26.2 saves what a login form submitted, where
-	     the owner chooses in its screen; it registers none with the system
-	     and makes no passkeys. It does not declare ProvidesOneTimeCodes:
-	     iOS offers a provider's codes only for the sites it registered. -->
+	     the owner chooses in its screen; from iOS 18 it gives the text of
+	     an item's field (a card's number, say) for the field the owner
+	     chose AutoFill in. It registers none with the system and makes no
+	     passkeys. It does not declare ProvidesOneTimeCodes: iOS offers a
+	     provider's codes only for the sites it registered. -->
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>
@@ -16,6 +18,8 @@
 				<key>ProvidesPasswords</key>
 				<true/>
 				<key>SupportsSavePasswordCredentials</key>
+				<true/>
+				<key>ProvidesTextToInsert</key>
 				<true/>
 			</dict>
 		</dict>

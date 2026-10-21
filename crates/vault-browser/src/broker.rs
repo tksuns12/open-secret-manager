@@ -3,10 +3,34 @@ use std::{
     time::{Duration, Instant},
 };
 
-use osm_browser_link::{Caller, FillRequest, Forwarded, Origin, Refusal};
+use osm_browser_link::{Caller, CardRequest, FillRequest, Origin, Refusal};
 
 /// How many request IDs are remembered, to refuse one that comes again.
 const REMEMBERED: usize = 1024;
+
+/// What a request asks for: a login for a page, or a card for the
+/// documents of a tab.
+#[derive(Debug)]
+pub(crate) enum Asked {
+    Login(FillRequest),
+    Card(CardRequest),
+}
+
+impl Asked {
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Login(request) => &request.request_id,
+            Self::Card(request) => &request.request_id,
+        }
+    }
+
+    fn check(&self) -> Result<Origin, Refusal> {
+        match self {
+            Self::Login(request) => request.check(),
+            Self::Card(request) => request.check(),
+        }
+    }
+}
 
 /// The request waiting for the owner.
 #[derive(Debug)]
@@ -14,7 +38,7 @@ pub(crate) struct Pending {
     /// Names this request to the connection that brought it.
     pub ticket: u64,
     pub caller: Caller,
-    pub request: FillRequest,
+    pub asked: Asked,
     /// The page's origin, as checked.
     pub origin: Origin,
     /// When the request ends if the owner has not decided.
@@ -46,13 +70,17 @@ impl Broker {
     /// Takes a request in to wait for the owner, or says why not. The host
     /// checked it already; it is checked again here because the socket can
     /// be reached by any program of this account.
-    pub fn submit(&mut self, forwarded: Forwarded, now: Instant) -> Result<&Pending, Refusal> {
-        let Forwarded { caller, request } = forwarded;
+    pub fn submit(
+        &mut self,
+        caller: Caller,
+        asked: Asked,
+        now: Instant,
+    ) -> Result<&Pending, Refusal> {
         if !caller.is_allowed() {
             return Err(Refusal::ExtensionNotAllowed);
         }
-        let origin = request.check()?;
-        if self.seen.contains(&request.request_id) {
+        let origin = asked.check()?;
+        if self.seen.iter().any(|seen| seen == asked.request_id()) {
             return Err(Refusal::Replayed);
         }
         if self.pending(now).is_some() {
@@ -61,12 +89,12 @@ impl Broker {
         if self.seen.len() == REMEMBERED {
             self.seen.pop_front();
         }
-        self.seen.push_back(request.request_id.clone());
+        self.seen.push_back(asked.request_id().to_owned());
         self.tickets += 1;
         Ok(self.pending.insert(Pending {
             ticket: self.tickets,
             caller,
-            request,
+            asked,
             origin,
             deadline: now + self.limit,
         }))
@@ -96,7 +124,7 @@ impl Broker {
     /// request is decided once: after this it waits no longer.
     pub fn take(&mut self, request_id: &str, now: Instant) -> Option<Pending> {
         self.pending(now)
-            .is_some_and(|pending| pending.request.request_id == request_id)
+            .is_some_and(|pending| pending.asked.request_id() == request_id)
             .then(|| self.pending.take())
             .flatten()
     }
@@ -104,9 +132,16 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
-    use osm_browser_link::{CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, VERSION};
+    use osm_browser_link::{Forwarded, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, VERSION};
 
     use super::*;
+
+    impl Broker {
+        /// Takes in a login's request as the host forwards it.
+        fn take_in(&mut self, forwarded: Forwarded, now: Instant) -> Result<&Pending, Refusal> {
+            self.submit(forwarded.caller, Asked::Login(forwarded.request), now)
+        }
+    }
 
     const LIMIT: Duration = Duration::from_secs(120);
 
@@ -139,19 +174,19 @@ mod tests {
         let mut broker = Broker::new(LIMIT);
         assert!(broker.pending(start).is_none());
 
-        let first = broker.submit(fill("first"), start).unwrap();
+        let first = broker.take_in(fill("first"), start).unwrap();
         assert_eq!(first.origin.to_string(), "https://example.com");
         assert_eq!(first.deadline, start + LIMIT);
         let ticket = first.ticket;
-        assert_eq!(broker.pending(start).unwrap().request.request_id, "first");
+        assert_eq!(broker.pending(start).unwrap().asked.request_id(), "first");
 
         // While it waits, another is turned away, and so is the same again.
         assert_eq!(
-            broker.submit(fill("second"), start).unwrap_err(),
+            broker.take_in(fill("second"), start).unwrap_err(),
             Refusal::Busy
         );
         assert_eq!(
-            broker.submit(fill("first"), start).unwrap_err(),
+            broker.take_in(fill("first"), start).unwrap_err(),
             Refusal::Replayed
         );
         assert_eq!(broker.pending(start).unwrap().ticket, ticket);
@@ -165,10 +200,10 @@ mod tests {
 
         // Its ID is spent; one that was turned away as busy is not.
         assert_eq!(
-            broker.submit(fill("first"), start).unwrap_err(),
+            broker.take_in(fill("first"), start).unwrap_err(),
             Refusal::Replayed
         );
-        let second = broker.submit(fill("second"), start).unwrap().ticket;
+        let second = broker.take_in(fill("second"), start).unwrap().ticket;
         assert_ne!(second, ticket);
 
         // A withdrawal ends only the request it names.
@@ -178,7 +213,7 @@ mod tests {
         assert!(broker.pending(start).is_none());
         assert!(broker.take("second", start).is_none());
         assert_eq!(
-            broker.submit(fill("second"), start).unwrap_err(),
+            broker.take_in(fill("second"), start).unwrap_err(),
             Refusal::Replayed
         );
     }
@@ -187,7 +222,7 @@ mod tests {
     fn a_request_waits_no_longer_than_the_limit() {
         let start = Instant::now();
         let mut broker = Broker::new(LIMIT);
-        broker.submit(fill("first"), start).unwrap();
+        broker.take_in(fill("first"), start).unwrap();
         let last_moment = start + LIMIT - Duration::from_millis(1);
         assert!(broker.pending(last_moment).is_some());
         assert!(broker.pending(start + LIMIT).is_none());
@@ -195,7 +230,7 @@ mod tests {
 
         // Once its time is up it does not hold the next one back, even
         // before its connection has noticed.
-        let next = broker.submit(fill("next"), start + LIMIT).unwrap();
+        let next = broker.take_in(fill("next"), start + LIMIT).unwrap();
         assert_eq!(next.deadline, start + LIMIT + LIMIT);
         assert!(broker.take("first", start + LIMIT).is_none());
         assert!(broker.take("next", start + LIMIT).is_some());
@@ -205,7 +240,7 @@ mod tests {
     fn what_the_host_should_have_refused_is_refused_here_too() {
         let now = Instant::now();
         let mut broker = Broker::new(LIMIT);
-        let refused = |broker: &mut Broker, forwarded| broker.submit(forwarded, now).unwrap_err();
+        let refused = |broker: &mut Broker, forwarded| broker.take_in(forwarded, now).unwrap_err();
 
         for forged in [
             Caller::Chromium("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".into()),
@@ -257,7 +292,7 @@ mod tests {
         assert!(broker.pending(now).is_none());
         let firefox = Caller::Firefox(FIREFOX_EXTENSION_ID.into());
         let taken = broker
-            .submit(from(firefox, request("a", "https://example.com:8443")), now)
+            .take_in(from(firefox, request("a", "https://example.com:8443")), now)
             .unwrap();
         assert_eq!(taken.origin.to_string(), "https://example.com:8443");
         assert_eq!(taken.caller.browser(), "Firefox");
@@ -269,15 +304,15 @@ mod tests {
         let mut broker = Broker::new(LIMIT);
         for number in 0..=REMEMBERED {
             let id = format!("request-{number}");
-            broker.submit(fill(&id), now).unwrap();
+            broker.take_in(fill(&id), now).unwrap();
             assert!(broker.take(&id, now).is_some());
         }
         assert_eq!(broker.seen.len(), REMEMBERED);
         // The newest are still refused; the very oldest has been forgotten.
         assert_eq!(
-            broker.submit(fill("request-1"), now).unwrap_err(),
+            broker.take_in(fill("request-1"), now).unwrap_err(),
             Refusal::Replayed
         );
-        assert!(broker.submit(fill("request-0"), now).is_ok());
+        assert!(broker.take_in(fill("request-0"), now).is_ok());
     }
 }

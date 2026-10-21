@@ -1009,6 +1009,7 @@ pub fn run() {
             archive::delete_archive,
             browser::fill_request,
             browser::approve_fill,
+            browser::approve_card,
             browser::deny_fill,
             browser::browser_status,
             browser::connect_browser,

@@ -1,4 +1,5 @@
-//! The desktop session's end of filling a login into a browser page.
+//! The desktop session's end of filling a login, or a card, into a browser
+//! page.
 //!
 //! The native messaging host brings a request to the session's socket. The
 //! [`Desk`] holds it, one at a time, until the owner decides: the app shows
@@ -20,5 +21,5 @@ mod listen;
 #[cfg(test)]
 mod tests;
 
-pub use desk::{Choices, Config, Desk, Refused};
+pub use desk::{CardChoices, Choices, Config, Desk, Refused};
 pub use listen::{bind, serve, Bound};

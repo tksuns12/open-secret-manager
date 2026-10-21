@@ -63,6 +63,19 @@ const previewConflict: VersionSummary[] = [
   { revision: "preview-conflict-there", deleted: false, title: "GitHub", username: "northstar-ops", url: "github.com", device: "3f9a1c2e", thisDevice: false, differs: ["username", "password"] },
 ];
 
+/** With `?card-fill`: a checkout page asking for a card, its number and code in a payment provider's frame. */
+let previewCardFill: FillAsked | null = previewAsks("card-fill") ? {
+  requestId: "preview-card-fill", origin: "https://shop.example", browser: "Chromium", secondsLeft: 120, session: "preview",
+  logins: [], notOffered: [],
+  card: {
+    documents: [
+      { origin: "https://shop.example", page: true, fields: ["cardholder", "expiry_month", "expiry_year"] },
+      { origin: "https://pay.example.net", page: false, fields: ["number", "security_code"] },
+    ],
+    cards: [{ id: "6", title: "Everyday card", brand: "Visa", ending: "4242" }],
+  },
+} : null;
+
 /** With `?held`: changes written by a device that was removed, waiting for the owner. */
 let previewHeld: HeldChange[] = previewAsks("held") ? [
   { revision: "preview-held-new", device: "7c41d09e", removedDevice: true, change: "new", title: "Old router", username: "admin", url: "192.168.0.1", changed: [] },
@@ -343,13 +356,23 @@ export const bridge: DesktopBridge = {
   },
   deleteArchive: (name) => nativeOnly("delete_archive", { name }),
   // Requests come from a browser through the native shell; the preview
-  // never has one.
+  // has one only when its address asks (`?card-fill`).
   async fillRequest() {
     const invoke = native();
-    return invoke ? ((await invoke("fill_request")) as FillAsked | null) : null;
+    return invoke ? ((await invoke("fill_request")) as FillAsked | null) : previewCardFill;
   },
   approveFill: (requestId, itemId, session) => nativeOnly("approve_fill", { requestId, itemId, session }),
-  denyFill: (requestId) => nativeOnly("deny_fill", { requestId }),
+  async approveCard(requestId, itemId, session) {
+    const invoke = native();
+    if (invoke) { await invoke("approve_card", { requestId, itemId, session }); return; }
+    previewCardFill = null;
+  },
+  async denyFill(requestId) {
+    const invoke = native();
+    if (invoke) { await invoke("deny_fill", { requestId }); return; }
+    if (previewCardFill) { previewCardFill = null; return; }
+    throw new Error("preview");
+  },
   async browserStatus() {
     const invoke = native();
     if (invoke) return (await invoke("browser_status")) as BrowserStatus;

@@ -1,11 +1,12 @@
-//! The app's end of filling a login into a browser page.
+//! The app's end of filling a login, or a card, into a browser page.
 //!
 //! While the app is open it listens on a socket in its data folder, which
 //! the native messaging host brings requests to. A request waits here for
 //! the owner: the window comes forward and shows the page's origin and the
-//! logins stored for exactly that origin, and the owner picks one or turns
-//! the request down. A login's password never crosses the bridge to the
-//! window; it goes from the vault to the socket here.
+//! logins stored for exactly that origin, or, for a card form, the
+//! documents to be filled and every card, and the owner picks one or turns
+//! the request down. A login's password and a card's number never cross
+//! the bridge to the window; they go from the vault to the socket here.
 //!
 //! This module also tells each browser where the host is, by writing the
 //! manifest the browser looks for, and takes that manifest away again.
@@ -15,7 +16,9 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use osm_browser_link::{endpoint, Origin, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME};
+use osm_browser_link::{
+    endpoint, CardField, Origin, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME,
+};
 use osm_vault_browser::{bind, serve, Config, Desk, Refused};
 use osm_vault_core::{ItemKind, Vault};
 use serde::Serialize;
@@ -425,6 +428,35 @@ pub struct NotOffered {
     pub(crate) reason: &'static str,
 }
 
+/// A card the owner may choose. Its number is not here, but for the last
+/// four digits.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillCard {
+    pub(crate) id: String,
+    title: String,
+    brand: Option<String>,
+    ending: Option<String>,
+}
+
+/// A document a card's request would fill, and what of the card goes there.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardDocument {
+    origin: String,
+    /// The page itself, not a frame in it.
+    page: bool,
+    fields: Vec<CardField>,
+}
+
+/// What a card's request asks.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardAsked {
+    documents: Vec<CardDocument>,
+    pub(crate) cards: Vec<FillCard>,
+}
+
 /// What the owner is asked.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -438,6 +470,8 @@ pub struct FillAsked {
     pub(crate) session: Option<String>,
     pub(crate) logins: Vec<FillLogin>,
     pub(crate) not_offered: Vec<NotOffered>,
+    /// For a card form instead of a login form.
+    pub(crate) card: Option<CardAsked>,
 }
 
 /// Logins whose address would have the page's origin if it were written
@@ -480,9 +514,32 @@ pub async fn fill_request(
         return Ok(None);
     };
     let not_offered = match vault.as_ref() {
-        Some(vault) if choices.session.is_some() => not_offered(vault, &choices.origin),
+        Some(vault) if choices.session.is_some() && choices.card.is_none() => {
+            not_offered(vault, &choices.origin)
+        }
         _ => Vec::new(),
     };
+    let card = choices.card.map(|card| CardAsked {
+        documents: card
+            .frames
+            .into_iter()
+            .map(|frame| CardDocument {
+                origin: frame.origin,
+                page: frame.frame_id == 0,
+                fields: frame.fields,
+            })
+            .collect(),
+        cards: card
+            .cards
+            .into_iter()
+            .map(|item| FillCard {
+                id: item.id,
+                title: item.title,
+                brand: item.brand,
+                ending: item.card_ending,
+            })
+            .collect(),
+    });
     Ok(Some(FillAsked {
         session: choices.session.map(|session| session.to_string()),
         logins: choices
@@ -497,6 +554,7 @@ pub async fn fill_request(
             })
             .collect(),
         not_offered,
+        card,
         request_id: choices.request_id,
         origin: choices.origin,
         browser: choices.browser,
@@ -532,6 +590,42 @@ pub async fn approve_fill<R: Runtime>(
                 Refused::NotForThisPage => CommandError {
                     code: "not_for_this_page",
                     message: "that item is not a login for this page".into(),
+                },
+                Refused::Vault(error) => error.into(),
+            })?;
+    }
+    step_back(&app, &request_id);
+    Ok(())
+}
+
+/// The owner chose a card for the waiting card's request, as
+/// [`approve_fill`] a login.
+#[tauri::command]
+pub async fn approve_card<R: Runtime>(
+    request_id: String,
+    item_id: String,
+    session: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
+) -> Result<(), CommandError> {
+    let locked = || CommandError {
+        code: "locked",
+        message: "the vault locked before the card was sent".into(),
+    };
+    {
+        let vault = state.vault.lock().await;
+        let vault = vault.as_ref().ok_or_else(locked)?;
+        let session = session.parse().map_err(|_| locked())?;
+        state
+            .browser
+            .desk
+            .approve_card(&request_id, &item_id, session, vault)
+            .map_err(|refused| match refused {
+                Refused::Locked => locked(),
+                Refused::NotPending => fill_ended(),
+                Refused::NotForThisPage => CommandError {
+                    code: "not_a_card",
+                    message: "that item is not a card that can be filled".into(),
                 },
                 Refused::Vault(error) => error.into(),
             })?;

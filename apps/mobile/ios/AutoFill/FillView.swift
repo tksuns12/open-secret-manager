@@ -9,13 +9,18 @@ struct FillView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    Asker(requester: model.requester)
+                    if model.inserting {
+                        // iOS says nothing of where the text goes.
+                        Text("Into the field you chose").font(.headline).accessibilityIdentifier("asker")
+                    } else {
+                        Asker(requester: model.requester)
+                    }
                     Divider()
                     content
                 }
                 .padding()
             }
-            .navigationTitle(model.saving != nil ? "Save a login" : model.oneTimeCode ? "Fill a one-time code" : "Fill a login")
+            .navigationTitle(model.saving != nil ? "Save a login" : model.inserting ? "Insert text" : model.oneTimeCode ? "Fill a one-time code" : "Fill a login")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -41,6 +46,8 @@ struct FillView: View {
         case .unlocked:
             if let saving = model.saving {
                 SaveChoices(model: model, saving: saving)
+            } else if model.inserting {
+                InsertChoices(model: model)
             } else {
                 Logins(model: model)
             }
@@ -187,6 +194,63 @@ private struct SaveChoices: View {
             "It is offered to \(name) again, and to no other app."
         case .notHTTPS, .unnamed:
             "This app does not say which site it belongs to: to fill the login into it, you choose it, warned."
+        }
+    }
+}
+
+/// For text to insert: any item, then one of its fields, whose text goes
+/// into the field the owner chose. A secret is not shown.
+private struct InsertChoices: View {
+    @ObservedObject var model: FillModel
+    @State private var query = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let chosen = model.insertingFrom {
+                Text(chosen.item.title).font(.headline).accessibilityIdentifier("insert-item")
+                ForEach(chosen.fields) { field in
+                    Button { model.insert(field) } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(field.label).font(.body)
+                            if case let .shown(text) = field.source, !field.isSecret {
+                                Text(text).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("insert-field:\(field.label)")
+                    Divider()
+                }
+                Button("Choose another item", action: model.chooseAnotherToInsert).accessibilityIdentifier("insert-another")
+            } else {
+                Text("Choose an item, then what of it goes into the field: a card's number, a password, or another. Insert it only where you mean it to go.")
+                    .font(.callout)
+                TextField("Search", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("fill-search")
+                ForEach(model.offered.filter { item in
+                    query.isEmpty || item.title.localizedCaseInsensitiveContains(query)
+                        || item.username.localizedCaseInsensitiveContains(query)
+                        || item.url.localizedCaseInsensitiveContains(query)
+                }, id: \.id) { item in
+                    Button { model.chooseToInsert(item) } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.title).font(.body)
+                            let below = item.kind == .card ? cardLine(brand: item.brand, ending: item.cardEnding) : item.username
+                            if !below.isEmpty { Text(below).font(.caption).foregroundStyle(.secondary) }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("insert:\(item.title)")
+                    Divider()
+                }
+            }
         }
     }
 }

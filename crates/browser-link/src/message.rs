@@ -5,8 +5,17 @@ use zeroize::Zeroize;
 
 use crate::Origin;
 
-/// The protocol version every message names.
+/// The protocol version of a login's request and of a withdrawal, which
+/// stay at 1: the extension updates apart from the app, and an older app
+/// keeps understanding them.
 pub const VERSION: u32 = 1;
+
+/// The protocol version of a card's request, which came later (Phase 17):
+/// an app that does not know it refuses it by its version or its type.
+pub const CARD_VERSION: u32 = 2;
+
+/// The most documents of a tab one card request may name.
+const MAX_FRAMES: usize = 8;
 
 /// The name browsers know the native messaging host by.
 pub const HOST_NAME: &str = "org.opensecretmanager.native";
@@ -94,6 +103,95 @@ impl FillRequest {
     }
 }
 
+/// What a field of a card form asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardField {
+    Number,
+    Cardholder,
+    /// The month and the year in one field.
+    Expiry,
+    ExpiryMonth,
+    ExpiryYear,
+    SecurityCode,
+}
+
+/// A document of the tab with a card's fields: the page itself (frame 0) or
+/// a frame inside it, with its own origin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CardFrame {
+    pub frame_id: i64,
+    /// Names the document; a navigation makes another.
+    pub document_id: String,
+    /// The document's own origin, as the browser reports it.
+    pub origin: String,
+    /// What its fields ask for, each once.
+    pub fields: Vec<CardField>,
+}
+
+/// Asks for a card to be filled into one tab: into each document named,
+/// the fields it asks for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CardRequest {
+    pub version: u32,
+    /// Chosen by the extension, at random, for this one request.
+    pub request_id: String,
+    pub tab_id: i64,
+    /// The page's origin, as the browser reports it for the tab.
+    pub top_origin: String,
+    /// At least one, at most eight, each frame once.
+    pub frames: Vec<CardFrame>,
+}
+
+impl CardRequest {
+    /// Checks everything that can be checked without a vault and returns
+    /// the page's origin. Each document must be an HTTPS origin as a
+    /// browser writes one, and the page itself, if named, the page's.
+    pub fn check(&self) -> Result<Origin, Refusal> {
+        if self.version != CARD_VERSION {
+            return Err(Refusal::UnsupportedVersion);
+        }
+        if !is_id(&self.request_id)
+            || self.tab_id < 0
+            || self.frames.is_empty()
+            || self.frames.len() > MAX_FRAMES
+        {
+            return Err(Refusal::InvalidMessage);
+        }
+        let mut frames = std::collections::BTreeSet::new();
+        for frame in &self.frames {
+            let mut fields = frame.fields.clone();
+            fields.sort();
+            fields.dedup();
+            if !is_id(&frame.document_id)
+                || frame.frame_id < 0
+                || !frames.insert(frame.frame_id)
+                || frame.fields.is_empty()
+                || fields.len() != frame.fields.len()
+            {
+                return Err(Refusal::InvalidMessage);
+            }
+        }
+        let top = Origin::parse(&self.top_origin).ok_or(Refusal::OriginRejected)?;
+        for frame in &self.frames {
+            let origin = Origin::parse(&frame.origin).ok_or(Refusal::OriginRejected)?;
+            if frame.frame_id == 0 && origin != top {
+                return Err(Refusal::FrameRejected);
+            }
+        }
+        Ok(top)
+    }
+
+    /// Whether some document asks for `field`.
+    pub fn asks(&self, field: CardField) -> bool {
+        self.frames
+            .iter()
+            .any(|frame| frame.fields.contains(&field))
+    }
+}
+
 /// Withdraws a request, when its page went away.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -108,6 +206,7 @@ pub struct Cancel {
 pub enum Request {
     FillRequest(FillRequest),
     Cancel(Cancel),
+    CardRequest(CardRequest),
 }
 
 impl Request {
@@ -128,12 +227,13 @@ impl Request {
         if !value.is_object() {
             return Err(refuse(Refusal::InvalidMessage));
         }
-        match field("type").and_then(serde_json::Value::as_str) {
-            Some("fill_request" | "cancel") => {}
+        let version = match field("type").and_then(serde_json::Value::as_str) {
+            Some("fill_request" | "cancel") => VERSION,
+            Some("card_request") => CARD_VERSION,
             Some(_) => return Err(refuse(Refusal::UnsupportedMessage)),
             None => return Err(refuse(Refusal::InvalidMessage)),
-        }
-        if field("version").and_then(serde_json::Value::as_u64) != Some(u64::from(VERSION)) {
+        };
+        if field("version").and_then(serde_json::Value::as_u64) != Some(u64::from(version)) {
             return Err(refuse(Refusal::UnsupportedVersion));
         }
         let request: Self =
@@ -141,6 +241,9 @@ impl Request {
         match &request {
             Self::FillRequest(fill) => {
                 fill.check().map_err(refuse)?;
+            }
+            Self::CardRequest(card) => {
+                card.check().map_err(refuse)?;
             }
             Self::Cancel(cancel) => {
                 if !is_id(&cancel.request_id) {
@@ -205,6 +308,57 @@ impl fmt::Debug for FillReply {
     }
 }
 
+/// A card's fields, for a reply: only those some document of the request
+/// asks for, the others empty.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CardValues {
+    pub cardholder: String,
+    /// Its digits only.
+    pub number: String,
+    pub expiry_month: String,
+    pub expiry_year: String,
+    pub security_code: String,
+}
+
+impl Drop for CardValues {
+    fn drop(&mut self) {
+        self.cardholder.zeroize();
+        self.number.zeroize();
+        self.expiry_month.zeroize();
+        self.expiry_year.zeroize();
+        self.security_code.zeroize();
+    }
+}
+
+impl fmt::Debug for CardValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CardValues([REDACTED])")
+    }
+}
+
+/// The card the owner chose, for the one request it answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CardReply {
+    pub request_id: String,
+    pub tab_id: i64,
+    pub top_origin: String,
+    pub frames: Vec<CardFrame>,
+    pub card: CardValues,
+}
+
+impl CardReply {
+    /// Whether this is a reply to exactly `request`: the same request, tab,
+    /// page, and documents, each with the same fields.
+    pub fn answers(&self, request: &CardRequest) -> bool {
+        self.request_id == request.request_id
+            && self.tab_id == request.tab_id
+            && self.top_origin == request.top_origin
+            && self.frames == request.frames
+    }
+}
+
 /// A refusal, for the request it names if it names one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -237,6 +391,7 @@ pub enum Response {
     Waiting(Waiting),
     FillReply(FillReply),
     Error(Failure),
+    CardReply(CardReply),
 }
 
 impl Response {
@@ -253,6 +408,19 @@ impl Response {
             Self::Error(failure) => {
                 failure.request_id.as_deref() == Some(request.request_id.as_str())
             }
+            Self::CardReply(_) => false,
+        }
+    }
+
+    /// As [`Response::answers`], for a card's request.
+    pub fn answers_card(&self, request: &CardRequest) -> bool {
+        match self {
+            Self::Waiting(waiting) => waiting.request_id == request.request_id,
+            Self::CardReply(reply) => reply.answers(request),
+            Self::Error(failure) => {
+                failure.request_id.as_deref() == Some(request.request_id.as_str())
+            }
+            Self::FillReply(_) => false,
         }
     }
 
@@ -315,6 +483,15 @@ impl Caller {
 pub struct Forwarded {
     pub caller: Caller,
     pub request: FillRequest,
+}
+
+/// What the host passes to the desktop session for a card: a request it
+/// has checked, and who made it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForwardedCard {
+    pub caller: Caller,
+    pub card: CardRequest,
 }
 
 #[cfg(test)]
@@ -528,6 +705,170 @@ mod tests {
         assert!(
             serde_json::from_str::<Response>(r#"{"type":"fill_reply","requestId":"abc"}"#).is_err()
         );
+    }
+
+    const CARD: &str = r#"{"type":"card_request","version":2,"requestId":"c0a1e7f6-0b9c-4f5d-9a57-2f1f8f3f9d11","tabId":12,"topOrigin":"https://shop.example","frames":[{"frameId":0,"documentId":"0d3b6a52-6b1c-4c0e-8a6e-0a7d6c1b2e3f","origin":"https://shop.example","fields":["cardholder","expiry_month","expiry_year"]},{"frameId":3,"documentId":"a7d6c1b2-6b1c-4c0e-8a6e-0d3b6a522e3f","origin":"https://pay.example.net","fields":["number","security_code"]}]}"#;
+
+    fn card_request() -> CardRequest {
+        match Request::read(CARD.as_bytes()).unwrap() {
+            Request::CardRequest(request) => request,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `CARD` with `change` made to it.
+    fn card_with(change: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(CARD).unwrap();
+        change(&mut value);
+        serde_json::to_string(&value).unwrap()
+    }
+
+    #[test]
+    fn a_card_request_names_each_document_with_its_origin_and_fields() {
+        let request = card_request();
+        assert_eq!(request.check().unwrap().to_string(), "https://shop.example");
+        assert_eq!(request.frames.len(), 2);
+        assert_eq!(request.frames[1].origin, "https://pay.example.net");
+        assert_eq!(
+            request.frames[1].fields,
+            [CardField::Number, CardField::SecurityCode]
+        );
+        assert!(request.asks(CardField::SecurityCode) && !request.asks(CardField::Expiry));
+        assert_eq!(
+            serde_json::to_string(&Request::CardRequest(request)).unwrap(),
+            CARD
+        );
+    }
+
+    #[test]
+    fn a_card_request_out_of_bounds_is_refused_with_the_reason() {
+        let id = Some("c0a1e7f6-0b9c-4f5d-9a57-2f1f8f3f9d11".to_owned());
+        // A login's version, or a later one.
+        for version in ["1", "3"] {
+            assert_eq!(
+                refused(&card_with(
+                    |card| card["version"] = serde_json::from_str(version).unwrap()
+                )),
+                (id.clone(), Refusal::UnsupportedVersion)
+            );
+        }
+        // And a login's request at the card's version.
+        assert_eq!(
+            refused(&fill_with("version", "2")).1,
+            Refusal::UnsupportedVersion
+        );
+        for body in [
+            card_with(|card| card["frames"] = serde_json::json!([])),
+            card_with(|card| {
+                let frame = card["frames"][1].clone();
+                card["frames"] = serde_json::json!(vec![frame; 9]);
+            }),
+            card_with(|card| card["frames"][1]["frameId"] = 0.into()),
+            card_with(|card| card["frames"][1]["frameId"] = (-1).into()),
+            card_with(|card| card["frames"][1]["fields"] = serde_json::json!([])),
+            card_with(|card| card["frames"][1]["fields"] = serde_json::json!(["number", "number"])),
+            card_with(|card| card["frames"][1]["fields"] = serde_json::json!(["pin"])),
+            card_with(|card| card["frames"][1]["documentId"] = "has space".into()),
+            card_with(|card| card["frames"][1]["password"] = "x".into()),
+            card_with(|card| card["tabId"] = (-1).into()),
+            card_with(|card| card["frameId"] = 0.into()),
+        ] {
+            assert_eq!(
+                refused(&body),
+                (id.clone(), Refusal::InvalidMessage),
+                "{body}"
+            );
+        }
+        for origin in [
+            "http://pay.example.net",
+            "https://pay.example.net/",
+            "null",
+            "",
+        ] {
+            assert_eq!(
+                refused(&card_with(
+                    |card| card["frames"][1]["origin"] = origin.into()
+                )),
+                (id.clone(), Refusal::OriginRejected),
+                "{origin}"
+            );
+        }
+        assert_eq!(
+            refused(&card_with(
+                |card| card["topOrigin"] = "https://shop.example:8443".into()
+            )),
+            (id.clone(), Refusal::FrameRejected)
+        );
+    }
+
+    #[test]
+    fn a_card_reply_is_handed_on_only_for_the_request_it_answers() {
+        let request = card_request();
+        let reply = CardReply {
+            request_id: request.request_id.clone(),
+            tab_id: request.tab_id,
+            top_origin: request.top_origin.clone(),
+            frames: request.frames.clone(),
+            card: CardValues {
+                cardholder: "Owner".into(),
+                number: "4111111111111111".into(),
+                expiry_month: "12".into(),
+                expiry_year: "2030".into(),
+                security_code: "123".into(),
+            },
+        };
+        let response = Response::CardReply(reply.clone());
+        assert!(response.answers_card(&request) && response.is_final());
+        assert!(!response.answers(&self::tests::request()));
+        let shown = format!("{reply:?}");
+        assert!(
+            !shown.contains("4111") && !shown.contains("123\""),
+            "{shown}"
+        );
+        let written = serde_json::to_string(&response).unwrap();
+        assert!(
+            written.starts_with(r#"{"type":"card_reply","requestId":"c0a1e7f6"#),
+            "{written}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&written).unwrap(),
+            response
+        );
+
+        let changed = |change: fn(&mut CardReply)| {
+            let mut other = reply.clone();
+            change(&mut other);
+            Response::CardReply(other)
+        };
+        for other in [
+            changed(|reply| reply.request_id = "another".into()),
+            changed(|reply| reply.tab_id = 13),
+            changed(|reply| reply.top_origin = "https://other.example".into()),
+            changed(|reply| reply.frames[1].frame_id = 4),
+            changed(|reply| reply.frames[1].document_id = "another".into()),
+            changed(|reply| reply.frames[1].origin = "https://other.example".into()),
+            changed(|reply| reply.frames[0].fields.push(CardField::SecurityCode)),
+            changed(|reply| {
+                reply.frames.pop();
+            }),
+        ] {
+            assert!(!other.answers_card(&request), "{other:?}");
+        }
+        // A login's reply does not answer a card's request, nor the reverse.
+        assert!(!Response::FillReply(FillReply {
+            request_id: request.request_id.clone(),
+            tab_id: request.tab_id,
+            frame_id: 0,
+            document_id: request.frames[0].document_id.clone(),
+            origin: request.top_origin.clone(),
+            username: "u".into(),
+            password: "p".into(),
+        })
+        .answers_card(&request));
+        assert!(Response::Waiting(Waiting {
+            request_id: request.request_id.clone()
+        })
+        .answers_card(&request));
     }
 
     fn arguments(list: &[&str]) -> Vec<String> {

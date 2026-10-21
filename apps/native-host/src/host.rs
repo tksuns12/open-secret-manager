@@ -10,7 +10,9 @@ use std::{
 };
 
 use osm_browser_link::{
-    endpoint, frame::Prefix, Caller, Failure, FillRequest, Forwarded, Refusal, Request, Response,
+    endpoint,
+    frame::{self, Prefix},
+    Caller, Failure, Forwarded, ForwardedCard, Refusal, Request, Response,
 };
 
 /// How many requests may wait for the desktop session at once. The session
@@ -70,21 +72,64 @@ impl<W: Write + Send + 'static> Host<W> {
     pub fn handle(&mut self, body: &[u8]) {
         match Request::read(body) {
             Ok(Request::FillRequest(request)) => {
-                if let Err(code) = self.forward(&request) {
-                    send(&self.out, &Response::refusal(&request.request_id, code));
-                }
+                let request_id = request.request_id.clone();
+                let forwarded = self.caller.clone().map(|caller| {
+                    frame::encode(&Forwarded {
+                        caller,
+                        request: request.clone(),
+                    })
+                });
+                self.pass_on(&request_id, forwarded, move |response| {
+                    response.answers(&request)
+                });
+            }
+            Ok(Request::CardRequest(card)) => {
+                let request_id = card.request_id.clone();
+                let forwarded = self.caller.clone().map(|caller| {
+                    frame::encode(&ForwardedCard {
+                        caller,
+                        card: card.clone(),
+                    })
+                });
+                self.pass_on(&request_id, forwarded, move |response| {
+                    response.answers_card(&card)
+                });
             }
             Ok(Request::Cancel(cancel)) => self.cancel(&cancel.request_id),
             Err(failure) => send(&self.out, &Response::Error(failure)),
         }
     }
 
-    /// Passes a checked request to the desktop session and leaves a thread
-    /// handing back what the session answers.
-    fn forward(&self, request: &FillRequest) -> Result<(), Refusal> {
-        let caller = self.caller.clone().ok_or(Refusal::ExtensionNotAllowed)?;
+    /// Passes on the encoded `forwarded` request, or tells the extension
+    /// why not. `None`: the host was started by something other than the
+    /// allowed extension.
+    fn pass_on(
+        &self,
+        request_id: &str,
+        forwarded: Option<std::io::Result<frame::Body>>,
+        answers: impl Fn(&Response) -> bool + Send + 'static,
+    ) {
+        let outcome = match forwarded {
+            None => Err(Refusal::ExtensionNotAllowed),
+            Some(Err(_)) => Err(Refusal::InvalidMessage),
+            Some(Ok(body)) => self.forward(request_id, &body, answers),
+        };
+        if let Err(code) = outcome {
+            send(&self.out, &Response::refusal(request_id, code));
+        }
+    }
+
+    /// Passes a checked request, `body`, to the desktop session and leaves a
+    /// thread handing back what the session answers to it, as `answers`
+    /// tells.
+    fn forward(
+        &self,
+        request_id: &str,
+        body: &[u8],
+        answers: impl Fn(&Response) -> bool + Send + 'static,
+    ) -> Result<(), Refusal> {
         let mut open = lock(&self.open);
-        if open.contains_key(&request.request_id) {
+        if open.contains_key(request_id) {
             return Err(Refusal::Replayed);
         }
         if open.len() >= MAX_OPEN {
@@ -102,21 +147,16 @@ impl<W: Write + Send + 'static> Host<W> {
         session
             .set_write_timeout(Some(SEND_LIMIT))
             .map_err(unavailable)?;
-        let forwarded = Forwarded {
-            caller,
-            request: request.clone(),
-        };
-        Prefix::Socket
-            .write(&mut session, &forwarded)
-            .map_err(unavailable)?;
+        let framed = Prefix::Socket.frame(body).map_err(unavailable)?;
+        session.write_all(&framed).map_err(unavailable)?;
         open.insert(
-            request.request_id.clone(),
+            request_id.to_owned(),
             session.try_clone().map_err(unavailable)?,
         );
         drop(open);
 
-        let (request, out, open) = (request.clone(), self.out.clone(), self.open.clone());
-        thread::spawn(move || relay(&request, session, &out, &open));
+        let (request_id, out, open) = (request_id.to_owned(), self.out.clone(), self.open.clone());
+        thread::spawn(move || relay(&request_id, &answers, session, &out, &open));
         Ok(())
     }
 
@@ -131,7 +171,13 @@ impl<W: Write + Send + 'static> Host<W> {
 
 /// Hands the desktop session's answers to one request back to the
 /// extension, until the answer that ends it.
-fn relay(request: &FillRequest, mut session: UnixStream, out: &Mutex<impl Write>, open: &Open) {
+fn relay(
+    request_id: &str,
+    answers: &impl Fn(&Response) -> bool,
+    mut session: UnixStream,
+    out: &Mutex<impl Write>,
+    open: &Open,
+) {
     loop {
         // Only what answers exactly this request is handed on. Anything
         // else, a closed connection, and a long silence all mean there is
@@ -139,28 +185,22 @@ fn relay(request: &FillRequest, mut session: UnixStream, out: &Mutex<impl Write>
         let answer = match Prefix::Socket.read(&mut session) {
             Ok(Some(body)) => serde_json::from_slice::<Response>(&body)
                 .ok()
-                .filter(|response| response.answers(request)),
+                .filter(|response| answers(response)),
             _ => None,
         };
         // Held while answering, so that nothing but `cancelled` follows a
         // withdrawal.
         let mut open = lock(open);
-        if !open.contains_key(&request.request_id) {
-            send(
-                out,
-                &Response::refusal(&request.request_id, Refusal::Cancelled),
-            );
+        if !open.contains_key(request_id) {
+            send(out, &Response::refusal(request_id, Refusal::Cancelled));
             return;
         }
         let answer = answer.unwrap_or_else(|| {
-            Response::Error(Failure::new(
-                &request.request_id,
-                Refusal::DesktopSessionUnavailable,
-            ))
+            Response::Error(Failure::new(request_id, Refusal::DesktopSessionUnavailable))
         });
         send(out, &answer);
         if answer.is_final() {
-            open.remove(&request.request_id);
+            open.remove(request_id);
             return;
         }
     }
@@ -213,6 +253,13 @@ mod tests {
         .into_bytes()
     }
 
+    fn card(request_id: &str, origin: &str) -> Vec<u8> {
+        format!(
+            r#"{{"type":"card_request","version":2,"requestId":"{request_id}","tabId":1,"topOrigin":"{origin}","frames":[{{"frameId":0,"documentId":"d","origin":"{origin}","fields":["number"]}}]}}"#
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn a_request_that_cannot_be_passed_on_is_refused() {
         let written = Written::default();
@@ -241,6 +288,22 @@ mod tests {
             written.clone(),
         );
         host.handle(&fill("e", "https://example.test"));
+        host.handle(&card("f", "https://example.test"));
+
+        // A card's request is passed on as a login's is, and refused alike.
+        let mut host = Host::at(
+            allowed(),
+            Some("/nonexistent/browser.sock".into()),
+            written.clone(),
+        );
+        host.handle(&card("g", "https://example.test"));
+        host.handle(&card("h", "http://example.test"));
+        host.handle(
+            &card("i", "https://example.test")
+                .into_iter()
+                .map(|byte| if byte == b'2' { b'1' } else { byte })
+                .collect::<Vec<_>>(),
+        );
 
         assert_eq!(
             written.responses(),
@@ -251,6 +314,10 @@ mod tests {
                 Response::refusal("c", Refusal::DesktopSessionUnavailable),
                 Response::refusal("d", Refusal::DesktopSessionUnavailable),
                 Response::refusal("e", Refusal::ExtensionNotAllowed),
+                Response::refusal("f", Refusal::ExtensionNotAllowed),
+                Response::refusal("g", Refusal::DesktopSessionUnavailable),
+                Response::refusal("h", Refusal::OriginRejected),
+                Response::refusal("i", Refusal::UnsupportedVersion),
             ]
         );
     }

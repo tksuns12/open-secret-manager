@@ -9,6 +9,7 @@
 //! ```text
 //! osm-fill create <vault>                                     CREATED
 //! osm-fill add <vault> <title> <username> <password> <address>   ADDED <item>
+//! osm-fill add-card <vault> <title> <cardholder> <number> <month> <year> <code>   ADDED <item>
 //! osm-fill serve <vault> <socket|-> [first|deny|ask] [locked] [within=<seconds>]
 //! ```
 //!
@@ -22,11 +23,17 @@
 //! Each time a request arrives, and each time the vault locks or unlocks
 //! under one, it prints `REQUEST <request> <origin> <browser>
 //! <logins|locked>` and then `LOGIN <item> <title>` for every login
-//! offered. A request that ends without this process deciding it prints
-//! `ENDED <request>`. Commands on stdin, one per line:
+//! offered. A card's request prints `REQUEST <request> <origin> <browser>
+//! <cards|locked> card <documents>`, then `FRAME <frame> <origin>
+//! <field>,...` for each document it names and `CARD <item> <title>` for
+//! every card offered;
+//! `first` fills it with the first card. A request that ends without this
+//! process deciding it prints `ENDED <request>`. Commands on stdin, one per
+//! line:
 //!
 //! ```text
 //! approve <item>        FILLED <request> <item>, or REFUSED <reason>
+//! approve-card <item>   FILLED <request> <item>, or REFUSED <reason>
 //! deny                  DENIED <request>, or REFUSED not-pending
 //! lock                  LOCKED
 //! unlock                UNLOCKED

@@ -2,9 +2,10 @@ import AuthenticationServices
 import SwiftUI
 
 /// What the system opens when the owner chooses this app to fill a login
-/// form in another app or a page, or, from iOS 26.2, to save what a login
-/// form submitted. It registers no logins with the system, so the system
-/// knows nothing of the vault, and every fill and save starts here.
+/// form in another app or a page, from iOS 18 to insert the text of an
+/// item's field, or, from iOS 26.2, to save what a login form submitted. It
+/// registers no logins with the system, so the system knows nothing of the
+/// vault, and every fill and save starts here.
 final class CredentialProviderViewController: ASCredentialProviderViewController {
     private var model: FillModel?
 
@@ -49,6 +50,26 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
             oneTimeCode: true,
             onCode: { [weak self] code in
                 self?.extensionContext.completeOneTimeCodeRequest(using: ASOneTimeCodeCredential(code: code), completionHandler: nil)
+            },
+            onCancel: { [weak self] in
+                guard let self else { return }
+                extensionContext.cancelRequest(withError: userCanceled)
+            }
+        ))
+    }
+
+    /// The text of one field of an item, for the field the owner chose
+    /// AutoFill and then Passwords in: a card's number or security code, a
+    /// password, or another. iOS lets no other app fill a card, and this is
+    /// how one goes into a card form here. iOS says nothing of where the
+    /// text goes, so it is the owner's choice alone, as a paste is.
+    @available(iOS 18.0, *)
+    override func prepareInterfaceForUserChoosingTextToInsert() {
+        show(FillModel(
+            requester: .unnamed,
+            inserting: true,
+            onText: { [weak self] text in
+                self?.extensionContext.completeRequest(withTextToInsert: text, completionHandler: nil)
             },
             onCancel: { [weak self] in
                 guard let self else { return }

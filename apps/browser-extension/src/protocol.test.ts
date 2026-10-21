@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { answers, cancel, explain, fillRequest, MAX_MESSAGE_BYTES, NATIVE_HOST, pageOrigin, readResponse, VERSION, type FillReply } from "./protocol.ts";
+import { answers, answersCard, CARD_FIELDS, CARD_VERSION, cancel, cardRequest, explain, fillRequest, MAX_MESSAGE_BYTES, NATIVE_HOST, pageOrigin, readResponse, VERSION, type CardReply, type FillReply } from "./protocol.ts";
 
 test("only an https page has an origin to ask for", () => {
   assert.equal(pageOrigin("https://example.com/login?next=/home#form"), "https://example.com");
@@ -133,4 +133,45 @@ test("the extension writes and reads the frozen messages the host is tested agai
     assert.equal(failure.code, code);
     assert.match(explain(code), /\S/, code);
   }
+});
+
+// The messages of a card's fill, which came with version 2.
+const frozenCard = JSON.parse(readFileSync(new URL("../../../crates/browser-link/fixtures/messages-2.json", import.meta.url), "utf8"));
+
+test("the extension writes and reads the frozen messages of a card's fill", () => {
+  assert.equal(CARD_VERSION, frozenCard.version);
+  assert.deepEqual([...CARD_FIELDS], frozenCard.card_fields);
+  const asked = JSON.parse(frozenCard.from_extension.card_request);
+  assert.equal(JSON.stringify(cardRequest(asked.requestId, asked.tabId, asked.topOrigin, asked.frames)), frozenCard.from_extension.card_request);
+  const reply = readResponse(JSON.parse(frozenCard.to_extension.card_reply));
+  assert.ok(reply !== null && reply.type === "card_reply");
+  assert.ok(answersCard(reply as CardReply, asked));
+  assert.equal((reply as CardReply).card.number, "4111111111111111");
+
+  // A reply that names a document otherwise, or one more field, is not for it.
+  const other = (change: (reply: CardReply) => void) => {
+    const changed = JSON.parse(frozenCard.to_extension.card_reply) as CardReply;
+    change(changed);
+    return changed;
+  };
+  for (const changed of [
+    other((reply) => { reply.frames[1].origin = "https://other.example"; }),
+    other((reply) => { reply.frames[1].documentId = "another"; }),
+    other((reply) => { reply.frames[0].fields.push("security_code"); }),
+    other((reply) => { reply.frames.pop(); }),
+    other((reply) => { reply.topOrigin = "https://other.example"; }),
+  ]) {
+    assert.equal(answersCard(changed, asked), false, JSON.stringify(changed.frames));
+  }
+  // A card's reply missing a value, or with one more, is no reply.
+  for (const changed of [
+    other((reply) => { delete (reply.card as Partial<CardReply["card"]>).securityCode; }),
+    other((reply) => { (reply.card as Record<string, string>).pin = "1234"; }),
+    other((reply) => { (reply.frames[0] as unknown as Record<string, unknown>).fields = ["pin"]; }),
+  ]) {
+    assert.equal(readResponse(changed), null);
+  }
+  // An app that does not know a card's request says so, and the owner is told to update it.
+  assert.match(explain("unsupported_message"), /Update the app/);
+  assert.match(explain("unsupported_version"), /Update the app/);
 });

@@ -100,11 +100,64 @@ proptest! {
                 prop_assert_eq!(request.frame_id, 0);
             }
             Ok(Request::Cancel(cancel)) => prop_assert!(is_id(&cancel.request_id)),
+            Ok(Request::CardRequest(card)) => {
+                let origin = card.check();
+                prop_assert!(origin.is_ok());
+                prop_assert_eq!(origin.unwrap().to_string(), card.top_origin.clone());
+                prop_assert!(!card.frames.is_empty() && card.frames.len() <= 8);
+            }
             Err(failure) => {
                 if let Some(id) = &failure.request_id {
                     prop_assert!(is_id(id));
                 }
             }
+        }
+    }
+
+    /// A card's request is refused, or every document it names is an HTTPS
+    /// origin, each frame once with fields each once, and the page itself,
+    /// if named, of the page's origin.
+    #[test]
+    fn a_card_request_is_refused_or_wholly_valid(
+        frames in prop::collection::vec(
+            (
+                0_i64..4,
+                prop_oneof![
+                    Just("https://example.com"),
+                    Just("https://pay.example.net"),
+                    Just("http://example.com"),
+                    Just("https://example.com/"),
+                    Just("null"),
+                ],
+                prop::collection::vec(
+                    prop_oneof![Just("number"), Just("security_code"), Just("expiry"), Just("pin")],
+                    0..4,
+                ),
+            ),
+            0..10,
+        ),
+    ) {
+        let frames: Vec<Value> = frames
+            .into_iter()
+            .map(|(frame, origin, fields)| json!({ "frameId": frame, "documentId": "d-1", "origin": origin, "fields": fields }))
+            .collect();
+        let message = json!({ "type": "card_request", "version": 2, "requestId": "r-1", "tabId": 1,
+            "topOrigin": "https://example.com", "frames": frames });
+        match Request::read(&serde_json::to_vec(&message).unwrap()) {
+            Ok(Request::CardRequest(card)) => {
+                prop_assert!(card.check().is_ok());
+                let mut ids: Vec<i64> = card.frames.iter().map(|frame| frame.frame_id).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                prop_assert_eq!(ids.len(), card.frames.len());
+                for frame in &card.frames {
+                    prop_assert!(frame.origin == "https://example.com" || frame.origin == "https://pay.example.net");
+                    prop_assert!(frame.frame_id != 0 || frame.origin == "https://example.com");
+                    prop_assert!(!frame.fields.is_empty());
+                }
+            }
+            Ok(other) => prop_assert!(false, "{other:?}"),
+            Err(failure) => prop_assert_eq!(failure.request_id.as_deref(), Some("r-1")),
         }
     }
 

@@ -83,6 +83,38 @@ func askToFill(file: StaticString = #filePath, line: UInt = #line) {
     XCTAssert(fixture.staticTexts["asker"].waitForExistence(timeout: startTimeout), "no fill screen", file: file, line: line)
 }
 
+/// Opens the stand-in app's form and asks for text to insert into its
+/// account field, as the owner would from iOS 18: the field's menu,
+/// AutoFill, Passwords, then the keyboard's Passwords and Open Secret
+/// Manager among the providers, until the screen to insert text shows.
+/// That screen is shown by the system over the app, in its own tree: it
+/// is returned, for the test to drive.
+@discardableResult
+func askToInsert(file: StaticString = #filePath, line: UInt = #line) -> XCUIApplication {
+    fixture.launch()
+    let field = fixture.textFields["fixture-username"]
+    field.waitAndTap(timeout: startTimeout, file: file, line: line)
+    let autofill = fixture.menuItems["AutoFill"]
+    // A tap on the field that has the focus shows its menu.
+    field.settledTap(file: file, line: line) { autofill.exists }
+    capture("insert-1-menu")
+    autofill.tap()
+    // The menu's entries are known by their images: Passwords by its key.
+    let passwords = fixture.cells.containing(.image, identifier: "key.dots").firstMatch
+    passwords.waitAndTap(file: file, line: line)
+    let ours = springboard.buttons["Open Secret Manager"]
+    fixture.buttons["Passwords"].settledTap(file: file, line: line) { ours.exists }
+    capture("insert-2-providers")
+    ours.settledTap(file: file, line: line) { !ours.exists }
+    let deadline = Date().addingTimeInterval(startTimeout)
+    while Date() < deadline {
+        for shown in [fixture, springboard] where shown.staticTexts["asker"].exists { return shown }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    XCTFail("no screen to insert text", file: file, line: line)
+    return fixture
+}
+
 extension XCUIElement {
     func waitAndTap(timeout: TimeInterval = 20, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssert(waitForExistence(timeout: timeout), "\(self) never appeared", file: file, line: line)

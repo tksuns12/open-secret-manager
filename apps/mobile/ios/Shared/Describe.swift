@@ -34,3 +34,9 @@ func describe(_ error: Error) -> String {
     case .KeystoreLost: return "This phone no longer holds its network key · remove it on your computer and join again"
     }
 }
+
+/// A card as a list names it: its brand and the last four digits of its number, nothing else of it.
+func cardLine(brand: String?, ending: String?) -> String {
+    let brand = (brand?.trimmingCharacters(in: .whitespaces).isEmpty ?? true) ? "Card" : brand!
+    return [brand, ending.map { "•••• \($0)" }].compactMap { $0 }.joined(separator: " ")
+}

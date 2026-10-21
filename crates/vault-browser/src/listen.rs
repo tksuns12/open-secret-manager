@@ -9,7 +9,7 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{self, Body, Prefix},
-    Forwarded, Refusal, Response, Waiting,
+    Forwarded, ForwardedCard, Refusal, Response, Waiting,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -20,7 +20,7 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
-use crate::Desk;
+use crate::{broker::Asked, Desk};
 
 /// How many connections are served at once. Each carries one request and
 /// only one request waits at a time, so more than a few are never needed.
@@ -148,11 +148,16 @@ async fn converse(mut stream: UnixStream, desk: &Desk) {
     let Ok(Ok(body)) = timeout(config.exchange_within, read_frame(&mut stream)).await else {
         return;
     };
-    let Ok(forwarded) = serde_json::from_slice::<Forwarded>(&body) else {
-        return;
+    // A login's request, or a card's.
+    let (caller, asked) = match serde_json::from_slice::<Forwarded>(&body) {
+        Ok(Forwarded { caller, request }) => (caller, Asked::Login(request)),
+        Err(_) => match serde_json::from_slice::<ForwardedCard>(&body) {
+            Ok(ForwardedCard { caller, card }) => (caller, Asked::Card(card)),
+            Err(_) => return,
+        },
     };
-    let request_id = forwarded.request.request_id.clone();
-    let (ticket, deadline, mut answered) = match desk.submit(forwarded) {
+    let request_id = asked.request_id().to_owned();
+    let (ticket, deadline, mut answered) = match desk.submit(caller, asked) {
         Ok(taken) => taken,
         Err(failure) => {
             let refusal = Response::Error(failure);

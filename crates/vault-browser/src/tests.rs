@@ -10,7 +10,8 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{self, Prefix, MAX_FRAME},
-    Caller, FillRequest, Forwarded, Refusal, Response, CHROMIUM_EXTENSION_ID, VERSION,
+    Caller, CardField, CardFrame, CardRequest, FillRequest, Forwarded, ForwardedCard, Refusal,
+    Response, CARD_VERSION, CHROMIUM_EXTENSION_ID, VERSION,
 };
 use osm_vault_core::{Item, ItemKind, Vault};
 use tempfile::TempDir;
@@ -98,6 +99,14 @@ impl Client {
 
     /// Connects and brings one request.
     async fn bring(session: &Session, forwarded: &Forwarded) -> Self {
+        let mut client = Self::connect(session).await;
+        let body = frame::encode(forwarded).unwrap();
+        client.send(&Prefix::Socket.frame(&body).unwrap()).await;
+        client
+    }
+
+    /// Connects and brings one card's request.
+    async fn bring_card(session: &Session, forwarded: &ForwardedCard) -> Self {
         let mut client = Self::connect(session).await;
         let body = frame::encode(forwarded).unwrap();
         client.send(&Prefix::Socket.frame(&body).unwrap()).await;
@@ -248,6 +257,140 @@ async fn the_owners_choice_fills_the_one_request_it_was_made_for() {
     assert_eq!(replay.next().await, refusal("first", Refusal::Replayed));
     assert_eq!(replay.next().await, None);
     assert!(session.desk.choices(Some(&vault)).unwrap().is_none());
+}
+
+/// A card's request from a checkout page whose number and code are in a
+/// payment provider's frame.
+fn card_request(id: &str, code: bool) -> ForwardedCard {
+    let mut payment = vec![CardField::Number];
+    if code {
+        payment.push(CardField::SecurityCode);
+    }
+    ForwardedCard {
+        caller: extension(),
+        card: CardRequest {
+            version: CARD_VERSION,
+            request_id: id.into(),
+            tab_id: 31,
+            top_origin: "https://shop.example".into(),
+            frames: vec![
+                CardFrame {
+                    frame_id: 0,
+                    document_id: format!("page-of-{id}"),
+                    origin: "https://shop.example".into(),
+                    fields: vec![CardField::Cardholder, CardField::Expiry],
+                },
+                CardFrame {
+                    frame_id: 2,
+                    document_id: format!("frame-of-{id}"),
+                    origin: "https://pay.example.net".into(),
+                    fields: payment,
+                },
+            ],
+        },
+    }
+}
+
+fn card(title: &str) -> Item {
+    let mut item = Item::new(title);
+    item.kind = ItemKind::Card;
+    osm_vault_core::card::CardChange {
+        cardholder: Some("Owner".into()),
+        number: Some("4111 1111 1111 1111".into()),
+        expiry_month: Some("3".into()),
+        expiry_year: Some("2030".into()),
+        security_code: Some("123".into()),
+        brand: None,
+    }
+    .apply_to(&mut item);
+    item
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_card_goes_to_a_card_request_with_only_the_fields_it_asks_for() {
+    let session = Session::start(Config::default());
+    let visa = card("Visa");
+    let bank = login("bank", "https://shop.example/");
+    let mut vault = vault_with(session.dir.path(), &[visa.clone(), bank.clone()]);
+
+    let asked = card_request("card", true);
+    let mut client = Client::bring_card(&session, &asked).await;
+    assert_eq!(client.next().await, waiting("card"));
+    let choices = session.asked(Some(&vault)).await;
+    assert_eq!(choices.origin, "https://shop.example");
+    assert!(choices.logins.is_empty());
+    let card_choices = choices.card.clone().unwrap();
+    // Every card, for any page; each document named with its origin.
+    let offered: Vec<&str> = card_choices
+        .cards
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    assert_eq!(offered, [visa.id.as_str()]);
+    assert_eq!(card_choices.frames, asked.card.frames);
+    client.is_quiet().await;
+
+    // A card is not a login, nor a login a card.
+    let unlock = choices.session.unwrap();
+    assert!(matches!(
+        session.desk.approve("card", &visa.id, unlock, &vault),
+        Err(Refused::NotForThisPage)
+    ));
+    assert!(matches!(
+        session.desk.approve_card("card", &bank.id, unlock, &vault),
+        Err(Refused::NotForThisPage)
+    ));
+    session
+        .desk
+        .approve_card("card", &visa.id, unlock, &vault)
+        .unwrap();
+    let Some(Response::CardReply(reply)) = client.next().await else {
+        panic!("a reply")
+    };
+    assert!(reply.answers(&asked.card));
+    let values = &reply.card;
+    assert_eq!(
+        (
+            values.cardholder.as_str(),
+            values.number.as_str(),
+            values.expiry_month.as_str(),
+            values.expiry_year.as_str(),
+            values.security_code.as_str()
+        ),
+        ("Owner", "4111111111111111", "03", "2030", "123")
+    );
+    assert_eq!(client.next().await, None);
+
+    // A request that does not ask for the code is not given it.
+    let asked = card_request("no-code", false);
+    let mut client = Client::bring_card(&session, &asked).await;
+    let choices = session.asked(Some(&vault)).await;
+    session
+        .desk
+        .approve_card("no-code", &visa.id, choices.session.unwrap(), &vault)
+        .unwrap();
+    let Some(Response::CardReply(reply)) = client.last().await else {
+        panic!("a reply")
+    };
+    assert_eq!(reply.card.security_code, "");
+    assert_eq!(reply.card.number, "4111111111111111");
+
+    // Locked, no card is listed, and none is released.
+    let asked = card_request("locked", true);
+    let mut client = Client::bring_card(&session, &asked).await;
+    let choices = session.asked(Some(&vault)).await;
+    let unlock = choices.session.unwrap();
+    vault.lock();
+    let choices = session.desk.choices(Some(&vault)).unwrap().unwrap();
+    assert!(choices.card.unwrap().cards.is_empty() && choices.session.is_none());
+    assert!(matches!(
+        session
+            .desk
+            .approve_card("locked", &visa.id, unlock, &vault),
+        Err(Refused::Locked)
+    ));
+    assert!(session.desk.deny("locked"));
+    assert_eq!(client.last().await, refusal("locked", Refusal::Denied));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
