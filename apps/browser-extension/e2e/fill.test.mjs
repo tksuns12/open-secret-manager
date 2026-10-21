@@ -84,6 +84,18 @@ describe("with the desktop session and the real host", () => {
     await page.close();
   });
 
+  test("a page its site serves sandboxed is refused, though its address is the site's", async () => {
+    // Its scripts run with an origin of their own, not the site's: a login
+    // for the site filled here would be theirs to read.
+    const page = await browser.open("https://login.test/sandboxed");
+    await browser.press(page);
+    const status = await browser.until(page, "!");
+    assert.match(status.title, /sandboxed by its site/);
+    await browser.app.quiet();
+    assert.deepEqual(fields(await page.form()), EMPTY);
+    await page.close();
+  });
+
   test("a subdomain and another port are other origins, with no login to offer", async () => {
     for (const [address, origin] of [
       ["https://www.login.test/login", "https://www.login.test"],

@@ -51,12 +51,14 @@ const loginForm = (title) => `<!doctype html><meta charset="utf-8"><title>${titl
 
 function respond(request, response) {
   const url = new URL(request.url, "https://placeholder.test");
-  const send = (body) => { response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(body); };
+  const send = (body, headers = {}) => { response.writeHead(200, { "content-type": "text/html; charset=utf-8", ...headers }); response.end(body); };
   switch (url.pathname) {
     case "/login": return send(loginForm("Sign in"));
     case "/next": return send(loginForm("Another page of the same site"));
     // A page that keeps scripts that came later from hearing that it is being left.
     case "/sticky": return send(loginForm("A page that hides its leaving") + `<script>window.addEventListener("pagehide", (event) => event.stopImmediatePropagation(), true);</script>`);
+    // A page its site serves sandboxed: the site's address, but an origin of its own.
+    case "/sandboxed": return send(loginForm("Sandboxed"), { "content-security-policy": "sandbox allow-scripts allow-forms" });
     case "/empty": return send(`<!doctype html><title>Nothing to fill</title><p>No form here.</p>`);
     // A page with no form of its own that shows another site's form in a frame.
     case "/framing": return send(`<!doctype html><title>Framing page</title><p>The form below belongs to another site.</p><iframe id="inner" src="https://login.test/login" width="400" height="200"></iframe>`);

@@ -73,6 +73,11 @@ async function ask(tab: chrome.tabs.Tab) {
     show(tabId, "problem", "This page cannot be filled.");
     return;
   }
+  if (found.origin === "null") {
+    page.disconnect();
+    show(tabId, "problem", "This page is sandboxed by its site and has no origin of its own, so no login can be filled into it.");
+    return;
+  }
   if (found.origin !== origin) {
     page.disconnect();
     show(tabId, "problem", "The page changed while you asked. Try again.");

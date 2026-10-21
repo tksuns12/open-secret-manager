@@ -61,9 +61,14 @@ function put(input: HTMLInputElement, value: string) {
   input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-/** Whether this is the page itself, opened over https, and not a frame in another page. */
+/**
+ * Whether this is the page itself, opened over https, with the origin of its
+ * address, and not a frame in another page. A page its site serves
+ * sandboxed (`Content-Security-Policy: sandbox`) has the site's address but
+ * an origin of its own, which no login is for.
+ */
 function isTopHttpsDocument(): boolean {
-  return window.top === window && window.location.protocol === "https:";
+  return window.top === window && window.location.protocol === "https:" && self.origin === window.location.origin;
 }
 
 // Done once per document: putting the script in again does nothing. The
@@ -92,7 +97,7 @@ if (globalThis.osmFillDocument === undefined) {
         say({
           type: "prepared",
           documentId,
-          origin: window.location.origin,
+          origin: self.origin,
           fields: target ? [...(target.username ? ["username" as const] : []), ...(target.password ? ["password" as const] : [])] : [],
         });
         return;
@@ -100,7 +105,7 @@ if (globalThis.osmFillDocument === undefined) {
       if (message.type !== "fill") return;
       // One fill for one request, into the document it was asked for.
       const allowed = !used && target !== null && isTopHttpsDocument()
-        && message.documentId === documentId && message.origin === window.location.origin;
+        && message.documentId === documentId && message.origin === self.origin;
       used = true;
       const filled: ("username" | "password")[] = [];
       if (allowed && target) {
