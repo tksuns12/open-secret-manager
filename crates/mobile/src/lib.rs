@@ -70,6 +70,8 @@ pub enum MobileError {
     NotForThisPage,
     #[error("that item is not a login")]
     NotALogin,
+    #[error("that item is not a card")]
+    NotACard,
     #[error("{reason}")]
     InvalidItem { reason: String },
     /// The item changed since it was read, here or on another device.
@@ -540,6 +542,25 @@ impl std::fmt::Debug for FillCredentials {
     }
 }
 
+/// What fills a card form: the card's fields, given only when the owner
+/// chose the card. A card belongs to no site, so it may go to any app or
+/// page that asks; what it does not have is empty.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CardFill {
+    pub cardholder: String,
+    /// Its digits only, as the card keeps it.
+    pub number: String,
+    pub expiry_month: String,
+    pub expiry_year: String,
+    pub security_code: String,
+}
+
+impl std::fmt::Debug for CardFill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CardFill { .. }")
+    }
+}
+
 /// A login that what a form submitted could be saved into: one that form
 /// could be filled with, under the username it had.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -734,6 +755,14 @@ impl Device {
     /// that app.
     pub fn fill_for_app(&self, id: String) -> Result<FillCredentials, MobileError> {
         self.tokio.block_on(self.inner.fill_for_app(&id))
+    }
+
+    /// The fields of the card the owner chose for a card form, in an app or
+    /// on a page; refused for an item that is not a card, and for a card two
+    /// devices changed at once, until a computer settles which version is
+    /// meant.
+    pub fn card_fill(&self, id: String) -> Result<CardFill, MobileError> {
+        self.tokio.block_on(self.inner.card_fill(&id))
     }
 
     /// For a form that asks for a one-time code: of the logins in `ids`,

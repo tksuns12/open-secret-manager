@@ -23,6 +23,7 @@ func describe(_ error: Error) -> String {
     case .InvalidOrigin: return "Logins are filled only into https pages"
     case .NotForThisPage: return "That login is not saved for this page"
     case .NotALogin: return "Only a login can be filled"
+    case .NotACard: return "Only a card can be filled into a card form"
     case let .InvalidItem(reason): return reason
     case .ChangedElsewhere: return "This item changed since you opened it · open it again"
     case .InConflict: return "Two devices changed this item at once · choose a version on your computer"

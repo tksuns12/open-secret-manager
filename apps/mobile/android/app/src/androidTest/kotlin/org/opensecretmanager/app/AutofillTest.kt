@@ -201,8 +201,15 @@ class AutofillTest {
      * Opens a form of the stand-in app (with [extras] for `am start`), chooses
      * "unlock to fill" in it, and unlocks.
      */
-    private fun askToFill(activity: String, origin: String? = null, name: String? = null, field: String = "username", extras: String = "") {
-        val offer = openAndFind(OFFER, activity, origin, field, extras)
+    private fun askToFill(
+        activity: String,
+        origin: String? = null,
+        name: String? = null,
+        field: String = "username",
+        extras: String = "",
+        entry: BySelector = OFFER,
+    ) {
+        val offer = openAndFind(entry, activity, origin, field, extras)
         name?.let { capture("$it-offer") }
         offer.click()
         // The fill screen's first start can take long on an emulator.
@@ -938,11 +945,70 @@ class AutofillTest {
         assertLockedAgain()
     }
 
+    /** The vault with a card (and an identity), for the tests of card forms: Visa, 4111 1111 1111 1111, 12/2030, code 123, Owner. */
+    private fun withTheCardsVault() {
+        session.reopenForTests { folder ->
+            BiometricUnlock(context).disable()
+            instrumentation.context.assets.open("cards-vault.sqlite3").use { input ->
+                File(folder, "vault.sqlite3").outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+    }
+
+    @Test
+    fun anAppsCardFormIsOfferedTheCardsAndFilledWithTheOneChosenButForAFieldNotShown() {
+        withTheCardsVault()
+        // A login form is offered no card.
+        openAndFind(OFFER, "NativeLoginActivity")
+        assertNull(device.findObject(CARD_OFFER))
+        shell("am force-stop $FIXTURE")
+
+        askToFill("CardFormActivity", name = "card-app", field = "number", entry = CARD_OFFER)
+        // Who asks, and what the form asks for.
+        assertEquals(
+            "This form asks for the card's number, cardholder's name, expiry month, expiry year, security code. " +
+                "A card is offered to any app or page that asks: choose one only if this is where you mean to pay.",
+            find(mine("card-asks")).text,
+        )
+        capture("card-app-cards")
+        find(mine("fill:Visa")).click()
+        // The number whole, the name, the month chosen from the list, the
+        // year in the two digits the field takes, the code; the second code
+        // field, drawn with no size, nothing.
+        assertFilled("4111111111111111|Owner|12|30|123|")
+        assertLockedAgain()
+    }
+
+    @Test
+    fun aPagesCardFormIsFilledOverItsSplitNumberAndItsListsButForAFieldNotShown() {
+        withTheCardsVault()
+        StayUnlocked.millisForTests = 60_000L
+        // A page in an app that is not a trusted browser: a card belongs to
+        // no site, so it is offered there as anywhere.
+        askToFill("WebLoginActivity", "https://shop.example.test", name = "card-web", extras = " --es page card", entry = CARD_OFFER)
+        find(mine("fill:Visa")).click()
+        assertFilled("Owner|4111111111111111|12|2030|123|")
+        assertStillUnlocked()
+
+        // While unlocked, the list under the field names the card by its
+        // brand and the last four digits of its number, and fills at once.
+        val visa = openAndFind(By.text("Visa"), "WebLoginActivity", "https://shop.example.test", extras = " --es page card")
+        find(By.text("Visa •••• 1111"))
+        capture("card-web-unlocked-list")
+        assertNull(device.findObject(By.textContains("4111111111111111")))
+        visa.click()
+        assertFilled("Owner|4111111111111111|12|2030|123|")
+        assertNull(device.findObject(mine("asker")))
+    }
+
     private companion object {
         const val FIXTURE = "org.opensecretmanager.loginfixture"
 
         /** The service's offer under a field, to unlock and fill it. */
         val OFFER: BySelector = By.text("Open Secret Manager · unlock to fill")
+
+        /** The service's offer under a card form's field. */
+        val CARD_OFFER: BySelector = By.text("Open Secret Manager · unlock to fill a card")
 
         /** Where a failed wait leaves what it saw, on the device. */
         const val FAILURES = "/data/local/tmp/osm-failures"

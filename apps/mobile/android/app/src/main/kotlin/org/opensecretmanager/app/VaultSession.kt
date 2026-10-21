@@ -21,6 +21,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.opensecretmanager.vault.CardFill
 import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.AndroidKeystore
 import org.opensecretmanager.vault.Device
@@ -481,6 +482,50 @@ class VaultSession(private val context: Context, private val folder: File) {
     }
 
     /**
+     * For the system's list under a card form's field, while the vault is
+     * unlocked: every card, which any app or page may be offered. Null while
+     * the vault is locked, or if it does not answer within a moment, as
+     * [offered]. Then, on the main thread, [done].
+     */
+    fun offeredCards(done: (List<ItemSummary>?) -> Unit) {
+        scope.launch {
+            val found = withTimeoutOrNull(OFFER_MILLIS) {
+                calls.withLock {
+                    runCatching {
+                        lockIfDue()
+                        val device = device?.takeIf { it.state() == DeviceState.UNLOCKED } ?: return@runCatching null
+                        device.items().filter { it.kind == ItemKind.CARD && !it.conflict }.sortedBy { it.title.lowercase() }
+                    }.getOrNull()
+                }
+            }
+            withContext(Dispatchers.Main) { done(found) }
+        }
+    }
+
+    /** The fields of the card the owner chose; then, on the main thread, [done]. */
+    fun fillCard(id: String, done: (CardFill) -> Unit) = run(null) {
+        val card = device!!.cardFill(id)
+        withContext(Dispatchers.Main) { done(card) }
+    }
+
+    /**
+     * As [fillCard], for a card the owner chose in the system's list while
+     * the vault was unlocked: [done] with null if it is locked by now, for
+     * the fill screen to take over. Nothing is shown meanwhile.
+     */
+    fun fillCardChosen(id: String, done: (CardFill?) -> Unit) {
+        scope.launch {
+            val filled = calls.withLock {
+                runCatching {
+                    lockIfDue()
+                    device?.takeIf { it.state() == DeviceState.UNLOCKED }?.cardFill(id)
+                }.getOrNull()
+            }
+            withContext(Dispatchers.Main) { done(filled) }
+        }
+    }
+
+    /**
      * As [fill], for a login the owner chose in the system's list while the
      * vault was unlocked: [done] with what fills the form, or with null if
      * the vault is locked by now or the login does not fill this form, for
@@ -666,6 +711,7 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.InvalidOrigin -> "Logins are filled only into https pages"
         is MobileException.NotForThisPage -> "That login is not saved for this page"
         is MobileException.NotALogin -> "Only a login can be filled"
+        is MobileException.NotACard -> "Only a card can be filled into a card form"
         is MobileException.InvalidItem -> error.reason
         is MobileException.ChangedElsewhere -> "This item changed since you opened it · open it again"
         is MobileException.InConflict -> "Two devices changed this item at once · choose a version on your computer"

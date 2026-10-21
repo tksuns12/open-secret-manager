@@ -17,7 +17,7 @@ import android.widget.TextView
  * in a web view, or, with the extra `page` set to `code`, a page that asks
  * for a one-time code, or set to `split`, a page whose ID and password are
  * each in a form of their own, which a web view reports to autofill one at
- * a time. The page is served from here, so no network is needed;
+ * a time, or set to `card`, a checkout page's card form (see [CARD_PAGE]). The page is served from here, so no network is needed;
  * the web view still navigates to the address and reports its domain.
  * Signing in posts the form and shows the page again. With the extra
  * `asBrowser` true, the stand-in opens a link to any site from then on, as
@@ -43,6 +43,7 @@ class WebLoginActivity : Activity() {
         val html = when (intent.getStringExtra("page")) {
             "code" -> CODE_PAGE
             "split" -> SPLIT_PAGE
+            "card" -> CARD_PAGE
             else -> PAGE
         }
         val filled = findViewById<TextView>(R.id.filled)
@@ -55,6 +56,9 @@ class WebLoginActivity : Activity() {
 
                 @JavascriptInterface
                 fun reportCode(code: String) = runOnUiThread { filled.text = code }
+
+                @JavascriptInterface
+                fun reportCard(card: String) = runOnUiThread { filled.text = card }
             },
             "fixture",
         )
@@ -95,6 +99,31 @@ class WebLoginActivity : Activity() {
             <form id="pw-form"><input id="userPw" type="password" name="userPw" placeholder="비밀번호"></form>
             <script>
               setInterval(() => fixture.report(userId.value, userPw.value), 200);
+            </script>
+        """.trimIndent()
+
+        /**
+         * A card form as checkouts make them: the cardholder, the number split
+         * over four fields of four digits, the month and the year as lists,
+         * and the code, each saying what it is (`autocomplete`), and a second
+         * code field drawn with no size. It reports what each holds, in order,
+         * the field with no size last: `holder|number|month|year|code|hidden`.
+         */
+        val CARD_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>input, select { display: block; width: 90%; font-size: 22px; margin: 12px 0; } .part { display: inline-block; width: 20%; }
+              #hidden { width: 0; height: 0; padding: 0; border: 0; margin: 0; }</style>
+            <form id="pay">
+              <input id="holder" autocomplete="cc-name" placeholder="Name on card">
+              <div><input class="part" id="n1" autocomplete="cc-number" maxlength="4" inputmode="numeric"><input class="part" id="n2" autocomplete="cc-number" maxlength="4" inputmode="numeric"><input class="part" id="n3" autocomplete="cc-number" maxlength="4" inputmode="numeric"><input class="part" id="n4" autocomplete="cc-number" maxlength="4" inputmode="numeric"></div>
+              <select id="month" autocomplete="cc-exp-month"><option value="">MM</option><option>01</option><option>02</option><option>03</option><option>04</option><option>05</option><option>06</option><option>07</option><option>08</option><option>09</option><option>10</option><option>11</option><option>12</option></select>
+              <select id="year" autocomplete="cc-exp-year"><option value="">YYYY</option><option>2026</option><option>2027</option><option>2028</option><option>2029</option><option>2030</option><option>2031</option><option>2032</option></select>
+              <input id="code" autocomplete="cc-csc" inputmode="numeric" placeholder="CVC">
+              <input id="hidden" autocomplete="cc-csc">
+            </form>
+            <script>
+              setInterval(() => fixture.reportCard([holder.value, n1.value + n2.value + n3.value + n4.value, month.value, year.value, code.value, hidden.value].join("|")), 200);
             </script>
         """.trimIndent()
 

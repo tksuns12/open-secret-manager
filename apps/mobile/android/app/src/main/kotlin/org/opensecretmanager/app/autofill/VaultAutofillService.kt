@@ -19,12 +19,13 @@ import android.view.autofill.AutofillId
 import android.widget.RemoteViews
 import java.util.concurrent.atomic.AtomicInteger
 import org.opensecretmanager.app.VaultApp
+import org.opensecretmanager.app.cardLine
 import org.opensecretmanager.vault.ItemSummary
 
 /**
- * Offers to fill a login form, a username field alone, or a one-time code
- * field in another app or a browser, and to save what a login form
- * submitted. While the vault is locked it says nothing of what the vault
+ * Offers to fill a login form, a username field alone, a one-time code
+ * field, or a card form in another app or a browser, and to save what a
+ * login form submitted. While the vault is locked it says nothing of what the vault
  * holds: the only offer is "unlock to fill", which opens [FillActivity],
  * where the owner unlocks and chooses the login. While it is unlocked (for a
  * while after the app or a fill screen was left, see
@@ -47,6 +48,12 @@ class VaultAutofillService : AutofillService() {
         // on. The system keeps what is typed there for the save the
         // password's screen asks for.
         val form = structure?.let { Form.parse(it) ?: Form.usernameScreen(it) }
+        // A card form, or a card's field on a screen with a login form too.
+        val card = structure?.let(CardForm::parse)
+        if (card != null && card.packageName != packageName && (form == null || card.focused)) {
+            offerCards(request, card, callback)
+            return
+        }
         if (form == null) {
             callback.onSuccess(null)
             return
@@ -119,6 +126,52 @@ class VaultAutofillService : AutofillService() {
         @Suppress("DEPRECATION")
         return Dataset.Builder(presentation).apply {
             listOfNotNull(form.username, form.password, form.oneTimeCode).forEach { setValue(it, null) }
+            if (inline != null && Build.VERSION.SDK_INT >= 30) setInlinePresentation(inline)
+            setAuthentication(sender)
+        }.build()
+    }
+
+    /**
+     * Offers the cards for a card form: while locked, "unlock to fill a
+     * card"; while unlocked, every card by its title, brand, and the last
+     * four digits of its number, as a card belongs to no site, and the fill
+     * screen ([CardFillActivity]) for the rest. Nothing is offered to save.
+     */
+    private fun offerCards(request: FillRequest, card: CardForm, callback: FillCallback) {
+        val strip = if (Build.VERSION.SDK_INT >= 30) request.inlineSuggestionsRequest?.let { Strip(this, it) } else null
+        session().offeredCards { cards ->
+            val response = FillResponse.Builder()
+            val offers = mutableListOf<Dataset>()
+            val add = { title: String, subtitle: String?, inStrip: String, item: String? ->
+                val inline = if (Build.VERSION.SDK_INT >= 30) strip?.entry(offers.size, inStrip, subtitle) else null
+                offers += cardOffer(card, entry(this, title, subtitle), inline, item)
+            }
+            if (cards == null) {
+                add("Open Secret Manager · unlock to fill a card", null, "Unlock to fill", null)
+            } else {
+                val listed = if (Build.VERSION.SDK_INT >= 30 && strip != null) minOf(MAX_LOGINS, strip.room - 1) else MAX_LOGINS
+                cards.take(listed.coerceAtLeast(0)).forEach { add(it.title, cardLine(it.brand, it.cardEnding), it.title, it.id) }
+                if (cards.isEmpty()) add("Open Secret Manager · no card saved", null, "No card saved", null)
+                else add("Open Secret Manager…", null, "Open Secret Manager…", null)
+            }
+            offers.forEach(response::addDataset)
+            callback.onSuccess(response.build())
+        }
+    }
+
+    /** As [offer], for a card form: the card chosen in the list is [item]. */
+    private fun cardOffer(card: CardForm, presentation: RemoteViews, inline: InlinePresentation?, item: String?): Dataset {
+        val intent = Intent(this, CardFillActivity::class.java).putExtras(card.toBundle())
+        item?.let { intent.putExtra(CardFillActivity.ITEM, it) }
+        val sender = PendingIntent.getActivity(
+            this,
+            requests.incrementAndGet(),
+            intent,
+            PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_MUTABLE,
+        ).intentSender
+        @Suppress("DEPRECATION")
+        return Dataset.Builder(presentation).apply {
+            card.fields.forEach { setValue(it.id, null) }
             if (inline != null && Build.VERSION.SDK_INT >= 30) setInlinePresentation(inline)
             setAuthentication(sender)
         }.build()

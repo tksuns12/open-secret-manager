@@ -947,6 +947,23 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
         (listed.card_ending.as_deref(), listed.brand.as_deref()),
         (Some("1111"), Some("Visa"))
     );
+    // Filled whole, as it is kept, only for a card.
+    let filled = device.card_fill(card.clone()).unwrap();
+    assert_eq!(
+        (
+            filled.cardholder.as_str(),
+            filled.number.as_str(),
+            filled.expiry_month.as_str(),
+            filled.expiry_year.as_str(),
+            filled.security_code.as_str()
+        ),
+        ("Owner Renamed", "4111111111111111", "09", "2031", "123")
+    );
+    assert_eq!(format!("{filled:?}"), "CardFill { .. }");
+    assert!(matches!(
+        device.card_fill("fixture-bank".into()),
+        Err(MobileError::NotACard)
+    ));
     // An identity is still not edited here.
     let identity_now = device.item(identity.clone()).unwrap();
     assert!(matches!(

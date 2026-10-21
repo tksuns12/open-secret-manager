@@ -41,21 +41,25 @@ sealed interface Requester {
         /** Packages trusted as browsers in tests only, whatever their certificate. */
         internal val trustedForTests = mutableSetOf<String>()
 
-        fun of(context: Context, form: Form): Requester? {
-            val certificates = certificates(context, form.packageName)
-            val domain = form.webDomain?.takeIf { it.isNotBlank() }
+        fun of(context: Context, form: Form): Requester? = of(context, form.packageName, form.webDomain, form.webScheme)
+
+        fun of(context: Context, form: CardForm): Requester? = of(context, form.packageName, form.webDomain, form.webScheme)
+
+        private fun of(context: Context, packageName: String, webDomain: String?, webScheme: String?): Requester? {
+            val certificates = certificates(context, packageName)
+            val domain = webDomain?.takeIf { it.isNotBlank() }
             val label = runCatching {
                 val manager = context.packageManager
-                manager.getApplicationLabel(manager.getApplicationInfo(form.packageName, 0)).toString()
-            }.getOrDefault(form.packageName)
+                manager.getApplicationLabel(manager.getApplicationInfo(packageName, 0)).toString()
+            }.getOrDefault(packageName)
             // Pages over https only, as on the desktop.
-            if (domain != null && form.webScheme == "https" && trusts(context, form.packageName, certificates)) {
-                return Web("https://${domain.lowercase()}", form.packageName, label)
+            if (domain != null && webScheme == "https" && trusts(context, packageName, certificates)) {
+                return Web("https://${domain.lowercase()}", packageName, label)
             }
             // The original certificate, which stays first in its history when
             // the app moves to a new one: the app keeps its identity here.
             val certificate = certificates.firstOrNull() ?: return null
-            return App(form.packageName, label, certificate, domain?.lowercase())
+            return App(packageName, label, certificate, domain?.lowercase())
         }
 
         private fun trusts(context: Context, packageName: String, certificates: Set<String>): Boolean {

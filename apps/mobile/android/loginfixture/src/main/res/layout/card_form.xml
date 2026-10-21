@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A card form as an app shows one: the number, the expiry, and the code
+     say what they are to autofill, the cardholder is only named, the month
+     is a list, and a second code field is there but drawn with no size. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/form"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true"
+    android:orientation="vertical"
+    android:padding="24dp">
+    <EditText
+        android:id="@+id/number"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:autofillHints="creditCardNumber"
+        android:hint="Card number"
+        android:inputType="number" />
+    <EditText
+        android:id="@+id/holder"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Name on card"
+        android:inputType="textPersonName" />
+    <Spinner
+        android:id="@+id/month"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:autofillHints="creditCardExpirationMonth" />
+    <EditText
+        android:id="@+id/year"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:autofillHints="creditCardExpirationYear"
+        android:hint="YY"
+        android:inputType="number"
+        android:maxLength="2" />
+    <EditText
+        android:id="@+id/code"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:autofillHints="creditCardSecurityCode"
+        android:hint="CVC"
+        android:inputType="numberPassword" />
+    <EditText
+        android:id="@+id/hidden_code"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:autofillHints="creditCardSecurityCode"
+        android:inputType="numberPassword" />
+    <TextView
+        android:id="@+id/filled"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+</LinearLayout>

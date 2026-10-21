@@ -30,8 +30,8 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::{
-    CardDetail, DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail, ItemDraft,
-    ItemSummary, MobileError, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
+    CardDetail, CardFill, DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail,
+    ItemDraft, ItemSummary, MobileError, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
 };
 
 /// The first eight hex digits of a device's ID, as the screens name it.
@@ -674,6 +674,34 @@ impl Runtime {
         Ok(FillCredentials {
             username: found.item.username.clone(),
             password: found.item.password.clone(),
+        })
+    }
+
+    pub(crate) async fn card_fill(&self, id: &str) -> Result<CardFill, MobileError> {
+        use osm_vault_core::card;
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let found = vault.get(id)?;
+        if found.item.kind != ItemKind::Card {
+            return Err(MobileError::NotACard);
+        }
+        if found.conflict {
+            return Err(MobileError::InConflict);
+        }
+        let field = |name: &str| {
+            found
+                .item
+                .custom_fields
+                .get(name)
+                .cloned()
+                .unwrap_or_default()
+        };
+        Ok(CardFill {
+            cardholder: field(card::CARDHOLDER),
+            number: field(card::NUMBER),
+            expiry_month: field(card::EXPIRY_MONTH),
+            expiry_year: field(card::EXPIRY_YEAR),
+            security_code: field(card::SECURITY_CODE),
         })
     }
 

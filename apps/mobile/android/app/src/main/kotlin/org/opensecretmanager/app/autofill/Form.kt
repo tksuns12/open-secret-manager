@@ -162,7 +162,8 @@ data class Form(
                 ?: window.drop(at + 1).firstOrNull { candidate(it) && isUsername(it.node) }
         }
 
-        private fun hints(node: AssistStructure.ViewNode): List<String> =
+        /** What a field says it is to autofill: an app's hints and a page's `autocomplete`, in lower case. */
+        internal fun hints(node: AssistStructure.ViewNode): List<String> =
             node.autofillHints.orEmpty().map { it.lowercase() } +
                 node.htmlInfo?.attributes.orEmpty()
                     .filter { it.first.equals("autocomplete", ignoreCase = true) }
@@ -239,17 +240,17 @@ data class Form(
          * placeholder, or a page's name, id, label, and placeholder for it.
          * Apps that say nothing of a field to autofill often name it.
          */
-        private fun names(node: AssistStructure.ViewNode): List<String> =
+        internal fun names(node: AssistStructure.ViewNode): List<String> =
             listOfNotNull(node.idEntry, node.hint) +
                 node.htmlInfo?.attributes.orEmpty()
                     .filter { it.first.lowercase() in NAME_ATTRIBUTES }
                     .mapNotNull { it.second }
 
         /** The words of a name, `loginID` and `login_id` alike giving `login` and `id`. */
-        private fun words(name: String): List<String> =
+        internal fun words(name: String): List<String> =
             name.split(WORD_BREAK).map { it.lowercase() }.filter { it.isNotEmpty() }
 
-        private fun named(names: List<String>, parts: List<String>, wholeWords: Set<String>): Boolean =
+        internal fun named(names: List<String>, parts: List<String>, wholeWords: Set<String>): Boolean =
             names.any { name -> parts.any { it in name.lowercase() } || words(name).any { it in wholeWords } }
 
         /** Named a username, an email address, a phone number, or an ID, and not a password. */
