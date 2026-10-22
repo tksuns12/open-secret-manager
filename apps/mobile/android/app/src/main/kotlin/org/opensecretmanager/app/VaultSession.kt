@@ -29,7 +29,9 @@ import org.opensecretmanager.vault.DeviceState
 import org.opensecretmanager.vault.FillCredentials
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
+import org.opensecretmanager.vault.PasskeyCaller
 import org.opensecretmanager.vault.PasskeyDetail
+import org.opensecretmanager.vault.PasskeySignIn
 import org.opensecretmanager.vault.ItemDraft
 import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
@@ -535,6 +537,46 @@ class VaultSession(private val context: Context, private val folder: File) {
     }
 
     /**
+     * For the system's list when an app or a page asks for a passkey, while
+     * the vault is unlocked: for each of the [asked] requests (its JSON, and
+     * who asks), the passkeys the vault holds for its site, or null for a
+     * request that is not answered here. Null for all while the vault is
+     * locked, or if it does not answer within a moment, as [offered]. Then,
+     * on the main thread, [done].
+     */
+    fun offeredPasskeys(asked: List<Pair<String, PasskeyCaller>>, done: (List<PasskeySignIn?>?) -> Unit) {
+        scope.launch {
+            val found = withTimeoutOrNull(OFFER_MILLIS) {
+                calls.withLock {
+                    runCatching {
+                        lockIfDue()
+                        val device = device?.takeIf { it.state() == DeviceState.UNLOCKED } ?: return@runCatching null
+                        asked.map { (options, caller) -> runCatching { device.passkeySignIn(options, caller) }.getOrNull() }
+                    }.getOrNull()
+                }
+            }
+            withContext(Dispatchers.Main) { done(found) }
+        }
+    }
+
+    /**
+     * Runs [work] with the device, as every call is, for a passkey's
+     * request; then, on the main thread, [done] with what it gave or how it
+     * failed, which the passkey screen tells the app that asked.
+     */
+    fun <T> forPasskey(work: (Device) -> T, done: (Result<T>) -> Unit) {
+        scope.launch {
+            val result = calls.withLock {
+                runCatching {
+                    lockIfDue()
+                    work(device ?: throw MobileException.NoVault())
+                }.also { runCatching { refresh() } }
+            }
+            withContext(Dispatchers.Main) { done(result) }
+        }
+    }
+
+    /**
      * As [fill], for a login the owner chose in the system's list while the
      * vault was unlocked: [done] with what fills the form, or with null if
      * the vault is locked by now or the login does not fill this form, for
@@ -721,6 +763,9 @@ class VaultSession(private val context: Context, private val folder: File) {
         is MobileException.NotForThisPage -> "That login is not saved for this page"
         is MobileException.NotALogin -> "Only a login can be filled"
         is MobileException.NotACard -> "Only a card can be filled into a card form"
+        is MobileException.PasskeyRefused -> "The site's request cannot be answered here · ${error.reason}"
+        is MobileException.PasskeyExists -> "Your vault already has a passkey for this account on this site"
+        is MobileException.NotVerified -> "The site asks to verify it is you, which did not happen"
         is MobileException.InvalidItem -> error.reason
         is MobileException.ChangedElsewhere -> "This item changed since you opened it · open it again"
         is MobileException.InConflict -> "Two devices changed this item at once · choose a version on your computer"

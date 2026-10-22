@@ -1,6 +1,7 @@
 // A stand-in for another app with login forms, for the autofill tests
 // (app/src/androidTest/.../AutofillTest.kt): a form of its own, and a page
-// in a web view. Never shipped.
+// in a web view; and an app that asks for passkeys (PasskeyTest). Never
+// shipped.
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -30,4 +31,8 @@ kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
     }
+}
+
+dependencies {
+    implementation("androidx.credentials:credentials:1.6.0")
 }

@@ -24,6 +24,9 @@ func describe(_ error: Error) -> String {
     case .NotForThisPage: return "That login is not saved for this page"
     case .NotALogin: return "Only a login can be filled"
     case .NotACard: return "Only a card can be filled into a card form"
+    case let .PasskeyRefused(_, reason): return "The site's request cannot be answered here · \(reason)"
+    case .PasskeyExists: return "Your vault already has a passkey for this account on this site"
+    case .NotVerified: return "The site asks to verify it is you, which did not happen"
     case let .InvalidItem(reason): return reason
     case .ChangedElsewhere: return "This item changed since you opened it · open it again"
     case .InConflict: return "Two devices changed this item at once · choose a version on your computer"

@@ -3,4 +3,8 @@
     <string name="app_name">Open Secret Manager</string>
     <string name="other_field_label">Open Secret Manager: fill both fields</string>
     <string name="other_field_description">Some apps show their sign-in page to autofill one field at a time, so a login you choose for the ID fills the ID alone. With this on, the login you choose in Open Secret Manager for the ID or the password of such an app fills the other field too. It reads the screen only for a few seconds after you choose a login, and only that app\'s window, to find the other field. It reads nothing at any other time, keeps nothing, and fills nothing in a browser.</string>
+    <string name="passkey_provider_subtitle">Passkeys</string>
+    <string name="passkey_account">Your vault</string>
+    <string name="passkey_saved_where">On all your devices with Open Secret Manager</string>
+    <string name="passkey_unlock">Unlock Open Secret Manager</string>
 </resources>

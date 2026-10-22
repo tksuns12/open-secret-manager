@@ -16,7 +16,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use osm_vault_core::{Item, ItemKind, Origin, Vault, VaultItem};
+use osm_vault_core::{
+    passkey::{self, Ceremony, Registering, Signing, UserVerification},
+    Item, ItemKind, Origin, Vault, VaultItem,
+};
 use osm_vault_membership::{ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
     control, serve_members, serve_relayed, start_node, AddressBook, Invitation, MemberEndpoint,
@@ -31,7 +34,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     CardDetail, CardFill, DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail,
-    ItemDraft, ItemSummary, MobileError, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
+    ItemDraft, ItemSummary, MobileError, PasskeyCaller, PasskeyChoice, PasskeyCreation,
+    PasskeyRefusal, PasskeySignIn, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
 };
 
 /// The first eight hex digits of a device's ID, as the screens name it.
@@ -121,6 +125,77 @@ pub(crate) struct Runtime {
     status: StdMutex<SyncStatus>,
     removed: AtomicBool,
     syncing: AtomicBool,
+}
+
+/// Who asks for a passkey, read: the page whose domains it may use, the
+/// origin its client data names, and the hash of the client data a browser
+/// made, if it did.
+pub(crate) struct Asking {
+    pub(crate) page: Option<Origin>,
+    origin: String,
+    client_data_hash: Option<[u8; 32]>,
+}
+
+impl Asking {
+    pub(crate) fn of(caller: &PasskeyCaller) -> Result<Self, MobileError> {
+        match caller {
+            PasskeyCaller::Page {
+                origin,
+                client_data_hash,
+            } => {
+                let page = Origin::of_url(origin).ok_or(MobileError::InvalidOrigin)?;
+                let client_data_hash = client_data_hash
+                    .as_deref()
+                    .map(|hash| {
+                        <[u8; 32]>::try_from(hash).map_err(|_| MobileError::PasskeyRefused {
+                            refusal: PasskeyRefusal::Malformed,
+                            reason: "the browser's client data hash is not one".into(),
+                        })
+                    })
+                    .transpose()?;
+                Ok(Self {
+                    origin: page.to_string(),
+                    page: Some(page),
+                    client_data_hash,
+                })
+            }
+            PasskeyCaller::App { certificate_sha256 } => {
+                let certificate = <[u8; 32]>::try_from(certificate_sha256.as_slice())
+                    .map_err(|_| MobileError::InvalidOrigin)?;
+                Ok(Self {
+                    page: None,
+                    origin: passkey::android_app_origin(&certificate),
+                    client_data_hash: None,
+                })
+            }
+        }
+    }
+
+    /// The client data the site is sent, and the hash that is signed. A
+    /// browser that made its own sends the site that one, so the response
+    /// holds a placeholder, as Android's guide for providers says; otherwise
+    /// it is made here.
+    fn client_data(&self, ceremony: Ceremony, challenge: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        match self.client_data_hash {
+            Some(hash) => (b"{}".to_vec(), hash),
+            None => {
+                let data = passkey::client_data(ceremony, challenge, &self.origin);
+                let hash = passkey::client_data_hash(&data);
+                (data, hash)
+            }
+        }
+    }
+}
+
+/// Whether a login's address is on the site `rp_id`, or under it.
+fn on_site(url: &str, rp_id: &str) -> bool {
+    Origin::of_url(url).is_some_and(|origin| {
+        let host = origin.host();
+        host == rp_id
+            || host
+                .strip_suffix(rp_id)
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
 }
 
 fn now() -> u64 {
@@ -698,6 +773,139 @@ impl Runtime {
             username: found.item.username.clone(),
             password: found.item.password.clone(),
         })
+    }
+
+    pub(crate) async fn passkey_creation(
+        &self,
+        options: &str,
+        caller: &PasskeyCaller,
+    ) -> Result<PasskeyCreation, MobileError> {
+        let asking = Asking::of(caller)?;
+        let request = Registering::from_options(options, asking.page.as_ref())?;
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let logins = vault
+            .list()?
+            .into_iter()
+            .filter(|item| {
+                item.kind == ItemKind::Login && !item.conflict && on_site(&item.url, &request.rp_id)
+            })
+            .map(ItemSummary::from)
+            .collect();
+        Ok(PasskeyCreation {
+            rp_id: request.rp_id.clone(),
+            rp_name: request.rp_name.clone(),
+            user_name: request.user_name.clone(),
+            user_display_name: request.user_display_name.clone(),
+            verification: request.user_verification.into(),
+            logins,
+        })
+    }
+
+    pub(crate) async fn create_passkey(
+        self: &Arc<Self>,
+        options: &str,
+        caller: &PasskeyCaller,
+        verified: bool,
+        into: Option<&str>,
+    ) -> Result<String, MobileError> {
+        let asking = Asking::of(caller)?;
+        let request = Registering::from_options(options, asking.page.as_ref())?;
+        if request.user_verification == UserVerification::Required && !verified {
+            return Err(MobileError::NotVerified);
+        }
+        let response = {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            // Asked only now that the owner chose to save, so that a site
+            // learns nothing of the vault before.
+            if vault.holds_passkey(&request.rp_id, &request.exclude)? {
+                return Err(MobileError::PasskeyExists);
+            }
+            let created = request.create(verified, now())?;
+            let (client_data, _) = asking.client_data(Ceremony::Create, &request.challenge);
+            let response = created.registration.response_json(&client_data);
+            match into {
+                Some(id) => {
+                    let found = vault.get(id)?;
+                    if found.conflict {
+                        return Err(MobileError::InConflict);
+                    }
+                    if found.item.kind != ItemKind::Login {
+                        return Err(MobileError::NotALogin);
+                    }
+                    vault.add_passkey(id, &found.revision, created.passkey)?;
+                }
+                None => {
+                    vault.save_passkey_as_login(created.passkey, &request.rp_id)?;
+                }
+            }
+            response
+        };
+        self.sync_soon();
+        Ok(response)
+    }
+
+    pub(crate) async fn passkey_sign_in(
+        &self,
+        options: &str,
+        caller: &PasskeyCaller,
+    ) -> Result<PasskeySignIn, MobileError> {
+        let asking = Asking::of(caller)?;
+        let request = Signing::from_options(options, asking.page.as_ref())?;
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let passkeys = vault
+            .passkeys_for(&request.rp_id, &request.allowed)?
+            .into_iter()
+            .map(|found| PasskeyChoice {
+                item_id: found.item_id,
+                title: found.title,
+                credential_id: found.passkey.credential_id,
+                user_name: found.passkey.user_name,
+                user_display_name: found.passkey.user_display_name,
+            })
+            .collect();
+        Ok(PasskeySignIn {
+            rp_id: request.rp_id,
+            verification: request.user_verification.into(),
+            passkeys,
+        })
+    }
+
+    pub(crate) async fn sign_in_with_passkey(
+        &self,
+        options: &str,
+        caller: &PasskeyCaller,
+        item_id: &str,
+        credential_id: &str,
+        verified: bool,
+    ) -> Result<String, MobileError> {
+        let asking = Asking::of(caller)?;
+        let request = Signing::from_options(options, asking.page.as_ref())?;
+        if request.user_verification == UserVerification::Required && !verified {
+            return Err(MobileError::NotVerified);
+        }
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        // Only one the site takes, whatever was chosen.
+        if !vault
+            .passkeys_for(&request.rp_id, &request.allowed)?
+            .iter()
+            .any(|found| found.item_id == item_id && found.passkey.credential_id == credential_id)
+        {
+            return Err(MobileError::NotFound);
+        }
+        let (client_data, hash) = asking.client_data(Ceremony::Get, &request.challenge);
+        let assertion = vault.sign_with_passkey(
+            item_id,
+            credential_id,
+            &request.rp_id,
+            &hash,
+            verified,
+            now(),
+        )?;
+        Ok(assertion.response_json(&client_data))
     }
 
     pub(crate) async fn card_fill(&self, id: &str) -> Result<CardFill, MobileError> {

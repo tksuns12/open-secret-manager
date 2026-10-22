@@ -93,6 +93,9 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
     // The entries of a fill in the keyboard's strip (autofill/Presentation.kt).
     implementation("androidx.autofill:autofill:1.3.0")
+    // Passkeys for Android's Credential Manager (passkey/), Apache-2.0: the
+    // library alone, never its Google Play services part.
+    implementation("androidx.credentials:credentials:1.6.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("androidx.work:work-runtime-ktx:2.12.0")
     // Scanning the QR code of an invitation (ScanInvitation.kt): the camera

@@ -564,6 +564,10 @@ fn a_passkey_made_signs_in_and_each_has_its_own_key_and_id() {
     assert_eq!(response["id"], b64(&assertion.credential_id));
     assert_eq!(response["response"]["clientDataJSON"], b64(b"{}"));
     assert_eq!(response["authenticatorAttachment"], "platform");
+    assert_eq!(
+        crate::passkey::android_app_origin(&[0xfa; 32]),
+        format!("android:apk-key-hash:{}", b64(&[0xfa; 32]))
+    );
     let response: Value = serde_json::from_str(&one.registration.response_json(b"{}")).unwrap();
     assert_eq!(response["response"]["publicKeyAlgorithm"], ES256);
     assert_eq!(response["clientExtensionResults"]["credProps"]["rk"], true);

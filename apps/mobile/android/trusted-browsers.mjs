@@ -3,8 +3,11 @@
 // of the web page it shows (the browsers and a few others), each with the
 // SHA-256 of its release signing certificates. The autofill service
 // believes a page's domain only from such an app; from any other, a domain
-// in a request is just what that app says. Run it to update the list and
-// review the change before committing it.
+// in a request is just what that app says. The same apps go, in Google's
+// own form, into privileged_browsers.json beside it, which Android's
+// Credential Manager library reads (CallingAppInfo.getOrigin) before it
+// gives the passkey provider a page's origin. Run it to update the lists
+// and review the change before committing it.
 //
 //   node apps/mobile/android/trusted-browsers.mjs
 import { writeFileSync } from "node:fs";
@@ -32,4 +35,19 @@ writeFileSync(out, JSON.stringify({
   fetched: new Date().toISOString().slice(0, 10),
   apps,
 }, null, 2) + "\n");
-console.log(`${apps.length} apps written to ${out}`);
+// Google's form, with what the library reads only: release signatures,
+// of the same apps.
+const privileged = join(dirname(out), "privileged_browsers.json");
+writeFileSync(privileged, JSON.stringify({
+  apps: apps.map((app) => ({
+    type: "android",
+    info: {
+      package_name: app.package,
+      signatures: app.sha256.map((hash) => ({
+        build: "release",
+        cert_fingerprint_sha256: hash.match(/../g).join(":"),
+      })),
+    },
+  })),
+}, null, 2) + "\n");
+console.log(`${apps.length} apps written to ${out} and ${privileged}`);

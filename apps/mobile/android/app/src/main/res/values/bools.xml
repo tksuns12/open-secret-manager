@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Passkeys are provided to Android's Credential Manager from Android 14
+         on (values-v34): the provider's service is off before. -->
+    <bool name="provides_passkeys">false</bool>
+</resources>

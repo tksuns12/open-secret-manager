@@ -381,6 +381,13 @@ pub fn client_data(ceremony: Ceremony, challenge: &[u8], origin: &str) -> Vec<u8
     .into_bytes()
 }
 
+/// The origin an Android app has in a client data: `android:apk-key-hash:`
+/// and the SHA-256 of the app's signing certificate in base64url. A site
+/// that takes passkeys from the app checks it against the app's.
+pub fn android_app_origin(certificate_sha256: &[u8; 32]) -> String {
+    format!("android:apk-key-hash:{}", b64(certificate_sha256))
+}
+
 /// The SHA-256 hash of a client data, which an authenticator signs.
 pub fn client_data_hash(client_data: &[u8]) -> [u8; 32] {
     Sha256::digest(client_data).into()

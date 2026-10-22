@@ -29,9 +29,14 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   unlocked from the system's list under the field, or from the keyboard's
   strip for a keyboard that asks for it (and its one-time code into a
   field that asks for one), and offers to save a login those apps and
-  pages send, where the owner chooses on its save screen.
+  pages send, where the owner chooses on its save screen. From Android
+  14 on it also provides passkeys to Android's Credential Manager
+  (`passkey/`), believing a page's origin only from the browsers on
+  `res/raw/privileged_browsers.json`, made by the same script.
 - `loginfixture`: a stand-in for another app with login forms, which the
-  autofill tests fill and sign in to. Never shipped.
+  autofill tests fill and sign in to, and an app that asks for passkeys
+  through Credential Manager (`PasskeyClientActivity`), for the passkey
+  tests. Never shipped.
 - `testkeyboard`: two keyboards for the autofill tests, one that leaves a
   fill's entries to the system's list and one that asks for them in its
   strip. Never shipped.

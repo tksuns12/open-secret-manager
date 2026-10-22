@@ -1,7 +1,7 @@
 {
   "about": "Apps trusted to report the origin of the web page they show, with the SHA-256 of their release signing certificates. Made by trusted-browsers.mjs from the source; not edited by hand.",
   "source": "https://www.gstatic.com/gpm-passkeys-privileged-apps/apps.json",
-  "fetched": "2026-10-03",
+  "fetched": "2026-10-21",
   "apps": [
     {
       "package": "ai.perplexity.comet",

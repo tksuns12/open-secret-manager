@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The passkey provider's settings in Android's Credential Manager: passkeys
+     only, since passwords stay with autofill; the app's own screens are its
+     settings. -->
+<credential-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsSubtitle="@string/passkey_provider_subtitle"
+    android:settingsActivity="org.opensecretmanager.app.MainActivity">
+    <capabilities>
+        <capability name="androidx.credentials.TYPE_PUBLIC_KEY_CREDENTIAL" />
+    </capabilities>
+</credential-provider>

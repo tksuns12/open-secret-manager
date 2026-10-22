@@ -1580,10 +1580,12 @@ dependencies = [
 name = "osm-mobile"
 version = "0.1.0"
 dependencies = [
+ "base64ct",
  "osm-vault-core",
  "osm-vault-membership",
  "osm-vault-peer",
  "osm-vault-sync",
+ "p256",
  "rusqlite",
  "serde_json",
  "tempfile",

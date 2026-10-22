@@ -72,6 +72,21 @@ pub enum MobileError {
     NotALogin,
     #[error("that item is not a card")]
     NotACard,
+    /// A site's request for a passkey that is not answered here (see
+    /// [`PasskeyRefusal`]): another provider, or the browser, may answer it.
+    #[error("{reason}")]
+    PasskeyRefused {
+        refusal: PasskeyRefusal,
+        reason: String,
+    },
+    /// The vault holds a passkey the site says it already has for the
+    /// account, so another is not made.
+    #[error("this vault already holds a passkey for that account")]
+    PasskeyExists,
+    /// The site requires the owner to be verified in this request, and the
+    /// owner was not.
+    #[error("the site requires you to be verified")]
+    NotVerified,
     #[error("{reason}")]
     InvalidItem { reason: String },
     /// The item changed since it was read, here or on another device.
@@ -96,6 +111,32 @@ pub enum MobileError {
     /// another phone: the device has to be removed and joined again.
     #[error("this phone no longer holds this device's network key")]
     KeystoreLost,
+}
+
+/// Why a request for a passkey is not answered here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum PasskeyRefusal {
+    /// It is not a request this app reads.
+    Malformed,
+    /// The site named a domain it may not use passkeys of, or one no
+    /// passkey may be for.
+    Site,
+    /// The site takes no key of the kind this app makes.
+    Algorithm,
+}
+
+impl From<osm_vault_core::passkey::Refusal> for MobileError {
+    fn from(refusal: osm_vault_core::passkey::Refusal) -> Self {
+        use osm_vault_core::passkey::Refusal;
+        Self::PasskeyRefused {
+            refusal: match refusal {
+                Refusal::Malformed(_) => PasskeyRefusal::Malformed,
+                Refusal::RelyingParty => PasskeyRefusal::Site,
+                Refusal::Algorithm => PasskeyRefusal::Algorithm,
+            },
+            reason: refusal.to_string(),
+        }
+    }
 }
 
 impl From<osm_vault_core::Error> for MobileError {
@@ -319,6 +360,80 @@ pub struct ItemDetail {
     /// The revision it was read at, which an edit names: an edit of an item
     /// that changed since is refused.
     pub revision: String,
+}
+
+/// Who asks for a passkey.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum PasskeyCaller {
+    /// A page, shown by a browser this app trusts to say which page it shows
+    /// (Android checked it against the list): the page's origin as Android
+    /// gave it, which may end in `/`, and, if the browser made the client
+    /// data, its hash, which is then signed as it is.
+    Page {
+        origin: String,
+        client_data_hash: Option<Vec<u8>>,
+    },
+    /// An app, by the SHA-256 of its signing certificate. Its client data is
+    /// made here, with the app's own origin, whatever hash it sent: an app
+    /// that is not a trusted browser cannot speak for a site.
+    App { certificate_sha256: Vec<u8> },
+}
+
+/// Whether the owner is to be verified, as the site asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum PasskeyVerification {
+    /// The site refuses an answer without it.
+    Required,
+    /// The site wants it: the owner is verified when the phone can.
+    Preferred,
+    /// The site does not want it.
+    Discouraged,
+}
+
+impl From<osm_vault_core::passkey::UserVerification> for PasskeyVerification {
+    fn from(verification: osm_vault_core::passkey::UserVerification) -> Self {
+        use osm_vault_core::passkey::UserVerification;
+        match verification {
+            UserVerification::Required => Self::Required,
+            UserVerification::Preferred => Self::Preferred,
+            UserVerification::Discouraged => Self::Discouraged,
+        }
+    }
+}
+
+/// A site's request to make a passkey, as the owner is asked about it.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PasskeyCreation {
+    /// The site it is for.
+    pub rp_id: String,
+    /// The site's name for itself, as it gave it: not checked.
+    pub rp_name: String,
+    pub user_name: String,
+    pub user_display_name: String,
+    pub verification: PasskeyVerification,
+    /// The logins of that site it may be added to instead of a new one:
+    /// those whose address is on the site, or under it, and not in
+    /// conflict.
+    pub logins: Vec<ItemSummary>,
+}
+
+/// A site's request to sign in, as the owner is asked about it.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PasskeySignIn {
+    pub rp_id: String,
+    pub verification: PasskeyVerification,
+    /// The passkeys the vault holds for the site, of those it takes.
+    pub passkeys: Vec<PasskeyChoice>,
+}
+
+/// A passkey a site may be signed in to with, and the login it is on.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PasskeyChoice {
+    pub item_id: String,
+    pub title: String,
+    pub credential_id: String,
+    pub user_name: String,
+    pub user_display_name: String,
 }
 
 /// An edit that met a change made elsewhere, put on top of the item as it
@@ -549,6 +664,27 @@ pub fn check_card_number(number: String) -> CardNumberCheck {
 /// A new password of `length` characters with letters, digits, and
 /// symbols, from the shared code's generator, as the desktop app makes
 /// them; a length it does not allow is refused.
+/// Whether a site's request for a passkey is one this app answers, for
+/// `caller`, without the vault: read and checked as
+/// [`Device::passkey_creation`] (when `creating`) or
+/// [`Device::passkey_sign_in`] read and check it. For offering this app, or
+/// leaving the request to others, while the vault is locked.
+#[uniffi::export]
+pub fn check_passkey_request(
+    options: String,
+    caller: PasskeyCaller,
+    creating: bool,
+) -> Result<(), MobileError> {
+    use osm_vault_core::passkey::{Registering, Signing};
+    let asking = runtime::Asking::of(&caller)?;
+    if creating {
+        Registering::from_options(&options, asking.page.as_ref())?;
+    } else {
+        Signing::from_options(&options, asking.page.as_ref())?;
+    }
+    Ok(())
+}
+
 #[uniffi::export]
 pub fn generate_password(length: u32) -> Result<String, MobileError> {
     let policy = osm_vault_core::PasswordPolicy {
@@ -785,6 +921,72 @@ impl Device {
     /// that app.
     pub fn fill_for_app(&self, id: String) -> Result<FillCredentials, MobileError> {
         self.tokio.block_on(self.inner.fill_for_app(&id))
+    }
+
+    /// Reads and checks a site's request to make a passkey
+    /// (`PublicKeyCredentialCreationOptionsJSON`), for [`caller`], and says
+    /// what the owner is to be asked. Refused with
+    /// [`MobileError::PasskeyRefused`] if it is not one this app answers.
+    pub fn passkey_creation(
+        &self,
+        options: String,
+        caller: PasskeyCaller,
+    ) -> Result<PasskeyCreation, MobileError> {
+        self.tokio
+            .block_on(self.inner.passkey_creation(&options, &caller))
+    }
+
+    /// Makes the passkey a site asked for, once the owner chose to save it:
+    /// on the login `into`, or else on a new login for the site. `verified`
+    /// says the owner was verified in this request. Refused with
+    /// [`MobileError::PasskeyExists`] if the vault holds one the site says
+    /// it has, and with [`MobileError::NotVerified`] if the site requires
+    /// verification and the owner was not. Gives the
+    /// `RegistrationResponseJSON` for the site.
+    pub fn create_passkey(
+        &self,
+        options: String,
+        caller: PasskeyCaller,
+        verified: bool,
+        into: Option<String>,
+    ) -> Result<String, MobileError> {
+        self.tokio.block_on(
+            self.inner
+                .create_passkey(&options, &caller, verified, into.as_deref()),
+        )
+    }
+
+    /// Reads and checks a site's request to sign in
+    /// (`PublicKeyCredentialRequestOptionsJSON`), for [`caller`], and names
+    /// the passkeys the vault holds for it.
+    pub fn passkey_sign_in(
+        &self,
+        options: String,
+        caller: PasskeyCaller,
+    ) -> Result<PasskeySignIn, MobileError> {
+        self.tokio
+            .block_on(self.inner.passkey_sign_in(&options, &caller))
+    }
+
+    /// Signs in to the site with the passkey `credential_id` of the login
+    /// `item_id`, which the owner chose. `verified` as for
+    /// [`Device::create_passkey`]. Gives the `AuthenticationResponseJSON`
+    /// for the site.
+    pub fn sign_in_with_passkey(
+        &self,
+        options: String,
+        caller: PasskeyCaller,
+        item_id: String,
+        credential_id: String,
+        verified: bool,
+    ) -> Result<String, MobileError> {
+        self.tokio.block_on(self.inner.sign_in_with_passkey(
+            &options,
+            &caller,
+            &item_id,
+            &credential_id,
+            verified,
+        ))
     }
 
     /// The fields of the card the owner chose for a card form, in an app or

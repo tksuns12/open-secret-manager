@@ -25,6 +25,7 @@
         <activity android:name=".NestedDomainLoginActivity" android:exported="true" />
         <activity android:name=".NamedLoginActivity" android:exported="true" />
         <activity android:name=".CardFormActivity" android:exported="true" />
+        <activity android:name=".PasskeyClientActivity" android:exported="true" />
         <activity android:name=".TwoStepUsernameActivity" android:exported="true" />
         <activity android:name=".TwoStepPasswordActivity" android:exported="false" />
         <!-- Off but when a test turns it on (WebLoginActivity): the stand-in

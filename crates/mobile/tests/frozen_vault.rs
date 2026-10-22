@@ -1060,6 +1060,287 @@ fn a_logins_passkeys_are_named_kept_through_an_edit_here_and_removed() {
     assert_eq!(device.history(login).unwrap()[0].changed, ["passkeys"]);
 }
 
+/// A site's request to make a passkey for example.test, as an app or a
+/// browser hands it on.
+fn creation(rp_id: &str, exclude: &[&str]) -> String {
+    serde_json::json!({
+        "rp": { "id": rp_id, "name": "Example" },
+        "user": { "id": "AQIDBA", "name": "owner", "displayName": "Owner" },
+        "challenge": "Y2hhbGxlbmdlLWNoYWxsZW5nZQ",
+        "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }],
+        "excludeCredentials": exclude.iter().map(|id| serde_json::json!({ "type": "public-key", "id": id })).collect::<Vec<_>>(),
+        "authenticatorSelection": { "residentKey": "required", "userVerification": "required" },
+    })
+    .to_string()
+}
+
+fn sign_in(rp_id: &str, allowed: &[&str]) -> String {
+    serde_json::json!({
+        "challenge": "c2lnbi1pbi1jaGFsbGVuZ2U",
+        "rpId": rp_id,
+        "allowCredentials": allowed.iter().map(|id| serde_json::json!({ "type": "public-key", "id": id })).collect::<Vec<_>>(),
+        "userVerification": "preferred",
+    })
+    .to_string()
+}
+
+fn unbase64(text: &serde_json::Value) -> Vec<u8> {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    Base64UrlUnpadded::decode_vec(text.as_str().unwrap()).unwrap()
+}
+
+/// Whether a sign-in's signature is over its authenticator data and
+/// `hash`, by the key the registration gave.
+fn signed(registration: &serde_json::Value, assertion: &serde_json::Value, hash: &[u8]) -> bool {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    use p256::pkcs8::DecodePublicKey;
+    let key = VerifyingKey::from_public_key_der(&unbase64(&registration["response"]["publicKey"]))
+        .unwrap();
+    let mut message = unbase64(&assertion["response"]["authenticatorData"]);
+    message.extend_from_slice(hash);
+    key.verify(
+        &message,
+        &Signature::from_der(&unbase64(&assertion["response"]["signature"])).unwrap(),
+    )
+    .is_ok()
+}
+
+#[test]
+fn a_passkey_is_made_and_signed_with_for_an_app_and_for_a_page_of_a_trusted_browser() {
+    use osm_mobile::{PasskeyCaller, PasskeyRefusal, PasskeyVerification};
+    use osm_vault_core::passkey::client_data_hash;
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    let app = PasskeyCaller::App {
+        certificate_sha256: vec![0xab; 32],
+    };
+    assert!(matches!(
+        device.passkey_creation(creation("example.test", &[]), app.clone()),
+        Err(MobileError::Locked)
+    ));
+    // Checked without the vault, for offering this app while it is locked.
+    osm_mobile::check_passkey_request(creation("example.test", &[]), app.clone(), true).unwrap();
+    osm_mobile::check_passkey_request(sign_in("example.test", &[]), app.clone(), false).unwrap();
+    assert!(matches!(
+        osm_mobile::check_passkey_request(creation("github.io", &[]), app.clone(), true),
+        Err(MobileError::PasskeyRefused {
+            refusal: PasskeyRefusal::Site,
+            ..
+        })
+    ));
+    assert!(
+        osm_mobile::check_passkey_request(creation("example.test", &[]), app.clone(), false)
+            .is_err()
+    );
+    device.unlock(PASSWORD.into()).unwrap();
+    let mut login = draft("Example", ItemKind::Login);
+    login.url = "https://login.example.test/sign-in".into();
+    let existing = device.create_item(login).unwrap();
+
+    // What the owner is asked, with the site's logins to add it to.
+    let asked = device
+        .passkey_creation(creation("example.test", &[]), app.clone())
+        .unwrap();
+    assert_eq!(
+        (
+            asked.rp_id.as_str(),
+            asked.user_name.as_str(),
+            asked.verification
+        ),
+        ("example.test", "owner", PasskeyVerification::Required)
+    );
+    // The fixture's bank and mail are on the site too.
+    let mut logins = asked
+        .logins
+        .iter()
+        .map(|login| login.id.as_str())
+        .collect::<Vec<_>>();
+    logins.sort();
+    let mut expected = vec![existing.as_str(), "fixture-bank", "fixture-mail"];
+    expected.sort();
+    assert_eq!(logins, expected);
+    // Verification the site requires, or a site no passkey may be for, is
+    // refused.
+    assert!(matches!(
+        device.create_passkey(creation("example.test", &[]), app.clone(), false, None),
+        Err(MobileError::NotVerified)
+    ));
+    assert!(matches!(
+        device.passkey_creation(creation("com", &[]), app.clone()),
+        Err(MobileError::PasskeyRefused {
+            refusal: PasskeyRefusal::Site,
+            ..
+        })
+    ));
+
+    // For an app: its client data is made here, with its own origin,
+    // whatever it sent.
+    let made: serde_json::Value = serde_json::from_str(
+        &device
+            .create_passkey(creation("example.test", &[]), app.clone(), true, None)
+            .unwrap(),
+    )
+    .unwrap();
+    let client_data = unbase64(&made["response"]["clientDataJSON"]);
+    let client_data: serde_json::Value = serde_json::from_slice(&client_data).unwrap();
+    assert_eq!(client_data["type"], "webauthn.create");
+    assert_eq!(
+        client_data["origin"],
+        "android:apk-key-hash:q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s"
+    );
+    let credential = made["id"].as_str().unwrap().to_owned();
+    // A new login, named for the site.
+    let saved = device
+        .items()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.passkeys == 1)
+        .unwrap();
+    assert_eq!(
+        (saved.title.as_str(), saved.username.as_str()),
+        ("example.test", "owner")
+    );
+    // Asked again with the passkey excluded: refused once the owner chose
+    // to save.
+    assert!(matches!(
+        device.create_passkey(
+            creation("example.test", &[&credential]),
+            app.clone(),
+            true,
+            None
+        ),
+        Err(MobileError::PasskeyExists)
+    ));
+
+    // And signed in with.
+    let offered = device
+        .passkey_sign_in(sign_in("example.test", &[]), app.clone())
+        .unwrap();
+    assert_eq!(offered.passkeys.len(), 1);
+    assert_eq!(
+        (
+            offered.passkeys[0].credential_id.as_str(),
+            offered.passkeys[0].user_name.as_str(),
+            offered.verification
+        ),
+        (credential.as_str(), "owner", PasskeyVerification::Preferred)
+    );
+    let assertion: serde_json::Value = serde_json::from_str(
+        &device
+            .sign_in_with_passkey(
+                sign_in("example.test", &[]),
+                app.clone(),
+                saved.id.clone(),
+                credential.clone(),
+                false,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let client_data = unbase64(&assertion["response"]["clientDataJSON"]);
+    assert!(signed(&made, &assertion, &client_data_hash(&client_data)));
+    assert_eq!(unbase64(&assertion["response"]["userHandle"]), [1, 2, 3, 4]);
+    // Not one the site takes.
+    assert!(matches!(
+        device.sign_in_with_passkey(
+            sign_in("example.test", &["AQID"]),
+            app.clone(),
+            saved.id.clone(),
+            credential.clone(),
+            false
+        ),
+        Err(MobileError::NotFound)
+    ));
+    assert!(device
+        .passkey_sign_in(sign_in("other.test", &[]), app.clone())
+        .unwrap()
+        .passkeys
+        .is_empty());
+
+    // For a page of a trusted browser, which made the client data: its hash
+    // is signed, and the response holds a placeholder.
+    let page = |hash: Option<Vec<u8>>| PasskeyCaller::Page {
+        origin: "https://www.example.test/".into(),
+        client_data_hash: hash,
+    };
+    let hash = vec![0x5a; 32];
+    let made_there: serde_json::Value = serde_json::from_str(
+        &device
+            .create_passkey(
+                creation("example.test", &[]),
+                page(Some(hash.clone())),
+                true,
+                Some(existing.clone()),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(made_there["response"]["clientDataJSON"], "e30");
+    assert_eq!(device.item(existing.clone()).unwrap().passkeys.len(), 1);
+    let assertion: serde_json::Value = serde_json::from_str(
+        &device
+            .sign_in_with_passkey(
+                sign_in("example.test", &[made_there["id"].as_str().unwrap()]),
+                page(Some(hash.clone())),
+                existing.clone(),
+                made_there["id"].as_str().unwrap().into(),
+                true,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(assertion["response"]["clientDataJSON"], "e30");
+    assert!(signed(&made_there, &assertion, &hash));
+    // Without its own client data, a browser's is made here for the page.
+    let assertion: serde_json::Value = serde_json::from_str(
+        &device
+            .sign_in_with_passkey(
+                sign_in("example.test", &[]),
+                page(None),
+                existing.clone(),
+                made_there["id"].as_str().unwrap().into(),
+                true,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let client_data = unbase64(&assertion["response"]["clientDataJSON"]);
+    let read: serde_json::Value = serde_json::from_slice(&client_data).unwrap();
+    assert_eq!(read["origin"], "https://www.example.test");
+    assert!(signed(
+        &made_there,
+        &assertion,
+        &client_data_hash(&client_data)
+    ));
+    // A page may not use another site's passkeys, nor an app speak as a
+    // page of an origin that is not https, nor give a hash of another
+    // length.
+    assert!(matches!(
+        device.passkey_sign_in(sign_in("other.test", &[]), page(None)),
+        Err(MobileError::PasskeyRefused {
+            refusal: PasskeyRefusal::Site,
+            ..
+        })
+    ));
+    assert!(matches!(
+        device.passkey_sign_in(
+            sign_in("example.test", &[]),
+            PasskeyCaller::Page {
+                origin: "http://www.example.test".into(),
+                client_data_hash: None
+            }
+        ),
+        Err(MobileError::InvalidOrigin)
+    ));
+    assert!(matches!(
+        device.passkey_sign_in(sign_in("example.test", &[]), page(Some(vec![1; 31]))),
+        Err(MobileError::PasskeyRefused {
+            refusal: PasskeyRefusal::Malformed,
+            ..
+        })
+    ));
+}
+
 #[test]
 fn the_password_changes_given_the_current_one_and_a_long_enough_new_one() {
     let (_dir, folder) = copy_of_the_frozen_vault();
