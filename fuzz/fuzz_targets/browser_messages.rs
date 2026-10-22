@@ -1,7 +1,7 @@
 //! What a browser extension sends the native host, and the frames it comes
-//! in: a login's request, a card's (version 2), or a withdrawal. A message
-//! is refused, naming its request only by an ID of the allowed form, or is
-//! one whose every check passed.
+//! in: a login's request, a card's or a passkey's (version 2), or a
+//! withdrawal. A message is refused, naming its request only by an ID of
+//! the allowed form, or is one whose every check passed.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -33,6 +33,12 @@ fuzz_target!(|data: &[u8]| {
                 assert!(is_id(&frame.document_id) && !frame.fields.is_empty());
                 assert!(frame.frame_id != 0 || frame.origin == card.top_origin);
             }
+        }
+        Ok(Request::PasskeyCreate(passkey) | Request::PasskeyGet(passkey)) => {
+            let origin = passkey.check().expect("a request read is a valid one");
+            assert_eq!(origin.to_string(), passkey.origin);
+            assert!(is_id(&passkey.request_id) && passkey.tab_id >= 0);
+            assert!((1..=osm_browser_link::MAX_PASSKEY_OPTIONS).contains(&passkey.options.len()));
         }
         Err(failure) => {
             if let Some(id) = &failure.request_id {

@@ -1,8 +1,10 @@
 //! What the desktop app needs from the system that Tauri does not give it:
 //! notice that the owner's session went away from the app (the computer
 //! sleeping, the displays sleeping, the screen locking, the screen saver
-//! starting, another user taking the screen), and a clipboard entry that
-//! clipboard managers leave alone, and that comes off again.
+//! starting, another user taking the screen), a clipboard entry that
+//! clipboard managers leave alone, and that comes off again, and on macOS
+//! the system's check that the owner is there (Touch ID or the Mac's
+//! password), for a passkey.
 //!
 //! On macOS from the system's notifications, and an entry that also stays on
 //! this Mac. On Linux (since Phase 10) from logind over the system bus: the
@@ -91,6 +93,34 @@ pub fn watch_system_notification(
     on_away: impl Fn(Away) + Send + Sync + 'static,
 ) {
     macos::observe_system(name, away, std::sync::Arc::new(on_away));
+}
+
+/// Whether this system can check that the owner is at the computer, for a
+/// site that asks a passkey to verify its user: on macOS, Touch ID or the
+/// Mac's password, as the system chooses. Elsewhere it cannot, and the app
+/// asks for the vault's password.
+pub fn can_check_owner() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::can_check_owner()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Asks the system to check the owner, telling them `reason`; `done` is
+/// called once, on a thread of the system's, with whether the check
+/// passed. Where [`can_check_owner`] says no, at once with `false`.
+pub fn check_owner(reason: &str, done: impl FnOnce(bool) + Send + 'static) {
+    #[cfg(target_os = "macos")]
+    macos::check_owner(reason, Box::new(done));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = reason;
+        done(false);
+    }
 }
 
 /// A secret put on the clipboard, to be taken off again later.

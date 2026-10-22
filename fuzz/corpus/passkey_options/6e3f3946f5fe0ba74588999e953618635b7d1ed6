@@ -1,0 +1,1 @@
+{"rp": {"id": "example.test", "name": "Exaep@@@@,@@@@@@@@@@@@@@@@@@@@@le"}, "user": {"id": "MDEyMzQ0Njc4OTo7PD0-Pw", "name": ""}, "challenge": "UFFSU0RVVldna2latqbxGm8", "pubKeyCredParams": [{"type": "public-key", "alg": -7}], "excludeCredentials": [{"type": "pqblic-key", "id": "oKG2urw"}], "authenticator{Selection": {"residentKey": "required", "userVerification": "required"}}

@@ -10,8 +10,9 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{self, Prefix, MAX_FRAME},
-    Caller, CardField, CardFrame, CardRequest, FillRequest, Forwarded, ForwardedCard, Refusal,
-    Response, CARD_VERSION, CHROMIUM_EXTENSION_ID, VERSION,
+    Caller, CardField, CardFrame, CardRequest, Ceremony, FillRequest, Forwarded, ForwardedCard,
+    ForwardedPasskey, PasskeyRequest, Refusal, Response, CARD_VERSION, CHROMIUM_EXTENSION_ID,
+    PASSKEY_VERSION, VERSION,
 };
 use osm_vault_core::{Item, ItemKind, Vault};
 use tempfile::TempDir;
@@ -99,6 +100,14 @@ impl Client {
 
     /// Connects and brings one request.
     async fn bring(session: &Session, forwarded: &Forwarded) -> Self {
+        let mut client = Self::connect(session).await;
+        let body = frame::encode(forwarded).unwrap();
+        client.send(&Prefix::Socket.frame(&body).unwrap()).await;
+        client
+    }
+
+    /// Connects and brings one passkey's request.
+    async fn bring_passkey(session: &Session, forwarded: &ForwardedPasskey) -> Self {
         let mut client = Self::connect(session).await;
         let body = frame::encode(forwarded).unwrap();
         client.send(&Prefix::Socket.frame(&body).unwrap()).await;
@@ -731,4 +740,306 @@ async fn one_session_listens_on_a_socket_and_cleans_up_after_itself() {
         std::io::ErrorKind::AlreadyExists
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+}
+
+/// A page's request for a passkey: to make one for `example.com`, from a
+/// page of `https://login.example.com`, or to sign in.
+fn passkey_request(
+    id: &str,
+    ceremony: Ceremony,
+    change: impl FnOnce(&mut serde_json::Value),
+) -> ForwardedPasskey {
+    let mut options = match ceremony {
+        Ceremony::Create => serde_json::json!({
+            "rp": { "id": "example.com", "name": "Example" },
+            "user": { "id": "AQIDBA", "name": "owner@example.com", "displayName": "Owner" },
+            "challenge": "Y2hhbGxlbmdlIG9mIGEgc2l0ZQ",
+            "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }],
+            "authenticatorSelection": { "residentKey": "required", "userVerification": "preferred" },
+        }),
+        Ceremony::Get => serde_json::json!({
+            "challenge": "c2lnbi1pbi1jaGFsbGVuZ2U",
+            "rpId": "example.com",
+            "userVerification": "preferred",
+        }),
+    };
+    change(&mut options);
+    ForwardedPasskey {
+        caller: extension(),
+        ceremony,
+        passkey: PasskeyRequest {
+            version: PASSKEY_VERSION,
+            request_id: id.into(),
+            tab_id: 31,
+            origin: "https://login.example.com".into(),
+            options: options.to_string(),
+        },
+    }
+}
+
+/// What a passkey's reply carries, read, with its client data.
+fn credential_of(
+    reply: Option<Response>,
+    request: &ForwardedPasskey,
+) -> (serde_json::Value, serde_json::Value) {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    let Some(Response::PasskeyReply(reply)) = reply else {
+        panic!("a passkey's reply: {reply:?}")
+    };
+    assert!(reply.answers(&request.passkey));
+    let credential: serde_json::Value = serde_json::from_str(&reply.credential).unwrap();
+    let data =
+        Base64UrlUnpadded::decode_vec(credential["response"]["clientDataJSON"].as_str().unwrap())
+            .unwrap();
+    (credential, serde_json::from_slice(&data).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pages_passkey_is_made_and_signed_in_with_once_the_owner_chooses() {
+    use osm_vault_core::passkey::UserVerification;
+    let session = Session::start(Config::default());
+    let on_site = login("on site", "https://example.com/");
+    let elsewhere = login("elsewhere", "https://example.org/");
+    let mut vault = vault_with(session.dir.path(), &[on_site.clone(), elsewhere]);
+
+    let create = passkey_request("make", Ceremony::Create, |_| {});
+    let mut client = Client::bring_passkey(&session, &create).await;
+    assert_eq!(client.next().await, waiting("make"));
+    let choices = session.asked(Some(&vault)).await;
+    let asked = choices.passkey.clone().unwrap();
+    assert_eq!(
+        (
+            asked.ceremony,
+            asked.rp_id.as_str(),
+            asked.rp_name.as_str(),
+            asked.user_name.as_str()
+        ),
+        (
+            Ceremony::Create,
+            "example.com",
+            "Example",
+            "owner@example.com"
+        )
+    );
+    assert_eq!(asked.verification, UserVerification::Preferred);
+    assert_eq!(
+        asked
+            .logins
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        [on_site.id.as_str()]
+    );
+    assert!(choices.logins.is_empty() && choices.card.is_none());
+    // Not a login's or a card's to answer.
+    let unlock = choices.session.unwrap();
+    assert!(matches!(
+        session.desk.approve("make", &on_site.id, unlock, &vault),
+        Err(Refused::NotForThisPage)
+    ));
+    client.is_quiet().await;
+
+    session
+        .desk
+        .approve_passkey_create("make", unlock, &mut vault, None, true)
+        .unwrap();
+    let (made, client_data) = credential_of(client.next().await, &create);
+    // The client data is the page's own, as a browser would make it.
+    assert_eq!(client_data["type"], "webauthn.create");
+    assert_eq!(client_data["origin"], "https://login.example.com");
+    assert_eq!(client_data["challenge"], "Y2hhbGxlbmdlIG9mIGEgc2l0ZQ");
+    assert_eq!(client_data["crossOrigin"], false);
+    assert_eq!(made["response"]["publicKeyAlgorithm"], -7);
+    assert_eq!(client.next().await, None);
+    let saved = vault
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.passkeys == 1)
+        .unwrap();
+    assert_eq!(
+        (saved.title.as_str(), saved.username.as_str()),
+        ("example.com", "owner@example.com")
+    );
+
+    // Signed in with: only a passkey the site takes, and once.
+    let get = passkey_request("sign", Ceremony::Get, |_| {});
+    let mut client = Client::bring_passkey(&session, &get).await;
+    assert_eq!(client.next().await, waiting("sign"));
+    let choices = session.asked(Some(&vault)).await;
+    let asked = choices.passkey.clone().unwrap();
+    assert_eq!(asked.passkeys.len(), 1);
+    let credential = asked.passkeys[0].passkey.credential_id.clone();
+    assert_eq!(credential, made["id"].as_str().unwrap());
+    let unlock = choices.session.unwrap();
+    assert!(matches!(
+        session
+            .desk
+            .approve_passkey_get("sign", unlock, &vault, &on_site.id, &credential, true),
+        Err(Refused::NotForThisPage)
+    ));
+    session
+        .desk
+        .approve_passkey_get("sign", unlock, &vault, &saved.id, &credential, true)
+        .unwrap();
+    let (signed, client_data) = credential_of(client.next().await, &get);
+    assert_eq!(client_data["type"], "webauthn.get");
+    assert_eq!(client_data["origin"], "https://login.example.com");
+    assert_eq!(signed["id"], made["id"]);
+    assert_eq!(signed["response"]["userHandle"], "AQIDBA");
+    assert!(matches!(
+        session
+            .desk
+            .approve_passkey_get("sign", unlock, &vault, &saved.id, &credential, true),
+        Err(Refused::NotPending)
+    ));
+
+    // The site has it already: once the owner chooses to save another, the
+    // page is told so, and nothing is made.
+    let again = passkey_request("again", Ceremony::Create, |options| {
+        options["excludeCredentials"] =
+            serde_json::json!([{ "type": "public-key", "id": credential }]);
+    });
+    let mut client = Client::bring_passkey(&session, &again).await;
+    assert_eq!(client.next().await, waiting("again"));
+    let unlock = session.asked(Some(&vault)).await.session.unwrap();
+    assert!(matches!(
+        session
+            .desk
+            .approve_passkey_create("again", unlock, &mut vault, Some(&on_site.id), true),
+        Err(Refused::Exists)
+    ));
+    assert_eq!(
+        client.last().await,
+        refusal("again", Refusal::PasskeyExists)
+    );
+    assert_eq!(vault.get(&on_site.id).unwrap().item.passkeys.len(), 0);
+
+    // Added to a login of the site, when the owner says so; a site that
+    // requires verification gets nothing without it.
+    let required = passkey_request("required", Ceremony::Create, |options| {
+        options["authenticatorSelection"]["userVerification"] = serde_json::json!("required");
+        options["user"]["id"] = serde_json::json!("BQYHCA");
+    });
+    let mut client = Client::bring_passkey(&session, &required).await;
+    assert_eq!(client.next().await, waiting("required"));
+    let unlock = session.asked(Some(&vault)).await.session.unwrap();
+    assert!(matches!(
+        session.desk.approve_passkey_create(
+            "required",
+            unlock,
+            &mut vault,
+            Some(&on_site.id),
+            false
+        ),
+        Err(Refused::NotVerified)
+    ));
+    session
+        .desk
+        .approve_passkey_create("required", unlock, &mut vault, Some(&on_site.id), true)
+        .unwrap();
+    credential_of(client.next().await, &required);
+    assert_eq!(vault.get(&on_site.id).unwrap().item.passkeys.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pages_request_is_left_to_the_browser_when_the_app_does_not_answer_it() {
+    let session = Session::start(Config::default());
+    let mut vault = vault_with(session.dir.path(), &[]);
+    // As the app tells the desk: the vault holds no passkey for any site.
+    let held = Arc::new(std::sync::Mutex::new(Some(false)));
+    let told = held.clone();
+    session
+        .desk
+        .answer_sign_ins_with(Box::new(move |_, _| *told.lock().unwrap()));
+
+    // A sign-in the vault holds nothing for: answered at once, nothing asked.
+    let get = passkey_request("none", Ceremony::Get, |_| {});
+    let mut client = Client::bring_passkey(&session, &get).await;
+    assert_eq!(client.next().await, refusal("none", Refusal::NoPasskey));
+    assert!(session.desk.choices(Some(&vault)).unwrap().is_none());
+    // While locked the app cannot tell: the owner is asked.
+    *held.lock().unwrap() = None;
+    let mut client =
+        Client::bring_passkey(&session, &passkey_request("locked", Ceremony::Get, |_| {})).await;
+    assert_eq!(client.next().await, waiting("locked"));
+    // The owner's choice of the browser's own.
+    session.asked(Some(&vault)).await;
+    assert!(session.desk.use_browser("locked"));
+    assert_eq!(client.last().await, refusal("locked", Refusal::UseBrowser));
+    assert!(!session.desk.use_browser("locked"));
+
+    // A site no passkey may be for, a page of another site, and one this
+    // app reads no key of are refused before anything is asked.
+    for (id, change) in [
+        (
+            "suffix",
+            Box::new(|options: &mut serde_json::Value| {
+                options["rp"]["id"] = serde_json::json!("com")
+            }) as Box<dyn FnOnce(&mut serde_json::Value)>,
+        ),
+        (
+            "other",
+            Box::new(|options: &mut serde_json::Value| {
+                options["rp"]["id"] = serde_json::json!("example.org")
+            }),
+        ),
+        (
+            "key",
+            Box::new(|options: &mut serde_json::Value| {
+                options["pubKeyCredParams"] =
+                    serde_json::json!([{ "type": "public-key", "alg": -257 }])
+            }),
+        ),
+    ] {
+        let mut client =
+            Client::bring_passkey(&session, &passkey_request(id, Ceremony::Create, change)).await;
+        assert_eq!(
+            client.next().await,
+            refusal(id, Refusal::PasskeyRefused),
+            "{id}"
+        );
+    }
+
+    // A fill the owner starts takes the place of a page's request.
+    let mut page =
+        Client::bring_passkey(&session, &passkey_request("page", Ceremony::Create, |_| {})).await;
+    assert_eq!(page.next().await, waiting("page"));
+    let mut owner = Client::bring(&session, &fill("owner", "https://example.com")).await;
+    assert_eq!(owner.next().await, waiting("owner"));
+    assert_eq!(page.last().await, refusal("page", Refusal::Busy));
+    assert_eq!(session.asked(Some(&vault)).await.request_id, "owner");
+    // But not the other way round.
+    let mut later = Client::bring_passkey(
+        &session,
+        &passkey_request("later", Ceremony::Create, |_| {}),
+    )
+    .await;
+    assert_eq!(later.next().await, refusal("later", Refusal::Busy));
+    assert!(session.desk.deny("owner"));
+    assert_eq!(owner.last().await, refusal("owner", Refusal::Denied));
+
+    // A lock ends what the owner chose under it.
+    let mut client =
+        Client::bring_passkey(&session, &passkey_request("lock", Ceremony::Create, |_| {})).await;
+    assert_eq!(client.next().await, waiting("lock"));
+    let unlock = session.asked(Some(&vault)).await.session.unwrap();
+    vault.lock();
+    assert!(session
+        .desk
+        .choices(Some(&vault))
+        .unwrap()
+        .unwrap()
+        .passkey
+        .unwrap()
+        .logins
+        .is_empty());
+    vault.unlock(PASSWORD).unwrap();
+    assert!(matches!(
+        session
+            .desk
+            .approve_passkey_create("lock", unlock, &mut vault, None, true),
+        Err(Refused::Locked)
+    ));
+    assert!(vault.list().unwrap().is_empty());
 }

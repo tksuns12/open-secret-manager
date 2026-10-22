@@ -72,6 +72,25 @@ pub async fn approve_card(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn approve_passkey(
+    _request_id: String,
+    _session: String,
+    _into: Option<String>,
+    _item_id: Option<String>,
+    _credential_id: Option<String>,
+    _password: Option<String>,
+    _owner_check: bool,
+) -> Result<(), CommandError> {
+    Err(unsupported())
+}
+
+#[tauri::command]
+pub async fn use_browser_passkey(_request_id: String) -> Result<(), CommandError> {
+    Err(unsupported())
+}
+
+#[tauri::command]
 pub async fn deny_fill(_request_id: String) -> Result<(), CommandError> {
     Err(unsupported())
 }

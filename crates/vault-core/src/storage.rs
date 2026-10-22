@@ -708,6 +708,22 @@ impl Vault {
         self.header.device.as_ref().map(|device| device.public_key)
     }
 
+    /// Whether `password` is this device's, without unlocking: for an
+    /// unlocked vault's owner to say again that it is them. As slow as an
+    /// unlock, on purpose.
+    pub fn check_password(&self, password: &str) -> Result<()> {
+        let wrapping_key =
+            derive_password_key(password, &self.header.password_salt, self.header.kdf)?;
+        decrypt(
+            &wrapping_key,
+            &self.header.password_nonce,
+            &key_wrap_aad(&self.header.vault_id, b"password"),
+            &self.header.password_wrapped_key,
+        )
+        .map(drop)
+        .map_err(|_| Error::InvalidCredentials)
+    }
+
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         if self.is_unlocked() {
             return Err(Error::AlreadyUnlocked);

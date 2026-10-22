@@ -721,6 +721,24 @@ fn a_passkey_saved_as_a_login_is_found_signs_in_and_is_removed() {
         .passkeys
         .contains(&created.passkey));
 
+    // The logins a new passkey may go on: those of the site, or under it.
+    let mut other = Item::new("Other site");
+    other.url = "https://example.com/sign-in".into();
+    vault.put(other).unwrap();
+    let mut under = Item::new("Under it");
+    under.url = "https://login.example.test/".into();
+    let under = vault.put(under).unwrap().item_id;
+    let mut on_site = vault
+        .logins_for_site("example.test")
+        .unwrap()
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    on_site.sort();
+    let mut expected = vec![saved.item_id.clone(), under];
+    expected.sort();
+    assert_eq!(on_site, expected);
+
     // Without a title, a login is named for its site.
     let unnamed = vault
         .save_passkey_as_login(made_for("login.example.test", "me").passkey, " ")

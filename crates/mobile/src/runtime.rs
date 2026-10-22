@@ -187,17 +187,6 @@ impl Asking {
     }
 }
 
-/// Whether a login's address is on the site `rp_id`, or under it.
-fn on_site(url: &str, rp_id: &str) -> bool {
-    Origin::of_url(url).is_some_and(|origin| {
-        let host = origin.host();
-        host == rp_id
-            || host
-                .strip_suffix(rp_id)
-                .is_some_and(|rest| rest.ends_with('.'))
-    })
-}
-
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -785,11 +774,8 @@ impl Runtime {
         let vault = self.vault.lock().await;
         let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
         let logins = vault
-            .list()?
+            .logins_for_site(&request.rp_id)?
             .into_iter()
-            .filter(|item| {
-                item.kind == ItemKind::Login && !item.conflict && on_site(&item.url, &request.rp_id)
-            })
             .map(ItemSummary::from)
             .collect();
         Ok(PasskeyCreation {

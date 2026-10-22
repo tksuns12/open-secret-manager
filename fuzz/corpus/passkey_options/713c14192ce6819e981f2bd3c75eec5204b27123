@@ -1,1 +1,0 @@
-{"2rhallenge": "UFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm8", "pubKeyCredParams": [{"type": "public-key", "alg": -7}], "excludeCredeia(s": [{"type": "public-key", "id": "oKGio6SlpqeoqaqrrK2urw"}], "authenticatorSelection": {"residentKey": "required", "userVerification": "required"}}

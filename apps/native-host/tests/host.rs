@@ -218,6 +218,13 @@ impl StandIn {
         }
     }
 
+    /// The next connection, with the request it brought, as it came.
+    fn request_as_sent(&self) -> (Connection, Value) {
+        let mut connection = self.accepted(PATIENCE).expect("the host connects");
+        let body = Prefix::Socket.read(&mut connection.0).unwrap().unwrap();
+        (connection, serde_json::from_slice(&body).unwrap())
+    }
+
     /// The next connection, with the request it brought.
     fn request(&self) -> (Connection, Forwarded) {
         let mut connection = self.accepted(PATIENCE).expect("the host connects");
@@ -488,6 +495,80 @@ fn only_an_answer_to_the_request_is_handed_on() {
             "{bytes:?}"
         );
     }
+    host.is_quiet();
+}
+
+#[test]
+fn a_passkeys_request_is_handed_on_with_its_call_and_only_its_answer_comes_back() {
+    let home = home();
+    let session = StandIn::listen(home.path());
+    let mut host = Host::of_extension(home.path());
+    let request = |id: &str| {
+        json!({
+            "type": "passkey_get",
+            "version": 2,
+            "requestId": id,
+            "tabId": 9,
+            "origin": "https://login.example.com",
+            "options": r#"{"challenge":"AQID","rpId":"example.com"}"#,
+        })
+    };
+    let reply_to = |id: &str| {
+        json!({
+            "type": "passkey_reply",
+            "requestId": id,
+            "tabId": 9,
+            "origin": "https://login.example.com",
+            "credential": r#"{"id":"AQ","type":"public-key"}"#,
+        })
+    };
+    host.send(&request("a"));
+    let (mut connection, forwarded) = session.request_as_sent();
+    assert_eq!(
+        forwarded,
+        json!({
+            "caller": { "browser": "chromium", "extension": extension() },
+            "ceremony": "get",
+            "passkey": {
+                "version": 2,
+                "requestId": "a",
+                "tabId": 9,
+                "origin": "https://login.example.com",
+                "options": r#"{"challenge":"AQID","rpId":"example.com"}"#,
+            },
+        })
+    );
+    connection.say(&reply_to("a"));
+    assert_eq!(host.next(), Some(reply_to("a")));
+    assert!(connection.is_closed());
+
+    // A reply for another page or tab, or a login's, is not handed on.
+    let changed = |field: &str, value: Value| {
+        let mut reply = reply_to("b");
+        reply[field] = value;
+        reply
+    };
+    for answer in [
+        changed("origin", json!("https://example.com")),
+        changed("tabId", json!(10)),
+        changed("credential", json!(null)),
+        json!({ "type": "fill_reply", "requestId": "b", "tabId": 9, "frameId": 0, "documentId": "d",
+            "origin": "https://login.example.com", "username": "u", "password": "p" }),
+    ] {
+        host.send(&request("b"));
+        let (mut connection, _) = session.request_as_sent();
+        connection.say(&answer);
+        assert_eq!(
+            host.next(),
+            error("b", "desktop_session_unavailable"),
+            "{answer}"
+        );
+    }
+    // A refusal the passkeys brought is handed on as any is.
+    host.send(&request("c"));
+    let (mut connection, _) = session.request_as_sent();
+    connection.say(&json!({ "type": "error", "requestId": "c", "code": "no_passkey" }));
+    assert_eq!(host.next(), error("c", "no_passkey"));
     host.is_quiet();
 }
 

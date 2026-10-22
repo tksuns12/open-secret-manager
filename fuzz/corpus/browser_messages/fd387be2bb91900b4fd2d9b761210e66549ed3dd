@@ -1,0 +1,1 @@
+{"type":"card_request","version":2,"requestId":"c0a1ele","frames":[{"frameId":0,"documentId":"0d3b611","tabId":12,"frameId":0,"documentId":"0","origin":"hrequrrrvvvvvvvvvXN--vvvvvvvvvvvvvvvvvvvvvvvv","origin":"https://pay.example.net","fields":["number","expiry","security_code"]}]}

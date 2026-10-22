@@ -1,6 +1,6 @@
-// Builds the extension for each browser into dist/<browser>: the two
-// scripts, bundled from the one source, that browser's manifest, and the
-// icons.
+// Builds the extension for each browser into dist/<browser>: its scripts,
+// bundled from the one source, the options page, that browser's manifest,
+// and the icons.
 import { build } from "esbuild";
 import { copyFile, cp, mkdir, rm } from "node:fs/promises";
 
@@ -12,7 +12,7 @@ for (const browser of ["chromium", "firefox"]) {
   await mkdir(out, { recursive: true });
   await build({
     absWorkingDir: decodeURIComponent(here.pathname),
-    entryPoints: ["src/background.ts", "src/content.ts"],
+    entryPoints: ["src/background.ts", "src/content.ts", "src/options.ts", "src/passkey-page.ts", "src/passkey-bridge.ts"],
     outdir: `dist/${browser}`,
     bundle: true,
     // Plain scripts: a page script cannot be a module, and neither browser
@@ -23,5 +23,6 @@ for (const browser of ["chromium", "firefox"]) {
     logLevel: "warning",
   });
   await copyFile(new URL(`manifest.${browser}.json`, here), new URL("manifest.json", out));
+  await copyFile(new URL("options.html", here), new URL("options.html", out));
   await cp(new URL("icons/", here), new URL("icons/", out), { recursive: true });
 }

@@ -1,0 +1,1 @@
+{"type":"passkey_create","version":2,"requestId":"5b5e7a6c-2f8d-4d1a-9c3e56a4b2d8f1e07","tabId":14,"origin":"https://login.example.com","options":"{\"rp\"eyCredParams\":[{\"type\":\"public-key\",\"alg\":-ubKeyCredParam%s\":[{\"type\":\"public-keentKey\required\",\"userVerification\":\"preferred\"}}"}

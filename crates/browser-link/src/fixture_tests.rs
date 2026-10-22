@@ -9,9 +9,10 @@ use serde_json::{json, Value};
 
 use crate::{
     frame::{encode, Prefix},
-    Caller, Cancel, CardField, CardFrame, CardReply, CardRequest, CardValues, Failure, FillReply,
-    FillRequest, Forwarded, ForwardedCard, Refusal, Request, Response, Waiting, CARD_VERSION,
-    CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME, VERSION,
+    Caller, Cancel, CardField, CardFrame, CardReply, CardRequest, CardValues, Ceremony, Failure,
+    FillReply, FillRequest, Forwarded, ForwardedCard, ForwardedPasskey, PasskeyReply,
+    PasskeyRequest, Refusal, Request, Response, Waiting, CARD_VERSION, CHROMIUM_EXTENSION_ID,
+    FIREFOX_EXTENSION_ID, HOST_NAME, PASSKEY_VERSION, VERSION,
 };
 
 const REFUSALS: [Refusal; 12] = [
@@ -348,4 +349,156 @@ fn the_messages_of_a_card_fill_are_the_frozen_ones() {
             Refusal::UnsupportedVersion
         ))
     );
+}
+
+fn passkey_request(options: &str) -> PasskeyRequest {
+    PasskeyRequest {
+        version: PASSKEY_VERSION,
+        request_id: "5b0e7a6c-2f8d-4d1a-9c3e-6a4b2d8f1e07".into(),
+        tab_id: 14,
+        origin: "https://login.example.com".into(),
+        options: options.into(),
+    }
+}
+
+/// A site's request to make a passkey, as WebAuthn's JSON writes it.
+const CREATION: &str = r#"{"rp":{"id":"example.com","name":"Example"},"user":{"id":"AQIDBA","name":"owner@example.com","displayName":"Owner"},"challenge":"Y2hhbGxlbmdlIG9mIGEgc2l0ZQ","pubKeyCredParams":[{"type":"public-key","alg":-7}],"authenticatorSelection":{"residentKey":"required","userVerification":"preferred"}}"#;
+
+/// A site's request to sign in.
+const SIGN_IN: &str = r#"{"challenge":"Y2hhbGxlbmdlIG9mIGEgc2l0ZQ","rpId":"example.com","allowCredentials":[],"userVerification":"preferred"}"#;
+
+/// The passkey refusals, which came with the passkeys.
+const PASSKEY_REFUSALS: [Refusal; 4] = [
+    Refusal::NoPasskey,
+    Refusal::PasskeyRefused,
+    Refusal::PasskeyExists,
+    Refusal::UseBrowser,
+];
+
+fn passkey_reply() -> PasskeyReply {
+    let request = passkey_request(SIGN_IN);
+    PasskeyReply {
+        request_id: request.request_id,
+        tab_id: request.tab_id,
+        origin: request.origin,
+        credential: r#"{"id":"oKGio6SlpqeoqaqrrK2urw","rawId":"oKGio6SlpqeoqaqrrK2urw","type":"public-key"}"#.into(),
+    }
+}
+
+fn passkey_messages() -> Value {
+    let errors: serde_json::Map<String, Value> = PASSKEY_REFUSALS
+        .iter()
+        .map(|code| {
+            let name = serde_json::to_value(code)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let message = text(&Response::refusal(
+                &passkey_request(SIGN_IN).request_id,
+                *code,
+            ));
+            (name, Value::String(message))
+        })
+        .collect();
+    json!({
+        "about": "The messages of a passkey's request, which came with version 2 of the protocol (Phase 18, stop 6), as the Rust code wrote them when they were frozen. A site's options and the credential that answers them are WebAuthn's JSON, carried as text; `waiting`, a withdrawal, and the refusals of messages.json are the same messages for a passkey's request.",
+        "version": PASSKEY_VERSION,
+        "from_extension": {
+            "passkey_create": text(&Request::PasskeyCreate(passkey_request(CREATION))),
+            "passkey_get": text(&Request::PasskeyGet(passkey_request(SIGN_IN))),
+        },
+        "to_extension": {
+            "passkey_reply": text(&Response::PasskeyReply(passkey_reply())),
+            "errors": errors,
+        },
+        "host_to_session": {
+            "create_from_chromium": text(&ForwardedPasskey {
+                caller: Caller::Chromium(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")),
+                ceremony: Ceremony::Create,
+                passkey: passkey_request(CREATION),
+            }),
+            "get_from_firefox": text(&ForwardedPasskey {
+                caller: Caller::Firefox(FIREFOX_EXTENSION_ID.into()),
+                ceremony: Ceremony::Get,
+                passkey: passkey_request(SIGN_IN),
+            }),
+        },
+    })
+}
+
+#[test]
+fn the_messages_of_a_passkey_are_the_frozen_ones() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/messages-2-passkeys.json");
+    let made = passkey_messages();
+    if !path.exists() && std::env::var_os("OSM_WRITE_NEW_FIXTURES").is_some() {
+        std::fs::write(&path, serde_json::to_string_pretty(&made).unwrap() + "\n").unwrap();
+    }
+    let frozen: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut found = Vec::new();
+    differences("messages-2-passkeys", &frozen, &made, &mut found);
+    found.sort();
+    found.dedup();
+    assert!(
+        found.is_empty(),
+        "these no longer match the frozen values: {found:#?}"
+    );
+
+    let frozen_text =
+        |section: &str, name: &str| frozen[section][name].as_str().unwrap().as_bytes().to_vec();
+    assert_eq!(
+        Request::read(&frozen_text("from_extension", "passkey_create")).unwrap(),
+        Request::PasskeyCreate(passkey_request(CREATION))
+    );
+    assert_eq!(
+        Request::read(&frozen_text("from_extension", "passkey_get")).unwrap(),
+        Request::PasskeyGet(passkey_request(SIGN_IN))
+    );
+    let reply: Response =
+        serde_json::from_slice(&frozen_text("to_extension", "passkey_reply")).unwrap();
+    assert_eq!(reply, Response::PasskeyReply(passkey_reply()));
+    assert!(reply.answers_passkey(&passkey_request(SIGN_IN)) && !reply.answers(&request()));
+    let errors = frozen["to_extension"]["errors"].as_object().unwrap();
+    assert_eq!(errors.len(), PASSKEY_REFUSALS.len());
+    for code in PASSKEY_REFUSALS {
+        let name = serde_json::to_value(code).unwrap();
+        let stored = errors[name.as_str().unwrap()].as_str().unwrap();
+        let read: Response = serde_json::from_str(stored).unwrap();
+        assert!(read.answers_passkey(&passkey_request(SIGN_IN)) && read.is_final());
+    }
+    for (name, ceremony, browser) in [
+        ("create_from_chromium", Ceremony::Create, "Chromium"),
+        ("get_from_firefox", Ceremony::Get, "Firefox"),
+    ] {
+        let forwarded: ForwardedPasskey =
+            serde_json::from_slice(&frozen_text("host_to_session", name)).unwrap();
+        assert!(forwarded.caller.is_allowed());
+        assert_eq!(forwarded.caller.browser(), browser);
+        assert_eq!(forwarded.ceremony, ceremony);
+        // Not taken for a login's or a card's.
+        assert!(
+            serde_json::from_slice::<Forwarded>(&frozen_text("host_to_session", name)).is_err()
+        );
+        assert!(
+            serde_json::from_slice::<ForwardedCard>(&frozen_text("host_to_session", name)).is_err()
+        );
+    }
+    // At a login's version, refused by its version; too large, or for an
+    // origin that is not https, refused.
+    let text_of = |name: &str| String::from_utf8(frozen_text("from_extension", name)).unwrap();
+    let id = passkey_request(SIGN_IN).request_id;
+    assert_eq!(
+        Request::read(
+            text_of("passkey_get")
+                .replace("\"version\":2", "\"version\":1")
+                .as_bytes()
+        ),
+        Err(Failure::new(&id, Refusal::UnsupportedVersion))
+    );
+    let mut large = passkey_request(&"x".repeat(crate::MAX_PASSKEY_OPTIONS + 1));
+    assert_eq!(large.check(), Err(Refusal::InvalidMessage));
+    large.options = SIGN_IN.into();
+    large.origin = "http://login.example.com".into();
+    assert_eq!(large.check(), Err(Refusal::OriginRejected));
 }

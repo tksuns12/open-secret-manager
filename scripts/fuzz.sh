@@ -53,6 +53,8 @@ for name, text in messages["from_extension"].items():
     seed("browser_messages", name, text)
 for name, text in messages_2["from_extension"].items():
     seed("browser_messages", name, text)
+for name, text in json.load(open("crates/browser-link/fixtures/messages-2-passkeys.json"))["from_extension"].items():
+    seed("browser_messages", name, text)
 seed("import", "bitwarden", b"\x00" + json.dumps({"encrypted": False, "items": [{"type": 1, "name": "Bank", "notes": "n",
     "login": {"username": "a", "password": "p", "totp": "JBSWY3DPEHPK3PXP", "uris": [{"uri": "https://bank.example"}]},
     "fields": [{"name": "PIN", "value": "1234", "type": 1}]}, {"type": 2, "name": "Note", "notes": "text"}]}).encode())

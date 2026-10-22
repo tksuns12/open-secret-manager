@@ -112,6 +112,42 @@ pub(crate) fn clear_last(pasteboard: &NSPasteboard) {
     }
 }
 
+/// Whether the system can check the owner here: Touch ID, or the Mac's
+/// password, as the system chooses.
+pub(crate) fn can_check_owner() -> bool {
+    use objc2_local_authentication::{LAContext, LAPolicy};
+    // SAFETY: a new context, asked one question on this thread.
+    unsafe { LAContext::new().canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_ok()
+}
+
+/// Asks the system to check the owner, saying `reason`; `done` is called
+/// once, on a thread of the system's, with whether the check passed.
+pub(crate) fn check_owner(reason: &str, done: Box<dyn FnOnce(bool) + Send>) {
+    use objc2::runtime::Bool;
+    use objc2_foundation::NSError;
+    use objc2_local_authentication::{LAContext, LAPolicy};
+    // SAFETY: a new context, used for this one check.
+    let context = unsafe { LAContext::new() };
+    let done = Mutex::new(Some(done));
+    // The context is kept until the check ends, which calls the block once.
+    let kept = Mutex::new(Some(context.clone()));
+    let reply = RcBlock::new(move |passed: Bool, _: *mut NSError| {
+        if let Some(done) = done.lock().ok().and_then(|mut done| done.take()) {
+            done(passed.as_bool());
+        }
+        drop(kept.lock().ok().and_then(|mut kept| kept.take()));
+    });
+    // SAFETY: the system runs the block on a queue of its own; the block
+    // only calls `done`, which is `Send`, and lets go of the context.
+    unsafe {
+        context.evaluatePolicy_localizedReason_reply(
+            LAPolicy::DeviceOwnerAuthentication,
+            &NSString::from_str(reason),
+            &reply,
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

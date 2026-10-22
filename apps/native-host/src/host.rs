@@ -12,7 +12,8 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{self, Prefix},
-    Caller, Failure, Forwarded, ForwardedCard, Refusal, Request, Response,
+    Caller, Ceremony, Failure, Forwarded, ForwardedCard, ForwardedPasskey, PasskeyRequest, Refusal,
+    Request, Response,
 };
 
 /// How many requests may wait for the desktop session at once. The session
@@ -95,9 +96,26 @@ impl<W: Write + Send + 'static> Host<W> {
                     response.answers_card(&card)
                 });
             }
+            Ok(Request::PasskeyCreate(passkey)) => self.pass_on_passkey(Ceremony::Create, passkey),
+            Ok(Request::PasskeyGet(passkey)) => self.pass_on_passkey(Ceremony::Get, passkey),
             Ok(Request::Cancel(cancel)) => self.cancel(&cancel.request_id),
             Err(failure) => send(&self.out, &Response::Error(failure)),
         }
+    }
+
+    /// Passes on a passkey's request, as a card's.
+    fn pass_on_passkey(&self, ceremony: Ceremony, passkey: PasskeyRequest) {
+        let request_id = passkey.request_id.clone();
+        let forwarded = self.caller.clone().map(|caller| {
+            frame::encode(&ForwardedPasskey {
+                caller,
+                ceremony,
+                passkey: passkey.clone(),
+            })
+        });
+        self.pass_on(&request_id, forwarded, move |response| {
+            response.answers_passkey(&passkey)
+        });
     }
 
     /// Passes on the encoded `forwarded` request, or tells the extension
@@ -260,6 +278,13 @@ mod tests {
         .into_bytes()
     }
 
+    fn passkey(kind: &str, request_id: &str, origin: &str) -> Vec<u8> {
+        format!(
+            r#"{{"type":"{kind}","version":2,"requestId":"{request_id}","tabId":1,"origin":"{origin}","options":"{{}}"}}"#
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn a_request_that_cannot_be_passed_on_is_refused() {
         let written = Written::default();
@@ -304,6 +329,15 @@ mod tests {
                 .map(|byte| if byte == b'2' { b'1' } else { byte })
                 .collect::<Vec<_>>(),
         );
+        // And so is a passkey's.
+        host.handle(&passkey("passkey_get", "j", "https://example.test"));
+        host.handle(&passkey("passkey_create", "k", "http://example.test"));
+        let mut host = Host::at(
+            None,
+            Some("/nonexistent/browser.sock".into()),
+            written.clone(),
+        );
+        host.handle(&passkey("passkey_create", "l", "https://example.test"));
 
         assert_eq!(
             written.responses(),
@@ -318,6 +352,9 @@ mod tests {
                 Response::refusal("g", Refusal::DesktopSessionUnavailable),
                 Response::refusal("h", Refusal::OriginRejected),
                 Response::refusal("i", Refusal::UnsupportedVersion),
+                Response::refusal("j", Refusal::DesktopSessionUnavailable),
+                Response::refusal("k", Refusal::OriginRejected),
+                Response::refusal("l", Refusal::ExtensionNotAllowed),
             ]
         );
     }

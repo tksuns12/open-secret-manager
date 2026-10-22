@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { answers, answersCard, CARD_FIELDS, CARD_VERSION, cancel, cardRequest, explain, fillRequest, MAX_MESSAGE_BYTES, NATIVE_HOST, pageOrigin, readResponse, VERSION, type CardReply, type FillReply } from "./protocol.ts";
+import { answers, answersCard, answersPasskey, CARD_FIELDS, CARD_VERSION, cancel, cardRequest, explain, fillRequest, MAX_MESSAGE_BYTES, NATIVE_HOST, pageOrigin, PASSKEY_VERSION, passkeyRequest, readResponse, VERSION, type CardReply, type FillReply, type PasskeyReply } from "./protocol.ts";
+import { outcomeOf } from "./passkey.ts";
 
 test("only an https page has an origin to ask for", () => {
   assert.equal(pageOrigin("https://example.com/login?next=/home#form"), "https://example.com");
@@ -175,3 +176,39 @@ test("the extension writes and reads the frozen messages of a card's fill", () =
   assert.match(explain("unsupported_message"), /Update the app/);
   assert.match(explain("unsupported_version"), /Update the app/);
 });
+
+// The messages of a passkey's request, which came with version 2 too.
+const frozenPasskey = JSON.parse(readFileSync(new URL("../../../crates/browser-link/fixtures/messages-2-passkeys.json", import.meta.url), "utf8"));
+
+test("the extension writes and reads the frozen messages of a passkey's request", () => {
+  assert.equal(PASSKEY_VERSION, frozenPasskey.version);
+  for (const [name, kind] of [["passkey_create", "create"], ["passkey_get", "get"]] as const) {
+    const asked = JSON.parse(frozenPasskey.from_extension[name]);
+    assert.equal(JSON.stringify(passkeyRequest(kind, asked.requestId, asked.tabId, asked.origin, asked.options)), frozenPasskey.from_extension[name]);
+  }
+  const asked = JSON.parse(frozenPasskey.from_extension.passkey_get);
+  const reply = readResponse(JSON.parse(frozenPasskey.to_extension.passkey_reply));
+  assert.ok(reply !== null && reply.type === "passkey_reply" && answersPasskey(reply, asked));
+  const changed = (change: (reply: PasskeyReply) => void) => {
+    const copy = JSON.parse(frozenPasskey.to_extension.passkey_reply) as PasskeyReply;
+    change(copy);
+    return copy;
+  };
+  assert.equal(answersPasskey(changed((reply) => { reply.origin = "https://example.com"; }), asked), false);
+  assert.equal(answersPasskey(changed((reply) => { reply.tabId += 1; }), asked), false);
+  assert.equal(readResponse(changed((reply) => { (reply as unknown as Record<string, unknown>).credential = null; })), null);
+  // Each refusal the passkeys brought reads, and ends the page's call as it should.
+  const outcomes: Record<string, string> = {};
+  for (const [code, text] of Object.entries(frozenPasskey.to_extension.errors as Record<string, string>)) {
+    const failure = readResponse(JSON.parse(text));
+    assert.ok(failure?.type === "error" && failure.code === code);
+    outcomes[code] = JSON.stringify(outcomeOf(code));
+  }
+  assert.deepEqual(outcomes, {
+    no_passkey: JSON.stringify({ fallback: true, waitForFocus: false }),
+    passkey_refused: JSON.stringify({ fallback: true, waitForFocus: false }),
+    passkey_exists: JSON.stringify({ error: "InvalidStateError", message: "Open Secret Manager already holds a passkey of this account for this site." }),
+    use_browser: JSON.stringify({ fallback: true, waitForFocus: true }),
+  });
+});
+

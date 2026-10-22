@@ -8,6 +8,12 @@ export const VERSION = 1;
 /** The protocol version of a card's request, which came later: an older app refuses it. */
 export const CARD_VERSION = 2;
 
+/** The protocol version of a passkey's request, the same as a card's. */
+export const PASSKEY_VERSION = 2;
+
+/** The largest site's options a passkey's request carries, in bytes of JSON. */
+export const MAX_PASSKEY_OPTIONS = 32 * 1024;
+
 /** What a field of a card form asks for. */
 export type CardField = "number" | "cardholder" | "expiry" | "expiry_month" | "expiry_year" | "security_code";
 
@@ -54,6 +60,12 @@ export type CardValues = { cardholder: string; number: string; expiryMonth: stri
 /** The card the owner chose, for the one request it answers. */
 export type CardReply = { type: "card_reply"; requestId: string; tabId: number; topOrigin: string; frames: CardFrame[]; card: CardValues };
 
+/** Asks for a passkey for the page itself of one tab: to make one, or to sign in. */
+export type PasskeyRequest = { type: "passkey_create" | "passkey_get"; version: number; requestId: string; tabId: number; origin: string; options: string };
+
+/** What the owner's passkey sends the page: the credential, as WebAuthn's JSON writes it. */
+export type PasskeyReply = { type: "passkey_reply"; requestId: string; tabId: number; origin: string; credential: string };
+
 /** The owner has not decided yet. */
 export type Waiting = { type: "waiting"; requestId: string };
 
@@ -72,7 +84,7 @@ export type FillReply = {
 /** The request ended without a login. */
 export type Failure = { type: "error"; requestId: string | null; code: string };
 
-export type Response = Waiting | FillReply | Failure | CardReply;
+export type Response = Waiting | FillReply | Failure | CardReply | PasskeyReply;
 
 /** The origin of a tab's address, if that address is an https page. Any
  * other page, and a tab whose address the browser does not tell, has none. */
@@ -93,6 +105,11 @@ export function fillRequest(requestId: string, tabId: number, documentId: string
 
 export function cardRequest(requestId: string, tabId: number, topOrigin: string, frames: CardFrame[]): CardRequest {
   return { type: "card_request", version: CARD_VERSION, requestId, tabId, topOrigin, frames };
+}
+
+/** A page's call of `navigator.credentials.create` (`create`) or `get`, for the app. */
+export function passkeyRequest(kind: "create" | "get", requestId: string, tabId: number, origin: string, options: string): PasskeyRequest {
+  return { type: kind === "create" ? "passkey_create" : "passkey_get", version: PASSKEY_VERSION, requestId, tabId, origin, options };
 }
 
 /** Withdraws a request whose page went away. */
@@ -139,6 +156,8 @@ export function readResponse(message: unknown): Response | null {
       return hasExactly(message, { requestId: "string", tabId: "number", frameId: "number", documentId: "string", origin: "string", username: "string", password: "string" }) ? (message as FillReply) : null;
     case "error":
       return Object.keys(message).length === 3 && typeof message.code === "string" && (message.requestId === null || typeof message.requestId === "string") ? (message as Failure) : null;
+    case "passkey_reply":
+      return hasExactly(message, { requestId: "string", tabId: "number", origin: "string", credential: "string" }) ? (message as PasskeyReply) : null;
     case "card_reply":
       return Object.keys(message).length === 6 && typeof message.requestId === "string" && typeof message.tabId === "number" && typeof message.topOrigin === "string"
         && Array.isArray(message.frames) && message.frames.every(isCardFrame) && isCardValues(message.card) ? (message as CardReply) : null;
@@ -168,6 +187,11 @@ export function answersCard(reply: CardReply, request: CardRequest): boolean {
       return frame.frameId === asked.frameId && frame.documentId === asked.documentId && frame.origin === asked.origin
         && frame.fields.length === asked.fields.length && frame.fields.every((field, at) => field === asked.fields[at]);
     });
+}
+
+/** Whether a passkey's reply answers exactly this request: the same request, tab, and origin. */
+export function answersPasskey(reply: PasskeyReply, request: PasskeyRequest): boolean {
+  return reply.requestId === request.requestId && reply.tabId === request.tabId && reply.origin === request.origin;
 }
 
 /** What to tell the owner when a request ended without a login. */

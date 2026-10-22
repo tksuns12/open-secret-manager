@@ -27,13 +27,23 @@
 //! <cards|locked> card <documents>`, then `FRAME <frame> <origin>
 //! <field>,...` for each document it names and `CARD <item> <title>` for
 //! every card offered;
-//! `first` fills it with the first card. A request that ends without this
-//! process deciding it prints `ENDED <request>`. Commands on stdin, one per
-//! line:
+//! `first` fills it with the first card. A page's request for a passkey
+//! prints `REQUEST <request> <origin> <browser> <offered|locked> passkey
+//! <create|get> <site> <verification>`, then for a sign-in `PASSKEY <item>
+//! <credential> <user>` for each passkey the site takes, and for a new one
+//! `LOGIN <item> <title>` for each login of the site it may go on; `first`
+//! saves a new one as a new login and signs in with the first passkey, as
+//! a verified owner. While the vault is unlocked, a sign-in it holds no
+//! passkey for is answered `no_passkey` at once, as the app does. A request
+//! that ends without this process deciding it prints `ENDED <request>`.
+//! Commands on stdin, one per line:
 //!
 //! ```text
 //! approve <item>        FILLED <request> <item>, or REFUSED <reason>
 //! approve-card <item>   FILLED <request> <item>, or REFUSED <reason>
+//! save-passkey [<item>] [unverified]   PASSKEY-SENT <request>, or REFUSED <reason>
+//! sign-in <item> <credential> [unverified]   PASSKEY-SENT <request>, or REFUSED <reason>
+//! use-browser           BROWSER <request>, or REFUSED not-pending
 //! deny                  DENIED <request>, or REFUSED not-pending
 //! lock                  LOCKED
 //! unlock                UNLOCKED

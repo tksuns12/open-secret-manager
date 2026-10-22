@@ -1620,6 +1620,7 @@ dependencies = [
 name = "osm-vault-browser"
 version = "0.1.0"
 dependencies = [
+ "base64ct",
  "osm-browser-link",
  "osm-vault-core",
  "serde_json",

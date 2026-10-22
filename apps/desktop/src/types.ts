@@ -333,6 +333,41 @@ export type FillCardChoice = { id: string; title: string; brand: string | null; 
 /** A document of the page that a card's fields would go to: the page itself, or a frame in it. */
 export type FillCardDocument = { origin: string; page: boolean; fields: CardFieldName[] };
 
+/** A passkey the owner may sign in with, and the login it is on: its key is not here. */
+export type FillPasskey = { itemId: string; title: string; credentialId: string; userName: string; userDisplayName: string };
+
+/** What a page's request for a passkey asks. */
+export type PasskeyAsked = {
+  /** `create` for a new passkey, `get` to sign in. */
+  ceremony: "create" | "get";
+  rpId: string;
+  /** For a new passkey: the site's name for itself, as it gave it, and the account. */
+  rpName: string;
+  userName: string;
+  userDisplayName: string;
+  /** Whether the site asks the owner to be verified. */
+  verification: "required" | "preferred" | "discouraged";
+  /** To sign in: the passkeys the vault holds for the site. */
+  passkeys: FillPasskey[];
+  /** For a new passkey: the logins of the site it may go on instead of a new login. */
+  logins: FillLogin[];
+  /** This computer can check the owner itself (on macOS, Touch ID or the Mac's password). */
+  ownerCheck: boolean;
+};
+
+/** How the owner answers a page's request for a passkey. */
+export type PasskeyChoice = {
+  /** For a new passkey: the login it goes on, or none for a new login. */
+  into?: string | null;
+  /** To sign in: the passkey chosen. */
+  itemId?: string;
+  credentialId?: string;
+  /** This device's password, when the owner is verified by it. */
+  password?: string;
+  /** The system's check of the owner instead (Touch ID or the Mac's password). */
+  ownerCheck?: boolean;
+};
+
 /** A request from a browser extension that waits for the owner. */
 export type FillAsked = {
   requestId: string;
@@ -348,6 +383,8 @@ export type FillAsked = {
   notOffered: FillNotOffered[];
   /** For a card form: where each of the card's fields would go, and every card. */
   card?: { documents: FillCardDocument[]; cards: FillCardChoice[] } | null;
+  /** For a page's request for a passkey. */
+  passkey?: PasskeyAsked | null;
 };
 
 export type BrowserInfo = {
@@ -464,6 +501,10 @@ export type DesktopBridge = {
   /** Sends the chosen login's user name and password to the page that asked. `session` is the one the request was shown with. */
   approveFill: (requestId: string, itemId: string, session: string) => Promise<void>;
   approveCard: (requestId: string, itemId: string, session: string) => Promise<void>;
+  /** Makes or uses the passkey a page asked for, as the owner chose; the owner is verified on the way when the site asks. */
+  approvePasskey: (requestId: string, session: string, choice: PasskeyChoice) => Promise<void>;
+  /** Leaves a page's request for a passkey to the browser's own passkeys. */
+  useBrowserPasskey: (requestId: string) => Promise<void>;
   denyFill: (requestId: string) => Promise<void>;
   browserStatus: () => Promise<BrowserStatus>;
   /** Tells a browser where to find this app; resolves to the new status. */

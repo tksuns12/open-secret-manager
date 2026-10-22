@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Open Secret Manager",
   "version": "0.1.0",
-  "description": "Fills a login you choose in the Open Secret Manager app into the page you are on.",
+  "description": "Fills a login or a card you choose in the Open Secret Manager app into the page you are on, and, if you turn it on, answers sites' requests for passkeys from the app.",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -35,7 +35,14 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "extension@opensecretmanager.org",
-      "strict_min_version": "115.0"
+      "strict_min_version": "128.0"
     }
+  },
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }

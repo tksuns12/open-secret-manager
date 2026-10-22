@@ -1,6 +1,12 @@
-use std::{io::BufRead, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    io::BufRead,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use osm_browser_link::endpoint;
+use osm_browser_link::{endpoint, Ceremony};
 use osm_vault_browser::{bind, serve, Choices, Config, Desk, Refused};
 use osm_vault_core::{Item, UnlockSession, Vault};
 use tokio::sync::mpsc;
@@ -95,6 +101,10 @@ enum Decide {
     Ask,
 }
 
+/// The passkeys the vault holds, by site and credential ID, while it is
+/// unlocked: what the desk is told of a sign-in before the owner is asked.
+type Held = Arc<Mutex<Option<Vec<(String, Vec<u8>)>>>>;
+
 /// The owner's part, played by this process.
 struct Owner {
     vault: Vault,
@@ -102,6 +112,7 @@ struct Owner {
     config: Config,
     /// The request last printed, and the unlock it was printed under.
     shown: Option<(String, Option<UnlockSession>)>,
+    held: Held,
 }
 
 impl Owner {
@@ -111,6 +122,7 @@ impl Owner {
             decide: Decide::Ask,
             config: Config::default(),
             shown: None,
+            held: Held::default(),
         };
         let mut locked = false;
         for option in options {
@@ -134,8 +146,46 @@ impl Owner {
         Ok(owner)
     }
 
+    /// Notes which passkeys the vault holds now.
+    fn note_passkeys(&self) {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        let held = self.vault.is_unlocked().then(|| {
+            self.vault
+                .list()
+                .unwrap_or_default()
+                .iter()
+                .filter(|item| item.passkeys > 0)
+                .filter_map(|item| self.vault.get(&item.id).ok())
+                .flat_map(|found| {
+                    found
+                        .item
+                        .passkeys
+                        .iter()
+                        .filter_map(|passkey| {
+                            Base64UrlUnpadded::decode_vec(&passkey.credential_id)
+                                .ok()
+                                .map(|id| (passkey.rp_id.clone(), id))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        });
+        *self.held.lock().unwrap() = held;
+    }
+
     async fn serve(mut self, socket: PathBuf) -> CliResult {
         let desk = Desk::new(self.config);
+        let held = self.held.clone();
+        desk.answer_sign_ins_with(Box::new(move |rp_id, allowed| {
+            let held = held.lock().unwrap();
+            let held = held.as_ref()?;
+            Some(
+                held.iter().any(|(site, id)| {
+                    site == rp_id && (allowed.is_empty() || allowed.contains(id))
+                }),
+            )
+        }));
+        self.note_passkeys();
         let bound = bind(&socket)?;
         println!("LISTENING {}", bound.path().display());
         let serving = tokio::spawn(serve(bound, desk.clone()));
@@ -174,9 +224,11 @@ impl Owner {
             }
             return Ok(());
         };
-        let offered = match &choices.card {
-            Some(card) => card.cards.len(),
-            None => choices.logins.len(),
+        let offered = match (&choices.card, &choices.passkey) {
+            (Some(card), _) => card.cards.len(),
+            (_, Some(passkey)) if passkey.ceremony == Ceremony::Get => passkey.passkeys.len(),
+            (_, Some(passkey)) => passkey.logins.len(),
+            _ => choices.logins.len(),
         };
         println!(
             "REQUEST {} {} {} {}{}",
@@ -187,11 +239,31 @@ impl Owner {
                 Some(_) => offered.to_string(),
                 None => "locked".into(),
             },
-            match &choices.card {
-                Some(card) => format!(" card {}", card.frames.len()),
-                None => String::new(),
+            match (&choices.card, &choices.passkey) {
+                (Some(card), _) => format!(" card {}", card.frames.len()),
+                (_, Some(passkey)) => format!(
+                    " passkey {} {} {}",
+                    match passkey.ceremony {
+                        Ceremony::Create => "create",
+                        Ceremony::Get => "get",
+                    },
+                    passkey.rp_id,
+                    format!("{:?}", passkey.verification).to_lowercase()
+                ),
+                _ => String::new(),
             }
         );
+        if let Some(passkey) = &choices.passkey {
+            for found in &passkey.passkeys {
+                println!(
+                    "PASSKEY {} {} {}",
+                    found.item_id, found.passkey.credential_id, found.passkey.user_name
+                );
+            }
+            for login in &passkey.logins {
+                println!("LOGIN {} {}", login.id, login.title);
+            }
+        }
         for login in &choices.logins {
             println!("LOGIN {} {}", login.id, login.title);
         }
@@ -220,6 +292,24 @@ impl Owner {
             }
         }
         self.shown = now;
+        if let Some(passkey) = choices.passkey.clone() {
+            match (self.decide, choices.session) {
+                (Decide::Deny, _) => self.deny(desk),
+                (Decide::First, Some(_)) => match passkey.ceremony {
+                    Ceremony::Create => self.save_passkey(desk, &choices, None, true),
+                    Ceremony::Get => match passkey.passkeys.first() {
+                        Some(found) => {
+                            let (item, credential) =
+                                (found.item_id.clone(), found.passkey.credential_id.clone());
+                            self.sign_in(desk, &choices, &item, &credential, true)
+                        }
+                        None => self.deny(desk),
+                    },
+                },
+                _ => {}
+            }
+            return Ok(());
+        }
         let first = match &choices.card {
             Some(card) => card.cards.first().map(|item| (item.id.clone(), true)),
             None => choices
@@ -251,19 +341,99 @@ impl Owner {
                     None => println!("REFUSED not-pending"),
                 }
             }
+            ["save-passkey", rest @ ..] => {
+                let verified = !rest.contains(&"unverified");
+                let into = rest.iter().find(|word| **word != "unverified").copied();
+                match self.chosen(desk)? {
+                    Some(choices) => self.save_passkey(desk, &choices, into, verified),
+                    None => println!("REFUSED not-pending"),
+                }
+            }
+            ["sign-in", item, credential, rest @ ..] => {
+                let verified = !rest.contains(&"unverified");
+                match self.chosen(desk)? {
+                    Some(choices) => self.sign_in(desk, &choices, item, credential, verified),
+                    None => println!("REFUSED not-pending"),
+                }
+            }
+            ["use-browser"] => match self.shown.take() {
+                Some((request, _)) if desk.use_browser(&request) => println!("BROWSER {request}"),
+                _ => println!("REFUSED not-pending"),
+            },
             ["deny"] => self.deny(desk),
             ["lock"] => {
                 self.vault.lock();
+                self.note_passkeys();
                 println!("LOCKED");
             }
             ["unlock"] => {
                 self.vault.unlock(&password()?)?;
+                self.note_passkeys();
                 println!("UNLOCKED");
             }
             [] => {}
             _ => println!("FAILED {line}: unknown command"),
         }
         Ok(())
+    }
+
+    /// What is waiting, with the unlock it was last printed under, as the
+    /// owner's choice is made under.
+    fn chosen(&self, desk: &Arc<Desk>) -> Result<Option<Choices>, Box<dyn std::error::Error>> {
+        Ok(desk.choices(Some(&self.vault))?.map(|mut choices| {
+            choices.session = self.shown.as_ref().and_then(|(_, session)| *session);
+            choices
+        }))
+    }
+
+    fn save_passkey(
+        &mut self,
+        desk: &Arc<Desk>,
+        choices: &Choices,
+        into: Option<&str>,
+        verified: bool,
+    ) {
+        let request = choices.request_id.clone();
+        let outcome = match choices.session {
+            Some(session) => {
+                desk.approve_passkey_create(&request, session, &mut self.vault, into, verified)
+            }
+            None => Err(Refused::Locked),
+        };
+        self.note_passkeys();
+        self.passkey_sent(&request, outcome);
+    }
+
+    fn sign_in(
+        &mut self,
+        desk: &Arc<Desk>,
+        choices: &Choices,
+        item: &str,
+        credential: &str,
+        verified: bool,
+    ) {
+        let request = choices.request_id.clone();
+        let outcome = match choices.session {
+            Some(session) => {
+                desk.approve_passkey_get(&request, session, &self.vault, item, credential, verified)
+            }
+            None => Err(Refused::Locked),
+        };
+        self.passkey_sent(&request, outcome);
+    }
+
+    fn passkey_sent(&mut self, request: &str, outcome: Result<(), Refused>) {
+        match outcome {
+            Ok(()) => {
+                self.shown = None;
+                println!("PASSKEY-SENT {request}");
+            }
+            Err(Refused::Exists) => {
+                self.shown = None;
+                println!("REFUSED exists");
+            }
+            Err(refused) => println!("REFUSED {}", said(refused)),
+        }
     }
 
     fn approve(&mut self, desk: &Arc<Desk>, choices: &Choices, item: &str, card: bool) {
@@ -278,10 +448,7 @@ impl Owner {
                 self.shown = None;
                 println!("FILLED {request} {item}");
             }
-            Err(Refused::NotPending) => println!("REFUSED not-pending"),
-            Err(Refused::Locked) => println!("REFUSED locked"),
-            Err(Refused::NotForThisPage) => println!("REFUSED not-for-this-page"),
-            Err(Refused::Vault(error)) => println!("REFUSED {error}"),
+            Err(refused) => println!("REFUSED {}", said(refused)),
         }
     }
 
@@ -290,5 +457,17 @@ impl Owner {
             Some((request, _)) if desk.deny(&request) => println!("DENIED {request}"),
             _ => println!("REFUSED not-pending"),
         }
+    }
+}
+
+/// How a refusal is printed.
+fn said(refused: Refused) -> String {
+    match refused {
+        Refused::NotPending => "not-pending".into(),
+        Refused::Locked => "locked".into(),
+        Refused::NotForThisPage => "not-for-this-page".into(),
+        Refused::NotVerified => "not-verified".into(),
+        Refused::Exists => "exists".into(),
+        Refused::Vault(error) => error.to_string(),
     }
 }

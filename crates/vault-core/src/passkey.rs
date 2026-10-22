@@ -421,12 +421,15 @@ pub fn rp_id_valid(rp_id: &str) -> bool {
 /// Whether a page of `origin` may use passkeys for `rp_id`: the origin's
 /// host is the RP ID itself, or a name under it.
 pub fn rp_id_allowed(rp_id: &str, origin: &Origin) -> bool {
-    let host = origin.host();
-    rp_id_valid(rp_id)
-        && (host == rp_id
-            || host
-                .strip_suffix(rp_id)
-                .is_some_and(|rest| rest.ends_with('.')))
+    rp_id_valid(rp_id) && on_site(origin.host(), rp_id)
+}
+
+/// Whether `host` is the site `rp_id`, or a name under it.
+fn on_site(host: &str, rp_id: &str) -> bool {
+    host == rp_id
+        || host
+            .strip_suffix(rp_id)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// A request to make a passkey, as checked: what the owner is asked, and
@@ -1005,6 +1008,21 @@ impl Vault {
             (&one.title, &one.passkey.user_name).cmp(&(&other.title, &other.passkey.user_name))
         });
         Ok(found)
+    }
+
+    /// The logins a new passkey for `rp_id` may go on instead of a new
+    /// login: those whose address is on the site or under it, and that no
+    /// two devices changed at once.
+    pub fn logins_for_site(&self, rp_id: &str) -> Result<Vec<crate::ItemSummary>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|item| {
+                item.kind == ItemKind::Login
+                    && !item.conflict
+                    && Origin::of_url(&item.url).is_some_and(|origin| on_site(origin.host(), rp_id))
+            })
+            .collect())
     }
 
     /// Whether the vault holds a passkey for `rp_id` of one of these

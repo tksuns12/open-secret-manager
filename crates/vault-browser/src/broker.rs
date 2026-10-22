@@ -3,17 +3,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use osm_browser_link::{Caller, CardRequest, FillRequest, Origin, Refusal};
+use osm_browser_link::{
+    Caller, CardRequest, Ceremony, FillRequest, Origin, PasskeyRequest, Refusal,
+};
+use osm_vault_core::passkey::{Registering, Signing};
 
 /// How many request IDs are remembered, to refuse one that comes again.
 const REMEMBERED: usize = 1024;
 
-/// What a request asks for: a login for a page, or a card for the
-/// documents of a tab.
+/// What a request asks for: a login for a page, a card for the documents
+/// of a tab, or a passkey for a page.
 #[derive(Debug)]
 pub(crate) enum Asked {
     Login(FillRequest),
     Card(CardRequest),
+    Passkey(Ceremony, PasskeyRequest),
 }
 
 impl Asked {
@@ -21,13 +25,45 @@ impl Asked {
         match self {
             Self::Login(request) => &request.request_id,
             Self::Card(request) => &request.request_id,
+            Self::Passkey(_, request) => &request.request_id,
         }
+    }
+
+    /// Whether a page asked, as a passkey's request is made by the page's
+    /// call, rather than the owner, who presses the extension's button for
+    /// a login or a card.
+    pub fn started_by_page(&self) -> bool {
+        matches!(self, Self::Passkey(..))
+    }
+
+    /// The sign-in a passkey's request asks for, read.
+    pub fn sign_in(&self) -> Option<Signing> {
+        let Self::Passkey(Ceremony::Get, request) = self else {
+            return None;
+        };
+        let origin = request.check().ok()?;
+        Signing::from_options(&request.options, Some(&origin)).ok()
     }
 
     fn check(&self) -> Result<Origin, Refusal> {
         match self {
             Self::Login(request) => request.check(),
             Self::Card(request) => request.check(),
+            // And the site's options, which only the app reads: a request
+            // it does not answer is left to the browser.
+            Self::Passkey(ceremony, request) => {
+                let origin = request.check()?;
+                let read = match ceremony {
+                    Ceremony::Create => {
+                        Registering::from_options(&request.options, Some(&origin)).map(drop)
+                    }
+                    Ceremony::Get => {
+                        Signing::from_options(&request.options, Some(&origin)).map(drop)
+                    }
+                };
+                read.map_err(|_| Refusal::PasskeyRefused)?;
+                Ok(origin)
+            }
         }
     }
 }

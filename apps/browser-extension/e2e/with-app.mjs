@@ -9,6 +9,15 @@
 // name, and only the length of the password.
 //
 //   npm run build && node e2e/with-app.mjs
+//   npm run build && node e2e/with-app.mjs passkey
+//
+// With `passkey`, the extension has access to all sites (in Chromium a copy
+// that lists it as needed, in Firefox the switch on its options page, which
+// Firefox asks about), and it opens a test site that signs in with
+// passkeys, https://login.test/passkeys, and presses its Register button
+// and then its Sign in button, each waiting for the decision in the app;
+// it prints what the site's own server made of each. The passkey made is
+// one for login.test, saved in the vault: remove it afterwards.
 //
 // `OSM_APP_HOME` names the home folder the app runs for, if it is not this
 // account's own. With `OSM_BROWSER=firefox` the browser is Firefox, which
@@ -18,8 +27,18 @@
 // builds: the one inside a packaged app, to check that app as a whole.
 import { start } from "./harness.mjs";
 
-const browser = await start({ appHome: process.env.OSM_APP_HOME ?? process.env.HOME, hostProgram: process.env.OSM_HOST || null });
+const passkey = process.argv[2] === "passkey";
+const browser = await start({ appHome: process.env.OSM_APP_HOME ?? process.env.HOME, hostProgram: process.env.OSM_HOST || null, access: passkey });
 try {
+  if (passkey) {
+    const page = await browser.open("https://login.test/passkeys");
+    for (const [button, said] of [["#register", "Register"], ["#sign-in", "Sign in"]]) {
+      await page.click(button);
+      console.log(`Pressed ${said} on https://login.test/passkeys. Decide in Open Secret Manager.`);
+      console.log(`page: ${await page.result()}`);
+    }
+    process.exit(0);
+  }
   const page = await browser.open("https://login.test/login");
   await browser.press(page);
   console.log("Pressed the extension's button on https://login.test/login. Decide in Open Secret Manager.");

@@ -17,9 +17,10 @@ mod message;
 pub mod endpoint;
 
 pub use message::{
-    Caller, Cancel, CardField, CardFrame, CardReply, CardRequest, CardValues, Failure, FillReply,
-    FillRequest, Forwarded, ForwardedCard, Refusal, Request, Response, Waiting, CARD_VERSION,
-    CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME, VERSION,
+    Caller, Cancel, CardField, CardFrame, CardReply, CardRequest, CardValues, Ceremony, Failure,
+    FillReply, FillRequest, Forwarded, ForwardedCard, ForwardedPasskey, PasskeyReply,
+    PasskeyRequest, Refusal, Request, Response, Waiting, CARD_VERSION, CHROMIUM_EXTENSION_ID,
+    FIREFOX_EXTENSION_ID, HOST_NAME, MAX_PASSKEY_OPTIONS, PASSKEY_VERSION, VERSION,
 };
 pub use osm_origin::Origin;
 

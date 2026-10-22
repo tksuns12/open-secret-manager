@@ -17,6 +17,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repository = path.resolve(here, "../../..");
@@ -62,10 +63,106 @@ const cardFields = {
 };
 const cardPage = (title, body) => `<!doctype html><meta charset="utf-8"><title>${title}</title><form id="pay">${body}</form>`;
 
+/**
+ * A site that signs in with passkeys, as a site's own page does: it asks its
+ * server for the options, calls the browser's WebAuthn, and has its server
+ * check what came back (with @simplewebauthn/server, below). It says how
+ * that went in #result. With \`?on-load\` it asks to sign in as it loads,
+ * without the owner's activation.
+ */
+const passkeyPage = `<!doctype html><meta charset="utf-8"><title>Passkeys</title>
+<button id="register">Register</button> <button id="sign-in">Sign in</button>
+<pre id="result"></pre>
+<script>
+  const show = (text) => { document.getElementById("result").textContent = text; };
+  const unb64 = (text) => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), (char) => char.charCodeAt(0));
+  const post = async (path, body) => (await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json();
+  const options = async (path) => (await fetch(path + location.search)).json();
+  const descriptors = (list) => (list ?? []).map((item) => ({ ...item, id: unb64(item.id) }));
+  async function register() {
+    const asked = await options("/webauthn/register-options");
+    const credential = await navigator.credentials.create({ publicKey: { ...asked, challenge: unb64(asked.challenge), user: { ...asked.user, id: unb64(asked.user.id) }, excludeCredentials: descriptors(asked.excludeCredentials) } });
+    const checked = await post("/webauthn/register", credential.toJSON());
+    return checked.verified ? "registered " + credential.id + " uv=" + checked.userVerified + " backed-up=" + checked.backedUp : "refused " + checked.error;
+  }
+  async function signIn() {
+    const asked = await options("/webauthn/sign-in-options");
+    const credential = await navigator.credentials.get({ publicKey: { ...asked, challenge: unb64(asked.challenge), allowCredentials: descriptors(asked.allowCredentials) } });
+    const checked = await post("/webauthn/sign-in", credential.toJSON());
+    return checked.verified ? "signed-in " + credential.id + " uv=" + checked.userVerified : "refused " + checked.error;
+  }
+  const run = (work) => { show(""); work().then(show, (error) => show("error " + error.name + " " + error.message)); };
+  document.getElementById("register").addEventListener("click", () => run(register));
+  document.getElementById("sign-in").addEventListener("click", () => run(signIn));
+  // Whether WebAuthn is the browser's own here, or the extension's.
+  window.nativeWebAuthn = () => navigator.credentials.create.toString().includes("[native code]");
+  if (location.search.includes("on-load")) run(signIn);
+</script>`;
+
+/** What the site's server knows: the challenge it gave last, and the passkeys registered with it. */
+const site = { challenge: null, passkeys: [] };
+const RP_ID = "login.test";
+const RP_ORIGIN = "https://login.test";
+
+/** The site's server: options for the page, and a check of what the browser sent back. */
+async function relyingParty(url, request, response) {
+  const send = (body) => { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify(body)); };
+  let body = null;
+  if (request.method === "POST") {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    body = JSON.parse(text);
+  }
+  const verification = url.searchParams.get("uv") ?? "preferred";
+  try {
+    switch (url.pathname) {
+      case "/webauthn/register-options": {
+        const options = await generateRegistrationOptions({
+          rpName: "Login test", rpID: RP_ID, userName: "site-user", userDisplayName: "Site User", userID: new TextEncoder().encode("site-user"),
+          attestationType: "none", authenticatorSelection: { residentKey: "required", userVerification: verification },
+          excludeCredentials: url.searchParams.has("exclude") ? site.passkeys.map((passkey) => ({ id: passkey.id })) : [],
+        });
+        site.challenge = options.challenge;
+        return send(options);
+      }
+      case "/webauthn/register": {
+        const checked = await verifyRegistrationResponse({ response: body, expectedChallenge: site.challenge, expectedOrigin: RP_ORIGIN, expectedRPID: RP_ID, requireUserVerification: false });
+        if (checked.verified) site.passkeys.push(checked.registrationInfo.credential);
+        return send({ verified: checked.verified, userVerified: checked.registrationInfo?.userVerified, backedUp: checked.registrationInfo?.credentialBackedUp });
+      }
+      case "/webauthn/sign-in-options": {
+        const options = await generateAuthenticationOptions({ rpID: RP_ID, userVerification: verification, allowCredentials: [] });
+        site.challenge = options.challenge;
+        return send(options);
+      }
+      case "/webauthn/sign-in": {
+        const credential = site.passkeys.find((passkey) => passkey.id === body.id);
+        if (!credential) return send({ verified: false, error: "unknown passkey" });
+        const checked = await verifyAuthenticationResponse({ response: body, expectedChallenge: site.challenge, expectedOrigin: RP_ORIGIN, expectedRPID: RP_ID, credential, requireUserVerification: false });
+        if (checked.verified) credential.counter = checked.authenticationInfo.newCounter;
+        return send({ verified: checked.verified, userVerified: checked.authenticationInfo.userVerified });
+      }
+      default:
+        response.writeHead(404);
+        return response.end();
+    }
+  } catch (error) {
+    return send({ verified: false, error: error.message });
+  }
+}
+
 function respond(request, response) {
   const url = new URL(request.url, "https://placeholder.test");
   const send = (body, headers = {}) => { response.writeHead(200, { "content-type": "text/html; charset=utf-8", ...headers }); response.end(body); };
+  if (url.pathname.startsWith("/webauthn/")) { void relyingParty(url, request, response); return; }
   switch (url.pathname) {
+    case "/passkeys": return send(passkeyPage);
+    // The site's page with another site's frame in it, which posts to the page as the bridge's messages look.
+    case "/passkeys-framed": return send(passkeyPage + `<iframe id="inner" src="https://other.test/posting-frame" width="300" height="80"></iframe>`);
+    case "/posting-frame": return send(`<!doctype html><title>Posting frame</title><button id="post">Post</button><script>
+      document.getElementById("post").addEventListener("click", () => parent.postMessage({ channel: "osm-passkey", type: "ask", id: crypto.randomUUID(), kind: "get", options: "{}", timeout: null }, "*"));
+      window.nativeWebAuthn = () => navigator.credentials.create.toString().includes("[native code]");
+    </script>`);
     case "/login": return send(loginForm("Sign in"));
     case "/next": return send(loginForm("Another page of the same site"));
     // A page that keeps scripts that came later from hearing that it is being left.
@@ -161,7 +258,7 @@ export async function start(options = {}) {
   }
 }
 
-async function prepare(closers, { logins = [], cards = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null, hostProgram = null }) {
+async function prepare(closers, { logins = [], cards = [], fakeHost = false, standIn = ["ask"], registerHost = true, forged = false, appHome = null, hostProgram = null, access = false }) {
   // Short, because a socket's path has to fit in about a hundred bytes.
   const home = mkdtempSync("/tmp/osm");
   closers.push(() => {
@@ -172,7 +269,7 @@ async function prepare(closers, { logins = [], cards = [], fakeHost = false, sta
   });
   // With `appHome`, the desktop app itself is running for that home folder:
   // the browser and the host use it, and nothing stands in for the app.
-  if (appHome) return browse({ home, accountHome: appHome, closers, fakeHost, hostProgram, registerHost, forged, app: null, items: {}, vault: null });
+  if (appHome) return browse({ home, accountHome: appHome, closers, fakeHost, hostProgram, registerHost, forged, access, app: null, items: {}, vault: null });
   const env = { ...process.env, HOME: home, OSM_PASSWORD: PASSWORD };
   delete env.XDG_DATA_HOME;
 
@@ -198,7 +295,7 @@ async function prepare(closers, { logins = [], cards = [], fakeHost = false, sta
     app = new Lines(child);
     await app.expect("LISTENING");
   }
-  return browse({ home, accountHome: home, closers, fakeHost, hostProgram, registerHost, forged, app, items, vault });
+  return browse({ home, accountHome: home, closers, fakeHost, hostProgram, registerHost, forged, access, app, items, vault });
 }
 
 /**
@@ -227,7 +324,7 @@ function startable(program) {
 }
 
 /** The pages, and a browser with the extension, for the account whose home folder is `accountHome`. */
-async function browse({ home, accountHome, closers, fakeHost, hostProgram, registerHost, forged, app, items, vault }) {
+async function browse({ home, accountHome, closers, fakeHost, hostProgram, registerHost, forged, access, app, items, vault }) {
   // The pages: one server for https under every name, one for plain http.
   execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=login.test",
     "-addext", "subjectAltName=DNS:login.test,DNS:*.login.test,DNS:framing.test,DNS:other.test",
@@ -243,7 +340,9 @@ async function browse({ home, accountHome, closers, fakeHost, hostProgram, regis
   // seen until it has checked it, which can take many seconds.
   // `hostProgram` names the real host somewhere else: inside a packaged app.
   const host = hostProgram ?? startable(fakeHost ? path.join(here, "fake-host.mjs") : built("osm-native-host"));
-  const setup = { home, accountHome, closers, host, registerHost, forged, securePort, plainPort };
+  const setup = { home, accountHome, closers, host, registerHost, forged, access, securePort, plainPort };
+  site.challenge = null;
+  site.passkeys = [];
   const driver = BROWSER === "firefox" ? await firefoxWith(setup) : await chromiumWith(setup);
   let pressed = null;
 
@@ -265,6 +364,8 @@ async function browse({ home, accountHome, closers, fakeHost, hostProgram, regis
     },
     /** Opens `address` in a new tab. */
     open: driver.open,
+    /** The passkeys the site's server has registered. */
+    sitePasskeys: () => site.passkeys.map((passkey) => passkey.id),
     /** Presses the extension's toolbar button for the tab showing `page`, as the owner would. With `forged`, the button of the other extension. */
     press(page, options) {
       pressed = page;
@@ -327,6 +428,16 @@ async function eventually(what, attempt) {
   }
 }
 
+/** A copy of the built Chromium extension that has access to all sites from the start. */
+function accessCopy(home) {
+  const copy = path.join(home, "extension-with-access");
+  cpSync(path.resolve(here, "../dist/chromium"), copy, { recursive: true });
+  const manifest = JSON.parse(readFileSync(path.join(copy, "manifest.json"), "utf8"));
+  manifest.host_permissions = ["<all_urls>"];
+  writeFileSync(path.join(copy, "manifest.json"), JSON.stringify(manifest));
+  return copy;
+}
+
 /** A copy of a built extension that the browser takes for another one. */
 function forgedCopy(home, browser, change) {
   const copy = path.join(home, "forged-extension");
@@ -343,7 +454,7 @@ function forgedCopy(home, browser, change) {
  * The toolbar button is pressed through the browser's debugging interface,
  * which grants the tab what a real press grants.
  */
-async function chromiumWith({ home, accountHome, closers, host, registerHost, forged, securePort, plainPort }) {
+async function chromiumWith({ home, accountHome, closers, host, registerHost, forged, access, securePort, plainPort }) {
   const { chromium } = await import("playwright");
   const env = { ...process.env, HOME: accountHome };
   delete env.XDG_DATA_HOME;
@@ -360,7 +471,11 @@ async function chromiumWith({ home, accountHome, closers, host, registerHost, fo
       allowed_origins: [`chrome-extension://${CHROMIUM_EXTENSION_ID}/`],
     }));
   }
-  const extension = path.resolve(here, "../dist/chromium");
+  // With `access`, the extension as the owner has it after turning on its
+  // access to all sites: Chromium's prompt for that cannot be answered by
+  // a test, so the copy lists the access as one it needs, which Chromium
+  // grants it when it is put in. The code is the built one.
+  const extension = access ? accessCopy(home) : path.resolve(here, "../dist/chromium");
   // Without the `key` that fixes its ID, the same code is another extension.
   const extensions = [extension, ...(forged ? [forgedCopy(home, "chromium", (manifest) => { delete manifest.key; })] : [])].join(",");
   const context = await chromium.launchPersistentContext(profile, {
@@ -385,6 +500,9 @@ async function chromiumWith({ home, accountHome, closers, host, registerHost, fo
   // after it was put into a new browser, is lost. Wait until it listens.
   const listening = (id) => eventually(`the extension ${id} listens for its button`, async () => (await worker(id)).evaluate(() => chrome.action.onClicked.hasListeners()));
   await listening(CHROMIUM_EXTENSION_ID);
+  if (access) {
+    await eventually("the scripts for passkeys are registered", async () => (await (await worker(CHROMIUM_EXTENSION_ID)).evaluate(() => chrome.scripting.getRegisteredContentScripts())).length === 2);
+  }
   let forgedId = null;
   if (forged) {
     // The other extension is whichever is not ours.
@@ -411,6 +529,24 @@ async function chromiumWith({ home, accountHome, closers, host, registerHost, fo
           const frame = page.frames().find((candidate) => candidate !== page.mainFrame());
           return frame ? frame.evaluate(INNER).catch(() => null) : null;
         }),
+        /** Clicks, as the owner would, which gives the page the owner's activation. */
+        click: (selector) => page.click(selector),
+        /** Runs `expression` in the page and gives its value, once a promise settles. */
+        run: (expression) => page.evaluate(expression),
+        /** Runs `expression` in the page's frame. */
+        runInFrame: (expression) => eventually("the frame is there", async () => {
+          const frame = page.frames().find((candidate) => candidate !== page.mainFrame() && candidate.url() !== "about:blank");
+          return frame ? frame.evaluate(expression).then((value) => ({ value })).catch(() => null) : null;
+        }).then((found) => found.value),
+        clickInFrame: (selector) => page.frameLocator("iframe").locator(selector).click(),
+        /** What the page's #result says, once it says something. */
+        result: () => eventually("the page shows a result", async () => (await page.textContent("#result").catch(() => "")) || null),
+        /** Chrome's own virtual authenticator for this tab, a passkey store of the browser's own that answers at once. */
+        async virtualAuthenticator() {
+          const session = await context.newCDPSession(page);
+          await session.send("WebAuthn.enable", { enableUI: false });
+          await session.send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", ctap2Version: "ctap2_1", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
+        },
       };
     },
     async press({ raw: page }, which) {
@@ -475,7 +611,7 @@ async function proxyTo(securePort, plainPort) {
  * Headless Firefox with the extension installed as a temporary add-on.
  * The toolbar button is clicked in the browser's own interface.
  */
-async function firefoxWith({ home, accountHome, closers, host, registerHost, forged, securePort, plainPort }) {
+async function firefoxWith({ home, accountHome, closers, host, registerHost, forged, access, securePort, plainPort }) {
   const { Builder, By } = await import("selenium-webdriver");
   const firefox = (await import("selenium-webdriver/firefox.js")).default;
   // Firefox looks for the host's manifest under the account's home folder,
@@ -533,6 +669,20 @@ async function firefoxWith({ home, accountHome, closers, host, registerHost, for
   };
   await eventually("the extension's button is in the toolbar", () => inChrome(() => driver.executeScript("return document.getElementById(arguments[0]) !== null;", button())));
   const first = await driver.getWindowHandle();
+  if (access) {
+    // As the owner does: the switch on the extension's options page, and
+    // Firefox's own prompt, which asks whether to allow it.
+    const hostname = await inChrome(() => driver.executeScript("return WebExtensionPolicy.getByID(arguments[0]).mozExtensionHostname;", FIREFOX_EXTENSION_ID));
+    await driver.switchTo().newWindow("tab");
+    await driver.get(`moz-extension://${hostname}/options.html`);
+    await driver.findElement(By.id("all-sites")).click();
+    await eventually("Firefox asks to allow the access", () => inChrome(() => driver.executeScript(
+      "const button = document.querySelector('#addon-webext-permissions-notification .popup-notification-primary-button'); if (!button) return false; button.click(); return true;",
+    )));
+    await eventually("the options say the access is on", async () => (await driver.findElement(By.id("state")).getText()).startsWith("On"));
+    await driver.close();
+    await driver.switchTo().window(first);
+  }
 
   return {
     kind: "Firefox",
@@ -551,6 +701,30 @@ async function firefoxWith({ home, accountHome, closers, host, registerHost, for
         isClosed: () => closed,
         async form() { await here(); return driver.executeScript(`return ${FORM};`); },
         async card() { await here(); return driver.executeScript(`return ${CARD};`); },
+        async click(selector) { await here(); await driver.findElement(By.css(selector)).click(); },
+        async run(expression) { await here(); return driver.executeScript(`return ${expression};`); },
+        async runInFrame(expression) {
+          await here();
+          await driver.switchTo().frame(await driver.findElement(By.css("iframe")));
+          try { return await driver.executeScript(`return ${expression};`); } finally { await driver.switchTo().defaultContent(); }
+        },
+        async clickInFrame(selector) {
+          await here();
+          await driver.switchTo().frame(await driver.findElement(By.css("iframe")));
+          try { await driver.findElement(By.css(selector)).click(); } finally { await driver.switchTo().defaultContent(); }
+        },
+        result: () => eventually("the page shows a result", async () => { await here(); return (await driver.findElement(By.id("result")).getText()) || null; }),
+        async virtualAuthenticator() {
+          const { VirtualAuthenticatorOptions, Protocol, Transport } = await import("selenium-webdriver/lib/virtual_authenticator.js");
+          const authenticator = new VirtualAuthenticatorOptions();
+          authenticator.setProtocol(Protocol.CTAP2);
+          authenticator.setTransport(Transport.INTERNAL);
+          authenticator.setHasResidentKey(true);
+          authenticator.setHasUserVerification(true);
+          authenticator.setIsUserVerified(true);
+          await here();
+          await driver.addVirtualAuthenticator(authenticator);
+        },
         innerForm: () => eventually("the frame shows the login page", async () => {
           await here();
           await driver.switchTo().frame(await driver.findElement(By.id("inner")));

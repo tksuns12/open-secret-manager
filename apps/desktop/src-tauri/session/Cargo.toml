@@ -5,14 +5,17 @@ edition = "2021"
 license = "GPL-3.0-only"
 description = "What the desktop app needs from the system that Tauri does not give it"
 
-# This crate holds the desktop app's only `unsafe` call: registering for
-# the system's notifications. Everything else here is safe Rust.
+# This crate holds the desktop app's only `unsafe` calls: registering for
+# the system's notifications, and asking the system to check the owner.
+# Everything else here is safe Rust.
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSDistributedNotificationCenter", "NSOperation", "NSString", "NSArray", "NSRunLoop", "NSDate"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard"] }
+# The owner's check for a passkey: Touch ID, or the Mac's password.
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError"] }
 
 # logind over D-Bus, through the libdbus binding the windowing already
 # links on Linux; and a clipboard this process keeps serving. Under a

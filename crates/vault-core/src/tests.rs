@@ -579,6 +579,18 @@ fn password_change_rewraps_master_key() {
     ));
     reopened.unlock("new password").unwrap();
     assert_eq!(reopened.get(&item_id).unwrap().item.title, "Kept login");
+
+    // The password is checked without unlocking again, and a lock stays.
+    let session = reopened.unlock_session();
+    reopened.check_password("new password").unwrap();
+    assert!(matches!(
+        reopened.check_password("old password"),
+        Err(Error::InvalidCredentials)
+    ));
+    assert_eq!(reopened.unlock_session(), session);
+    reopened.lock();
+    reopened.check_password("new password").unwrap();
+    assert!(!reopened.is_unlocked());
 }
 
 #[test]

@@ -285,3 +285,50 @@ test("a card's fill says where each of its fields goes and sends the card chosen
   await toast(page).filter({ hasText: "Everyday card was sent to the page · the form was not submitted" }).waitFor();
   assert.deepEqual(errors, []);
 });
+
+test("a page's new passkey is saved where the owner chooses, once the owner is verified", async () => {
+  const { page, errors } = await window.open("?passkey-create", SMALLEST_SIZE);
+  const dialog = page.getByRole("dialog", { name: "A passkey" });
+  await dialog.getByRole("heading", { name: "Save a passkey for example.com" }).waitFor();
+  assert.match(await dialog.textContent(), /The page https:\/\/login\.example\.com asks to make a passkey for example\.com, for the account hello@northstar\.dev \(Northstar\)\./);
+  // A new login, unless the owner picks one of the site's.
+  const choices = dialog.locator(".fill-choice");
+  assert.deepEqual(await choices.allTextContents(), ["+A new login for example.comhello@northstar.dev", "PAdd to Proton Mailhello@northstar.dev"]);
+  assert.equal(await choices.first().getAttribute("aria-pressed"), "true");
+  await choices.nth(1).click();
+  assert.equal(await choices.nth(1).getAttribute("aria-pressed"), "true");
+  // The site asks to verify the owner: this Mac's check, or the password.
+  assert.match(await dialog.textContent(), /The site asks to verify it is you\. This Mac checks it with Touch ID or its password when you go on/);
+  await dialog.getByLabel("This device's password").fill("wrong");
+  await dialog.getByRole("button", { name: "Save passkey" }).click();
+  await toast(page).filter({ hasText: "That is not this device's password · nothing was sent" }).waitFor();
+  await dialog.getByLabel("This device's password").fill("the right one");
+  await dialog.getByRole("button", { name: "Save passkey" }).click();
+  await dialog.waitFor({ state: "detached" });
+  await toast(page).filter({ hasText: "A passkey for example.com was saved and sent to the page" }).waitFor();
+  assert.deepEqual(errors, []);
+});
+
+test("a page's sign-in offers the site's passkeys, or the browser's own", async () => {
+  const { page, errors } = await window.open("?passkey-get", SMALLEST_SIZE);
+  const dialog = page.getByRole("dialog", { name: "A passkey" });
+  await dialog.getByRole("heading", { name: "Sign in to example.com with a passkey" }).waitFor();
+  // The only one is chosen; the site does not ask to verify the owner.
+  const choice = dialog.locator(".fill-choice");
+  assert.equal(await choice.count(), 1);
+  assert.equal(await choice.getAttribute("aria-pressed"), "true");
+  assert.equal(await choice.textContent(), "Gnorthstar-labs (Northstar Labs)On GitHub");
+  assert.equal(await dialog.getByLabel("This device's password").count(), 0);
+  // It fits the smallest window.
+  const drawn = await edges(page.locator(".generator-modal"));
+  assert.ok(drawn.top >= 0 && drawn.bottom <= SMALLEST_SIZE.height && drawn.right <= SMALLEST_SIZE.width, JSON.stringify(drawn));
+  await dialog.getByRole("button", { name: "Use the browser's passkeys" }).click();
+  await dialog.waitFor({ state: "detached" });
+  await toast(page).filter({ hasText: "The browser's own passkeys answer the page instead" }).waitFor();
+
+  const again = await window.open("?passkey-get");
+  await again.page.getByRole("dialog", { name: "A passkey" }).getByRole("button", { name: "Sign in" }).click();
+  await toast(again.page).filter({ hasText: "You were signed in to example.com with your passkey" }).waitFor();
+  assert.deepEqual([...errors, ...again.errors], []);
+});
+

@@ -8,6 +8,12 @@
 //! the request down. A login's password and a card's number never cross
 //! the bridge to the window; they go from the vault to the socket here.
 //!
+//! A page's request for a passkey (Phase 18, stop 6) waits here too, but a
+//! fill the owner starts takes its place, and a sign-in the unlocked vault
+//! holds no passkey for is left to the browser before the window comes
+//! forward. A passkey's key never crosses the bridge either: the window
+//! learns the site, the account, and which login holds it.
+//!
 //! This module also tells each browser where the host is, by writing the
 //! manifest the browser looks for, and takes that manifest away again.
 
@@ -17,12 +23,13 @@ use std::{
 };
 
 use osm_browser_link::{
-    endpoint, CardField, Origin, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME,
+    endpoint, CardField, Ceremony, Origin, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME,
 };
 use osm_vault_browser::{bind, serve, Config, Desk, Refused};
-use osm_vault_core::{ItemKind, Vault};
+use osm_vault_core::{passkey::UserVerification, ItemKind, Vault};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+use zeroize::Zeroizing;
 
 use crate::{AppState, CommandError};
 
@@ -321,6 +328,21 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         }
     }
 
+    // A page's sign-in the unlocked vault holds no passkey for is the
+    // browser's own to answer. A vault that is busy, or locked, cannot say.
+    let vault_of = app.clone();
+    browser
+        .desk
+        .answer_sign_ins_with(Box::new(move |rp_id, allowed| {
+            let state = vault_of.state::<AppState>();
+            let vault = state.vault.try_lock().ok()?;
+            let vault = vault.as_ref().filter(|vault| vault.is_unlocked())?;
+            vault
+                .passkeys_for(rp_id, allowed)
+                .ok()
+                .map(|found| !found.is_empty())
+        }));
+
     let mut changes = browser.desk.changes();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -457,6 +479,42 @@ pub struct CardAsked {
     pub(crate) cards: Vec<FillCard>,
 }
 
+/// A passkey the owner may sign in with, and the login it is on. Its key is
+/// not here.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillPasskey {
+    pub(crate) item_id: String,
+    title: String,
+    pub(crate) credential_id: String,
+    user_name: String,
+    user_display_name: String,
+}
+
+/// What a page's request for a passkey asks.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyAsked {
+    /// `create` for a new passkey, `get` to sign in.
+    ceremony: Ceremony,
+    rp_id: String,
+    /// For a new passkey: the site's name for itself, as it gave it, and the
+    /// account.
+    rp_name: String,
+    user_name: String,
+    user_display_name: String,
+    /// `required`, `preferred`, or `discouraged`: whether the site asks the
+    /// owner to be verified.
+    verification: &'static str,
+    /// To sign in: the passkeys the vault holds for the site.
+    pub(crate) passkeys: Vec<FillPasskey>,
+    /// For a new passkey: the logins of the site it may go on.
+    pub(crate) logins: Vec<FillLogin>,
+    /// This computer can check the owner itself (on macOS, Touch ID or the
+    /// Mac's password); otherwise the vault's password does.
+    owner_check: bool,
+}
+
 /// What the owner is asked.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -472,6 +530,8 @@ pub struct FillAsked {
     pub(crate) not_offered: Vec<NotOffered>,
     /// For a card form instead of a login form.
     pub(crate) card: Option<CardAsked>,
+    /// For a page's request for a passkey.
+    pub(crate) passkey: Option<PasskeyAsked>,
 }
 
 /// Logins whose address would have the page's origin if it were written
@@ -514,7 +574,9 @@ pub async fn fill_request(
         return Ok(None);
     };
     let not_offered = match vault.as_ref() {
-        Some(vault) if choices.session.is_some() && choices.card.is_none() => {
+        Some(vault)
+            if choices.session.is_some() && choices.card.is_none() && choices.passkey.is_none() =>
+        {
             not_offered(vault, &choices.origin)
         }
         _ => Vec::new(),
@@ -540,6 +602,38 @@ pub async fn fill_request(
             })
             .collect(),
     });
+    let fill_login = |login: &osm_vault_core::ItemSummary| FillLogin {
+        id: login.id.clone(),
+        title: login.title.clone(),
+        username: login.username.clone(),
+        url: login.url.clone(),
+        conflict: login.conflict,
+    };
+    let passkey = choices.passkey.map(|asked| PasskeyAsked {
+        ceremony: asked.ceremony,
+        verification: match asked.verification {
+            UserVerification::Required => "required",
+            UserVerification::Preferred => "preferred",
+            UserVerification::Discouraged => "discouraged",
+        },
+        passkeys: asked
+            .passkeys
+            .into_iter()
+            .map(|found| FillPasskey {
+                item_id: found.item_id,
+                title: found.title,
+                credential_id: found.passkey.credential_id,
+                user_name: found.passkey.user_name,
+                user_display_name: found.passkey.user_display_name,
+            })
+            .collect(),
+        logins: asked.logins.iter().map(fill_login).collect(),
+        rp_id: asked.rp_id,
+        rp_name: asked.rp_name,
+        user_name: asked.user_name,
+        user_display_name: asked.user_display_name,
+        owner_check: osm_desktop_session::can_check_owner(),
+    });
     Ok(Some(FillAsked {
         session: choices.session.map(|session| session.to_string()),
         logins: choices
@@ -555,6 +649,7 @@ pub async fn fill_request(
             .collect(),
         not_offered,
         card,
+        passkey,
         request_id: choices.request_id,
         origin: choices.origin,
         browser: choices.browser,
@@ -586,7 +681,8 @@ pub async fn approve_fill<R: Runtime>(
             .approve(&request_id, &item_id, session, vault)
             .map_err(|refused| match refused {
                 Refused::Locked => locked(),
-                Refused::NotPending => fill_ended(),
+                // Only a passkey's choice is refused for the other two.
+                Refused::NotPending | Refused::NotVerified | Refused::Exists => fill_ended(),
                 Refused::NotForThisPage => CommandError {
                     code: "not_for_this_page",
                     message: "that item is not a login for this page".into(),
@@ -622,13 +718,134 @@ pub async fn approve_card<R: Runtime>(
             .approve_card(&request_id, &item_id, session, vault)
             .map_err(|refused| match refused {
                 Refused::Locked => locked(),
-                Refused::NotPending => fill_ended(),
+                // Only a passkey's choice is refused for the other two.
+                Refused::NotPending | Refused::NotVerified | Refused::Exists => fill_ended(),
                 Refused::NotForThisPage => CommandError {
                     code: "not_a_card",
                     message: "that item is not a card that can be filled".into(),
                 },
                 Refused::Vault(error) => error.into(),
             })?;
+    }
+    step_back(&app, &request_id);
+    Ok(())
+}
+
+/// The owner's choice for the waiting passkey's request: to save a new
+/// one, `into` names a login of the site, or none for a new login; to sign
+/// in, `item_id` and `credential_id` name the passkey. When the site asks
+/// to verify the owner, the owner is verified now: by the system when
+/// `owner_check` (Touch ID or the Mac's password), or by this device's
+/// `password`; neither is kept. `session` as for [`approve_fill`].
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn approve_passkey<R: Runtime>(
+    request_id: String,
+    session: String,
+    into: Option<String>,
+    item_id: Option<String>,
+    credential_id: Option<String>,
+    password: Option<String>,
+    owner_check: bool,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
+) -> Result<(), CommandError> {
+    let password = password.map(Zeroizing::new);
+    let locked = || CommandError {
+        code: "locked",
+        message: "the vault locked before the passkey was sent".into(),
+    };
+    let asked = state
+        .browser
+        .desk
+        .choices(None)?
+        .filter(|choices| choices.request_id == request_id)
+        .and_then(|choices| choices.passkey)
+        .ok_or_else(fill_ended)?;
+    let not_verified = || CommandError {
+        code: "not_verified",
+        message: "you were not verified".into(),
+    };
+    // The system's check, before the vault is held: the owner may take a
+    // while over it.
+    let checked = if owner_check {
+        let reason = match asked.ceremony {
+            Ceremony::Create => format!("save a passkey for {}", asked.rp_id),
+            Ceremony::Get => format!("sign in to {} with a passkey", asked.rp_id),
+        };
+        let (passed, said) = tokio::sync::oneshot::channel();
+        osm_desktop_session::check_owner(&reason, move |result| {
+            let _ = passed.send(result);
+        });
+        if !said.await.unwrap_or(false) {
+            return Err(not_verified());
+        }
+        true
+    } else {
+        false
+    };
+    {
+        let mut vault = state.vault.lock().await;
+        let vault = vault.as_mut().ok_or_else(locked)?;
+        let verified = checked
+            || match &password {
+                Some(password) => {
+                    vault.check_password(password).map_err(|_| CommandError {
+                        code: "wrong_password",
+                        message: "that is not this device's password".into(),
+                    })?;
+                    true
+                }
+                None => false,
+            };
+        let session = session.parse().map_err(|_| locked())?;
+        let desk = &state.browser.desk;
+        let outcome = match asked.ceremony {
+            Ceremony::Create => {
+                desk.approve_passkey_create(&request_id, session, vault, into.as_deref(), verified)
+            }
+            Ceremony::Get => {
+                let (Some(item), Some(credential)) = (&item_id, &credential_id) else {
+                    return Err(CommandError {
+                        code: "not_for_this_page",
+                        message: "choose a passkey".into(),
+                    });
+                };
+                desk.approve_passkey_get(&request_id, session, vault, item, credential, verified)
+            }
+        };
+        outcome.map_err(|refused| match refused {
+            Refused::Locked => locked(),
+            Refused::NotPending => fill_ended(),
+            Refused::NotVerified => not_verified(),
+            Refused::NotForThisPage => CommandError {
+                code: "not_for_this_page",
+                message: "that is not a passkey or a login for this site".into(),
+            },
+            Refused::Exists => {
+                step_back(&app, &request_id);
+                CommandError {
+                    code: "passkey_exists",
+                    message: "the site already has a passkey of this vault for the account".into(),
+                }
+            }
+            Refused::Vault(error) => error.into(),
+        })?;
+    }
+    step_back(&app, &request_id);
+    Ok(())
+}
+
+/// The owner chose the browser's own passkeys for the waiting passkey's
+/// request.
+#[tauri::command]
+pub async fn use_browser_passkey<R: Runtime>(
+    request_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle<R>,
+) -> Result<(), CommandError> {
+    if !state.browser.desk.use_browser(&request_id) {
+        return Err(fill_ended());
     }
     step_back(&app, &request_id);
     Ok(())

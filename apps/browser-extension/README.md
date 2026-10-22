@@ -33,6 +33,20 @@ shows nothing inside a page. It never receives a list of what your vault
 holds: the app shows the choices, and sends back only the one login you
 picked.
 
+## Passkeys, and a payment provider's frames
+
+On its options page (in the browser's list of extensions, Options) one
+switch gives it access to all sites, which the browser asks you about.
+With it on, it puts a small script into every https page, and a page's
+request for a passkey goes to the app, which asks you what to do: save a
+new passkey there, sign in with one, or leave the request to the
+browser's own passkeys. A request the app does not answer, such as one
+for a site whose passkeys your vault does not hold, or one made while the
+app is not running, goes to the browser's own as if the extension were
+not there. The access also lets a press fill a card's number into a
+payment provider's frame, which is another site. With the switch off,
+nothing of the extension runs in pages. Firefox 128 or later is needed.
+
 It does not save logins, fill on its own, fill one-time codes, or fill
 forms inside frames. A login is offered only for the exact origin of its
 stored address; see [the format contract](../../docs/formats.md#implemented-fill-protocol-phase-5-stop-1).

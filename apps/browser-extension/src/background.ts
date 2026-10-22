@@ -4,9 +4,16 @@
 // if the page has a card form, and puts the one the owner chooses there
 // into the page. It holds no login or card before that and keeps none
 // after, and never learns what the vault contains.
+//
+// Once the owner gives it access to all sites on its options page, it also
+// puts scripts into pages for passkeys (passkey-page.ts, passkey-bridge.ts),
+// and hands a page's call for a passkey to the app, for the page's origin
+// as the browser reports it; and it reaches a card form's frames of other
+// sites.
 
-import { answers, answersCard, cancel, cardRequest, explain, fillRequest, GIVE_UP_AFTER_MS, MAX_CARD_FRAMES, NATIVE_HOST, pageOrigin, readResponse, type CardField, type CardFrame, type CardReply, type CardRequest, type CardValues, type FillReply, type FillRequest } from "./protocol";
+import { answers, answersCard, answersPasskey, cancel, cardRequest, explain, fillRequest, GIVE_UP_AFTER_MS, MAX_CARD_FRAMES, MAX_PASSKEY_OPTIONS, NATIVE_HOST, pageOrigin, passkeyRequest, readResponse, type CardField, type CardFrame, type CardReply, type CardRequest, type CardValues, type FillReply, type FillRequest, type PasskeyRequest } from "./protocol";
 import { isFilled, isFilledCard, isPrepared, type Field, type Prepared, type ToPage } from "./page";
+import { outcomeOf, toBrowser, waitFor, type Outcome } from "./passkey";
 
 /**
  * A request the owner has yet to decide in the app: a login's, with the
@@ -16,6 +23,7 @@ import { isFilled, isFilledCard, isPrepared, type Field, type Prepared, type ToP
 type Waiting = { tabId: number; giveUp: ReturnType<typeof setTimeout> } & (
   | { kind: "login"; request: FillRequest; page: chrome.runtime.Port }
   | { kind: "card"; request: CardRequest; pages: Map<number, chrome.runtime.Port> }
+  | { kind: "passkey"; request: PasskeyRequest; page: chrome.runtime.Port }
 );
 
 /** A document of the tab, connected to, and what its script found. */
@@ -29,6 +37,10 @@ const NOT_CONNECTED = "This browser is not connected to Open Secret Manager. In 
 const PAGE_ANSWERS_WITHIN_MS = 5_000;
 /** How long the mark for a finished fill stays on the button. */
 const FILLED_MARK_MS = 6_000;
+/** How long a site's requests for passkeys go to the browser's own after the owner turned one down, or let it run out. */
+const PASSKEY_PAUSE_MS = 60_000;
+/** The access the owner gives on the options page: every site. */
+const ALL_SITES = ["<all_urls>"];
 
 /** How a card's fields are named to the owner. */
 const CARD_FIELD_NAMES: Record<CardField, string> = {
@@ -37,6 +49,8 @@ const CARD_FIELD_NAMES: Record<CardField, string> = {
 
 const waiting = new Map<string, Waiting>();
 let host: chrome.runtime.Port | undefined;
+/** Until when each origin's requests for passkeys are the browser's own. */
+const paused = new Map<string, number>();
 
 /** Says on the toolbar button, for one tab, how its request stands. */
 function show(tabId: number, mark: Mark, text: string) {
@@ -87,6 +101,11 @@ async function reachable(tabId: number): Promise<number[]> {
 async function ask(tab: chrome.tabs.Tab) {
   const tabId = tab.id;
   if (tabId === undefined) return;
+  // A page's own call for a passkey gives way to the owner's press, and
+  // goes on to the browser's own passkeys.
+  for (const [requestId, other] of waiting) {
+    if (other.tabId === tabId && other.kind === "passkey") end(requestId, "none", "", true, toBrowser(true));
+  }
   // This tab's request is already waiting in the app.
   if ([...waiting.values()].some((other) => other.tabId === tabId)) return;
   // The address comes from the browser, not from the page.
@@ -153,7 +172,7 @@ async function ask(tab: chrome.tabs.Tab) {
   }
   release();
   show(tabId, "problem", carded.length > 0
-    ? "This page's card number is in a frame of another site, which the extension cannot reach. Copy the number in Open Secret Manager."
+    ? "This page's card number is in a frame of another site, which the extension cannot reach. Give it access to all sites in its options, or copy the number in Open Secret Manager."
     : "No login form or card form was found on this page.");
 }
 
@@ -198,8 +217,12 @@ function releaseHost() {
   port.disconnect();
 }
 
-/** Ends a request without a fill. `withdraw` tells the host, for a request the app may still be showing. */
-function end(requestId: string, mark: Mark, text: string, withdraw: boolean) {
+/**
+ * Ends a request without a fill. `withdraw` tells the host, for a request
+ * the app may still be showing. A page's call for a passkey ends as
+ * `outcome` says, or else goes on to the browser's own passkeys.
+ */
+function end(requestId: string, mark: Mark, text: string, withdraw: boolean, outcome?: Outcome) {
   const request = waiting.get(requestId);
   if (!request) return;
   waiting.delete(requestId);
@@ -207,11 +230,14 @@ function end(requestId: string, mark: Mark, text: string, withdraw: boolean) {
   if (withdraw) {
     try { host?.postMessage(cancel(requestId)); } catch { /* the host is gone, which withdraws it too */ }
   }
-  finish(request, mark, text);
+  finish(request, mark, text, outcome);
 }
 
-function finish(request: Waiting, mark: Mark, text: string) {
-  const pages = request.kind === "login" ? [request.page] : [...request.pages.values()];
+function finish(request: Waiting, mark: Mark, text: string, outcome?: Outcome) {
+  if (request.kind === "passkey") {
+    try { request.page.postMessage(outcome ?? toBrowser()); } catch { /* the page went away */ }
+  }
+  const pages = request.kind === "card" ? [...request.pages.values()] : [request.page];
   for (const page of pages) {
     try { page.disconnect(); } catch { /* already closed */ }
   }
@@ -228,10 +254,19 @@ function fromHost(message: unknown) {
   const request = waiting.get(response.requestId);
   if (!request) return;
   if (response.type === "waiting") {
-    show(request.tabId, "waiting", `Waiting for you in Open Secret Manager. Choose a ${request.kind === "card" ? "card" : "login"} there.`);
+    show(request.tabId, "waiting", request.kind === "passkey"
+      ? "The page asks for a passkey. Choose in Open Secret Manager how to answer it."
+      : `Waiting for you in Open Secret Manager. Choose a ${request.kind === "card" ? "card" : "login"} there.`);
     return;
   }
   if (response.type === "error") {
+    if (request.kind === "passkey") {
+      // A request the owner turned down, or let run out, is not asked
+      // again at once: the page may not ask over and over.
+      if (response.code === "denied" || response.code === "expired") paused.set(request.request.origin, Date.now() + PASSKEY_PAUSE_MS);
+      end(response.requestId, response.code === "denied" ? "problem" : "none", response.code === "denied" ? "You turned down the page's request for a passkey." : "", false, outcomeOf(response.code));
+      return;
+    }
     end(response.requestId, "problem", explain(response.code), false);
     return;
   }
@@ -242,6 +277,8 @@ function fromHost(message: unknown) {
     void deliver(request, response);
   } else if (response.type === "card_reply" && request.kind === "card" && answersCard(response, request.request)) {
     void deliverCard(request, response);
+  } else if (response.type === "passkey_reply" && request.kind === "passkey" && answersPasskey(response, request.request)) {
+    void deliverPasskey(request, response.credential);
   } else {
     finish(request, "problem", "The answer from Open Secret Manager was not for this page. Nothing was filled.");
   }
@@ -336,6 +373,83 @@ async function deliverCard(request: Waiting & { kind: "card" }, reply: CardReply
   else finish(request, "problem", "The card form is gone. Nothing was filled.");
 }
 
+/** Hands the page the credential, if the tab still shows a page of the origin that asked; the connection is its document's. */
+async function deliverPasskey(request: Waiting & { kind: "passkey" }, credential: string) {
+  if (await originNow(request.tabId) !== request.request.origin) {
+    finish(request, "problem", "The page changed before the passkey's answer arrived. Nothing was sent.");
+    return;
+  }
+  finish(request, "filled", "Open Secret Manager answered the page's request for a passkey.", { credential });
+}
+
+/** Whether the bridge's first message is a request: a call, its options as WebAuthn's JSON, and the page's time limit. */
+function isBridgeAsk(message: unknown): message is { type: "ask"; kind: "create" | "get"; options: string; timeout: number | null } {
+  if (typeof message !== "object" || message === null) return false;
+  const asked = message as Record<string, unknown>;
+  return asked.type === "ask" && (asked.kind === "create" || asked.kind === "get") && typeof asked.options === "string"
+    && asked.options.length > 0 && asked.options.length <= MAX_PASSKEY_OPTIONS && (asked.timeout === null || typeof asked.timeout === "number");
+}
+
+/**
+ * A page's call for a passkey, from the bridge in the page. The page's
+ * origin is the browser's: what it reports for the connection's sender,
+ * which must be the page itself, of an https address, and the origin of
+ * both that document's address and the tab's. One request per tab, and
+ * none from a site while it is paused; anything else goes on to the
+ * browser's own passkeys.
+ */
+function servePasskey(port: chrome.runtime.Port) {
+  const sender = port.sender;
+  const tabId = sender?.tab?.id;
+  const origin = sender?.origin ?? pageOrigin(sender?.url);
+  const refuse = () => {
+    try { port.postMessage(toBrowser()); port.disconnect(); } catch { /* the page went away */ }
+  };
+  if (tabId === undefined || sender?.frameId !== 0 || !origin || origin === "null" || pageOrigin(sender.url) !== origin || pageOrigin(sender.tab?.url) !== origin) {
+    refuse();
+    return;
+  }
+  let requestId: string | null = null;
+  port.onMessage.addListener((message: unknown) => {
+    if (requestId !== null) {
+      // The page's call was aborted.
+      if ((message as { type?: unknown } | null)?.type === "withdraw") end(requestId, "none", "", true, outcomeOf("cancelled"));
+      return;
+    }
+    if (!isBridgeAsk(message) || [...waiting.values()].some((other) => other.tabId === tabId) || (paused.get(origin) ?? 0) > Date.now()) {
+      refuse();
+      return;
+    }
+    const id = crypto.randomUUID();
+    requestId = id;
+    const giveUp = setTimeout(() => {
+      paused.set(origin, Date.now() + PASSKEY_PAUSE_MS);
+      end(id, "none", "", true, outcomeOf("expired"));
+    }, waitFor(message.timeout));
+    begin(id, { kind: "passkey", request: passkeyRequest(message.kind, id, tabId, origin, message.options), page: port, tabId, giveUp });
+  });
+  // The document went: a navigation, a reload, or the tab closing.
+  port.onDisconnect.addListener(() => { if (requestId !== null) end(requestId, "none", "", true); });
+}
+
+/** The scripts for passkeys, put into the page itself of every https page once the owner gives access to all sites. */
+const PASSKEY_SCRIPTS = [
+  { id: "passkey-page", js: ["passkey-page.js"], matches: ["https://*/*"], runAt: "document_start", world: "MAIN", allFrames: false, persistAcrossSessions: true },
+  { id: "passkey-bridge", js: ["passkey-bridge.js"], matches: ["https://*/*"], runAt: "document_start", world: "ISOLATED", allFrames: false, persistAcrossSessions: true },
+] satisfies chrome.scripting.RegisteredContentScript[];
+
+/** Brings the scripts for passkeys in line with the access the owner gave, one change at a time. */
+let following: Promise<void> = Promise.resolve();
+function followAccess() {
+  following = following.then(async () => {
+    const granted = await chrome.permissions.contains({ origins: ALL_SITES });
+    const registered = await chrome.scripting.getRegisteredContentScripts({ ids: PASSKEY_SCRIPTS.map((script) => script.id) });
+    if (granted && registered.length === PASSKEY_SCRIPTS.length) return;
+    if (registered.length > 0) await chrome.scripting.unregisterContentScripts({ ids: registered.map((script) => script.id) });
+    if (granted) await chrome.scripting.registerContentScripts(PASSKEY_SCRIPTS);
+  }).catch(() => { /* tried again at the next change or start */ });
+}
+
 /** Ends the request made in a tab, when the browser says the tab is gone. */
 function tabLeft(tabId: number) {
   for (const [requestId, request] of waiting) {
@@ -345,3 +459,9 @@ function tabLeft(tabId: number) {
 
 chrome.action.onClicked.addListener((tab) => { void ask(tab); });
 chrome.tabs.onRemoved.addListener(tabLeft);
+chrome.runtime.onConnect.addListener((port) => { if (port.name === "passkey") servePasskey(port); });
+chrome.permissions.onAdded.addListener(followAccess);
+chrome.permissions.onRemoved.addListener(followAccess);
+chrome.runtime.onInstalled.addListener(followAccess);
+chrome.runtime.onStartup.addListener(followAccess);
+followAccess();

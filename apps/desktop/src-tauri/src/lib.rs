@@ -1042,6 +1042,8 @@ pub fn run() {
             browser::fill_request,
             browser::approve_fill,
             browser::approve_card,
+            browser::approve_passkey,
+            browser::use_browser_passkey,
             browser::deny_fill,
             browser::browser_status,
             browser::connect_browser,

@@ -44,6 +44,8 @@ fn request_like() -> impl Strategy<Value = Value> {
     let kind = prop_oneof![
         Just(Value::from("fill_request")),
         Just(Value::from("cancel")),
+        Just(Value::from("passkey_create")),
+        Just(Value::from("passkey_get")),
         Just(Value::from("unlock")),
         any_json(),
     ];
@@ -55,6 +57,7 @@ fn request_like() -> impl Strategy<Value = Value> {
         Just("documentId".to_owned()),
         Just("origin".to_owned()),
         Just("username".to_owned()),
+        Just("options".to_owned()),
         "[a-zA-Z]{1,8}",
     ];
     let value = prop_oneof![
@@ -72,7 +75,15 @@ fn request_like() -> impl Strategy<Value = Value> {
         (-2_i64..3).prop_map(Value::from),
     ];
     (kind, prop::collection::vec((field, value), 0..8)).prop_map(|(kind, fields)| {
-        let mut message = json!({ "type": kind, "version": 1, "requestId": "r-1", "tabId": 1,
+        let version = if kind
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("passkey"))
+        {
+            2
+        } else {
+            1
+        };
+        let mut message = json!({ "type": kind, "version": version, "requestId": "r-1", "tabId": 1,
             "frameId": 0, "documentId": "d-1", "origin": "https://example.com" });
         for (name, value) in fields {
             message[name.as_str()] = value;
@@ -105,6 +116,13 @@ proptest! {
                 prop_assert!(origin.is_ok());
                 prop_assert_eq!(origin.unwrap().to_string(), card.top_origin.clone());
                 prop_assert!(!card.frames.is_empty() && card.frames.len() <= 8);
+            }
+            Ok(Request::PasskeyCreate(passkey) | Request::PasskeyGet(passkey)) => {
+                let origin = passkey.check();
+                prop_assert!(origin.is_ok());
+                prop_assert_eq!(origin.unwrap().to_string(), passkey.origin.clone());
+                prop_assert!(is_id(&passkey.request_id) && passkey.tab_id >= 0);
+                prop_assert!((1..=crate::MAX_PASSKEY_OPTIONS).contains(&passkey.options.len()));
             }
             Err(failure) => {
                 if let Some(id) = &failure.request_id {

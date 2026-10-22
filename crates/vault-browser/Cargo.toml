@@ -9,6 +9,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# For osm-fill only, which names passkeys by their credential IDs.
+base64ct = { version = "1.8.3", features = ["alloc"] }
 osm-browser-link = { path = "../browser-link" }
 osm-vault-core = { path = "../vault-core" }
 serde_json = "1.0.149"

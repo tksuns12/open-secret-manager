@@ -14,8 +14,17 @@ pub const VERSION: u32 = 1;
 /// an app that does not know it refuses it by its version or its type.
 pub const CARD_VERSION: u32 = 2;
 
+/// The protocol version of a passkey's request (Phase 18), the same as a
+/// card's: an app from before refuses it by its type.
+pub const PASSKEY_VERSION: u32 = 2;
+
 /// The most documents of a tab one card request may name.
 const MAX_FRAMES: usize = 8;
+
+/// The largest site's options a passkey's request carries, in bytes of
+/// JSON. A message is at most 64 KiB, and a site's options are a few
+/// hundred bytes.
+pub const MAX_PASSKEY_OPTIONS: usize = 32 * 1024;
 
 /// The name browsers know the native messaging host by.
 pub const HOST_NAME: &str = "org.opensecretmanager.native";
@@ -67,6 +76,17 @@ pub enum Refusal {
     Cancelled,
     /// The owner did not decide in time.
     Expired,
+    /// The vault holds no passkey the site takes (Phase 18): the browser's
+    /// own may answer.
+    NoPasskey,
+    /// The site's request is not one this app answers, such as one for a
+    /// domain no passkey may be for: the browser's own may answer.
+    PasskeyRefused,
+    /// The vault holds a passkey the site says it already has for the
+    /// account, so another is not made.
+    PasskeyExists,
+    /// The owner chose the browser's own passkeys for this request.
+    UseBrowser,
 }
 
 /// Asks for a login to be filled into one document of one tab.
@@ -192,6 +212,54 @@ impl CardRequest {
     }
 }
 
+/// Which call a page made of WebAuthn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ceremony {
+    /// `navigator.credentials.create`: make a passkey.
+    Create,
+    /// `navigator.credentials.get`: sign in with one.
+    Get,
+}
+
+/// Asks for a passkey for the page itself of one tab, to make one or to
+/// sign in with one: what a page asked of `navigator.credentials`, which
+/// the extension hands on as it was asked, while the owner was using the
+/// page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PasskeyRequest {
+    pub version: u32,
+    /// Chosen by the extension, at random, for this one request.
+    pub request_id: String,
+    pub tab_id: i64,
+    /// The page's origin, as the browser told the extension the document's
+    /// origin.
+    pub origin: String,
+    /// The site's options, as WebAuthn's JSON writes them
+    /// (`PublicKeyCredentialCreationOptionsJSON` or
+    /// `PublicKeyCredentialRequestOptionsJSON`), read by the desktop app.
+    pub options: String,
+}
+
+impl PasskeyRequest {
+    /// Checks everything that can be checked without the site's options and
+    /// returns the page's origin.
+    pub fn check(&self) -> Result<Origin, Refusal> {
+        if self.version != PASSKEY_VERSION {
+            return Err(Refusal::UnsupportedVersion);
+        }
+        if !is_id(&self.request_id)
+            || self.tab_id < 0
+            || self.options.is_empty()
+            || self.options.len() > MAX_PASSKEY_OPTIONS
+        {
+            return Err(Refusal::InvalidMessage);
+        }
+        Origin::parse(&self.origin).ok_or(Refusal::OriginRejected)
+    }
+}
+
 /// Withdraws a request, when its page went away.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -207,6 +275,8 @@ pub enum Request {
     FillRequest(FillRequest),
     Cancel(Cancel),
     CardRequest(CardRequest),
+    PasskeyCreate(PasskeyRequest),
+    PasskeyGet(PasskeyRequest),
 }
 
 impl Request {
@@ -230,6 +300,7 @@ impl Request {
         let version = match field("type").and_then(serde_json::Value::as_str) {
             Some("fill_request" | "cancel") => VERSION,
             Some("card_request") => CARD_VERSION,
+            Some("passkey_create" | "passkey_get") => PASSKEY_VERSION,
             Some(_) => return Err(refuse(Refusal::UnsupportedMessage)),
             None => return Err(refuse(Refusal::InvalidMessage)),
         };
@@ -244,6 +315,9 @@ impl Request {
             }
             Self::CardRequest(card) => {
                 card.check().map_err(refuse)?;
+            }
+            Self::PasskeyCreate(passkey) | Self::PasskeyGet(passkey) => {
+                passkey.check().map_err(refuse)?;
             }
             Self::Cancel(cancel) => {
                 if !is_id(&cancel.request_id) {
@@ -359,6 +433,29 @@ impl CardReply {
     }
 }
 
+/// What the owner's passkey sends the page, for the one request it answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PasskeyReply {
+    pub request_id: String,
+    pub tab_id: i64,
+    pub origin: String,
+    /// The credential, as WebAuthn's JSON writes it
+    /// (`RegistrationResponseJSON` or `AuthenticationResponseJSON`): what
+    /// the page's call returns. It holds no secret: it is for the site.
+    pub credential: String,
+}
+
+impl PasskeyReply {
+    /// Whether this is a reply to exactly `request`: the same request, tab,
+    /// and origin.
+    pub fn answers(&self, request: &PasskeyRequest) -> bool {
+        self.request_id == request.request_id
+            && self.tab_id == request.tab_id
+            && self.origin == request.origin
+    }
+}
+
 /// A refusal, for the request it names if it names one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -392,6 +489,7 @@ pub enum Response {
     FillReply(FillReply),
     Error(Failure),
     CardReply(CardReply),
+    PasskeyReply(PasskeyReply),
 }
 
 impl Response {
@@ -408,7 +506,7 @@ impl Response {
             Self::Error(failure) => {
                 failure.request_id.as_deref() == Some(request.request_id.as_str())
             }
-            Self::CardReply(_) => false,
+            Self::CardReply(_) | Self::PasskeyReply(_) => false,
         }
     }
 
@@ -420,7 +518,19 @@ impl Response {
             Self::Error(failure) => {
                 failure.request_id.as_deref() == Some(request.request_id.as_str())
             }
-            Self::FillReply(_) => false,
+            Self::FillReply(_) | Self::PasskeyReply(_) => false,
+        }
+    }
+
+    /// As [`Response::answers`], for a passkey's request.
+    pub fn answers_passkey(&self, request: &PasskeyRequest) -> bool {
+        match self {
+            Self::Waiting(waiting) => waiting.request_id == request.request_id,
+            Self::PasskeyReply(reply) => reply.answers(request),
+            Self::Error(failure) => {
+                failure.request_id.as_deref() == Some(request.request_id.as_str())
+            }
+            Self::FillReply(_) | Self::CardReply(_) => false,
         }
     }
 
@@ -492,6 +602,16 @@ pub struct Forwarded {
 pub struct ForwardedCard {
     pub caller: Caller,
     pub card: CardRequest,
+}
+
+/// What the host passes to the desktop session for a passkey: a request it
+/// has checked, which call it is, and who made it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForwardedPasskey {
+    pub caller: Caller,
+    pub ceremony: Ceremony,
+    pub passkey: PasskeyRequest,
 }
 
 #[cfg(test)]

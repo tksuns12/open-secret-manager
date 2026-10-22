@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Open Secret Manager</title>
+<style>
+  :root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }
+  body { max-width: 36rem; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 18px; }
+  label { display: flex; gap: 10px; align-items: flex-start; font-weight: 600; }
+  input { margin-top: 4px; }
+  p { margin: 8px 0; }
+  #state { color: GrayText; }
+</style>
+</head>
+<body>
+<h1>Open Secret Manager</h1>
+<label><input type="checkbox" id="all-sites"> Take part in sign-ins with passkeys, and fill card fields in a payment provider's frame</label>
+<p>With this on, the extension can read and change every https page you open, and puts a small script into each of them. A page's call for a passkey then goes to Open Secret Manager, which asks you what to do; one the app does not answer goes to the browser's own passkeys. A card's number in another site's frame, as a payment provider's, can then be filled when you press the button.</p>
+<p>With it off, the extension reaches only the page you press its button on, and runs nothing in pages otherwise.</p>
+<p id="state" aria-live="polite"></p>
+<script src="options.js"></script>
+</body>
+</html>

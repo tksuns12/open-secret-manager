@@ -76,6 +76,19 @@ let previewCardFill: FillAsked | null = previewAsks("card-fill") ? {
   },
 } : null;
 
+/** With `?passkey-create` or `?passkey-get`: a page's request for a passkey for example.com. */
+let previewPasskey: FillAsked | null = previewAsks("passkey-create") || previewAsks("passkey-get") ? {
+  requestId: "preview-passkey", origin: "https://login.example.com", browser: "Chromium", secondsLeft: 120, session: "preview",
+  logins: [], notOffered: [],
+  passkey: previewAsks("passkey-create") ? {
+    ceremony: "create", rpId: "example.com", rpName: "Example", userName: "hello@northstar.dev", userDisplayName: "Northstar", verification: "required",
+    passkeys: [], logins: [{ id: "1", title: "Proton Mail", username: "hello@northstar.dev", url: "https://example.com", conflict: false }], ownerCheck: true,
+  } : {
+    ceremony: "get", rpId: "example.com", rpName: "", userName: "", userDisplayName: "", verification: "discouraged",
+    passkeys: [{ itemId: "2", title: "GitHub", credentialId: "cHJldmlldy1wYXNza2V5", userName: "northstar-labs", userDisplayName: "Northstar Labs" }], logins: [], ownerCheck: false,
+  },
+} : null;
+
 /** With `?held`: changes written by a device that was removed, waiting for the owner. */
 let previewHeld: HeldChange[] = previewAsks("held") ? [
   { revision: "preview-held-new", device: "7c41d09e", removedDevice: true, change: "new", title: "Old router", username: "admin", url: "192.168.0.1", changed: [] },
@@ -376,7 +389,7 @@ export const bridge: DesktopBridge = {
   // has one only when its address asks (`?card-fill`).
   async fillRequest() {
     const invoke = native();
-    return invoke ? ((await invoke("fill_request")) as FillAsked | null) : previewCardFill;
+    return invoke ? ((await invoke("fill_request")) as FillAsked | null) : previewCardFill ?? previewPasskey;
   },
   approveFill: (requestId, itemId, session) => nativeOnly("approve_fill", { requestId, itemId, session }),
   async approveCard(requestId, itemId, session) {
@@ -384,10 +397,28 @@ export const bridge: DesktopBridge = {
     if (invoke) { await invoke("approve_card", { requestId, itemId, session }); return; }
     previewCardFill = null;
   },
+  async approvePasskey(requestId, session, choice) {
+    const invoke = native();
+    if (invoke) {
+      await invoke("approve_passkey", { requestId, session, into: choice.into ?? null, itemId: choice.itemId ?? null, credentialId: choice.credentialId ?? null, password: choice.password ?? null, ownerCheck: Boolean(choice.ownerCheck) });
+      return;
+    }
+    // The preview's device password is anything but empty; a site that asks
+    // to verify the owner gets nothing without it or the system's check.
+    if (previewPasskey?.passkey?.verification !== "discouraged" && !choice.ownerCheck && !choice.password) throw { code: "not_verified" };
+    if (choice.password === "wrong") throw { code: "wrong_password" };
+    previewPasskey = null;
+  },
+  async useBrowserPasskey(requestId) {
+    const invoke = native();
+    if (invoke) { await invoke("use_browser_passkey", { requestId }); return; }
+    previewPasskey = null;
+  },
   async denyFill(requestId) {
     const invoke = native();
     if (invoke) { await invoke("deny_fill", { requestId }); return; }
     if (previewCardFill) { previewCardFill = null; return; }
+    if (previewPasskey) { previewPasskey = null; return; }
     throw new Error("preview");
   },
   async browserStatus() {

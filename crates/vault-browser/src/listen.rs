@@ -9,7 +9,7 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{self, Body, Prefix},
-    Forwarded, ForwardedCard, Refusal, Response, Waiting,
+    Forwarded, ForwardedCard, ForwardedPasskey, Refusal, Response, Waiting,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -148,13 +148,20 @@ async fn converse(mut stream: UnixStream, desk: &Desk) {
     let Ok(Ok(body)) = timeout(config.exchange_within, read_frame(&mut stream)).await else {
         return;
     };
-    // A login's request, or a card's.
-    let (caller, asked) = match serde_json::from_slice::<Forwarded>(&body) {
-        Ok(Forwarded { caller, request }) => (caller, Asked::Login(request)),
-        Err(_) => match serde_json::from_slice::<ForwardedCard>(&body) {
-            Ok(ForwardedCard { caller, card }) => (caller, Asked::Card(card)),
-            Err(_) => return,
-        },
+    // A login's request, a card's, or a passkey's.
+    let (caller, asked) = if let Ok(Forwarded { caller, request }) = serde_json::from_slice(&body) {
+        (caller, Asked::Login(request))
+    } else if let Ok(ForwardedCard { caller, card }) = serde_json::from_slice(&body) {
+        (caller, Asked::Card(card))
+    } else if let Ok(ForwardedPasskey {
+        caller,
+        ceremony,
+        passkey,
+    }) = serde_json::from_slice(&body)
+    {
+        (caller, Asked::Passkey(ceremony, passkey))
+    } else {
+        return;
     };
     let request_id = asked.request_id().to_owned();
     let (ticket, deadline, mut answered) = match desk.submit(caller, asked) {

@@ -11,8 +11,9 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{self, Prefix},
-    Caller, CardField, CardFrame, CardRequest, FillRequest, Forwarded, ForwardedCard, Refusal,
-    Response, Waiting, CARD_VERSION, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, VERSION,
+    Caller, CardField, CardFrame, CardRequest, Ceremony, FillRequest, Forwarded, ForwardedCard,
+    ForwardedPasskey, PasskeyRequest, Refusal, Response, Waiting, CARD_VERSION,
+    CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, PASSKEY_VERSION, VERSION,
 };
 use osm_vault_core::{Item, ItemKind, Vault};
 use tauri::{
@@ -491,6 +492,166 @@ fn a_card_request_shows_its_documents_and_cards_and_sends_the_card_chosen() {
             ("Owner", "4111111111111111", "123", "")
         );
         until_idle(&handle).await;
+    });
+}
+
+/// A page's request for a passkey for example.com, from login.example.com.
+fn passkey_request(id: &str, ceremony: Ceremony) -> ForwardedPasskey {
+    let options = match ceremony {
+        Ceremony::Create => serde_json::json!({
+            "rp": { "id": "example.com", "name": "Example" },
+            "user": { "id": "AQIDBA", "name": "owner@example.com", "displayName": "Owner" },
+            "challenge": "Y2hhbGxlbmdlIG9mIGEgc2l0ZQ",
+            "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }],
+            "authenticatorSelection": { "userVerification": "required" },
+        }),
+        Ceremony::Get => serde_json::json!({
+            "challenge": "c2lnbi1pbi1jaGFsbGVuZ2U",
+            "rpId": "example.com",
+            "userVerification": "discouraged",
+        }),
+    };
+    ForwardedPasskey {
+        caller: Caller::Firefox(FIREFOX_EXTENSION_ID.into()),
+        ceremony,
+        passkey: PasskeyRequest {
+            version: PASSKEY_VERSION,
+            request_id: id.into(),
+            tab_id: 4,
+            origin: "https://login.example.com".into(),
+            options: options.to_string(),
+        },
+    }
+}
+
+#[test]
+fn a_pages_passkey_is_made_once_the_owner_is_verified_and_a_sign_in_without_one_is_the_browsers() {
+    let dir = folder();
+    let on_site = login("Example", "https://example.com/");
+    {
+        let (mut vault, _) = Vault::create(dir.path().join("vault.sqlite3"), PASSWORD).unwrap();
+        vault.put(on_site.clone()).unwrap();
+    }
+    let app = shell(dir.path(), dir.path(), None);
+    let handle = app.handle().clone();
+    let folder = dir.path().to_owned();
+    tauri::async_runtime::block_on(async move {
+        browser::start(&handle);
+        unlock(&handle).await;
+
+        // The vault holds no passkey for the site: a sign-in is the
+        // browser's, at once, and the window is asked nothing.
+        let mut host = Host::bring(&folder, &passkey_request("none", Ceremony::Get)).await;
+        assert_eq!(
+            host.next().await,
+            Some(Response::refusal("none", Refusal::NoPasskey))
+        );
+        assert!(browser::fill_request(handle.state())
+            .await
+            .unwrap()
+            .is_none());
+
+        let wanted = passkey_request("make", Ceremony::Create);
+        let mut host = Host::bring(&folder, &wanted).await;
+        assert_eq!(host.next().await, waiting("make"));
+        let shown = asked(&handle, "make").await;
+        let sent = serde_json::to_value(&shown).unwrap();
+        assert_eq!(sent["passkey"]["ceremony"], "create");
+        assert_eq!(sent["passkey"]["rpId"], "example.com");
+        assert_eq!(sent["passkey"]["userName"], "owner@example.com");
+        assert_eq!(sent["passkey"]["verification"], "required");
+        assert_eq!(sent["passkey"]["logins"][0]["id"], on_site.id.as_str());
+        assert_eq!(sent["origin"], "https://login.example.com");
+        assert_eq!(sent["browser"], "Firefox");
+        assert!(sent["logins"].as_array().unwrap().is_empty());
+        let unlock = shown.session.clone().unwrap();
+        let approve = |password: Option<&str>| {
+            browser::approve_passkey(
+                "make".into(),
+                unlock.clone(),
+                Some(on_site.id.clone()),
+                None,
+                None,
+                password.map(Into::into),
+                false,
+                handle.state(),
+                handle.clone(),
+            )
+        };
+        // The site requires the owner verified: not without, nor with
+        // another password.
+        assert_eq!(code(approve(None).await), "not_verified");
+        assert_eq!(
+            code(approve(Some("not the password")).await),
+            "wrong_password"
+        );
+        host.is_quiet().await;
+        approve(Some(PASSWORD)).await.unwrap();
+        let Some(Response::PasskeyReply(reply)) = host.answer().await else {
+            panic!("a passkey")
+        };
+        assert!(reply.answers(&wanted.passkey));
+        let credential: serde_json::Value = serde_json::from_str(&reply.credential).unwrap();
+        assert_eq!(credential["type"], "public-key");
+        until_idle(&handle).await;
+        {
+            let state = handle.state::<AppState>();
+            let vault = state.vault.lock().await;
+            let held = vault
+                .as_ref()
+                .unwrap()
+                .get(&on_site.id)
+                .unwrap()
+                .item
+                .passkeys
+                .len();
+            assert_eq!(held, 1);
+        }
+
+        // Signed in with it; or the browser's own, as the owner chooses.
+        let mut host = Host::bring(&folder, &passkey_request("sign", Ceremony::Get)).await;
+        assert_eq!(host.next().await, waiting("sign"));
+        let shown = asked(&handle, "sign").await;
+        let passkeys = &shown.passkey.as_ref().unwrap().passkeys;
+        assert_eq!(passkeys.len(), 1);
+        let (item, chosen) = (
+            passkeys[0].item_id.clone(),
+            passkeys[0].credential_id.clone(),
+        );
+        assert_eq!(chosen, credential["id"].as_str().unwrap());
+        browser::approve_passkey(
+            "sign".into(),
+            shown.session.clone().unwrap(),
+            None,
+            Some(item),
+            Some(chosen),
+            None,
+            false,
+            handle.state(),
+            handle.clone(),
+        )
+        .await
+        .unwrap();
+        let Some(Response::PasskeyReply(_)) = host.answer().await else {
+            panic!("a sign-in")
+        };
+        let mut host = Host::bring(&folder, &passkey_request("browser", Ceremony::Get)).await;
+        assert_eq!(host.next().await, waiting("browser"));
+        asked(&handle, "browser").await;
+        browser::use_browser_passkey("browser".into(), handle.state(), handle.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            host.answer().await,
+            Some(Response::refusal("browser", Refusal::UseBrowser))
+        );
+        assert_eq!(
+            code(
+                browser::use_browser_passkey("browser".into(), handle.state(), handle.clone())
+                    .await
+            ),
+            "fill_ended"
+        );
     });
 }
 
