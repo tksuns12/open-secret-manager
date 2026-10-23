@@ -433,7 +433,7 @@ function accessCopy(home) {
   const copy = path.join(home, "extension-with-access");
   cpSync(path.resolve(here, "../dist/chromium"), copy, { recursive: true });
   const manifest = JSON.parse(readFileSync(path.join(copy, "manifest.json"), "utf8"));
-  manifest.host_permissions = ["<all_urls>"];
+  manifest.host_permissions = ["https://*/*"];
   writeFileSync(path.join(copy, "manifest.json"), JSON.stringify(manifest));
   return copy;
 }

@@ -32,7 +32,7 @@
     }
   },
   "optional_host_permissions": [
-    "<all_urls>"
+    "https://*/*"
   ],
   "options_ui": {
     "page": "options.html",

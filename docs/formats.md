@@ -307,7 +307,7 @@ The app does not point a browser at a host whose path has a folder named `AppTra
 
 ### Extension (Phase 5, stop 3)
 
-One source builds an extension for Chromium and one for Firefox (`dist/chromium`, `dist/firefox`), each with its manifest. Both ask for `activeTab`, `scripting`, and `nativeMessaging`, and for nothing else: no host permissions, no content script declared for any page, no storage. Since Phase 18, stop 6, both may also be given access to all sites (`optional_host_permissions: ["<all_urls>"]`), only by the owner, on the extension's options page (below); Firefox's minimum is then 128. The Chromium manifest's `key` gives the extension the ID the host allows.
+One source builds an extension for Chromium and one for Firefox (`dist/chromium`, `dist/firefox`), each with its manifest. Both ask for `activeTab`, `scripting`, and `nativeMessaging`, and for nothing else: no host permissions, no content script declared for any page, no storage. Since Phase 18, stop 6, both may also be given access to all `https` sites (`optional_host_permissions: ["https://*/*"]`, not `<all_urls>`, which would also take plain http pages and the computer's own files, a second switch in Firefox), only by the owner, on the extension's options page (below); Firefox's minimum is then 128. The Chromium manifest's `key` gives the extension the ID the host allows.
 
 The extension acts on a press of its toolbar button (or the keyboard shortcut the owner may assign to it), which is what gives it access to that one tab:
 

@@ -39,8 +39,8 @@ const PAGE_ANSWERS_WITHIN_MS = 5_000;
 const FILLED_MARK_MS = 6_000;
 /** How long a site's requests for passkeys go to the browser's own after the owner turned one down, or let it run out. */
 const PASSKEY_PAUSE_MS = 60_000;
-/** The access the owner gives on the options page: every site. */
-const ALL_SITES = ["<all_urls>"];
+/** The access the owner gives on the options page: every https site, which is all the extension ever serves. */
+const ALL_SITES = ["https://*/*"];
 
 /** How a card's fields are named to the owner. */
 const CARD_FIELD_NAMES: Record<CardField, string> = {

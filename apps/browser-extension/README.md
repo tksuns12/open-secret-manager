@@ -17,6 +17,10 @@ button:
    the tab shows, and puts the user name and password into the form. It
    does not submit the form.
 
+A card goes the same way into a checkout form, the card's fields into the
+page and into its frames of the same site; the app shows which field goes
+where.
+
 If the page goes away while the request waits (a navigation, a reload, the
 tab closing), the request is withdrawn and a late answer is dropped.
 
@@ -26,9 +30,10 @@ filled.
 
 ## What it can and cannot do
 
-Its permissions are `activeTab`, `scripting`, and `nativeMessaging`. It has
-no access to any page until you press the button on that page, and then
-only to that tab. It runs nothing in pages otherwise, stores nothing, and
+Its permissions are `activeTab`, `scripting`, and `nativeMessaging`, and
+access to all sites only if you turn it on (below). Without that, it has
+no access to a page until you press the button on that page, and then only
+to that tab. It runs nothing in pages otherwise, stores nothing, and
 shows nothing inside a page. It never receives a list of what your vault
 holds: the app shows the choices, and sends back only the one login you
 picked.
@@ -47,9 +52,9 @@ not there. The access also lets a press fill a card's number into a
 payment provider's frame, which is another site. With the switch off,
 nothing of the extension runs in pages. Firefox 128 or later is needed.
 
-It does not save logins, fill on its own, fill one-time codes, or fill
-forms inside frames. A login is offered only for the exact origin of its
-stored address; see [the format contract](../../docs/formats.md#implemented-fill-protocol-phase-5-stop-1).
+It does not save logins or cards, fill on its own, or fill one-time codes,
+and it fills a login only into the page itself, never into a frame. A
+login is offered only for the exact origin of its stored address; see [the format contract](../../docs/formats.md#implemented-fill-protocol-phase-5-stop-1).
 
 ## Building and loading
 

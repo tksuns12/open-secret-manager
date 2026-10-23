@@ -3,7 +3,10 @@
 // the owner when it is turned on; the background follows what was granted
 // (see followAccess in background.ts).
 
-const ALL_SITES = { origins: ["<all_urls>"] };
+// Only https sites, all the extension serves: `<all_urls>` would also take
+// plain http pages and the computer's own files, which Firefox lists as a
+// second switch.
+const ALL_SITES = { origins: ["https://*/*"] };
 const box = document.getElementById("all-sites") as HTMLInputElement;
 const state = document.getElementById("state") as HTMLElement;
 
