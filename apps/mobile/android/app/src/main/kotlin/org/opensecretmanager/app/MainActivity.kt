@@ -410,6 +410,13 @@ internal fun Unlock(
 ) {
     var password by remember { mutableStateOf("") }
     var keepForFingerprint by remember { mutableStateOf(false) }
+    // A fingerprint is asked for at once, when the app comes back or a
+    // request's screen opens (see VaultSession.takeAskAtOnce): once, so
+    // "Use the password" and the owner's own Lock leave the screen as it is.
+    LifecycleResumeEffect(Unit) {
+        if (session.takeAskAtOnce() && biometric.available && biometric.enabled) onUnlockWithBiometric()
+        onPauseOrDispose { }
+    }
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Vault locked", style = MaterialTheme.typography.titleLarge, modifier = Modifier.testTag("locked"))
         SecretField(password, { password = it }, "This phone's password", "password")

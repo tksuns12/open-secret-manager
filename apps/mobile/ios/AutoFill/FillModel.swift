@@ -41,6 +41,10 @@ final class FillModel: ObservableObject {
     private var device: Device?
     /// The request ended: a device still opening is let go at once.
     private var closed = false
+    /// A face or a finger was asked for as the screen showed: see `askAtOnce`.
+    private var askedAtOnce = false
+    /// A face or a finger is being asked for: a second ask would cancel it.
+    private var asking = false
     /// For each offered login, the origin it is filled for.
     private var originOf: [String: String] = [:]
     private let onFill: (FillCredentials) -> Void
@@ -121,13 +125,24 @@ final class FillModel: ObservableObject {
         }
     }
 
+    /// Asks for a face or a finger as the screen first shows the vault
+    /// locked, once per request, if a password is kept for one.
+    func askAtOnce() {
+        guard !askedAtOnce else { return }
+        askedAtOnce = true
+        if biometric.available && biometric.enabled { unlockWithBiometrics() }
+    }
+
     func unlockWithBiometrics() {
+        guard !asking else { return }
+        asking = true
         Task {
             let biometric = biometric
             let reason = saving != nil ? "Unlock the vault to save a login" : inserting ? "Unlock the vault to insert text" : "Unlock the vault to fill a login"
             let outcome = await withCheckedContinuation { continuation in
                 DispatchQueue.global().async { continuation.resume(returning: biometric.read(reason: reason)) }
             }
+            asking = false
             let password: String
             switch outcome {
             case let .password(kept): password = kept

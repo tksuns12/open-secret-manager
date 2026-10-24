@@ -72,9 +72,9 @@ final class AutoFillTests: UITestCase {
         // iOS says nothing of where the text goes.
         XCTAssertEqual(screen.staticTexts["asker"].label, "Into the field you chose")
         XCTAssertFalse(screen.buttons["insert:Visa"].exists)
-        // A matching face, shown until it takes.
-        let useFace = screen.buttons["unlock-biometric"]
-        useFace.waitAndTap(timeout: 30)
+        // A matching face, shown until it takes: the screen asks for one as
+        // it opens.
+        XCTAssert(screen.buttons["unlock-biometric"].waitForExistence(timeout: 30))
         let deadline = Date().addingTimeInterval(45)
         while !screen.buttons["insert:Visa"].exists && Date() < deadline {
             notify_post("com.apple.BiometricKit_Sim.pearl.match")

@@ -88,7 +88,7 @@ class DeviceTest {
             // The owner's edits cross the other way, unicode and all.
             val draft = ItemDraft(
                 title = "Forum", kind = ItemKind.LOGIN, username = "me", url = "https://forum.example.test",
-                notes = "", favorite = false, password = "新しい 🔑 \"pass\"", oneTimeCodeSecret = null,
+                notes = "", favorite = false, password = "新しい 🔑 \"pass\"", oneTimeCodeSecret = null, card = null,
             )
             val created = device.createItem(draft)
             assertEquals("新しい 🔑 \"pass\"", device.password(created))

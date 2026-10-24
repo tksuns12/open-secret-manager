@@ -81,9 +81,10 @@ class SaveActivity : FragmentActivity() {
             return
         }
         val session = (application as VaultApp).session
-        val biometric = BiometricUnlock(this)
-        val prompts = FingerprintPrompts(this, biometric, session)
+        if (savedInstanceState == null) session.askAtOnceNext()
         val requester = save?.let { Requester.of(this, it.form) }
+        val biometric = BiometricUnlock(this)
+        val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 SaveScreen(

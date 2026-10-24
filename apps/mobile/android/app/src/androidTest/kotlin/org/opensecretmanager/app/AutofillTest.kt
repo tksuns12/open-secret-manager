@@ -282,6 +282,35 @@ class AutofillTest {
         assertNull(device.findObject(By.text("Mail")))
     }
 
+    /**
+     * With the password kept for a fingerprint, the fill screen asks for one
+     * as it opens, and a touch of the sensor (scripts/test-mobile.sh) unlocks
+     * it with no tap. Skipped where no strong biometric is enrolled.
+     */
+    @Test
+    fun withAFingerprintTheFillScreenAsksForItAtOnce() {
+        val biometric = BiometricUnlock(context)
+        assumeTrue(biometric.available)
+        Requester.trustedForTests += FIXTURE
+        try {
+            // Unlocked with the password, which a fingerprint then keeps.
+            openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test").click()
+            find(mine("remember-biometric"), 60_000).click()
+            find(mine("password")).text = password
+            find(mine("unlock")).click()
+            waitUntil("the password kept for a fingerprint") { biometric.enabled }
+            find(mine("fill:Mail"), 30_000).click()
+            assertFilled("owner@example.test|third password, with ünïcödé")
+            assertLockedAgain()
+
+            openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test").click()
+            find(mine("fill:Mail"), 60_000).click()
+            assertFilled("owner@example.test|third password, with ünïcödé")
+        } finally {
+            biometric.disable()
+        }
+    }
+
     @Test
     fun whileUnlockedAnAppIsListedTheLoginsChosenForItUntilTheTimeRunsOut() {
         StayUnlocked.millisForTests = 60_000L

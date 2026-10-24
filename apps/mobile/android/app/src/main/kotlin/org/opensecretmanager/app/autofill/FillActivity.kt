@@ -88,6 +88,7 @@ class FillActivity : FragmentActivity() {
         setResult(RESULT_CANCELED)
         form = intent.extras?.let(Form::fromBundle) ?: return finish()
         val session = (application as VaultApp).session
+        if (savedInstanceState == null) session.askAtOnceNext()
         val requester = Requester.of(this, form)
         this.requester = requester
         val appLogins = AppLogins(this)
@@ -111,7 +112,7 @@ class FillActivity : FragmentActivity() {
 
     private fun show(session: VaultSession, requester: Requester?, appLogins: AppLogins, chosen: String?) {
         val biometric = BiometricUnlock(this)
-        val prompts = FingerprintPrompts(this, biometric, session)
+        val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 FillScreen(

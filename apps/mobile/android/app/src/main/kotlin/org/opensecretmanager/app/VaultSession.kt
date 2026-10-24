@@ -6,6 +6,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -97,6 +98,13 @@ class VaultSession(private val context: Context, private val folder: File) {
     @Volatile private var lockAt: Long? = null
     /** Locks the vault once the time it stays unlocked for has run out. */
     private var lockLater: Job? = null
+    /**
+     * Whether the next locked vault shown asks for a fingerprint at once:
+     * when the app starts or comes back, or a fill, save, or passkey screen
+     * opens ([askAtOnceNext]); not after the owner's own Lock. The first
+     * unlock screen shown takes it ([takeAskAtOnce]).
+     */
+    private val askAtOnce = AtomicBoolean(true)
 
     init {
         openDevice()
@@ -188,7 +196,9 @@ class VaultSession(private val context: Context, private val folder: File) {
         if (onUnlocked != null) withContext(Dispatchers.Main) { onUnlocked() }
     }
 
+    /** The owner's own Lock, which asks for no fingerprint until the app leaves the screen. */
     fun lock(): Job {
+        askAtOnce.set(false)
         lockLater?.cancel()
         return run(null) {
             lockAt = null
@@ -196,6 +206,16 @@ class VaultSession(private val context: Context, private val folder: File) {
             refresh()
         }
     }
+
+    /** A fill, save, or passkey screen opened: its unlock asks for a fingerprint at once. */
+    fun askAtOnceNext() = askAtOnce.set(true)
+
+    /**
+     * Whether the unlock screen now shown asks for a fingerprint at once;
+     * the one shown after it does not, unless the app left the screen or
+     * another request opened meanwhile.
+     */
+    fun takeAskAtOnce(): Boolean = askAtOnce.getAndSet(false)
 
     /** Locks the vault, and lets go of what the screens held of it. Under [calls]. */
     private fun lockVault(device: Device) {
@@ -682,6 +702,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      */
     fun onBackground() {
         inFront = false
+        askAtOnce.set(true)
         foreground?.cancel()
         foreground = null
         val stay = StayUnlocked.millis(context)
@@ -715,6 +736,7 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     /** The phone's screen turned off: lock at once, whatever the time the vault would stay unlocked for. */
     fun onScreenOff() {
+        askAtOnce.set(true)
         lockLater?.cancel()
         lockLater = null
         run(null) {

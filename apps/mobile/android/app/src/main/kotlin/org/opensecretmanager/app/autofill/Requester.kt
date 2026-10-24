@@ -24,6 +24,13 @@ sealed interface Requester {
             is App -> claimedDomain?.removePrefix("www.") ?: label
         }
 
+    /** Who asks, in a line: under a fingerprint prompt, which covers the screen that names them. */
+    val said: String
+        get() = when (this) {
+            is Web -> "For ${origin.removePrefix("https://")}, in $browserLabel"
+            is App -> "For the app $label"
+        }
+
     /**
      * A page of `origin` (`https://host`), shown by a trusted browser. A
      * browser reports the page's host and scheme only, not its port.

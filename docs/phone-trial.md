@@ -124,6 +124,13 @@ and whether the phone synced at home after both apps were updated.
 - At an unlock, tick "Unlock with a fingerprint next time" (Android) or
   "Unlock with Face ID / Touch ID next time" (iOS). Lock, then unlock with
   the finger or face alone.
+- Leave the app until it locks, and open it again: the phone asks for the
+  finger or face at once, with no tap. So does a fill, save, or passkey
+  screen that opens locked. After the app's own Lock button it asks
+  nothing until "Use a fingerprint" is tapped, and after "Use the password"
+  or a cancel it does not ask again.
+- Fail the fingerprint until the phone stops trying: the app says to use
+  the password.
 - Enroll another finger or face in the phone's settings, then try again: the
   app should ask for the password once.
 - In the list, choose "Change this phone's password…", type the current

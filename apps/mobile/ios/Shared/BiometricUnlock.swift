@@ -81,7 +81,8 @@ struct BiometricUnlock {
         checked.wait()
         guard passed else {
             switch (failure as? LAError)?.code {
-            case .userCancel?, .userFallback?, .appCancel?: return .cancelled
+            // Turned away, the password chosen, or the screen left meanwhile.
+            case .userCancel?, .userFallback?, .appCancel?, .systemCancel?, .notInteractive?: return .cancelled
             case .biometryLockout?: return .failed("\(name) is locked after too many tries · use the password")
             case .biometryNotEnrolled?, .biometryNotAvailable?: return .failed("\(name) is not set up on this phone · use the password")
             default: return .failed(failure?.localizedDescription ?? "\(name) did not unlock")

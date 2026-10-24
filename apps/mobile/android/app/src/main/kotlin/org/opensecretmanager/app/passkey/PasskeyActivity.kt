@@ -112,6 +112,7 @@ class PasskeyActivity : FragmentActivity() {
         }
         setResult(RESULT_CANCELED)
         session = (application as VaultApp).session
+        if (savedInstanceState == null) session.askAtOnceNext()
         asked = read(intent) ?: return finish()
         startedLocked = session.state.value.screen != Screen.UNLOCKED
         val current = asked
@@ -131,7 +132,7 @@ class PasskeyActivity : FragmentActivity() {
         background?.let(window::setBackgroundDrawable)
         background = null
         val biometric = BiometricUnlock(this)
-        val prompts = FingerprintPrompts(this, biometric, session)
+        val prompts = FingerprintPrompts(this, biometric, session, asked.asker?.requester?.said)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 PasskeyScreen(asked, session, biometric, prompts, this)
@@ -193,7 +194,7 @@ class PasskeyActivity : FragmentActivity() {
         ).authenticate(
             BiometricPrompt.PromptInfo.Builder()
                 .setTitle(title)
-                .setSubtitle(asked.asker?.requester?.let(::said) ?: "")
+                .setSubtitle(asked.asker?.requester?.said ?: "")
                 .setAllowedAuthenticators(allowed)
                 .build(),
         )
@@ -328,12 +329,6 @@ internal sealed interface Asked {
     data class Unlock(val request: BeginGetCredentialRequest) : Asked {
         override val asker: PasskeyAsker? get() = null
     }
-}
-
-/** Who asks, as a line under the phone's check. */
-private fun said(requester: Requester): String = when (requester) {
-    is Requester.Web -> "For ${requester.origin.removePrefix("https://")}, in ${requester.browserLabel}"
-    is Requester.App -> "For the app ${requester.label}"
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)

@@ -12,7 +12,8 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   build. Neither is committed.
 - `app`: the app. It joins a vault from a computer by invitation and
   comparison of codes, unlocks with its own password or, once turned on,
-  a fingerprint, lists and searches the items, copies a username,
+  a fingerprint, which it asks for as soon as it shows the vault locked,
+  lists and searches the items, copies a username,
   password, or one-time code, creates, edits, and deletes logins and
   secure notes, shows an item's history and the items deleted,
   restoring a login or note from either, and changes its own password. It
@@ -75,7 +76,8 @@ synchronized with these):
 
 - `App`: the app, in SwiftUI. It joins a vault from a computer by
   invitation and comparison of codes, unlocks with its own password or,
-  once turned on, Face ID or Touch ID, lists and searches the items,
+  once turned on, Face ID or Touch ID, which it asks for as soon as it
+  shows the vault locked, lists and searches the items,
   copies a username, password, or one-time code, creates, edits, and
   deletes logins and secure notes, shows an item's history and the
   items deleted, restoring a login or note from either, and changes its

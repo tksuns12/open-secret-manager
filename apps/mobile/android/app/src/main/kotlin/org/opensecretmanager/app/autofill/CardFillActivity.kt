@@ -77,6 +77,7 @@ class CardFillActivity : FragmentActivity() {
         setResult(RESULT_CANCELED)
         form = intent.extras?.let(CardForm::fromBundle) ?: return finish()
         val session = (application as VaultApp).session
+        if (savedInstanceState == null) session.askAtOnceNext()
         val requester = Requester.of(this, form)
         val chosen = intent.getStringExtra(ITEM)
         if (chosen == null || requester == null) return show(session, requester, null)
@@ -95,7 +96,7 @@ class CardFillActivity : FragmentActivity() {
 
     private fun show(session: VaultSession, requester: Requester?, chosen: String?) {
         val biometric = BiometricUnlock(this)
-        val prompts = FingerprintPrompts(this, biometric, session)
+        val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 CardFillScreen(form, requester, chosen, session, biometric, prompts, onFill = ::finishWith, onCancel = ::finish)

@@ -50,6 +50,12 @@ final class VaultModel: ObservableObject {
     private let queue = DispatchQueue(label: "org.opensecretmanager.device")
     private var device: Device?
     private var refresher: Task<Void, Never>?
+    /// Whether the vault, shown locked when the app opens or comes back,
+    /// asks for a face or a finger at once: not after the owner's own Lock,
+    /// and once only, so that a cancel leaves the button.
+    private var askAtOnce = true
+    /// A face or a finger is being asked for: a second ask would cancel it.
+    private var asking = false
 
     private func onQueue<T>(_ work: @escaping () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
@@ -139,11 +145,14 @@ final class VaultModel: ObservableObject {
     }
 
     func unlockWithBiometrics() {
+        guard !asking else { return }
+        asking = true
         Task {
             let biometric = biometric
             let outcome = await withCheckedContinuation { continuation in
                 DispatchQueue.global().async { continuation.resume(returning: biometric.read(reason: "Unlock the vault")) }
             }
+            asking = false
             let password: String
             switch outcome {
             case let .password(kept): password = kept
@@ -157,7 +166,9 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    /// The owner's own Lock, which asks for no face or finger until the app leaves the screen.
     func lock() {
+        askAtOnce = false
         Task {
             detail = nil
             editor = nil
@@ -432,11 +443,17 @@ final class VaultModel: ObservableObject {
     }
 
     /// The app came to the front: open the device again if it was let go,
-    /// take part, and keep the list current.
+    /// ask for a face or a finger if it opens locked, take part, and keep the
+    /// list current. The phone's own sheet for the check makes the app
+    /// inactive and active again, which asks nothing more.
     func becameActive() {
         refresher?.cancel()
         refresher = Task {
             if device == nil { await openDevice() }
+            if askAtOnce {
+                askAtOnce = false
+                if screen == .locked && biometric.available && biometric.enabled { unlockWithBiometrics() }
+            }
             if screen == .locked || screen == .unlocked { await call { try? $0.goOnline() } }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -450,6 +467,7 @@ final class VaultModel: ObservableObject {
     /// the device go, so that no file of the shared folder stays open while
     /// iOS suspends the app.
     func wentToBackground() {
+        askAtOnce = true
         refresher?.cancel()
         refresher = nil
         guard let device else { return }
