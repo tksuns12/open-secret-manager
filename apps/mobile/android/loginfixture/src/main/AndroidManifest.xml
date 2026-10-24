@@ -21,6 +21,7 @@
             </intent-filter>
         </activity>
         <activity android:name=".CodeActivity" android:exported="true" />
+        <activity android:name=".SignUpActivity" android:exported="true" />
         <activity android:name=".WebLoginActivity" android:exported="true" />
         <activity android:name=".NestedDomainLoginActivity" android:exported="true" />
         <activity android:name=".NamedLoginActivity" android:exported="true" />

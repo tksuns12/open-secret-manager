@@ -163,7 +163,17 @@ private fun SaveScreen(
                 }
                 state.screen == Screen.UNLOCKED -> Column {
                     Asker(requester)
-                    SaveChoices(save, requester, session, appLogins, state.busy == null, onSaved)
+                    Column(
+                        Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Column {
+                            Text("Username", style = MaterialTheme.typography.labelMedium)
+                            Text(save.username.ifEmpty { "None" }, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.testTag("save-username"))
+                            Text("The password the form sent is not shown.", style = MaterialTheme.typography.bodySmall)
+                        }
+                        SaveChoices(save.username, save.password, requester, session, appLogins, state.busy == null, made = false, onSaved)
+                    }
                 }
                 state.screen == Screen.REMOVED -> Message("This phone was removed from the vault")
                 state.screen == Screen.UNREADABLE -> Message("The vault on this phone cannot be opened", state.unreadable)
@@ -175,37 +185,35 @@ private fun SaveScreen(
 }
 
 /**
- * The logins the form's password could go into, which are those the same
- * form could be filled with under the username it sent, and a new login.
+ * Where [password] goes: into a login the same form could be filled with
+ * under [username], in place of its password (the one it had stays in its
+ * history), or into a new login, for the trusted browser's page's origin or
+ * for the app. A form's password already saved is said so. [made]: the
+ * password was made here for a sign-up, not sent by the form. [onSaved]
+ * gets what to tell the owner.
  */
 @Composable
-private fun SaveChoices(
-    save: PendingSave.Save,
+internal fun SaveChoices(
+    username: String,
+    password: String,
     requester: Requester,
     session: VaultSession,
     appLogins: AppLogins,
     idle: Boolean,
+    made: Boolean,
     onSaved: (String?) -> Unit,
 ) {
     var candidates by remember { mutableStateOf<List<SaveCandidate>?>(null) }
-    // Read again after an update found its login changed.
+    // Read again after an update found its login changed, and as the username changes.
     var reads by remember { mutableIntStateOf(0) }
-    LaunchedEffect(reads) {
+    LaunchedEffect(reads, username) {
         val origin = (requester as? Requester.Web)?.origin
         val chosen = (requester as? Requester.App)?.let(appLogins::chosen).orEmpty()
-        session.saveCandidates(origin, chosen, save.username, save.password) { candidates = it }
+        session.saveCandidates(origin, chosen, username, password) { candidates = it }
     }
     val shown = candidates ?: return
     var title by remember { mutableStateOf(requester.title) }
-    Column(
-        Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Column {
-            Text("Username", style = MaterialTheme.typography.labelMedium)
-            Text(save.username.ifEmpty { "None" }, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.testTag("save-username"))
-            Text("The password the form sent is not shown.", style = MaterialTheme.typography.bodySmall)
-        }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         val already = shown.firstOrNull { it.hasThisPassword }
         if (already != null) {
             Text(
@@ -214,59 +222,62 @@ private fun SaveChoices(
                 modifier = Modifier.testTag("already-saved"),
             )
             Button(onClick = { onSaved(null) }, modifier = Modifier.testTag("done")) { Text("Done") }
-        } else {
-            if (shown.isNotEmpty()) {
-                HorizontalDivider()
-                Text("Update a login", style = MaterialTheme.typography.titleMedium)
-                shown.forEach { candidate ->
-                    OutlinedButton(
-                        onClick = {
-                            session.updatePassword(candidate, save.password) { saved ->
-                                if (saved) onSaved("Password updated in ${candidate.title}") else reads++
-                            }
-                        },
-                        enabled = idle,
-                        modifier = Modifier.fillMaxWidth().testTag("update:${candidate.title}"),
-                    ) { Text("Update the password of ${candidate.title}") }
-                }
-            }
-            HorizontalDivider()
-            Text(if (shown.isEmpty()) "Save a new login" else "Or save a new login", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
-                value = title,
-                onValueChange = { title = it },
-                label = { Text("Title") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth().testTag("save-title"),
-            )
-            Text(
-                when (requester) {
-                    is Requester.Web -> "It is offered on ${requester.origin.removePrefix("https://")} only."
-                    is Requester.App -> "It is offered to ${requester.label} again, and to no other app."
-                },
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Button(
-                onClick = {
-                    val draft = ItemDraft(
-                        title = title,
-                        kind = ItemKind.LOGIN,
-                        username = save.username,
-                        url = (requester as? Requester.Web)?.origin.orEmpty(),
-                        notes = "",
-                        favorite = false,
-                        password = save.password,
-                        oneTimeCodeSecret = null,
-                        card = null,
-                    )
-                    session.saveNew(draft) { id ->
-                        if (requester is Requester.App) appLogins.remember(requester, id)
-                        onSaved("Saved in Open Secret Manager")
-                    }
-                },
-                enabled = title.isNotBlank() && idle,
-                modifier = Modifier.testTag("save-new"),
-            ) { Text("Save as a new login") }
+            return@Column
         }
+        if (shown.isNotEmpty()) {
+            HorizontalDivider()
+            Text(if (made) "A new password for a login" else "Update a login", style = MaterialTheme.typography.titleMedium)
+            shown.forEach { candidate ->
+                OutlinedButton(
+                    onClick = {
+                        session.updatePassword(candidate, password) { saved ->
+                            if (saved) onSaved("Password updated in ${candidate.title}") else reads++
+                        }
+                    },
+                    enabled = idle,
+                    modifier = Modifier.fillMaxWidth().testTag("update:${candidate.title}"),
+                ) { Text("Update the password of ${candidate.title}") }
+            }
+        }
+        HorizontalDivider()
+        Text(if (shown.isEmpty()) "Save a new login" else "Or save a new login", style = MaterialTheme.typography.titleMedium)
+        OutlinedTextField(
+            value = title,
+            onValueChange = { title = it },
+            label = { Text("Title") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag("save-title"),
+        )
+        Text(
+            when (requester) {
+                is Requester.Web -> "It is offered on ${requester.origin.removePrefix("https://")} only."
+                is Requester.App -> "It is offered to ${requester.label} again, and to no other app."
+            },
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Button(
+            onClick = {
+                val draft = ItemDraft(
+                    title = title,
+                    kind = ItemKind.LOGIN,
+                    username = username,
+                    url = (requester as? Requester.Web)?.origin.orEmpty(),
+                    notes = "",
+                    favorite = false,
+                    password = password,
+                    oneTimeCodeSecret = null,
+                    card = null,
+                )
+                session.saveNew(draft) { id ->
+                    if (requester is Requester.App) appLogins.remember(requester, id)
+                    onSaved(
+                        if (made) "Saved as $title · if the sign-up does not go through, delete it in Open Secret Manager"
+                        else "Saved in Open Secret Manager",
+                    )
+                }
+            },
+            enabled = title.isNotBlank() && idle,
+            modifier = Modifier.testTag("save-new"),
+        ) { Text(if (made) "Save as a new login and fill" else "Save as a new login") }
     }
 }

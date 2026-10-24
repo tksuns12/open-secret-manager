@@ -33,7 +33,9 @@ import org.opensecretmanager.vault.ItemSummary
  * logins a fill would offer, by title and username, and choosing one fills
  * it at once. A keyboard that asks for them gets the same entries in its
  * strip, and the system's list is not shown (see [Strip]). A save opens
- * [SaveActivity], where the owner unlocks and chooses where it goes.
+ * [SaveActivity], where the owner unlocks and chooses where it goes. A
+ * sign-up's or a change of password's form is also offered, first, "make a
+ * strong password", locked or not, which opens [GenerateActivity].
  */
 class VaultAutofillService : AutofillService() {
     private val requests = AtomicInteger()
@@ -77,11 +79,19 @@ class VaultAutofillService : AutofillService() {
                 val inline = if (Build.VERSION.SDK_INT >= 30) strip?.entry(offers.size, inStrip, subtitle) else null
                 offers += offer(form, entry(this, title, subtitle), inline, item)
             }
+            // A password made for a new account or a change of password: it
+            // tells nothing of the vault, so it is offered locked too.
+            val generating = form.newPasswords.isNotEmpty()
+            if (generating) {
+                val inline = if (Build.VERSION.SDK_INT >= 30) strip?.entry(offers.size, "Make a strong password") else null
+                offers += generateOffer(form, entry(this, "Open Secret Manager · make a strong password"), inline)
+            }
             if (logins == null) {
                 add("Open Secret Manager · unlock to fill", null, "Unlock to fill", null)
             } else {
-                // Room left in the strip for the last entry.
-                val listed = if (Build.VERSION.SDK_INT >= 30 && strip != null) minOf(MAX_LOGINS, strip.room - 1) else MAX_LOGINS
+                // Room left in the strip for the last entry, and the one to make a password.
+                val kept = if (generating) 2 else 1
+                val listed = if (Build.VERSION.SDK_INT >= 30 && strip != null) minOf(MAX_LOGINS, strip.room - kept) else MAX_LOGINS
                 logins.take(listed.coerceAtLeast(0)).forEach { add(it.title, it.username, it.title, it.id) }
                 // The fill screen, for the rest, or for choosing a login for an app.
                 val (more, inStrip) = when {
@@ -126,6 +136,28 @@ class VaultAutofillService : AutofillService() {
         @Suppress("DEPRECATION")
         return Dataset.Builder(presentation).apply {
             listOfNotNull(form.username, form.password, form.oneTimeCode).forEach { setValue(it, null) }
+            if (inline != null && Build.VERSION.SDK_INT >= 30) setInlinePresentation(inline)
+            setAuthentication(sender)
+        }.build()
+    }
+
+    /**
+     * The entry that makes a password for [form]'s new password fields:
+     * [GenerateActivity], which saves it and fills it. It names the new
+     * fields and the username, so that it is offered on each.
+     */
+    private fun generateOffer(form: Form, presentation: RemoteViews, inline: InlinePresentation?): Dataset {
+        val intent = Intent(this, GenerateActivity::class.java).putExtras(form.toBundle())
+        // Mutable: the system adds the screen's structure to it.
+        val sender = PendingIntent.getActivity(
+            this,
+            requests.incrementAndGet(),
+            intent,
+            PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_MUTABLE,
+        ).intentSender
+        @Suppress("DEPRECATION")
+        return Dataset.Builder(presentation).apply {
+            (listOfNotNull(form.username) + form.newPasswords).forEach { setValue(it, null) }
             if (inline != null && Build.VERSION.SDK_INT >= 30) setInlinePresentation(inline)
             setAuthentication(sender)
         }.build()
@@ -207,9 +239,10 @@ class VaultAutofillService : AutofillService() {
      * password the owner typed (not one this app filled), or once its fields
      * are gone, for apps that hide a form rather than close its screen.
      * [usernameEarlier]: the username was asked for on an earlier screen.
+     * On a change of password, the new password is the one saved.
      */
     private fun saveInfo(form: Form, usernameEarlier: Boolean): SaveInfo? {
-        val password = form.password ?: return null
+        val password = form.newPasswords.firstOrNull() ?: form.password ?: return null
         val type = SaveInfo.SAVE_DATA_TYPE_PASSWORD or
             (if (form.username != null || usernameEarlier) SaveInfo.SAVE_DATA_TYPE_USERNAME else 0)
         return SaveInfo.Builder(type, arrayOf(password)).apply {
@@ -229,8 +262,9 @@ class VaultAutofillService : AutofillService() {
             callback.onSuccess()
             return
         }
-        val values = Form.values(structure, setOfNotNull(form.username, form.password))
-        val password = form.password?.let(values::get).orEmpty()
+        val sent = form.newPasswords.firstOrNull() ?: form.password
+        val values = Form.values(structure, setOfNotNull(form.username, sent))
+        val password = sent?.let(values::get).orEmpty()
         // A screen that asked for the password alone: the username, if an
         // earlier screen of the same sign-in asked for it.
         val username = form.username?.let(values::get)

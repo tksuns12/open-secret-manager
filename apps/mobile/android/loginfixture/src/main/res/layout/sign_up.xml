@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A sign-up as apps make it: an email address, and a new password typed
+     twice, each saying what it is to autofill. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true"
+    android:orientation="vertical"
+    android:padding="24dp">
+    <!-- Takes the form away, as a sign-in does here; above the fields,
+         where neither the keyboard nor the offer to fill covers it. -->
+    <Button
+        android:id="@+id/sign_up"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sign up" />
+    <EditText
+        android:id="@+id/email"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:autofillHints="emailAddress"
+        android:hint="Email"
+        android:inputType="textEmailAddress" />
+    <EditText
+        android:id="@+id/new_password"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:autofillHints="newPassword"
+        android:hint="New password"
+        android:inputType="textPassword" />
+    <EditText
+        android:id="@+id/confirm_password"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:autofillHints="newPassword"
+        android:hint="New password again"
+        android:inputType="textPassword" />
+    <TextView
+        android:id="@+id/filled"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+</LinearLayout>

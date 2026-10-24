@@ -17,7 +17,9 @@ import android.widget.TextView
  * in a web view, or, with the extra `page` set to `code`, a page that asks
  * for a one-time code, or set to `split`, a page whose ID and password are
  * each in a form of their own, which a web view reports to autofill one at
- * a time, or set to `card`, a checkout page's card form (see [CARD_PAGE]). The page is served from here, so no network is needed;
+ * a time, or set to `card`, a checkout page's card form (see [CARD_PAGE]),
+ * or set to `signup`, `signup-plain`, or `change`, a sign-up or a change of
+ * password (see [SIGNUP_PAGE], [PLAIN_SIGNUP_PAGE], [CHANGE_PAGE]). The page is served from here, so no network is needed;
  * the web view still navigates to the address and reports its domain.
  * Signing in posts the form and shows the page again. With the extra
  * `asBrowser` true, the stand-in opens a link to any site from then on, as
@@ -44,6 +46,9 @@ class WebLoginActivity : Activity() {
             "code" -> CODE_PAGE
             "split" -> SPLIT_PAGE
             "card" -> CARD_PAGE
+            "signup" -> SIGNUP_PAGE
+            "signup-plain" -> PLAIN_SIGNUP_PAGE
+            "change" -> CHANGE_PAGE
             else -> PAGE
         }
         val filled = findViewById<TextView>(R.id.filled)
@@ -124,6 +129,62 @@ class WebLoginActivity : Activity() {
             </form>
             <script>
               setInterval(() => fixture.reportCard([holder.value, n1.value + n2.value + n3.value + n4.value, month.value, year.value, code.value, hidden.value].join("|")), 200);
+            </script>
+        """.trimIndent()
+
+        /**
+         * A sign-up whose password fields say they take a new password
+         * (`new-password`), the second its confirmation. It reports
+         * `email|password|again`.
+         */
+        val SIGNUP_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>input, button { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
+            <form method="post" action="/login">
+              <button id="sign-up" type="submit">Sign up</button>
+              <input id="email" type="email" name="email" autocomplete="email" placeholder="Email">
+              <input id="password" type="password" name="password" autocomplete="new-password" placeholder="New password">
+              <input id="again" type="password" name="again" autocomplete="new-password" placeholder="New password again">
+            </form>
+            <script>
+              setInterval(() => fixture.report(email.value, password.value + "|" + again.value), 200);
+            </script>
+        """.trimIndent()
+
+        /** As [SIGNUP_PAGE], its two password fields saying nothing of what they take. */
+        val PLAIN_SIGNUP_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>input, button { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
+            <form method="post" action="/login">
+              <button id="sign-up" type="submit">Sign up</button>
+              <input id="email" type="email" name="email" placeholder="Email">
+              <input id="password" type="password" name="password" placeholder="Password">
+              <input id="again" type="password" name="again" placeholder="Password again">
+            </form>
+            <script>
+              setInterval(() => fixture.report(email.value, password.value + "|" + again.value), 200);
+            </script>
+        """.trimIndent()
+
+        /**
+         * A change of password: the account, the current password, and the
+         * new one typed twice. It reports `account|current|new|again`.
+         */
+        val CHANGE_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>input, button { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
+            <form method="post" action="/login">
+              <button id="change" type="submit">Change</button>
+              <input id="account" type="text" name="account" autocomplete="username" value="owner@example.test">
+              <input id="current" type="password" name="current" autocomplete="current-password" placeholder="Current password">
+              <input id="password" type="password" name="password" autocomplete="new-password" placeholder="New password">
+              <input id="again" type="password" name="again" autocomplete="new-password" placeholder="New password again">
+            </form>
+            <script>
+              setInterval(() => fixture.report(account.value, [current.value, password.value, again.value].join("|")), 200);
             </script>
         """.trimIndent()
 

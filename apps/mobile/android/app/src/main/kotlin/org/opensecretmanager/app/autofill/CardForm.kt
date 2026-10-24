@@ -183,7 +183,7 @@ data class CardForm(
                 val id = node.autofillId
                 val part = partOf(node)
                 if (id != null && part != null && node.width > 0 && node.height > 0 && node.autofillType in TYPES_TAKEN) {
-                    fields += CardField(id, part, node.autofillType, node.autofillOptions.orEmpty().map { it.toString() }, maxLength(node))
+                    fields += CardField(id, part, node.autofillType, node.autofillOptions.orEmpty().map { it.toString() }, Form.maxLength(node))
                     if (node.isFocused) focused = true
                 }
                 for (index in 0 until node.childCount) visit(node.getChildAt(index))
@@ -194,12 +194,6 @@ data class CardForm(
         }
 
         private val TYPES_TAKEN = setOf(View.AUTOFILL_TYPE_TEXT, View.AUTOFILL_TYPE_LIST, View.AUTOFILL_TYPE_DATE)
-
-        private fun maxLength(node: AssistStructure.ViewNode): Int {
-            val html = node.htmlInfo?.attributes.orEmpty()
-                .firstOrNull { it.first.equals("maxlength", ignoreCase = true) }?.second?.toIntOrNull()
-            return (html ?: node.maxTextLength).coerceAtLeast(0)
-        }
 
         /** What a field of a card form asks for, by what it says to autofill, or else by its names. */
         private fun partOf(node: AssistStructure.ViewNode): CardPart? {

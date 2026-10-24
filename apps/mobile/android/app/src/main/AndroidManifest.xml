@@ -85,6 +85,14 @@
             android:taskAffinity=""
             android:theme="@style/FillOver"
             android:windowSoftInputMode="adjustResize" />
+        <!-- As FillActivity, for a password made at a sign-up. -->
+        <activity
+            android:name=".autofill.GenerateActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@style/FillOver"
+            android:windowSoftInputMode="adjustResize" />
         <!-- As FillActivity, for a card form. -->
         <activity
             android:name=".autofill.CardFillActivity"

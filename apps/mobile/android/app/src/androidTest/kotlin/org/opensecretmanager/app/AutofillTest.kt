@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.os.Build
 import android.os.PowerManager
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import android.view.KeyEvent
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -886,6 +887,102 @@ class AutofillTest {
         assertLockedAgain()
     }
 
+    /** Chooses "make a strong password" in [offer], unlocks, and returns the password the screen made. */
+    private fun makeAPassword(offer: UiObject2): String {
+        offer.click()
+        find(mine("password"), 60_000).text = password
+        find(mine("unlock")).click()
+        find(mine("asker"))
+        return find(mine("generated-password")).text
+    }
+
+    @Test
+    fun anAppsSignUpGetsAStrongPasswordSavedForItAndFilledIntoBothFields() {
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.SignUpActivity")
+        find(By.res(FIXTURE, "email"), 30_000).click()
+        find(By.res(FIXTURE, "email")).text = "new@example.test"
+        find(By.res(FIXTURE, "new_password")).click()
+        val made = makeAPassword(find(MAKE, 30_000))
+        capture("make-app")
+        assertTrue(made, Regex("[^lIO01]{20}").matches(made))
+        // Android shows the screen the form as it was when it asked, before
+        // the email address was typed (an empty field on the emulator); the
+        // owner types it there.
+        val shown = find(mine("generate-username")).text.orEmpty()
+        Log.i("AutofillTest", "the username a sign-up's screen was shown: \"$shown\"")
+        if (shown != "new@example.test") find(mine("generate-username")).text = "new@example.test"
+        assertNull(device.findObject(mine("update:Bank")))
+        assertEquals("Login fixture", find(mine("save-title")).text)
+        find(mine("save-new")).click()
+        assertFilled("new@example.test|$made|$made")
+        // Saved before the form is sent: Android offers no save after it.
+        find(By.res(FIXTURE, "sign_up")).click()
+        if (device.wait(Until.hasObject(By.res("android", "autofill_save_yes")), 5_000) == true) fail("Android offered to save it again")
+        assertLockedAgain()
+
+        // That app is offered it at its next sign-in.
+        askToFill("NativeLoginActivity")
+        find(mine("fill:Login fixture")).click()
+        assertFilled("new@example.test|$made")
+    }
+
+    @Test
+    fun aPasswordMadeForAFieldThatTakesFewerCharactersIsAsLongAsTheField() {
+        val made = makeAPassword(openAndFind(MAKE, "SignUpActivity", field = "email", extras = " --ei maxLength 16"))
+        assertEquals(16, made.length)
+        find(mine("generated-capped"))
+        find(mine("save-new")).click()
+        // No username given, none filled.
+        assertFilled("|$made|$made")
+    }
+
+    @Test
+    fun aTrustedBrowsersSignUpGetsAPasswordSavedForItsOrigin() {
+        Requester.trustedForTests += FIXTURE
+        val made = makeAPassword(openAndFind(MAKE, "WebLoginActivity", "https://new.example.test", extras = " --es page signup"))
+        capture("make-web")
+        assertEquals("new.example.test", find(mine("save-title")).text)
+        find(mine("generate-username")).text = "someone@new.example.test"
+        find(mine("save-new")).click()
+        assertFilled("someone@new.example.test|$made|$made")
+        assertLockedAgain()
+        askToFill("WebLoginActivity", "https://new.example.test")
+        find(mine("fill:new.example.test")).click()
+        assertFilled("someone@new.example.test|$made")
+    }
+
+    @Test
+    fun aChangeOfPasswordPutsTheNewOneInTheLoginAndOnlyInTheNewFields() {
+        Requester.trustedForTests += FIXTURE
+        val made = makeAPassword(openAndFind(MAKE, "WebLoginActivity", "https://mail.example.test", extras = " --es page change"))
+        // The screen is not given the account the page shows, but offers
+        // those saved for the site, whose logins the password can then go to.
+        find(mine("account:owner@example.test")).click()
+        find(mine("update:Mail")).click()
+        assertFilled("owner@example.test||$made|$made")
+        assertLockedAgain()
+        askToFill("WebLoginActivity", "https://mail.example.test")
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|$made")
+    }
+
+    @Test
+    fun aSignInIsOfferedNoPasswordToMake() {
+        Requester.trustedForTests += FIXTURE
+        // A page's, its password the current one.
+        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+        assertNull(device.findObject(MAKE))
+        // An app's, with one password field.
+        openAndFind(OFFER, "NativeLoginActivity")
+        assertNull(device.findObject(MAKE))
+        // An ID typed as a password shown as typed, before the password.
+        openAndFind(OFFER, "NamedLoginActivity", field = "login_id", extras = " --es form shown")
+        assertNull(device.findObject(MAKE))
+        // A sign-up whose two password fields say nothing is known by them.
+        openAndFind(MAKE, "WebLoginActivity", "https://new.example.test", extras = " --es page signup-plain")
+    }
+
     /** The code of RFC 6238 for a base32 [secret] at [unixTime], as the shared code makes it. */
     private fun totp(secret: String, unixTime: Long): String {
         val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
@@ -1038,6 +1135,9 @@ class AutofillTest {
 
         /** The service's offer under a card form's field. */
         val CARD_OFFER: BySelector = By.text("Open Secret Manager · unlock to fill a card")
+
+        /** The service's offer under a sign-up's or a change of password's field. */
+        val MAKE: BySelector = By.text("Open Secret Manager · make a strong password")
 
         /** Where a failed wait leaves what it saw, on the device. */
         const val FAILURES = "/data/local/tmp/osm-failures"

@@ -18,6 +18,10 @@ import android.view.autofill.AutofillId
  * [page]: the fields are a page's, in a web view or a browser, which may
  * have told of one form of the page only, where a screen of an app tells of
  * all its fields.
+ * [newPasswords]: the fields of a sign-up or a change of password that take
+ * a new password, and its confirmation, which a password made for it fills
+ * (see [parse]); [newPasswordMaxLength] the most characters they all take,
+ * or 0 if none says.
  */
 data class Form(
     val packageName: String,
@@ -27,6 +31,8 @@ data class Form(
     val password: AutofillId?,
     val oneTimeCode: AutofillId?,
     val page: Boolean = false,
+    val newPasswords: List<AutofillId> = emptyList(),
+    val newPasswordMaxLength: Int = 0,
 ) {
     /** Asks for a one-time code, and neither a username nor a password. */
     val codeOnly: Boolean
@@ -40,6 +46,8 @@ data class Form(
         putParcelable(PASSWORD, password)
         putParcelable(ONE_TIME_CODE, oneTimeCode)
         putBoolean(PAGE, page)
+        putParcelableArrayList(NEW_PASSWORDS, ArrayList(newPasswords))
+        putInt(NEW_PASSWORD_MAX_LENGTH, newPasswordMaxLength)
     }
 
     companion object {
@@ -50,6 +58,8 @@ data class Form(
         private const val PASSWORD = "form.password"
         private const val ONE_TIME_CODE = "form.oneTimeCode"
         private const val PAGE = "form.page"
+        private const val NEW_PASSWORDS = "form.newPasswords"
+        private const val NEW_PASSWORD_MAX_LENGTH = "form.newPasswordMaxLength"
 
         @Suppress("DEPRECATION")
         fun fromBundle(extras: Bundle): Form? {
@@ -62,6 +72,8 @@ data class Form(
                 extras.getParcelable(PASSWORD),
                 extras.getParcelable(ONE_TIME_CODE),
                 extras.getBoolean(PAGE),
+                extras.getParcelableArrayList<AutofillId>(NEW_PASSWORDS).orEmpty(),
+                extras.getInt(NEW_PASSWORD_MAX_LENGTH),
             )
         }
 
@@ -134,6 +146,7 @@ data class Form(
             if (password == null && code == null) return null
             // A screen that asks only for a code has no username.
             val username = password?.let { usernameFor(fields.all, it) }
+            val new = password?.let { newPasswords(passwords, it) }.orEmpty()
             return Form(
                 packageName = structure.activityComponent.packageName,
                 webDomain = fields.webDomain,
@@ -142,8 +155,48 @@ data class Form(
                 password = password?.node?.autofillId,
                 oneTimeCode = code?.node?.autofillId,
                 page = listOfNotNull(username, password, code).any { it.node.htmlInfo != null },
+                newPasswords = new.mapNotNull { it.node.autofillId },
+                newPasswordMaxLength = new.map { maxLength(it.node) }.filter { it > 0 }.minOrNull() ?: 0,
             )
         }
+
+        /**
+         * The fields of [passwords] that take a new password, in the window
+         * of [password]: those that say so (a page's `new-password`, an
+         * app's `newPassword`), or else, of two or more that hide what is
+         * typed, all but one that says or is named the current password, or
+         * the first of three. A sign-in's one password field takes none, nor
+         * a field shown as typed, as an ID typed so or a password "shown" is;
+         * nor a field drawn with no size, which the owner cannot see, nor a
+         * number's, as a PIN's.
+         */
+        private fun newPasswords(passwords: List<Field>, password: Field): List<Field> {
+            val window = passwords.filter {
+                it.window == password.window && it.node.width > 0 && it.node.height > 0 && !typedAsShownPassword(it.node) &&
+                    (it.node.inputType and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_NUMBER &&
+                    htmlAttribute(it.node, "inputmode") != "numeric"
+            }
+            val said = window.filter { field -> hints(field.node).any { it == "new-password" || it == "newpassword" } }
+            if (said.isNotEmpty()) return said
+            if (window.size < 2) return emptyList()
+            val current = window.filter { field ->
+                hints(field.node).any { it == "current-password" } || named(names(field.node), CURRENT_PARTS, CURRENT_WORDS)
+            }
+            return when {
+                current.isNotEmpty() -> window - current.toSet()
+                window.size >= 3 -> window.drop(1)
+                else -> window
+            }
+        }
+
+        /** The most characters a field takes, by a page's `maxlength` or an app's filter; 0 if it does not say. */
+        internal fun maxLength(node: AssistStructure.ViewNode): Int {
+            val html = htmlAttribute(node, "maxlength")?.toIntOrNull()
+            return (html ?: node.maxTextLength).coerceAtLeast(0)
+        }
+
+        private fun htmlAttribute(node: AssistStructure.ViewNode, name: String): String? =
+            node.htmlInfo?.attributes.orEmpty().firstOrNull { it.first.equals(name, ignoreCase = true) }?.second?.lowercase()
 
         /**
          * The username that goes with [password], in its window: the field
@@ -175,7 +228,7 @@ data class Form(
 
         fun isPassword(node: AssistStructure.ViewNode): Boolean {
             val hints = hints(node)
-            if (hints.any { it == View.AUTOFILL_HINT_PASSWORD.lowercase() || it == "current-password" || it == "new-password" }) return true
+            if (hints.any { it == View.AUTOFILL_HINT_PASSWORD.lowercase() || it in PASSWORD_HINTS }) return true
             if (htmlType(node) == "password") return true
             val type = node.inputType
             val variation = type and InputType.TYPE_MASK_VARIATION
@@ -204,7 +257,7 @@ data class Form(
          */
         private fun typedAsShownPassword(node: AssistStructure.ViewNode): Boolean {
             val hints = hints(node)
-            if (hints.any { it == View.AUTOFILL_HINT_PASSWORD.lowercase() || it == "current-password" || it == "new-password" }) return false
+            if (hints.any { it == View.AUTOFILL_HINT_PASSWORD.lowercase() || it in PASSWORD_HINTS }) return false
             if (htmlType(node) == "password") return false
             return (node.inputType and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT &&
                 (node.inputType and InputType.TYPE_MASK_VARIATION) == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
@@ -274,5 +327,10 @@ data class Form(
         private val PASSWORD_PARTS = listOf("password", "passwd", "pswd", "비밀번호", "패스워드")
         private val PASSWORD_WORDS = setOf("pw", "pwd", "pass")
         private val NOT_USERNAME_PARTS = listOf("search", "find", "recipient", "captcha", "검색")
+        /** A page's for its passwords, and androidx's `newPassword` for an app's new one, in lower case. */
+        private val PASSWORD_HINTS = setOf("current-password", "new-password", "newpassword")
+        // Of a change of password, the field for the password it has now.
+        private val CURRENT_PARTS = listOf("현재", "기존")
+        private val CURRENT_WORDS = setOf("current", "old", "cur")
     }
 }

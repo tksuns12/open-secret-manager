@@ -173,6 +173,19 @@ and whether the phone synced at home after both apps were updated.
    screen lists the logins with a one-time code; the chosen one's code
    fills the field. Note fields where nothing is offered (a field must say
    it takes a one-time code).
+7. On a site's sign-up page in Chrome, and in Firefox, and in an app's
+   sign-up screen, tap the email or the new password field: "Make a strong
+   password" comes first. Choose it: the fingerprint is asked for, the
+   screen names the site or app and shows a password made with the
+   generator's choice. Type the username if it is empty, and save it as a
+   new login: the password goes into both password fields. Send the form;
+   Android should not offer to save it again. Note a sign-up page where the
+   entry does not come, and whether the screen showed the username already
+   typed (on the emulator it never did).
+8. On a site's change of password page, with a login for that site saved:
+   choose "Make a strong password", choose the account from those listed,
+   and update its password. Only the new password fields fill, not the
+   current one. A sign-in page should never offer to make a password.
 
 **iOS:**
 
