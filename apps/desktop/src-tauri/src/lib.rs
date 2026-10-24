@@ -30,9 +30,7 @@ mod side_files_tests;
 
 use std::path::{Path, PathBuf};
 
-use osm_vault_core::{
-    card, Item, ItemKind, ItemSummary, PasskeySummary, PasswordPolicy, Vault, VaultItem,
-};
+use osm_vault_core::{card, Item, ItemKind, ItemSummary, PasskeySummary, Vault, VaultItem};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
@@ -187,13 +185,17 @@ async fn list_entries(state: tauri::State<'_, AppState>) -> Result<Vec<ItemSumma
         .map_err(Into::into)
 }
 
+/// A new password as `choice` asks, which is the owner's choice in the
+/// window, kept or not.
 #[tauri::command]
-fn generate_password(length: usize) -> Result<String, CommandError> {
-    let policy = PasswordPolicy {
-        length,
-        ..PasswordPolicy::default()
-    };
-    osm_vault_core::generate_password(&policy).map_err(Into::into)
+fn generate_password(choice: settings::GeneratorChoice) -> Result<String, CommandError> {
+    osm_vault_core::generate_password(&choice.policy()).map_err(Into::into)
+}
+
+/// Copies a password the generator made, for 30 seconds, as an item's are.
+#[tauri::command]
+fn copy_generated(value: String) -> Result<(), CommandError> {
+    copy_for_a_while(&Zeroizing::new(value))
 }
 
 #[tauri::command]
@@ -419,8 +421,12 @@ impl EntryInput {
         item.url = std::mem::take(&mut self.url);
         item.notes = std::mem::take(&mut self.notes);
         item.favorite = self.favorite;
+        // A password only where the item shows one: one the editor still
+        // held for a login turned into a card or a note stays out.
         if let Some(password) = self.password.take() {
-            item.password = password;
+            if matches!(item.kind, ItemKind::Login | ItemKind::Identity) {
+                item.password = password;
+            }
         }
         if let Some(secret) = self.totp_secret.take() {
             let secret = Zeroizing::new(secret);
@@ -990,6 +996,7 @@ pub fn run() {
             lock_vault,
             list_entries,
             generate_password,
+            copy_generated,
             copy_totp,
             copy_password,
             copy_field,
@@ -1055,7 +1062,8 @@ pub fn run() {
             import::confirm_import,
             import::cancel_import,
             settings::settings,
-            settings::set_auto_lock
+            settings::set_auto_lock,
+            settings::set_generator
         ])
         .run(context)
         .expect("error while running Open Secret Manager");
@@ -1250,5 +1258,41 @@ mod tests {
         input.apply_to(&mut item);
         assert!(!item.custom_fields.contains_key(card::NUMBER));
         assert!(!item.custom_fields.contains_key(card::CARDHOLDER));
+    }
+
+    /// The editor opens a new item with a password made for it, which it
+    /// still holds if the owner makes the item a card or a note instead.
+    #[test]
+    fn a_password_is_kept_only_for_a_login_or_an_identity() {
+        for (kind, kept) in [
+            ("login", true),
+            ("identity", true),
+            ("secure_note", false),
+            ("card", false),
+        ] {
+            let mut input: EntryInput = serde_json::from_str(&format!(
+                r#"{{"title":"New","kind":"{kind}","username":"","url":"","notes":"","favorite":false,"password":"made for it"}}"#
+            ))
+            .unwrap();
+            let mut item = Item::new("New");
+            input.apply_to(&mut item);
+            assert_eq!(item.password == "made for it", kept, "{kind}");
+        }
+    }
+
+    /// The window's preview makes passwords of the same characters as the
+    /// shared code: `bridge.ts` holds each set as the core names it.
+    #[test]
+    fn the_preview_generator_has_the_cores_characters() {
+        let bridge = include_str!("../../src/bridge.ts");
+        for set in [
+            osm_vault_core::PASSWORD_LOWERCASE,
+            osm_vault_core::PASSWORD_UPPERCASE,
+            osm_vault_core::PASSWORD_DIGITS,
+            osm_vault_core::PASSWORD_SYMBOLS,
+            osm_vault_core::PASSWORD_LOOK_ALIKES,
+        ] {
+            assert!(bridge.contains(&format!("\"{set}\"")), "{set}");
+        }
     }
 }

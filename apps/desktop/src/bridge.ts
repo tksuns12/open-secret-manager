@@ -1,5 +1,5 @@
 import { cardBrand, cardDigits } from "./card";
-import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, HeldChange, HistoryEntry, ImportSummary, PasskeySummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, GeneratorChoice, HeldChange, HistoryEntry, ImportSummary, PasskeySummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -101,7 +101,43 @@ let previewRecoveryConfirmed = false;
 /** What the preview's import would add: sample data, no secret. */
 const previewImport: ImportSummary = { file: "sample-export.csv", items: 2, logins: 2, notes: 0, cards: 0, identities: 0, already: 1, warnings: [{ row: 4, message: "entry has no password" }] };
 let previewImportChosen = false;
-let previewSettings: Settings = { autoLockMinutes: 5 };
+let previewSettings: Settings = { autoLockMinutes: 5, generator: { length: 20, lowercase: true, uppercase: true, digits: true, symbols: true, avoidLookAlike: true } };
+
+/**
+ * The characters of each kind a password takes, and the look-alikes, as the
+ * shared code names them (crates/vault-core/src/util.rs); a test of the
+ * desktop app checks they are the same.
+ */
+const LOWERCASE = "abcdefghijklmnopqrstuvwxyz";
+const UPPERCASE = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const DIGITS = "0123456789";
+const SYMBOLS = "!@#$%^&*()-_=+[]{}:,.?";
+const LOOK_ALIKES = "lIO01";
+
+/** A random whole number below `bound`, without the bias of a remainder. */
+function randomBelow(bound: number): number {
+  const limit = Math.floor(0x100000000 / bound) * bound;
+  const value = new Uint32Array(1);
+  do crypto.getRandomValues(value); while (value[0] >= limit);
+  return value[0] % bound;
+}
+
+/** The preview's generator, made as the shared code's: one character of each kind chosen, the rest of any, shuffled. */
+function previewPassword(choice: GeneratorChoice): string {
+  const letters = choice.lowercase || choice.uppercase;
+  const sets = ([[choice.lowercase, LOWERCASE, true], [choice.uppercase, UPPERCASE, true], [choice.digits, DIGITS, letters], [choice.symbols, SYMBOLS, true]] as const)
+    .filter(([chosen]) => chosen)
+    .map(([, set, lookAlikesMatter]) => [...set].filter((character) => !(choice.avoidLookAlike && lookAlikesMatter && LOOK_ALIKES.includes(character))).join(""));
+  if (sets.length === 0 || choice.length < sets.length || choice.length > 1024) throw new Error("invalid_item");
+  const all = sets.join("");
+  const characters = sets.map((set) => set[randomBelow(set.length)]);
+  while (characters.length < choice.length) characters.push(all[randomBelow(all.length)]);
+  for (let index = characters.length - 1; index > 0; index--) {
+    const other = randomBelow(index + 1);
+    [characters[index], characters[other]] = [characters[other], characters[index]];
+  }
+  return characters.join("");
+}
 /** Whether the preview's owner confirmed its warning that records were taken out of the file. */
 let previewRowsConfirmed = false;
 
@@ -213,14 +249,12 @@ export const bridge: DesktopBridge = {
     if (invoke) return String(await invoke("create_vault", { password }));
     return "";
   },
-  async generatePassword(length) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
-    if (invoke) return String(await invoke("generate_password", { length }));
-    const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%";
-    const values = new Uint32Array(length);
-    crypto.getRandomValues(values);
-    return Array.from(values, (value) => alphabet[value % alphabet.length]).join("");
+  async generatePassword(choice) {
+    const invoke = native();
+    if (invoke) return String(await invoke("generate_password", { choice }));
+    return previewPassword(choice);
   },
+  copyGenerated: (value) => nativeOnly("copy_generated", { value }),
   async copyTotp(id) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) await invoke("copy_totp", { id });
@@ -498,7 +532,13 @@ export const bridge: DesktopBridge = {
   async setAutoLock(minutes) {
     const invoke = native();
     if (invoke) return (await invoke("set_auto_lock", { minutes })) as Settings;
-    previewSettings = { autoLockMinutes: minutes };
+    previewSettings = { ...previewSettings, autoLockMinutes: minutes };
+    return previewSettings;
+  },
+  async setGenerator(choice) {
+    const invoke = native();
+    if (invoke) return (await invoke("set_generator", { choice })) as Settings;
+    previewSettings = { ...previewSettings, generator: choice };
     return previewSettings;
   },
   async listen(event, handler) {

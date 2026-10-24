@@ -6,20 +6,46 @@ use zeroize::Zeroizing;
 
 use crate::{Error, PasswordPolicy, Result};
 
-pub fn generate_password(policy: &PasswordPolicy) -> Result<String> {
-    const LOWER: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
-    const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
-    const DIGITS: &[u8] = b"23456789";
-    const SYMBOLS: &[u8] = b"!@#$%^&*()-_=+[]{}:,.?";
-    let groups = [
-        policy.lowercase.then_some(LOWER),
-        policy.uppercase.then_some(UPPER),
-        policy.digits.then_some(DIGITS),
-        policy.symbols.then_some(SYMBOLS),
+/// The characters of each kind a generated password takes, before the
+/// look-alikes are left out. The desktop window's preview mirrors them
+/// (`apps/desktop/src/bridge.ts`), which a test of the desktop app checks.
+pub const PASSWORD_LOWERCASE: &str = "abcdefghijklmnopqrstuvwxyz";
+pub const PASSWORD_UPPERCASE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+pub const PASSWORD_DIGITS: &str = "0123456789";
+pub const PASSWORD_SYMBOLS: &str = "!@#$%^&*()-_=+[]{}:,.?";
+/// What [`PasswordPolicy::avoid_look_alike`] leaves out: `l`, `I`, and `1`,
+/// taken for one another, and `O` and `0`.
+pub const PASSWORD_LOOK_ALIKES: &str = "lIO01";
+
+/// The characters of each kind `policy` chose, in the order above.
+fn character_sets(policy: &PasswordPolicy) -> Vec<Vec<u8>> {
+    let letters = policy.lowercase || policy.uppercase;
+    [
+        (policy.lowercase, PASSWORD_LOWERCASE, true),
+        (policy.uppercase, PASSWORD_UPPERCASE, true),
+        // Digits alone, as for a PIN, have no letter to be taken for.
+        (policy.digits, PASSWORD_DIGITS, letters),
+        (policy.symbols, PASSWORD_SYMBOLS, true),
     ]
     .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    .filter(|(chosen, _, _)| *chosen)
+    .map(|(_, set, look_alikes_matter)| {
+        set.bytes()
+            .filter(|byte| {
+                !(policy.avoid_look_alike
+                    && look_alikes_matter
+                    && PASSWORD_LOOK_ALIKES.as_bytes().contains(byte))
+            })
+            .collect()
+    })
+    .collect()
+}
+
+/// A new password as `policy` asks, from the system's random source.
+/// Refused when no kind of character is chosen, or the length is below the
+/// number of kinds chosen or above 1024.
+pub fn generate_password(policy: &PasswordPolicy) -> Result<String> {
+    let groups = character_sets(policy);
     if groups.is_empty() {
         return Err(Error::InvalidItem(
             "password policy has no character sets".into(),

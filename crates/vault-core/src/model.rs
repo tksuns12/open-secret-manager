@@ -624,6 +624,8 @@ impl fmt::Debug for ImportPreview {
     }
 }
 
+/// What [`crate::generate_password`] makes: `length` characters, at least
+/// one of each kind chosen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PasswordPolicy {
     pub length: usize,
@@ -631,6 +633,10 @@ pub struct PasswordPolicy {
     pub uppercase: bool,
     pub digits: bool,
     pub symbols: bool,
+    /// Leaves out characters easily taken for one another
+    /// ([`crate::PASSWORD_LOOK_ALIKES`]): from letters, and from digits only
+    /// when letters are chosen too, so that digits alone are all ten.
+    pub avoid_look_alike: bool,
 }
 
 impl Default for PasswordPolicy {
@@ -641,6 +647,7 @@ impl Default for PasswordPolicy {
             uppercase: true,
             digits: true,
             symbols: true,
+            avoid_look_alike: true,
         }
     }
 }

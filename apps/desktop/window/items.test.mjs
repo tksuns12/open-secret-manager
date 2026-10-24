@@ -152,16 +152,103 @@ test("a deleted item is listed under Recently deleted and comes back from there"
   assert.deepEqual(errors, []);
 });
 
-test("the generator makes a password of the length chosen", async () => {
+/** Waits until the shown text of `selector` matches `pattern`. */
+async function shownMatches(page, selector, pattern) {
+  await page.waitForFunction(([selector, source]) => {
+    const element = document.querySelector(selector);
+    return new RegExp(source).test(element?.value ?? element?.textContent ?? "");
+  }, [selector, pattern.source]);
+}
+
+test("the generator makes a password of the length and kinds chosen, and keeps the choice", async () => {
   const { page, errors } = await window.open();
   await page.getByRole("button", { name: /Generator/ }).click();
-  await page.locator(".generator input[type=range]").focus();
+  const generator = page.locator(".generator-modal .generator");
+  const shown = ".generator-modal .generated-value code";
+  // One is made as it opens: 20 characters, without look-alikes.
+  await shownMatches(page, shown, /^[^lIO01]{20}$/);
+  await generator.getByLabel("Length").focus();
   await page.keyboard.press("End");
-  await page.locator(".range-label", { hasText: "48" }).waitFor();
+  await generator.locator(".range-label", { hasText: "64" }).waitFor();
+  await shownMatches(page, shown, /^[A-HJ-NP-Za-km-z2-9!@#$%^&*()\-_=+[\]{}:,.?]{64}$/);
+  await generator.getByLabel(/Avoid look-alikes/).uncheck();
+  await shownMatches(page, shown, /^[A-Za-z0-9!@#$%^&*()\-_=+[\]{}:,.?]{64}$/);
+
+  // Digits alone, the last kind not to be turned off.
+  for (const kind of ["A–Z", "a–z", "!@#$"]) await generator.getByLabel(kind, { exact: true }).uncheck();
+  assert.equal(await generator.getByLabel("0–9").isDisabled(), true);
+  await shownMatches(page, shown, /^[0-9]{64}$/);
   await page.getByRole("button", { name: /Generate new password/ }).click();
-  const value = await page.locator(".generated-value code").textContent();
-  assert.equal(value.length, 48);
-  assert.match(value, /^[A-Za-z0-9!@#$%]+$/);
+  await shownMatches(page, shown, /^[0-9]{64}$/);
+
+  // Opened again, it is as it was left.
+  await page.locator(".generator-modal").getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: /Generator/ }).click();
+  await generator.locator(".range-label", { hasText: "64" }).waitFor();
+  assert.equal(await generator.getByLabel("A–Z", { exact: true }).isChecked(), false);
+  assert.equal(await generator.getByLabel("0–9").isChecked(), true);
+  await shownMatches(page, shown, /^[0-9]{64}$/);
+  // The preview has no clipboard to clear, so it copies nothing.
+  await generator.getByRole("button", { name: "Copy" }).click();
+  await toast(page).filter({ hasText: "Copying is not available in the browser preview" }).waitFor();
+  assert.deepEqual(errors, []);
+});
+
+test("a new login opens with a password made for it, which the owner types over, makes again, or clears", async () => {
+  const { page, errors } = await window.open();
+  const editor = page.locator(".entry-editor");
+  const field = ".entry-editor input[autocomplete=new-password]";
+  await page.getByRole("button", { name: /New item/ }).click();
+  await shownMatches(page, field, /^[^lIO01]{20}$/);
+  assert.equal(await editor.getByLabel("Password").getAttribute("type"), "text");
+  await editor.getByText("Made for this item with the generator's choice").waitFor();
+
+  // Typed over, it is the owner's.
+  await editor.getByLabel("Password").fill("my own password");
+  assert.equal(await editor.getByText("Made for this item").count(), 0);
+
+  // The generator's options, opened under the field, make one of 8 digits.
+  await editor.getByRole("button", { name: "Generator options" }).click();
+  for (const kind of ["A–Z", "a–z", "!@#$"]) await editor.getByLabel(kind, { exact: true }).uncheck();
+  await editor.getByLabel("Length").focus();
+  await page.keyboard.press("Home");
+  await shownMatches(page, ".entry-editor .generated-value code", /^[0-9]{8}$/);
+  await editor.getByRole("button", { name: "Use this password" }).click();
+  await shownMatches(page, field, /^[0-9]{8}$/);
+  assert.equal(await editor.locator(".generator").count(), 0);
+  // The editor's own button uses the same choice, kept for the next time.
+  await editor.getByRole("button", { name: "Generate" }).click();
+  await shownMatches(page, field, /^[0-9]{8}$/);
+
+  // Cleared, there is none.
+  await editor.getByRole("button", { name: "Clear" }).click();
+  assert.equal(await editor.getByLabel("Password").inputValue(), "");
+  await editor.getByLabel("Title").fill("Router");
+  await editor.getByRole("button", { name: "Create item" }).click();
+  await page.locator(".entry-row.selected", { hasText: "Router" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Copy password" }).count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test("a new item made a note keeps none of the password made for it", async () => {
+  const { page, errors } = await window.open();
+  const editor = page.locator(".entry-editor");
+  await page.getByRole("button", { name: /New item/ }).click();
+  await shownMatches(page, ".entry-editor input[autocomplete=new-password]", /^.{20}$/);
+  await editor.getByLabel("Title").fill("Door code");
+  await editor.getByLabel("Type").selectOption("secure_note");
+  await editor.getByLabel("Notes").fill("4711");
+  await editor.getByRole("button", { name: "Create item" }).click();
+  await page.locator(".entry-row.selected", { hasText: "Door code" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Copy password" }).count(), 0);
+
+  // A login made with it keeps it.
+  await page.getByRole("button", { name: /New item/ }).click();
+  await shownMatches(page, ".entry-editor input[autocomplete=new-password]", /^.{20}$/);
+  await editor.getByLabel("Title").fill("Mail");
+  await editor.getByRole("button", { name: "Create item" }).click();
+  await page.locator(".entry-row.selected", { hasText: "Mail" }).waitFor();
+  await page.getByRole("button", { name: "Copy password", exact: true }).waitFor();
   assert.deepEqual(errors, []);
 });
 

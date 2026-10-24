@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, Sparkles, Trash2, UnlockKeyhole, Wifi, X } from "lucide-react";
+import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eraser, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge, previewHasDevices } from "./bridge";
 import { cardBrand, cardDigits, passesCardCheck } from "./card";
-import type { ArchivedItem, ArchiveInfo, BackupAge, BrowserInfo, BrowserStatus, CardFieldName, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillCardChoice, FillLogin, HeldChange, HistoryEntry, ImportFormat, ImportSummary, InviteQr, MemberInfo, PasskeyAsked, PasskeyChoice, PasskeySummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchivedItem, ArchiveInfo, BackupAge, BrowserInfo, BrowserStatus, CardFieldName, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillCardChoice, FillLogin, GeneratorChoice, HeldChange, HistoryEntry, ImportFormat, ImportSummary, InviteQr, MemberInfo, PasskeyAsked, PasskeyChoice, PasskeySummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 const filters = ["All items", "Favorites", "Logins", "Cards", "Secure notes"] as const;
 /** The sign before each filter in the sidebar. */
@@ -103,6 +103,8 @@ function App() {
   const [deleted, setDeleted] = useState<DeletedEntry[] | null>(null);
   // The owner's auto-lock setting, in minutes.
   const [autoLockMinutes, setAutoLockMinutes] = useState(5);
+  /** The generator's choice kept on this device, once read. */
+  const [generator, setGenerator] = useState<GeneratorChoice | null>(null);
   const autoLockRef = useRef(autoLockMinutes);
   // The open item's details: its notes and which secrets it has.
   const [shown, setShown] = useState<EntryDetail | null>(null);
@@ -208,7 +210,7 @@ function App() {
     if (endPairing()) setNotice(`Vault locked after ${minutesText(autoLockRef.current)} without activity · the pairing was cancelled`);
   }
   useEffect(() => {
-    void bridge.settings().then((settings) => setAutoLockMinutes(settings.autoLockMinutes)).catch(() => {});
+    void bridge.settings().then((settings) => { setAutoLockMinutes(settings.autoLockMinutes); setGenerator(settings.generator); }).catch(() => {});
   }, []);
   useEffect(() => {
     autoLockRef.current = autoLockMinutes;
@@ -320,6 +322,28 @@ function App() {
       setNotice(`${what} · on all your devices at the next sync`);
     } catch (error) {
       setNotice(commandMessage(error, "It could not be restored"));
+    }
+  }
+
+  async function changeGenerator(choice: GeneratorChoice) {
+    setGenerator(choice);
+    try {
+      setGenerator((await bridge.setGenerator(choice)).generator);
+    } catch (error) {
+      setNotice(commandMessage(error, "The generator's choice was not saved"));
+    }
+  }
+
+  async function copyGenerated(value: string) {
+    if (previewMode) {
+      setNotice("Copying is not available in the browser preview");
+      return;
+    }
+    try {
+      await bridge.copyGenerated(value);
+      setNotice("Generated password copied · cleared in 30 seconds");
+    } catch (error) {
+      setNotice(commandMessage(error, "Nothing was copied"));
     }
   }
 
@@ -720,8 +744,8 @@ function App() {
         {rowsChanged && !locked ? <div className="recovery-overlay"><div className="recovery-card rows-changed-card"><strong>Something in this vault's file was taken out, changed, or set back</strong><span>Since this computer last wrote to it, something outside Open Secret Manager removed or changed records in the vault's file, or put an earlier copy of the file in its place: an item, an edit, or a device's keys may be missing. Your other devices send back what they have at the next sync. If this is your only device, restore a backup to get it back. If you did not put back an earlier copy yourself, check this computer for software you do not trust.</span><button onClick={() => { setRowsChanged(false); void bridge.confirmRowsChanged().catch(() => {}); }}>I understand</button></div></div> : recoveryKey && !locked && <div className="recovery-overlay"><div className="recovery-card"><strong>Recovery key · store this offline</strong><code>{recoveryKey}</code><span>It is shown after every unlock until you confirm here that you stored it.</span><button onClick={() => { setRecoveryKey(null); void bridge.confirmRecoveryKey().catch(() => {}); }}>I stored it</button></div></div>}
         <footer className="footer-bar"><div><Wifi size={14} /><span>{previewMode ? "Development preview" : "Local vault"}</span><span className="footer-separator">•</span><span>{previewMode ? "No native sync session" : syncDetail(sync)}</span></div><button onClick={() => devicesUnavailable ? setNotice("Sync is unavailable in the browser preview") : setDevicesOpen(true)}>Devices <ChevronRight size={14} /></button></footer>
       </section>
-      {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" aria-label="Close" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div><Generator onCopy={(value) => { navigator.clipboard?.writeText(value); setNotice("Generated password copied"); }} /></div></div>}
-      {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} onCancel={() => setEditor(null)} onSave={saveEntry} onDelete={editor.mode === "edit" ? deleteEntry : undefined} /></div></div>}
+      {generatorOpen && <div className="modal-backdrop" onClick={() => setGeneratorOpen(false)}><div className="generator-modal" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">TOOLS</p><h2>Password generator</h2></div><button className="icon-button" aria-label="Close" onClick={() => setGeneratorOpen(false)}><X size={18} /></button></div>{generator && <Generator choice={generator} onChoice={(choice) => void changeGenerator(choice)} onCopy={(value) => void copyGenerated(value)} />}</div></div>}
+      {editor && <div className="modal-backdrop" onClick={() => setEditor(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">{editor.mode === "edit" ? "EDIT ITEM" : "NEW ITEM"}</p><h2>{editor.mode === "edit" ? editor.detail.title : "Create an item"}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setEditor(null)}><X size={18} /></button></div><EntryEditor detail={editor.mode === "edit" ? editor.detail : undefined} generator={generator} onGeneratorChoice={(choice) => void changeGenerator(choice)} onCancel={() => setEditor(null)} onSave={saveEntry} onDelete={editor.mode === "edit" ? deleteEntry : undefined} /></div></div>}
       {review && <div className="modal-backdrop" onClick={() => setReview(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">RESOLVE CONFLICT</p><h2>{review.title}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setReview(null)}><X size={18} /></button></div><p className="review-hint">These versions were changed independently. Keep one; it replaces all of them.{review.versions.some((version) => version.differs.includes("passkeys")) && " The passkeys of every version are kept, whichever you keep; remove one afterwards if you mean to."}</p><div className="version-list">{review.versions.map((version) => <div key={version.revision} className="version-card"><div className="version-meta"><strong>{version.thisDevice ? "This device" : `Device ${version.device}`}</strong><code>{version.revision.slice(0, 10)}</code></div>{version.deleted ? <span className="version-deleted">Deleted this item</span> : <dl><dt>Title</dt><dd>{version.title}</dd><dt>Username</dt><dd>{version.username || "—"}</dd><dt>Website</dt><dd>{version.url || "—"}</dd>{version.differs.length > 0 && <><dt>Differs in</dt><dd>{version.differs.join(", ")}</dd></>}</dl>}<button className="generate-button" onClick={() => void keepVersion(version.revision)}>{version.deleted ? "Keep deletion" : "Keep this version"}</button></div>)}</div></div></div>}
       {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
       {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onSaved={loadBackupAge} onNotice={setNotice} /></div></div>}
@@ -1706,7 +1730,7 @@ const entryKinds: { value: EntryKind; label: string }[] = [
   { value: "card", label: "Card" },
 ];
 
-function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDetail; onCancel: () => void; onSave: (input: EntryInput) => Promise<void>; onDelete?: () => Promise<void> }) {
+function EntryEditor({ detail, generator, onGeneratorChoice, onCancel, onSave, onDelete }: { detail?: EntryDetail; generator: GeneratorChoice | null; onGeneratorChoice: (choice: GeneratorChoice) => void; onCancel: () => void; onSave: (input: EntryInput) => Promise<void>; onDelete?: () => Promise<void> }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [title, setTitle] = useState(detail?.title ?? "");
   const [kind, setKind] = useState<EntryKind>(detail?.kind ?? "login");
@@ -1714,6 +1738,12 @@ function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDet
   const [url, setUrl] = useState(detail?.url ?? "");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  // The password the generator made, until the owner types over it.
+  const [made, setMade] = useState(false);
+  const [generatorOpen, setGeneratorOpen] = useState(false);
+  /** The owner set the password, which a password still being made then leaves alone. */
+  const passwordSet = useRef(false);
+  const prefilled = useRef(false);
   const [totpSecret, setTotpSecret] = useState("");
   const [removeTotp, setRemoveTotp] = useState(false);
   const [notes, setNotes] = useState(detail?.notes ?? "");
@@ -1732,15 +1762,31 @@ function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDet
   const detected = cardBrand(number);
   const numberSlip = cardDigits(number) !== null && !passesCardCheck(number);
 
-  async function generate() { setPassword(await bridge.generatePassword(20)); setShowPassword(true); }
+  // A new item opens with a password made for it, shown, unless the owner
+  // set one before it came.
+  useEffect(() => {
+    if (detail || !generator || prefilled.current) return;
+    prefilled.current = true;
+    void bridge.generatePassword(generator).then((value) => {
+      if (passwordSet.current) return;
+      setPassword(value); setShowPassword(true); setMade(true);
+    }).catch(() => {});
+  }, [detail, generator]);
+  function setPasswordTo(value: string, generated: boolean) {
+    passwordSet.current = true;
+    setPassword(value); setMade(generated);
+    if (generated) setShowPassword(true);
+  }
+  async function generate() { if (generator) setPasswordTo(await bridge.generatePassword(generator), true); }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (!title.trim() || saving) return;
     setSaving(true);
     await onSave({
       title: title.trim(), kind, username, url: url.trim(), notes, favorite,
-      // Blank password/TOTP fields keep the stored value.
-      password: password ? password : undefined,
+      // Blank password/TOTP fields keep the stored value. Only a login or
+      // an identity shows a password, and keeps one.
+      password: password && (kind === "login" || kind === "identity") ? password : undefined,
       totpSecret: removeTotp ? "" : totpSecret.trim() ? totpSecret : undefined,
       // Blank number and code keep the stored ones too.
       card: kind === "card" ? {
@@ -1772,7 +1818,9 @@ function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDet
     {kind !== "secure_note" && kind !== "card" && <>
       <label>Username<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="off" /></label>
       <label>Website<input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://" autoComplete="off" /></label>
-      <label>Password<div className="field-row"><input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={detail?.hasPassword ? "Unchanged" : ""} autoComplete="new-password" /><button type="button" className="icon-button" title={showPassword ? "Hide" : "Show"} onClick={() => setShowPassword(!showPassword)}>{showPassword ? <EyeOff size={15} /> : <Eye size={15} />}</button><button type="button" className="icon-button" title="Generate" onClick={() => void generate()}><Sparkles size={15} /></button></div></label>
+      <label>Password<div className="field-row"><input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPasswordTo(event.target.value, false)} placeholder={detail?.hasPassword ? "Unchanged" : ""} autoComplete="new-password" /><button type="button" className="icon-button" title={showPassword ? "Hide" : "Show"} onClick={() => setShowPassword(!showPassword)}>{showPassword ? <EyeOff size={15} /> : <Eye size={15} />}</button>{password && <button type="button" className="icon-button" title="Clear" onClick={() => setPasswordTo("", false)}><Eraser size={15} /></button>}<button type="button" className="icon-button" title="Generate" onClick={() => void generate()} disabled={!generator}><Sparkles size={15} /></button><button type="button" className="icon-button" title="Generator options" aria-expanded={generatorOpen} onClick={() => setGeneratorOpen(!generatorOpen)} disabled={!generator}><SlidersHorizontal size={15} /></button></div></label>
+      {made && <p className="field-note">Made for this item with the generator's choice. Type over it, or clear it.</p>}
+      {generatorOpen && generator && <Generator choice={generator} onChoice={onGeneratorChoice} onUse={(value) => { setPasswordTo(value, true); setGeneratorOpen(false); }} />}
       <label>TOTP secret<input type="password" value={totpSecret} disabled={removeTotp} onChange={(event) => setTotpSecret(event.target.value)} placeholder={detail?.hasTotp ? "Unchanged" : "Base32 secret (optional)"} autoComplete="off" /></label>
       {detail?.hasTotp && <label className="check-row"><input type="checkbox" checked={removeTotp} onChange={(event) => setRemoveTotp(event.target.checked)} /> Remove one-time code</label>}
     </>}
@@ -1784,11 +1832,43 @@ function EntryEditor({ detail, onCancel, onSave, onDelete }: { detail?: EntryDet
   </form>;
 }
 
-function Generator({ onCopy }: { onCopy: (value: string) => void }) {
-  const [length, setLength] = useState(20);
+/**
+ * The generator: the owner's choice of length and of characters, kept on
+ * this device, and a password made with it, made again at each change. From
+ * the sidebar, `onCopy` copies it; in the editor, `onUse` puts it in the
+ * password field.
+ */
+function Generator({ choice, onChoice, onCopy, onUse }: { choice: GeneratorChoice; onChoice: (choice: GeneratorChoice) => void; onCopy?: (value: string) => void; onUse?: (value: string) => void }) {
+  const [length, setLength] = useState(choice.length);
   const [value, setValue] = useState("");
-  async function generate() { const next = await bridge.generatePassword(length); setValue(next); }
-  return <div className="generator"><div className="generated-value"><code>{value || "Generate a fresh password"}</code><button disabled={!value} onClick={() => onCopy(value)}><Copy size={16} /></button></div><label className="range-label">Length <strong>{length}</strong></label><input type="range" min="12" max="48" value={length} onChange={(event) => setLength(Number(event.target.value))} /><div className="generator-options"><span>Uppercase</span><span>Numbers</span><span>Symbols</span></div><button className="generate-button" onClick={generate}><Sparkles size={16} /> Generate new password</button></div>;
+  const shown = { ...choice, length };
+  async function generate() {
+    try { setValue(await bridge.generatePassword(shown)); } catch { setValue(""); }
+  }
+  useEffect(() => { void generate(); }, [length, choice.lowercase, choice.uppercase, choice.digits, choice.symbols, choice.avoidLookAlike]);
+  // The length is kept once the slider rests, or the generator closes.
+  const latest = useRef({ choice, length, onChoice });
+  latest.current = { choice, length, onChoice };
+  useEffect(() => {
+    if (length === choice.length) return;
+    const timer = setTimeout(() => onChoice({ ...choice, length }), 300);
+    return () => clearTimeout(timer);
+  }, [length]);
+  useEffect(() => () => {
+    const { choice, length, onChoice } = latest.current;
+    if (length !== choice.length) onChoice({ ...choice, length });
+  }, []);
+  const kinds = [["uppercase", "A–Z"], ["lowercase", "a–z"], ["digits", "0–9"], ["symbols", "!@#$"]] as const;
+  const chosen = kinds.filter(([kind]) => choice[kind]).length;
+  return <div className="generator">
+    <div className="generated-value"><code>{value || "Generate a fresh password"}</code>{onCopy && <button type="button" title="Copy" disabled={!value} onClick={() => onCopy(value)}><Copy size={16} /></button>}</div>
+    <label className="range-label">Length <strong>{length}</strong></label>
+    <input type="range" aria-label="Length" min="8" max="64" value={length} onChange={(event) => setLength(Number(event.target.value))} />
+    {/* The last kind chosen stays: a password needs one. */}
+    <div className="generator-options">{kinds.map(([kind, label]) => <label key={kind} className="check-row"><input type="checkbox" checked={choice[kind]} disabled={choice[kind] && chosen === 1} onChange={(event) => onChoice({ ...shown, [kind]: event.target.checked })} /> {label}</label>)}</div>
+    <label className="check-row generator-look-alike"><input type="checkbox" checked={choice.avoidLookAlike} onChange={(event) => onChoice({ ...shown, avoidLookAlike: event.target.checked })} /> Avoid look-alikes <code>l I 1 O 0</code></label>
+    <div className="generator-actions"><button type="button" className="generate-button" onClick={() => void generate()}><Sparkles size={16} /> Generate new password</button>{onUse && <button type="button" className="generate-button" disabled={!value} onClick={() => onUse(value)}>Use this password</button>}</div>
+  </div>;
 }
 
 export default App;

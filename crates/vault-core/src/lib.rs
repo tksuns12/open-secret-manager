@@ -23,7 +23,10 @@ pub use storage::{
     verify_pairing_signature, EncryptedRevision, EnrollmentMaterial, PendingDevice, Vault,
     BACKUPS_ID, CONTROL_SIGNATURE_DOMAIN, PAIRING_SIGNATURE_DOMAIN, RELAY_ID,
 };
-pub use util::{generate_password, totp_code};
+pub use util::{
+    generate_password, totp_code, PASSWORD_DIGITS, PASSWORD_LOOK_ALIKES, PASSWORD_LOWERCASE,
+    PASSWORD_SYMBOLS, PASSWORD_UPPERCASE,
+};
 
 impl Vault {
     /// Generates the current TOTP code for an unlocked vault item.

@@ -1,0 +1,11 @@
+{
+  "autoLockMinutes": 15,
+  "generator": {
+    "length": 8,
+    "lowercase": false,
+    "uppercase": false,
+    "digits": true,
+    "symbols": false,
+    "avoidLookAlike": true
+  }
+}

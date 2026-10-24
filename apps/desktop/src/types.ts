@@ -137,6 +137,18 @@ export type BackupAge = {
 export type Settings = {
   /** Minutes without activity before the window locks the vault: 1, 5, 15, or 60. */
   autoLockMinutes: number;
+  generator: GeneratorChoice;
+};
+
+/** What the generator makes: 8 to 64 characters, of at least one kind. */
+export type GeneratorChoice = {
+  length: number;
+  lowercase: boolean;
+  uppercase: boolean;
+  digits: boolean;
+  symbols: boolean;
+  /** Leaves out l, I, 1, O, and 0, from letters, and from digits when letters are chosen too. */
+  avoidLookAlike: boolean;
 };
 
 /** `password` and `totpSecret` are omitted to keep the stored value; an empty `totpSecret` removes it. */
@@ -417,7 +429,9 @@ export type DesktopBridge = {
   unlock: (password: string) => Promise<void>;
   createVault: (password: string) => Promise<string>;
   lock: () => Promise<void>;
-  generatePassword: (length: number) => Promise<string>;
+  generatePassword: (choice: GeneratorChoice) => Promise<string>;
+  /** Copies a password the generator made, for 30 seconds. */
+  copyGenerated: (value: string) => Promise<void>;
   copyTotp: (id: string) => Promise<void>;
   /** Copies an item's password for 30 seconds; the password never reaches the window. */
   copyPassword: (id: string) => Promise<void>;
@@ -524,6 +538,7 @@ export type DesktopBridge = {
   cancelImport: () => Promise<void>;
   settings: () => Promise<Settings>;
   setAutoLock: (minutes: number) => Promise<Settings>;
+  setGenerator: (choice: GeneratorChoice) => Promise<Settings>;
   /** Subscribes to a shell event; resolves to an unsubscribe function. */
   listen: <T>(event: string, handler: (payload: T) => void) => Promise<() => void>;
 };

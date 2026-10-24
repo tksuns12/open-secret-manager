@@ -11,7 +11,8 @@ use crate::{
         random_array, KdfConfig,
     },
     generate_password, preview_import, totp_code, Error, ImportFormat, Item, PasswordPolicy,
-    RecoveryKey, Vault,
+    RecoveryKey, Vault, PASSWORD_DIGITS, PASSWORD_LOOK_ALIKES, PASSWORD_LOWERCASE,
+    PASSWORD_SYMBOLS, PASSWORD_UPPERCASE,
 };
 
 fn login(title: &str) -> Item {
@@ -805,6 +806,146 @@ fn generator_honors_required_character_sets() {
     assert!(generated
         .bytes()
         .any(|byte| b"!@#$%^&*()-_=+[]{}:,.?".contains(&byte)));
+}
+
+/// The distinct characters of four passwords of 1024 characters made with
+/// `policy`: enough that every character it may take shows up.
+fn characters_made_with(policy: PasswordPolicy) -> std::collections::BTreeSet<u8> {
+    let policy = PasswordPolicy {
+        length: 1024,
+        ..policy
+    };
+    (0..4)
+        .flat_map(|_| generate_password(&policy).unwrap().into_bytes())
+        .collect()
+}
+
+fn set_of(characters: &str) -> std::collections::BTreeSet<u8> {
+    characters.bytes().collect()
+}
+
+#[test]
+fn the_generator_takes_the_kinds_chosen_and_leaves_out_look_alikes() {
+    let all =
+        format!("{PASSWORD_LOWERCASE}{PASSWORD_UPPERCASE}{PASSWORD_DIGITS}{PASSWORD_SYMBOLS}");
+    let without_look_alikes: String = all
+        .chars()
+        .filter(|character| !PASSWORD_LOOK_ALIKES.contains(*character))
+        .collect();
+    assert_eq!(
+        characters_made_with(PasswordPolicy::default()),
+        set_of(&without_look_alikes)
+    );
+    assert_eq!(
+        characters_made_with(PasswordPolicy {
+            avoid_look_alike: false,
+            ..PasswordPolicy::default()
+        }),
+        set_of(&all)
+    );
+    // Each kind left out, the others kept.
+    let without = |kind: &str| -> String {
+        without_look_alikes
+            .chars()
+            .filter(|character| !kind.contains(*character))
+            .collect()
+    };
+    for (policy, kind) in [
+        (
+            PasswordPolicy {
+                lowercase: false,
+                ..PasswordPolicy::default()
+            },
+            PASSWORD_LOWERCASE,
+        ),
+        (
+            PasswordPolicy {
+                uppercase: false,
+                ..PasswordPolicy::default()
+            },
+            PASSWORD_UPPERCASE,
+        ),
+        (
+            PasswordPolicy {
+                digits: false,
+                ..PasswordPolicy::default()
+            },
+            PASSWORD_DIGITS,
+        ),
+        (
+            PasswordPolicy {
+                symbols: false,
+                ..PasswordPolicy::default()
+            },
+            PASSWORD_SYMBOLS,
+        ),
+    ] {
+        assert_eq!(characters_made_with(policy), set_of(&without(kind)));
+    }
+    let only = |lowercase, uppercase, digits, symbols| PasswordPolicy {
+        lowercase,
+        uppercase,
+        digits,
+        symbols,
+        ..PasswordPolicy::default()
+    };
+    assert_eq!(
+        characters_made_with(only(true, false, false, false)),
+        set_of("abcdefghijkmnopqrstuvwxyz")
+    );
+    assert_eq!(
+        characters_made_with(only(false, false, false, true)),
+        set_of(PASSWORD_SYMBOLS)
+    );
+    // Digits alone, as for a PIN, are all ten; with letters, not 0 or 1.
+    assert_eq!(
+        characters_made_with(only(false, false, true, false)),
+        set_of(PASSWORD_DIGITS)
+    );
+    assert_eq!(
+        characters_made_with(only(false, true, true, false)),
+        set_of("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+    );
+}
+
+#[test]
+fn the_generator_refuses_what_it_cannot_make() {
+    let refused =
+        |policy: PasswordPolicy| matches!(generate_password(&policy), Err(Error::InvalidItem(_)));
+    assert!(refused(PasswordPolicy {
+        lowercase: false,
+        uppercase: false,
+        digits: false,
+        symbols: false,
+        ..PasswordPolicy::default()
+    }));
+    // Shorter than one character of each kind chosen.
+    assert!(refused(PasswordPolicy {
+        length: 3,
+        ..PasswordPolicy::default()
+    }));
+    assert_eq!(
+        generate_password(&PasswordPolicy {
+            length: 4,
+            ..PasswordPolicy::default()
+        })
+        .unwrap()
+        .len(),
+        4
+    );
+    assert!(refused(PasswordPolicy {
+        length: 1025,
+        ..PasswordPolicy::default()
+    }));
+    assert_eq!(
+        generate_password(&PasswordPolicy {
+            length: 1024,
+            ..PasswordPolicy::default()
+        })
+        .unwrap()
+        .len(),
+        1024
+    );
 }
 
 #[test]

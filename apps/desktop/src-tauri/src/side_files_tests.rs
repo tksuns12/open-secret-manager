@@ -13,7 +13,7 @@ use proptest::prelude::*;
 use crate::archive::archived_at;
 use crate::backup::{backup_age_at, note_backup, FIRST_REMIND_AFTER_DAYS, REMIND_AFTER_DAYS};
 use crate::network::{finish_interrupted_recovery, putting_away_note, PutAway, PUTTING_AWAY};
-use crate::settings::{self, AUTO_LOCK_CHOICES};
+use crate::settings::{self, GeneratorChoice, AUTO_LOCK_CHOICES};
 
 const DAY: u64 = 86_400;
 /// The vault the fixtures' backup record is for.
@@ -65,6 +65,45 @@ fn the_settings_are_written_and_read_as_frozen() {
     assert_eq!(
         settings::read(&other.path().join("vault.sqlite3")).auto_lock_minutes,
         15
+    );
+}
+
+/// A generator choice set (Phase 19) is written beside the wait, which an
+/// earlier build reads as before, leaving what it does not know.
+#[test]
+fn the_generator_choice_is_written_and_read_as_frozen() {
+    let digits = GeneratorChoice {
+        length: 8,
+        lowercase: false,
+        uppercase: false,
+        digits: true,
+        symbols: false,
+        avoid_look_alike: true,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault.sqlite3");
+    settings::set_auto_lock_at(&vault, 15).unwrap();
+    settings::set_generator_at(&vault, digits.clone()).unwrap();
+    let made = std::fs::read(dir.path().join("settings.json")).unwrap();
+    let frozen = frozen("settings-generator.json", &made);
+    assert_eq!(
+        String::from_utf8_lossy(&made),
+        String::from_utf8_lossy(&frozen)
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("settings.json"), &frozen).unwrap();
+    let read = settings::read(&other.path().join("vault.sqlite3"));
+    assert_eq!((read.auto_lock_minutes, read.generator), (15, digits));
+    // The file of Phase 13 has no choice, which is the default.
+    std::fs::write(
+        other.path().join("settings.json"),
+        std::fs::read(fixture("settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings::read(&other.path().join("vault.sqlite3")).generator,
+        GeneratorChoice::default()
     );
 }
 
@@ -202,11 +241,32 @@ fn settings_bytes() -> impl Strategy<Value = Vec<u8>> {
         Just("[5]".to_owned()),
         Just("1e400".to_owned()),
     ];
+    // A generator choice as this app writes it, with any length and kinds,
+    // or something else in its place.
+    let generator = prop_oneof![
+        (any::<u32>(), proptest::array::uniform5(any::<bool>())).prop_map(
+            |(length, [lowercase, uppercase, digits, symbols, avoid])| format!(
+                "{{\"length\": {length}, \"lowercase\": {lowercase}, \"uppercase\": {uppercase}, \"digits\": {digits}, \"symbols\": {symbols}, \"avoidLookAlike\": {avoid}}}"
+            )
+        ),
+        (8u32..=64).prop_map(|length| format!("{{\"length\": {length}}}")),
+        Just("null".to_owned()),
+        Just("[]".to_owned()),
+        ".{0,12}".prop_map(|junk| format!("{junk:?}")),
+    ];
     prop_oneof![
         minutes.prop_map(|minutes| format!("{{\"autoLockMinutes\": {minutes}}}").into_bytes()),
         (any::<u32>(), ".{0,12}").prop_map(|(minutes, junk)| {
             format!("{{\"autoLockMinutes\": {minutes}, \"other\": {junk:?}}}").into_bytes()
         }),
+        (
+            proptest::sample::select(AUTO_LOCK_CHOICES.to_vec()),
+            generator
+        )
+            .prop_map(|(minutes, generator)| {
+                format!("{{\"autoLockMinutes\": {minutes}, \"generator\": {generator}}}")
+                    .into_bytes()
+            }),
         proptest::collection::vec(any::<u8>(), 0..64),
     ]
 }
@@ -317,6 +377,11 @@ proptest! {
             .and_then(|value| u32::try_from(value.get("autoLockMinutes")?.as_u64()?).ok())
             .filter(|minutes| AUTO_LOCK_CHOICES.contains(minutes));
         prop_assert_eq!(minutes, named.unwrap_or(5));
+        // Whatever the generator part holds, the choice read is one the
+        // generator can make.
+        let generator = settings::read(&dir.path().join("vault.sqlite3")).generator;
+        prop_assert!(settings::GENERATOR_LENGTHS.contains(&generator.length));
+        prop_assert!(osm_vault_core::generate_password(&generator.policy()).is_ok());
     }
 
     /// Whatever `backups.json` holds, the window is told a number of days

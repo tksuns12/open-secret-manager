@@ -2,6 +2,8 @@ The files the desktop app keeps beside the vault, as this code wrote them
 when they were frozen (Phase 13), read back by `src/side_files_tests.rs`:
 
 - `settings.json`: the auto-lock time set to 15 minutes.
+- `settings-generator.json` (Phase 19): the same, and the generator set to
+  8 digits.
 - `backups.json`: a backup of the vault `abab…ab` saved at 1791500000, a
   day after the device began counting.
 - `putting-away`: the marker of a copy being put away so that the device can
