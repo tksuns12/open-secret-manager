@@ -18,6 +18,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -134,7 +135,7 @@ fun VaultScreen(
         }
     }
     val fields = state.editor?.takeIf { state.screen == Screen.UNLOCKED }?.let { editor ->
-        remember(editor) { EditorFields(editor.detail, editor.draft) }
+        remember(editor) { EditorFields(editor.detail, editor.draft, editor.generated) }
     }
     Scaffold(
         topBar = {
@@ -911,18 +912,21 @@ private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
 }
 
 /**
- * What the editor holds while it is open: a new login or secure note, or
- * [detail] as it was read. A blank password or one-time code secret keeps
- * what the item has.
+ * What the editor holds while it is open: a new item, or [detail] as it was
+ * read, from [draft] if there is one. A blank password or one-time code
+ * secret keeps what the item has. A new item's password is the one made for
+ * it, [generated], shown, until the owner types over it.
  */
-/** The editor's fields, from [draft] if there is one, else from the item as read. */
-class EditorFields(detail: ItemDetail?, draft: ItemDraft? = null) {
+class EditorFields(detail: ItemDetail?, draft: ItemDraft? = null, generated: String? = null) {
     var kind by mutableStateOf(draft?.kind ?: detail?.kind ?: ItemKind.LOGIN)
     var title by mutableStateOf(draft?.title ?: detail?.title ?: "")
     var username by mutableStateOf(draft?.username ?: detail?.username ?: "")
     var url by mutableStateOf(draft?.url ?: detail?.url ?: "")
-    var password by mutableStateOf(draft?.password ?: "")
-    var showPassword by mutableStateOf(false)
+    var password by mutableStateOf(draft?.password ?: generated ?: "")
+    var showPassword by mutableStateOf(draft == null && generated != null)
+    /** The password is one the generator made. */
+    var made by mutableStateOf(draft == null && generated != null)
+    var generatorOpen by mutableStateOf(false)
     var code by mutableStateOf(draft?.oneTimeCodeSecret?.takeIf { it.isNotEmpty() } ?: "")
     var removeCode by mutableStateOf(draft?.oneTimeCodeSecret == "")
     var notes by mutableStateOf(draft?.notes ?: detail?.notes ?: "")
@@ -1022,26 +1026,55 @@ private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, changedElsewhe
             EditField(fields.url, { fields.url = it }, "Website", "edit-url", keyboard = KeyboardType.Uri)
             OutlinedTextField(
                 value = fields.password,
-                onValueChange = { fields.password = it },
+                onValueChange = {
+                    fields.password = it
+                    fields.made = false
+                },
                 label = { Text("Password") },
                 placeholder = { if (detail?.hasPassword == true) Text("Unchanged") },
-                supportingText = { if (detail?.hasPassword == true) Text("Left blank, the password stays as it is") },
+                supportingText = {
+                    when {
+                        fields.made -> Text("Made for this item with the generator's choice. Type over it, or clear it.", modifier = Modifier.testTag("password-made"))
+                        detail?.hasPassword == true -> Text("Left blank, the password stays as it is")
+                    }
+                },
                 singleLine = true,
                 visualTransformation = if (fields.showPassword) VisualTransformation.None else PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 modifier = Modifier.fillMaxWidth().testTag("edit-password"),
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            val context = LocalContext.current
+            fun generate() {
+                fields.password = session.generatePassword()
+                fields.made = true
+                fields.showPassword = true
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = { fields.showPassword = !fields.showPassword }, modifier = Modifier.testTag("show-password")) {
                     Text(if (fields.showPassword) "Hide" else "Show")
                 }
+                TextButton(onClick = ::generate, modifier = Modifier.testTag("generate")) { Text("Generate") }
+                TextButton(
+                    onClick = { fields.generatorOpen = !fields.generatorOpen },
+                    modifier = Modifier.testTag("generator-open"),
+                ) { Text(if (fields.generatorOpen) "Close options" else "Options") }
                 TextButton(
                     onClick = {
-                        fields.password = session.generatePassword()
-                        fields.showPassword = true
+                        fields.password = ""
+                        fields.made = false
                     },
-                    modifier = Modifier.testTag("generate"),
-                ) { Text("Generate") }
+                    enabled = fields.password.isNotEmpty(),
+                    modifier = Modifier.testTag("clear-password"),
+                ) { Text("Clear") }
+            }
+            if (fields.generatorOpen) {
+                // Each change makes the password again with it.
+                var options by remember { mutableStateOf(Generator.options(context)) }
+                GeneratorOptions(options) {
+                    Generator.set(context, it)
+                    options = it
+                    generate()
+                }
             }
             OutlinedTextField(
                 value = fields.code,

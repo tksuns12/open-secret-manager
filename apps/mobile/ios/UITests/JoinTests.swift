@@ -43,6 +43,8 @@ final class JoinTests: UITestCase {
         let title = app.descendants(matching: .any)["edit-title"].firstMatch
         title.waitAndTap()
         title.typeText("From the phone")
+        // In place of the password made for it.
+        app.buttons["clear-password"].waitAndTap()
         let secret = app.descendants(matching: .any)["edit-password"].firstMatch
         secret.waitAndTap()
         secret.typeText("phone-made password")

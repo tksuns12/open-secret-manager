@@ -7,11 +7,13 @@ enum Screen: Equatable { case opening, noVault, joining, locked, unlocked, remov
 /// An item being written: a new one when `detail` is nil, otherwise that
 /// item as it was read. A save refused because the item changed elsewhere
 /// opens it again with `draft`, what was typed put on top of the item as it
-/// is now, and names what changed in `changedElsewhere`.
+/// is now, and names what changed in `changedElsewhere`. A new item comes
+/// with a password made for it, `generated`.
 struct Editor: Hashable {
     let detail: ItemDetail?
     var draft: ItemDraft? = nil
     var changedElsewhere: [String] = []
+    var generated: String? = nil
 }
 
 /// An item's versions, newest first, while its history is open.
@@ -219,7 +221,7 @@ final class VaultModel: ObservableObject {
     }
 
     func startNew() {
-        editor = Editor(detail: nil)
+        editor = Editor(detail: nil, generated: generatePassword())
     }
 
     func startEdit(_ detail: ItemDetail) {
@@ -407,9 +409,9 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    /// A new password from the shared generator.
+    /// A new password from the shared generator, as the owner chose (`Generator`).
     func generatePassword() -> String {
-        (try? OpenSecretManager.generatePassword(length: 20)) ?? ""
+        (try? OpenSecretManager.generatePassword(options: Generator.options)) ?? ""
     }
 
     func copyUsername(_ detail: ItemDetail) {

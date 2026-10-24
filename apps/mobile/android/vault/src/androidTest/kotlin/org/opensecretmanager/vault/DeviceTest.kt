@@ -109,7 +109,7 @@ class DeviceTest {
             assertEquals("someone else", device.item(created).username)
             device.deleteItem(created, device.item(created).revision)
             fails<MobileException.NotFound> { device.item(created) }
-            assertEquals(24, generatePassword(24u).length)
+            assertEquals(24, generatePassword(defaultPasswordOptions().copy(length = 24u)).length)
 
             // A copy of a vault is not a device of its vault's devices.
             fails<MobileException.Network> { device.goOnline() }

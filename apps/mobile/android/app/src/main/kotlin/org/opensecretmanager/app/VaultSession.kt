@@ -70,13 +70,19 @@ data class UiState(
 /** The versions of [detail], newest first. */
 data class History(val detail: ItemDetail, val versions: List<HistoryEntry>)
 
-/** A new item when [detail] is null, otherwise that item as it was read. */
 /**
  * An item being made (`detail` null) or edited. After a save met a change
  * made elsewhere, [draft] holds what the owner typed put on top of the item
  * as it is now, and [changedElsewhere] names what the other device changed.
+ * A new item comes with a password made for it, [generated], kept here so
+ * that the screen made again, as when the phone turns, shows the same.
  */
-data class Editor(val detail: ItemDetail?, val draft: ItemDraft? = null, val changedElsewhere: List<String> = emptyList())
+data class Editor(
+    val detail: ItemDetail?,
+    val draft: ItemDraft? = null,
+    val changedElsewhere: List<String> = emptyList(),
+    val generated: String? = null,
+)
 
 /**
  * The device of the vault, as the screens use it. Every call to it runs off
@@ -273,7 +279,7 @@ class VaultSession(private val context: Context, private val folder: File) {
     }
 
     fun startNew() {
-        _state.update { it.copy(editor = Editor(null)) }
+        _state.update { it.copy(editor = Editor(null, generated = runCatching { generatePassword() }.getOrNull())) }
     }
 
     fun startEdit(detail: ItemDetail) {
@@ -416,8 +422,8 @@ class VaultSession(private val context: Context, private val folder: File) {
         refresh()
     }
 
-    /** A new password from the shared generator. */
-    fun generatePassword(): String = org.opensecretmanager.vault.generatePassword(20u)
+    /** A new password from the shared generator, as the owner chose ([Generator]). */
+    fun generatePassword(): String = org.opensecretmanager.vault.generatePassword(Generator.options(context))
 
     fun copyUsername(detail: ItemDetail) {
         SecretClipboard.copy(context, "Username", detail.username, secret = false)

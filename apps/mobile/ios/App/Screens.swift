@@ -529,7 +529,10 @@ private struct ItemEditor: View {
     @State private var username: String
     @State private var url: String
     @State private var password: String
-    @State private var showPassword = false
+    @State private var showPassword: Bool
+    /// The password the generator made, which the field holds until the owner types over it.
+    @State private var made: String?
+    @State private var generatorOpen = false
     @State private var code: String
     @State private var removeCode: Bool
     @State private var notes: String
@@ -556,7 +559,10 @@ private struct ItemEditor: View {
         _title = State(initialValue: draft?.title ?? detail?.title ?? "")
         _username = State(initialValue: draft?.username ?? detail?.username ?? "")
         _url = State(initialValue: draft?.url ?? detail?.url ?? "")
-        _password = State(initialValue: draft?.password ?? "")
+        _password = State(initialValue: draft?.password ?? editor.generated ?? "")
+        let made = draft == nil ? editor.generated : nil
+        _made = State(initialValue: made)
+        _showPassword = State(initialValue: made != nil)
         _code = State(initialValue: draft?.oneTimeCodeSecret ?? "")
         _removeCode = State(initialValue: draft?.oneTimeCodeSecret == "")
         _notes = State(initialValue: draft?.notes ?? detail?.notes ?? "")
@@ -568,6 +574,12 @@ private struct ItemEditor: View {
         _securityCode = State(initialValue: draft?.card?.securityCode ?? "")
         _removeSecurityCode = State(initialValue: draft?.card?.securityCode == "")
         _brand = State(initialValue: draft?.card?.brand)
+    }
+
+    private func generate() {
+        password = model.generatePassword()
+        made = password
+        showPassword = true
     }
 
     private var draft: ItemDraft {
@@ -656,15 +668,27 @@ private struct ItemEditor: View {
                     HStack {
                         Button(showPassword ? "Hide" : "Show") { showPassword.toggle() }.accessibilityIdentifier("show-password")
                         Spacer()
-                        Button("Generate") {
-                            password = model.generatePassword()
-                            showPassword = true
-                        }
-                        .accessibilityIdentifier("generate")
+                        Button("Clear") { password = "" }
+                            .disabled(password.isEmpty)
+                            .accessibilityIdentifier("clear-password")
+                        Spacer()
+                        Button(generatorOpen ? "Close options" : "Options") { generatorOpen.toggle() }
+                            .accessibilityIdentifier("generator-open")
+                        Spacer()
+                        Button("Generate", action: generate).accessibilityIdentifier("generate")
                     }
                     .buttonStyle(.borderless)
+                    // Each change makes the password again with it.
+                    if generatorOpen {
+                        GeneratorOptions { generate() }
+                    }
                 } footer: {
-                    if detail?.hasPassword == true { Text("Left blank, the password stays as it is.") }
+                    if made != nil && password == made {
+                        Text("Made for this item with the generator's choice. Type over it, or clear it.")
+                            .accessibilityIdentifier("password-made")
+                    } else if detail?.hasPassword == true {
+                        Text("Left blank, the password stays as it is.")
+                    }
                 }
                 Section {
                     SecureField(detail?.hasOneTimeCode == true ? "Unchanged" : "One-time code secret (optional)", text: $code)
@@ -800,5 +824,53 @@ private struct SyncLine: View {
             Spacer()
             Button("Sync now", action: model.syncNow).buttonStyle(.borderless)
         }
+    }
+}
+
+/// The generator's choice, to change, kept as it changes (`Generator`): the
+/// length, the kinds of characters, the last of which cannot be turned off,
+/// and the look-alikes. `onChange` follows each change.
+struct GeneratorOptions: View {
+    let onChange: () -> Void
+    @State private var options = Generator.options
+
+    private struct Kind: Identifiable {
+        let label: String
+        let path: WritableKeyPath<PasswordOptions, Bool>
+        var id: String { label }
+    }
+
+    private let kinds = [
+        Kind(label: "A–Z", path: \.uppercase), Kind(label: "a–z", path: \.lowercase),
+        Kind(label: "0–9", path: \.digits), Kind(label: "!@#$", path: \.symbols),
+    ]
+
+    var body: some View {
+        let chosen = kinds.filter { options[keyPath: $0.path] }.count
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Length \(options.length)").accessibilityIdentifier("generator-length-shown")
+            Slider(
+                value: Binding(get: { Double(options.length) }, set: { value in
+                    let length = UInt32(value.rounded())
+                    if length != options.length { change { $0.length = length } }
+                }),
+                in: Double(Generator.lengths.lowerBound)...Double(Generator.lengths.upperBound),
+                step: 1
+            )
+            .accessibilityIdentifier("generator-length")
+            ForEach(kinds) { kind in
+                Toggle(kind.label, isOn: Binding(get: { options[keyPath: kind.path] }, set: { on in change { $0[keyPath: kind.path] = on } }))
+                    .disabled(options[keyPath: kind.path] && chosen == 1)
+                    .accessibilityIdentifier("generator-kind:\(kind.label)")
+            }
+            Toggle("Avoid look-alikes: l I 1 O 0", isOn: Binding(get: { options.avoidLookAlike }, set: { on in change { $0.avoidLookAlike = on } }))
+                .accessibilityIdentifier("generator-avoid-look-alike")
+        }
+    }
+
+    private func change(_ edit: (inout PasswordOptions) -> Void) {
+        edit(&options)
+        Generator.options = options
+        onChange()
     }
 }

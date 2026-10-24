@@ -547,11 +547,39 @@ fn logins_notes_and_cards_are_created_edited_and_deleted_and_the_rest_is_left_to
     device.delete_item(id.clone(), current.revision).unwrap();
     assert!(matches!(device.item(id), Err(MobileError::NotFound)));
 
-    // New passwords come from the shared generator.
-    let generated = osm_mobile::generate_password(24).unwrap();
+    // New passwords come from the shared generator, as the owner chose.
+    let options = osm_mobile::default_password_options();
+    assert_eq!(options.length, 20);
+    let generated = osm_mobile::generate_password(osm_mobile::PasswordOptions {
+        length: 24,
+        ..options.clone()
+    })
+    .unwrap();
     assert_eq!(generated.chars().count(), 24);
+    let digits = osm_mobile::generate_password(osm_mobile::PasswordOptions {
+        length: 64,
+        lowercase: false,
+        uppercase: false,
+        symbols: false,
+        ..options.clone()
+    })
+    .unwrap();
+    assert!(digits.bytes().all(|byte| byte.is_ascii_digit()), "{digits}");
     assert!(matches!(
-        osm_mobile::generate_password(2),
+        osm_mobile::generate_password(osm_mobile::PasswordOptions {
+            length: 2,
+            ..options.clone()
+        }),
+        Err(MobileError::InvalidItem { .. })
+    ));
+    assert!(matches!(
+        osm_mobile::generate_password(osm_mobile::PasswordOptions {
+            lowercase: false,
+            uppercase: false,
+            digits: false,
+            symbols: false,
+            ..options
+        }),
         Err(MobileError::InvalidItem { .. })
     ));
     // A draft prints none of what it holds.

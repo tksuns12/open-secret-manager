@@ -21,6 +21,8 @@ final class SafariTests: UITestCase {
         unlock(in: app)
         XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
         app.buttons["new-item"].tap()
+        // In place of the password made for it.
+        app.buttons["clear-password"].waitAndTap()
         for (text, identifier) in [("Test site", "edit-title"), ("site-user", "edit-username"),
                                    (site!, "edit-url"), ("site-pass-1", "edit-password")] {
             let field = app.descendants(matching: .any)[identifier].firstMatch

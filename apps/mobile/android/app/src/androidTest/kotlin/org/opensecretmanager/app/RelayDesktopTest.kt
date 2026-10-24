@@ -7,6 +7,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.UiDevice
@@ -81,7 +82,7 @@ class RelayDesktopTest {
         compose.onNodeWithTag("new-item").performClick()
         compose.waitUntilAtLeastOneExists(hasTestTag("edit-title"), 10_000)
         compose.onNodeWithTag("edit-title").performTextInput("Sent through the relay")
-        compose.onNodeWithTag("edit-password").performTextInput("relayed password")
+        compose.onNodeWithTag("edit-password").performTextReplacement("relayed password")
         compose.onNodeWithTag("save").performClick()
         compose.waitUntil(60_000) { syncedSince(session, made) }
         Log.i("OSMJoin", "PHONE-MADE Sent through the relay")

@@ -122,7 +122,9 @@ do {
     check(try device.item(id: created).username == "someone else", "a saved password changes nothing else")
     try device.deleteItem(id: created, revision: try device.item(id: created).revision)
     check(fails({ try device.item(id: created) }) { if case .NotFound = $0 { true } else { false } }, "a deleted item is gone")
-    check(try generatePassword(length: 24).count == 24, "the generator makes the length asked for")
+    var options = defaultPasswordOptions()
+    options.length = 24
+    check(try generatePassword(options: options).count == 24, "the generator makes the length asked for")
     check(fails({ try device.goOnline() }) { if case .Network = $0 { true } else { false } }, "a copy of a vault does not go online")
     check(device.syncStatus().state == .offline, "it reports being offline")
     // The password changes, given the current one.

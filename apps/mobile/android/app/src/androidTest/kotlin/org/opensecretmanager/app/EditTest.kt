@@ -1,6 +1,7 @@
 package org.opensecretmanager.app
 
 import android.content.ClipboardManager
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertCountEquals
@@ -14,12 +15,16 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -52,6 +57,7 @@ class EditTest {
         compose.onNodeWithTag(tag).fetchSemanticsNode().config[SemanticsProperties.EditableText].text
 
     private fun unlocked() {
+        Generator.forget(instrumentation.targetContext)
         session.reopenForTests { folder ->
             BiometricUnlock(instrumentation.targetContext).disable()
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
@@ -87,7 +93,9 @@ class EditTest {
         compose.onNodeWithTag("edit-title").performTextInput("Forum")
         compose.onNodeWithTag("edit-username").performTextInput("me@forum.example.test")
         compose.onNodeWithTag("edit-url").performTextInput("https://forum.example.test")
-        compose.onNodeWithTag("edit-password").performTextInput("forum password")
+        // It comes with a password made for it, which typing replaces.
+        compose.onNodeWithTag("password-made", useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("edit-password").performTextReplacement("forum password")
         save()
         // The new item opens.
         waitFor("detail-username")
@@ -162,10 +170,14 @@ class EditTest {
         compose.onNodeWithTag("new-item").performClick()
         waitFor("edit-title")
         compose.onNodeWithTag("edit-title").performTextInput("Router")
+        // A new login comes with a password made for it, shown.
+        val made = value("edit-password")
+        assertTrue(made, Regex("[^lIO01]{20}").matches(made))
+        compose.onNodeWithTag("password-made", useUnmergedTree = true).assertExists()
         compose.onNodeWithTag("generate").performClick()
-        val generated = compose.onNodeWithTag("edit-password").fetchSemanticsNode()
-            .config[SemanticsProperties.EditableText].text
+        val generated = value("edit-password")
         assertEquals(20, generated.length)
+        assertNotEquals(made, generated)
         save()
         waitFor("copy-password")
         assertCopiedPassword(generated)
@@ -181,6 +193,40 @@ class EditTest {
         save()
         waitFor("detail-notes")
         assertEquals("first code\nsecond code", text("detail-notes"))
+        compose.onAllNodesWithTag("copy-password").assertCountEquals(0)
+    }
+
+    /**
+     * The generator's options, opened under the password, make the password
+     * again at each change, and are kept for the next new item; Clear
+     * leaves none.
+     */
+    @Test
+    fun theGeneratorsChoiceIsMadeUnderThePasswordAndKept() {
+        unlocked()
+        compose.onNodeWithTag("new-item").performClick()
+        waitFor("edit-title")
+        compose.onNodeWithTag("generator-open").performClick()
+        waitFor("generator-options")
+        for (kind in listOf("A–Z", "a–z", "!@#$")) compose.onNodeWithTag("generator-kind:$kind").performScrollTo().performClick()
+        // The last kind cannot be turned off.
+        compose.onNodeWithTag("generator-kind:0–9").assertIsNotEnabled()
+        compose.waitUntil(5_000) { Regex("[0-9]{20}").matches(value("edit-password")) }
+        compose.onNodeWithTag("generator-length").performScrollTo().performSemanticsAction(SemanticsActions.SetProgress) { it(8f) }
+        compose.waitUntil(5_000) { Regex("[0-9]{8}").matches(value("edit-password")) }
+        assertEquals("Length 8", text("generator-length-shown"))
+
+        // Kept: the next new item's password is made with it.
+        compose.onNodeWithTag("cancel-edit").performClick()
+        compose.onNodeWithTag("new-item").performClick()
+        waitFor("edit-title")
+        assertTrue(Regex("[0-9]{8}").matches(value("edit-password")))
+        compose.onNodeWithTag("clear-password").performClick()
+        assertEquals("", value("edit-password"))
+        compose.onAllNodesWithTag("password-made", useUnmergedTree = true).assertCountEquals(0)
+        compose.onNodeWithTag("edit-title").performTextInput("No password")
+        save()
+        waitFor("edit")
         compose.onAllNodesWithTag("copy-password").assertCountEquals(0)
     }
 

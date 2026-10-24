@@ -26,6 +26,7 @@ enum TestSupport {
             try? files.removeItem(at: folder.appendingPathComponent(name))
         }
         UserDefaults(suiteName: DeviceFolder.appGroup)?.removeObject(forKey: "app-logins")
+        Generator.forget()
         if vault != "none" {
             try? files.copyItem(at: URL(fileURLWithPath: vault), to: folder.appendingPathComponent("vault.sqlite3"))
         }

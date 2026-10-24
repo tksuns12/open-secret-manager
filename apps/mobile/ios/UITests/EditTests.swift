@@ -61,7 +61,9 @@ final class EditTests: UITestCase {
         type("Forum", into: "edit-title", in: app)
         type("me@forum.example.test", into: "edit-username", in: app)
         type("https://forum.example.test", into: "edit-url", in: app)
-        type("forum password", into: "edit-password", in: app)
+        // It comes with a password made for it, which the owner replaces.
+        XCTAssert(app.staticTexts["password-made"].exists)
+        replace("edit-password", with: "forum password", in: app)
         app.buttons["save"].tap()
         // The new item opens.
         XCTAssert(app.staticTexts["detail-username"].waitForLabel("me@forum.example.test"))
@@ -130,9 +132,14 @@ final class EditTests: UITestCase {
         let app = unlocked()
         app.buttons["new-item"].tap()
         type("Router", into: "edit-title", in: app)
+        // A new login comes with a password made for it, shown.
+        let made = (field("edit-password", in: app).value as? String) ?? ""
+        XCTAssertNotNil(made.wholeMatch(of: #/[^lIO01]{20}/#), made)
+        XCTAssert(app.staticTexts["password-made"].exists)
         app.buttons["generate"].waitAndTap()
         let generated = (field("edit-password", in: app).value as? String) ?? ""
         XCTAssertEqual(generated.count, 20)
+        XCTAssertNotEqual(generated, made)
         app.buttons["save"].tap()
         XCTAssert(app.buttons["copy-password"].waitForExistence(timeout: 15))
         XCTAssertEqual(pastedPassword(from: app), generated)
@@ -148,6 +155,42 @@ final class EditTests: UITestCase {
         capture("edit-4-note")
         app.buttons["save"].tap()
         XCTAssert(app.staticTexts["detail-notes"].waitForLabel("first code\nsecond code"))
+        XCTAssertFalse(app.buttons["copy-password"].exists)
+    }
+
+    /// The generator's options, opened under the password, make the
+    /// password again at each change, and are kept for the next new item;
+    /// Clear leaves none.
+    func testTheGeneratorsChoiceIsMadeUnderThePasswordAndKept() {
+        let app = unlocked()
+        app.buttons["new-item"].tap()
+        XCTAssert(field("edit-title", in: app).waitForExistence(timeout: 10))
+        app.buttons["generator-open"].waitAndTap()
+        for kind in ["A–Z", "a–z", "!@#$"] {
+            let toggle = app.switches["generator-kind:\(kind)"]
+            XCTAssert(toggle.waitForExistence(timeout: 10), kind)
+            if !toggle.isHittable { app.swipeUp() }
+            toggle.switches.firstMatch.exists ? toggle.switches.firstMatch.tap() : toggle.tap()
+        }
+        // The last kind cannot be turned off.
+        XCTAssertFalse(app.switches["generator-kind:0–9"].isEnabled)
+        let password = { (self.field("edit-password", in: app).value as? String) ?? "" }
+        XCTAssertNotNil(password().wholeMatch(of: #/[0-9]{20}/#), password())
+        app.sliders["generator-length"].adjust(toNormalizedSliderPosition: 0)
+        XCTAssert(app.staticTexts["generator-length-shown"].waitForLabel("Length 8"))
+        XCTAssertNotNil(password().wholeMatch(of: #/[0-9]{8}/#), password())
+
+        // Kept: the next new item's password is made with it.
+        app.buttons["cancel-edit"].tap()
+        app.buttons["new-item"].waitAndTap()
+        XCTAssert(field("edit-title", in: app).waitForExistence(timeout: 10))
+        XCTAssertNotNil(password().wholeMatch(of: #/[0-9]{8}/#), password())
+        app.buttons["clear-password"].tap()
+        XCTAssertEqual(password(), "")
+        XCTAssertFalse(app.staticTexts["password-made"].exists)
+        type("No password", into: "edit-title", in: app)
+        app.buttons["save"].tap()
+        XCTAssert(app.buttons["edit"].waitForExistence(timeout: 15))
         XCTAssertFalse(app.buttons["copy-password"].exists)
     }
 

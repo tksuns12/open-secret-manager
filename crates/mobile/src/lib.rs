@@ -661,9 +661,6 @@ pub fn check_card_number(number: String) -> CardNumberCheck {
     }
 }
 
-/// A new password of `length` characters with letters, digits, and
-/// symbols, from the shared code's generator, as the desktop app makes
-/// them; a length it does not allow is refused.
 /// Whether a site's request for a passkey is one this app answers, for
 /// `caller`, without the vault: read and checked as
 /// [`Device::passkey_creation`] (when `creating`) or
@@ -685,11 +682,45 @@ pub fn check_passkey_request(
     Ok(())
 }
 
+/// What the generator makes: `length` characters, at least one of each
+/// kind chosen, the look-alikes (l I 1 O 0) left out if asked, as the
+/// shared code's `PasswordPolicy` says.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PasswordOptions {
+    pub length: u32,
+    pub lowercase: bool,
+    pub uppercase: bool,
+    pub digits: bool,
+    pub symbols: bool,
+    pub avoid_look_alike: bool,
+}
+
+/// The generator's choice until the owner makes one: the shared code's.
 #[uniffi::export]
-pub fn generate_password(length: u32) -> Result<String, MobileError> {
+pub fn default_password_options() -> PasswordOptions {
+    let policy = osm_vault_core::PasswordPolicy::default();
+    PasswordOptions {
+        length: policy.length as u32,
+        lowercase: policy.lowercase,
+        uppercase: policy.uppercase,
+        digits: policy.digits,
+        symbols: policy.symbols,
+        avoid_look_alike: policy.avoid_look_alike,
+    }
+}
+
+/// A new password as `options` asks, from the shared code's generator, as
+/// the desktop app makes them; refused with no kind chosen, or a length
+/// below the number of kinds or above 1024.
+#[uniffi::export]
+pub fn generate_password(options: PasswordOptions) -> Result<String, MobileError> {
     let policy = osm_vault_core::PasswordPolicy {
-        length: length as usize,
-        ..osm_vault_core::PasswordPolicy::default()
+        length: options.length as usize,
+        lowercase: options.lowercase,
+        uppercase: options.uppercase,
+        digits: options.digits,
+        symbols: options.symbols,
+        avoid_look_alike: options.avoid_look_alike,
     };
     osm_vault_core::generate_password(&policy).map_err(Into::into)
 }

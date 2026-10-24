@@ -7,6 +7,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.UiDevice
@@ -62,7 +63,7 @@ class JoinDesktopTest {
         compose.onNodeWithTag("new-item").performClick()
         compose.waitUntilAtLeastOneExists(hasTestTag("edit-title"), 10_000)
         compose.onNodeWithTag("edit-title").performTextInput("From the phone")
-        compose.onNodeWithTag("edit-password").performTextInput("phone-made password")
+        compose.onNodeWithTag("edit-password").performTextReplacement("phone-made password")
         compose.onNodeWithTag("save").performClick()
         compose.waitUntil(60_000) { (session.state.value.sync?.lastSyncedAt?.toLong() ?: 0) >= made }
         Log.i("OSMJoin", "PHONE-MADE From the phone")
