@@ -21,22 +21,22 @@ has not been reviewed by anyone outside the project; this is the request.
 
 ## The code
 
-About 81,000 lines of Rust, TypeScript, Kotlin, and Swift, tests included. Each part below counts the lines of the source files `git ls-files` lists in its folders (`.rs`, `.ts`, `.tsx`, `.mjs`, `.kt`, `.swift`), tests included, frozen fixtures and generated bindings left out, rounded to the hundred (Phase 18); `apps/desktop/src-tauri` is counted without its `session` folder, which has its own row.
+About 82,000 lines of Rust, TypeScript, Kotlin, and Swift, tests included. Each part below counts the lines of the source files `git ls-files` lists in its folders (`.rs`, `.ts`, `.tsx`, `.mjs`, `.kt`, `.swift`), tests included, frozen fixtures and generated bindings left out, rounded to the hundred (Phase 19); `apps/desktop/src-tauri` is counted without its `session` folder, which has its own row.
 
 | Part | Lines | What it does | Look at |
 | --- | --- | --- | --- |
-| `crates/vault-core` | 15,900 | The encrypted vault: keys, revisions, signatures, the history of each item, held revisions, backups, recovery, imports, and passkeys: making and signing with one, and which sites it is for | `src/crypto.rs` (every primitive and each AAD); `src/storage.rs`: `verify_revision`, `validate_shape`, `is_active_author`, `apply_encrypted_revision`, `restore_backup`, `fork`, `reset_password`; `src/passkey.rs`: `rp_id_allowed` (which sites a passkey is for), `Registering::from_options` and `Signing::from_options` (what a request may ask), `Passkey::assert`, `check_written` (what this device may write) and `keep_all` (no passkey lost to a resolution or a restore) |
+| `crates/vault-core` | 16,100 | The encrypted vault: keys, revisions, signatures, the history of each item, held revisions, backups, recovery, imports, and passkeys: making and signing with one, and which sites it is for | `src/crypto.rs` (every primitive and each AAD); `src/storage.rs`: `verify_revision`, `validate_shape`, `is_active_author`, `apply_encrypted_revision`, `restore_backup`, `fork`, `reset_password`; `src/passkey.rs`: `rp_id_allowed` (which sites a passkey is for), `Registering::from_options` and `Signing::from_options` (what a request may ask), `Passkey::assert`, `check_written` (what this device may write) and `keep_all` (no passkey lost to a resolution or a restore); `src/util.rs`: `generate_password` (the system's random source, each kind chosen at least once, and the look-alikes left out) |
 | `crates/vault-membership` | 5,100 | Which devices belong to a vault, decided by a Raft majority (OpenRaft 0.9) over signed requests | `src/state.rs`: `is_enrolled`, `complete`, and how keys and authority follow signed enrollment rather than Raft membership |
 | `crates/vault-peer` | 11,900 | Pairing with a six-digit code the owner compares on both screens, sync, and the members' channel, over TLS 1.3 with pinned certificates; the relay (`osm-relay`) and a device's way through it | `src/pairing.rs`: `transcript`, `short_code`; `src/transport.rs`: frame limits before authentication, and `run_session` (it reads the peer's frames while it sends); `src/session/inventory.rs`: how two devices compare what they hold, and what a peer's IDs must be; `src/control.rs`: what a vault takes from committed membership; `src/members.rs`: `take_in` and `AddressBook::claim` (which addresses a roster may change, and whose); `src/relay.rs`: what the relay checks, and that a device registers only under its own certificate's pin |
 | `crates/vault-sync` | 2,300 | Key envelopes (HPKE) and one-use invitation tokens | the envelope and token code and its fixtures |
 | `crates/origin` | 290 | The rule for which page a login may be filled into: the exact origin (a passkey's sites follow another rule, in `vault-core`'s `src/passkey.rs`) | all of it |
 | `crates/browser-link`, `apps/native-host`, `crates/vault-browser` | 6,700 | The browser path for logins, cards, and passkeys: messages and frames, the host a browser starts (it holds no vault), and the desktop's end where a request waits for the owner | `crates/vault-browser/src/desk.rs`: `approve`, `approve_card`, `approve_passkey_create`, `approve_passkey_get`, and `submit` (a page's request gives way to the owner's); `crates/vault-browser/src/broker.rs`: `check`; `apps/native-host/src/host.rs`: what it checks before passing a request on, and which answers it hands back |
-| `apps/desktop/src-tauri` | 10,700 | The desktop app's native side: commands, devices and sync, the browser socket, archives, backups, imports, settings, and the count in the keystore that finds the vault's file set back (`src/rows_seen.rs`) | `src/lib.rs` (which secrets cross to the window: the stored password, one-time secret, and other fields' values never do), `src/import.rs` (an export is read here and only counts reach the window), `src/browser.rs` (`approve_fill`, `approve_card`, and `approve_passkey`: when the owner counts as verified), `src/network.rs` (`recover_vault`, `restore`) |
+| `apps/desktop/src-tauri` | 10,900 | The desktop app's native side: commands, devices and sync, the browser socket, archives, backups, imports, settings, and the count in the keystore that finds the vault's file set back (`src/rows_seen.rs`) | `src/lib.rs` (which secrets cross to the window: the stored password, one-time secret, and other fields' values never do), `src/import.rs` (an export is read here and only counts reach the window), `src/browser.rs` (`approve_fill`, `approve_card`, and `approve_passkey`: when the owner counts as verified), `src/network.rs` (`recover_vault`, `restore`), `src/settings.rs` (what `settings.json` may hold: the wait before locking and the generator's choice, each read on its own, a value it does not allow read as the default) |
 | `apps/desktop/src-tauri/session` | 1,200 | The only `unsafe` code in the project: registering for macOS notifications, to lock on sleep and screen lock, and asking macOS to verify the owner for a passkey (Touch ID or the Mac's password) | `src/macos.rs` |
-| `apps/desktop/src`, `apps/browser-extension/src` | 4,800 | The window, and the extension | `apps/browser-extension/src/background.ts` (what a reply must match before it is filled; `servePasskey`: which page's passkey request is taken, and with what origin; `followAccess`: the scripts it puts into pages only while it has access to all sites); `passkey-bridge.ts` and `passkey-page.ts` (what a page can tell the extension, and what it cannot) |
-| `crates/mobile` | 4,800 | The phone apps' one interface to the shared code (UniFFI bindings for Kotlin and Swift): a device of a vault that joins without a vote, unlocks, reads, writes, fills, saves, and syncs while the app is open | `src/runtime.rs`: `logins_for_web`, `fill_for_web`, `fill_for_app`, `save_candidates`, `update_password`; `src/lib.rs`: what crosses into Kotlin and Swift, `card_fill`, `check_passkey_request`, `passkey_creation`, `create_passkey`, `passkey_sign_in`, `sign_in_with_passkey` |
-| `apps/mobile/android` | 9,400 | The Android app, its autofill service, and its passkey provider | `app/.../autofill/Requester.kt` (when a page's domain is believed), `Form.kt` (which fields take the username and the password), `LinkedSites.kt` (which sites name an app as their own), `OtherFieldService.kt` (what the accessibility service reads, for which app, and which field it fills), `FillActivity.kt`, `SaveActivity.kt` and `PendingSave.kt` (what a save may change, and where the form's password waits), `BiometricUnlock.kt`, `VaultApp.kt` and `VaultSession.onBackground` (locking when the app is left, at once or after the time chosen), `VaultAutofillService.kt` (what the system's list and the keyboard's strip name while the vault is unlocked), `ScanInvitation.kt` (what a scanned QR code may be, and that no frame is kept), `CardForm.kt` and `CardFillActivity.kt` (which fields take a card's, and that a hidden one takes none), `passkey/PasskeyAsker.kt` (whose origin is believed, and whose client data is signed), `passkey/PasskeyProviderService.kt` (what the system's list names while locked and unlocked), `passkey/PasskeyActivity.kt` |
-| `apps/mobile/ios` | 4,200 | The iOS app and its AutoFill extension | `Shared/FillRequester.swift` (who asks, from what iOS says), `AutoFill/FillModel.swift` (`fill`, `saveNew`, `update`, and what of an item can be inserted as text), `Shared/BiometricUnlock.swift`, `App/VaultModel.swift` (`wentToBackground`), `App/ScanInvitation.swift` |
+| `apps/desktop/src`, `apps/browser-extension/src` | 5,000 | The window, and the extension | `apps/browser-extension/src/background.ts` (what a reply must match before it is filled; `servePasskey`: which page's passkey request is taken, and with what origin; `followAccess`: the scripts it puts into pages only while it has access to all sites); `passkey-bridge.ts` and `passkey-page.ts` (what a page can tell the extension, and what it cannot) |
+| `crates/mobile` | 4,900 | The phone apps' one interface to the shared code (UniFFI bindings for Kotlin and Swift): a device of a vault that joins without a vote, unlocks, reads, writes, fills, saves, and syncs while the app is open | `src/runtime.rs`: `logins_for_web`, `fill_for_web`, `fill_for_app`, `save_candidates`, `update_password`; `src/lib.rs`: what crosses into Kotlin and Swift, `card_fill`, `check_passkey_request`, `passkey_creation`, `create_passkey`, `passkey_sign_in`, `sign_in_with_passkey` |
+| `apps/mobile/android` | 10,300 | The Android app, its autofill service, and its passkey provider | `app/.../autofill/Requester.kt` (when a page's domain is believed), `Form.kt` (which fields take the username and the password, and which a new password: `newPasswords`), `LinkedSites.kt` (which sites name an app as their own), `OtherFieldService.kt` (what the accessibility service reads, for which app, and which field it fills), `FillActivity.kt`, `SaveActivity.kt` and `PendingSave.kt` (what a save may change, and where the form's password waits), `GenerateActivity.kt` (a password made at a sign-up: what it may change, written before the form is sent, and which fields it fills), `BiometricUnlock.kt`, `FingerprintPrompts.kt` and `VaultSession.takeAskAtOnce` (when the fingerprint is asked for without a tap, and never after the owner's Lock), `VaultApp.kt` and `VaultSession.onBackground` (locking when the app is left, at once or after the time chosen), `VaultAutofillService.kt` (what the system's list and the keyboard's strip name while the vault is unlocked), `ScanInvitation.kt` (what a scanned QR code may be, and that no frame is kept), `CardForm.kt` and `CardFillActivity.kt` (which fields take a card's, and that a hidden one takes none), `passkey/PasskeyAsker.kt` (whose origin is believed, and whose client data is signed), `passkey/PasskeyProviderService.kt` (what the system's list names while locked and unlocked), `passkey/PasskeyActivity.kt` |
+| `apps/mobile/ios` | 4,400 | The iOS app and its AutoFill extension | `Shared/FillRequester.swift` (who asks, from what iOS says), `AutoFill/FillModel.swift` (`fill`, `saveNew`, `update`, and what of an item can be inserted as text), `Shared/BiometricUnlock.swift`, `App/VaultModel.swift` (`wentToBackground`, and `becameActive`: when Face ID or Touch ID is asked for without a tap), `App/ScanInvitation.swift` |
 
 Everything else in the Rust workspaces forbids `unsafe`. Nothing writes a
 log.
@@ -82,7 +82,9 @@ the site asks.
 
 **Phones.** A phone runs the same shared code as a member without a vote,
 locks when its app leaves the screen, and can keep its password behind the
-phone's biometrics; on Android the owner can have it stay unlocked for 1,
+phone's biometrics, which it asks for by itself when it shows the vault
+locked, as the app comes back or a fill, save, or passkey screen opens,
+though not after the owner's own Lock (Phase 19); on Android the owner can have it stay unlocked for 1,
 5, or 15 minutes after the app is left (a minute unless changed), and the
 screen turning off locks it at once. Its autofill fills only after the
 owner unlocks and chooses on the app's own screen; on Android, while the
@@ -96,6 +98,11 @@ asks; an app it names by nothing gets a choice the owner makes after a
 warning. A save of what another app's form sent can change only the
 password of a login that form could be filled with; anything else is a new
 login, and nothing is written before the owner unlocks and chooses. On
+Android a sign-up or a change of password is also offered a password made
+for it: once the owner unlocks and chooses, it is written to the vault
+before the form is sent, under the same rule (a new login, or the new
+password of a login that form could be filled with, the old one kept in
+its history), and filled only into the form's new password fields. On
 Android 14 and later the app also answers passkey requests through
 Android's Credential Manager: it signs a browser's client data only for a
 browser on Google's list, and for any other app makes the client data for
@@ -105,7 +112,7 @@ the first time it asks for a site's passkeys.
 ## The evidence
 
 - `scripts/check.sh --network --browsers` runs every check: formatting,
-  lints with warnings as errors, 384 Rust tests (the vault, membership,
+  lints with warnings as errors, 390 Rust tests (the vault, membership,
   pairing and sync in process, between processes, and in desktop shells),
   the extension's 30 tests in headless Chromium and Firefox (Firefox skips
   one, of its own passkeys), and the
@@ -157,6 +164,9 @@ the first time it asks for a site's passkeys.
 9. With the extension's access to all sites turned on, can a page, a frame
    in it, or another site get a passkey signed, or a card's fields, that
    the owner did not choose for it?
+10. On Android, can a form, by how it names or hides its fields, get a
+    password made for it filled where the owner would not see it, or a
+    login's password changed that the owner did not mean to change?
 
 ## What is known to be missing
 
@@ -169,5 +179,7 @@ were tried for real on macOS for a screen lock and a sleep (Phase 14), and after
 on Linux only in a container; the backup screens and the system's file dialogs
 were driven in the real app only on Linux; the Android app has run on an
 emulator and on the owner's phone, the iOS app only in a simulator, and
-neither is published; passkeys are not on iOS and cannot be exported, and
+neither is published; passkeys are not on iOS and cannot be exported; a password is made at a
+sign-up only in Android's autofill, and the Mac unlocks only with the
+password, not Touch ID, until its app is signed by a developer team; and
 a Mac's Touch ID for them was not driven by a test; the iOS app's AutoFill tests pass on the iOS 26.5 simulator only with AutoFill turned on by the script, as neither 26.5 nor 27.0 simulators here show the system's prompts for it reliably.
