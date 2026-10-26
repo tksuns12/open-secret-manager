@@ -7,7 +7,7 @@ use std::{
 use ed25519_dalek::SigningKey;
 use openraft::{
     raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest},
-    Config, ServerState, SnapshotMeta, Vote,
+    ChangeMembers, Config, ServerState, SnapshotMeta, Vote,
 };
 use osm_vault_sync::{open_epoch_key, seal_epoch_key, HpkeKeyPair, VaultId};
 use tempfile::TempDir;
@@ -942,14 +942,17 @@ async fn a_voter_without_a_signed_enrollment_has_no_authority() {
     let leader = cluster.leader().await;
 
     // What a device holding only a voter's transport identity could do if
-    // it led: a membership entry carries no signature.
+    // it led: a membership entry carries no signature. Device 4 is made a
+    // voter in one change: added first as a learner, the leader would be
+    // removing it, as a learner no enrollment waits for, when the second
+    // change came.
     let raft = cluster.running[&leader].raft();
-    raft.add_learner(4, cluster.node_info(4), true)
-        .await
-        .unwrap();
-    raft.change_membership(BTreeSet::from([1, 2, 3, 4]), false)
-        .await
-        .unwrap();
+    raft.change_membership(
+        ChangeMembers::AddVoters(BTreeMap::from([(4, cluster.node_info(4))])),
+        false,
+    )
+    .await
+    .unwrap();
     cluster.settle(&[1, 2, 3, 4], &[1, 2, 3, 4]).await;
     let node = &cluster.running[&leader];
     let state = node.state();
