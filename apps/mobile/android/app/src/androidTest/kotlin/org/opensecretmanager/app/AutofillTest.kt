@@ -81,6 +81,9 @@ class AutofillTest {
     private val keyboard = Keyboard(::shell)
     private var previousAccessibility: Pair<String, String>? = null
 
+    /** What lets go of the session's calls or its network's turn, held by a test. */
+    private val holds = mutableListOf<() -> Unit>()
+
     @get:Rule
     val test = TestName()
 
@@ -119,6 +122,8 @@ class AutofillTest {
 
     @After
     fun putTheServiceBack() {
+        holds.forEach { it() }
+        holds.clear()
         Requester.trustedForTests.clear()
         forgetLinks()
         PendingSave.forgetForTests()
@@ -397,7 +402,10 @@ class AutofillTest {
             device.wakeUp()
             waitUntil("the screen turns on") { power.isInteractive }
             Thread.sleep(1_000)
-            if (pin != null) {
+            // Only on the lock screen: a phone can lock some seconds after
+            // its screen turns off, and a PIN typed before would go into the
+            // form's field, and its Enter send the form.
+            if (pin != null && keyguard.isKeyguardLocked) {
                 shell("input keyevent KEYCODE_MENU")
                 Thread.sleep(1_000)
                 shell("input text $pin")
@@ -410,6 +418,61 @@ class AutofillTest {
             if (attempt == 3) fail("the screen stayed locked")
         }
         openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+    }
+
+    /**
+     * The system's list waits for none of the session's other calls, which
+     * going online or a sync once held for longer than the system waits: it
+     * then said "unlock to fill" while unlocked, or came too late and was
+     * lost with the offer to save it carries. With the calls held, the list
+     * still names the login. A lock asked for meanwhile counts at once.
+     */
+    @Test
+    fun whileTheSessionIsBusyTheListStillNamesTheLoginsUntilALockIsAsked() {
+        StayUnlocked.millisForTests = 60_000L
+        Requester.trustedForTests += FIXTURE
+        askToFill("WebLoginActivity", "https://mail.example.test")
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertStillUnlocked()
+
+        val release = session.holdCallsForTests().also(holds::add)
+        val mail = openAndFind(By.text("Mail"), "WebLoginActivity", "https://mail.example.test")
+        assertNull(device.findObject(OFFER))
+        // Filling it is among the calls.
+        release()
+        mail.click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+
+        // The screen turned off while the calls are held: the lock waits for
+        // them, the list does not, and names nothing.
+        session.holdCallsForTests().also(holds::add)
+        instrumentation.runOnMainSync { session.onScreenOff() }
+        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+        assertNull(device.findObject(By.text("Mail")))
+        holds.forEach { it() }
+        assertLockedAgain()
+    }
+
+    /**
+     * Going online and offline, which a fill screen's coming and going
+     * starts, and syncs wait on the network, for seconds at times: no fill
+     * waits for them. With the network's turn held, a login chosen in the
+     * list fills.
+     */
+    @Test
+    fun whileTheNetworkIsSlowALoginChosenInTheListFills() {
+        StayUnlocked.millisForTests = 60_000L
+        Requester.trustedForTests += FIXTURE
+        askToFill("WebLoginActivity", "https://mail.example.test")
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertStillUnlocked()
+
+        session.holdNetworkForTests().also(holds::add)
+        openAndFind(By.text("Mail"), "WebLoginActivity", "https://mail.example.test").click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        assertStillUnlocked()
     }
 
     private fun waitUntil(what: String, condition: () -> Boolean) {

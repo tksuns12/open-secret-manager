@@ -167,7 +167,13 @@ and whether the phone synced at home after both apps were updated.
    Note any field where the login is named but choosing it fills nothing.
 5. In another app's login screen, the same entry appears, and the keyboard
    stays up; the first time the owner chooses a login for that app, after
-   a warning, and it is offered there again afterwards.
+   a warning, and it is offered there again afterwards. The entry comes at
+   once even right after the app or a fill screen was left, while the
+   phone is going offline: tap an app's ID field within a second or two of
+   leaving Open Secret Manager, a few times, locked and unlocked. It once
+   came seconds late there or not at all, and then Android did not offer
+   to save that sign-in either. A login chosen in the list while unlocked
+   fills without waiting.
 6. On a site or app that asks for a code from an authenticator app after
    the password, tap the code field: the same entry appears, and the fill
    screen lists the logins with a one-time code; the chosen one's code
