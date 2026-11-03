@@ -93,9 +93,15 @@ data class Form(
         /** A text field on the screen, and the window it is in. */
         private class Field(val node: AssistStructure.ViewNode, val window: Int)
 
-        /** The text fields shown, in the order of the screen's tree, and the page's domain and scheme. */
+        /** The text fields shown, and the page's domain and scheme. */
         private class Fields(val all: List<Field>, val webDomain: String?, val webScheme: String?)
 
+        /**
+         * The text fields shown, in the order of the screen's tree. A page's
+         * input that takes no text is none, though a browser may say it is a
+         * text field: Firefox reports a box to tick so, and may report it
+         * between a page's password and its ID.
+         */
         private fun fields(structure: AssistStructure): Fields {
             val fields = mutableListOf<Field>()
             var webDomain: String? = null
@@ -105,7 +111,9 @@ data class Form(
                     webDomain = node.webDomain
                     if (Build.VERSION.SDK_INT >= 28) webScheme = node.webScheme
                 }
-                if (node.autofillType == View.AUTOFILL_TYPE_TEXT && node.autofillId != null && node.visibility == View.VISIBLE) {
+                if (node.autofillType == View.AUTOFILL_TYPE_TEXT && node.autofillId != null && node.visibility == View.VISIBLE &&
+                    htmlType(node) !in NOT_TEXT_TYPES
+                ) {
                     fields += Field(node, window)
                 }
                 for (index in 0 until node.childCount) visit(node.getChildAt(index), window)
@@ -122,7 +130,9 @@ data class Form(
         fun usernameScreen(structure: AssistStructure): Form? {
             val fields = fields(structure)
             if (fields.all.any { isPasswordField(it.node) || isOneTimeCode(it.node) }) return null
-            val username = fields.all.firstOrNull { isUsername(it.node) } ?: return null
+            val username = fields.all.firstOrNull { isUsername(it.node) && saysUsername(it.node) }
+                ?: fields.all.firstOrNull { isUsername(it.node) }
+                ?: return null
             return Form(
                 packageName = structure.activityComponent.packageName,
                 webDomain = fields.webDomain,
@@ -200,9 +210,12 @@ data class Form(
 
         /**
          * The username that goes with [password], in its window: the field
-         * nearest before it that says or is named a username, or else the
-         * text field just before it, or else a field after it that says or is
-         * named one. A field named a search, or the like, is none.
+         * nearest before it that says it is a username, or else the first
+         * after it that says so, or else the field nearest before it named
+         * one, or else the text field just before it, or else a field after
+         * it named one. A field named a search, or the like, is none. Firefox
+         * says which field is a page's username, but may report it after the
+         * password, whatever the page's order.
          */
         private fun usernameFor(fields: List<Field>, password: Field): Field? {
             val window = fields.filter { it.window == password.window }
@@ -210,9 +223,12 @@ data class Form(
             fun candidate(field: Field) = field !== password && !isOneTimeCode(field.node) && !namedOtherThanUsername(field.node) &&
                 (!isPassword(field.node) || typedAsShownPassword(field.node))
             val before = window.take(at).filter(::candidate)
-            return before.lastOrNull { isUsername(it.node) }
+            val after = window.drop(at + 1).filter { candidate(it) && isUsername(it.node) }
+            return before.lastOrNull { isUsername(it.node) && saysUsername(it.node) }
+                ?: after.firstOrNull { saysUsername(it.node) }
+                ?: before.lastOrNull { isUsername(it.node) }
                 ?: before.lastOrNull()
-                ?: window.drop(at + 1).firstOrNull { candidate(it) && isUsername(it.node) }
+                ?: after.firstOrNull()
         }
 
         /** What a field says it is to autofill: an app's hints and a page's `autocomplete`, in lower case. */
@@ -270,14 +286,7 @@ data class Form(
         fun isUsername(node: AssistStructure.ViewNode): Boolean {
             if (isOneTimeCode(node) || (isPassword(node) && !typedAsShownPassword(node))) return false
             if (namedOtherThanUsername(node)) return false
-            val hints = hints(node)
-            if (hints.any {
-                    it == View.AUTOFILL_HINT_USERNAME.lowercase() || it == View.AUTOFILL_HINT_EMAIL_ADDRESS.lowercase() ||
-                        it == "email" || it == "username"
-                }
-            ) {
-                return true
-            }
+            if (saysUsername(node)) return true
             if (htmlType(node) == "email") return true
             val variation = node.inputType and InputType.TYPE_MASK_VARIATION
             if ((node.inputType and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT &&
@@ -286,6 +295,12 @@ data class Form(
                 return true
             }
             return namedUsername(node)
+        }
+
+        /** Says it is a username or an email address, in an app's hints or a page's `autocomplete`. */
+        private fun saysUsername(node: AssistStructure.ViewNode): Boolean = hints(node).any {
+            it == View.AUTOFILL_HINT_USERNAME.lowercase() || it == View.AUTOFILL_HINT_EMAIL_ADDRESS.lowercase() ||
+                it == "email" || it == "username"
         }
 
         /**
@@ -319,6 +334,8 @@ data class Form(
         fun namesOtherThanUsername(names: List<String>): Boolean = named(names, NOT_USERNAME_PARTS, emptySet())
 
         private val NAME_ATTRIBUTES = setOf("name", "id", "label", "aria-label", "placeholder")
+        /** A page's `type`s of input that take no text. */
+        private val NOT_TEXT_TYPES = setOf("checkbox", "radio", "submit", "button", "reset", "image", "file", "hidden", "range", "color")
         private val WORD_BREAK = Regex("[^\\p{L}\\p{N}]+|(?<=\\p{Ll})(?=\\p{Lu})|(?<=\\p{Lu})(?=\\p{Lu}\\p{Ll})|(?<=\\p{L})(?=\\p{N})|(?<=\\p{N})(?=\\p{L})")
         // In a name, anywhere; Korean words take particles after them.
         private val USERNAME_PARTS = listOf("username", "userid", "email", "phone", "login", "아이디", "이메일", "사번", "휴대폰", "전화", "사용자")

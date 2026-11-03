@@ -159,6 +159,11 @@ and whether the phone synced at home after both apps were updated.
    fields fill. A login saved with an
    unusual port is not offered (Android does not say a page's port); a
    login for the usual port is also offered on the same host's other ports.
+   In Firefox, sign out and open the page again a few times: the username
+   field is offered each time, and both fields fill. Firefox may tell a
+   page's fields in another order than the page's, and the ID of a
+   library's sign-in, told after its password and its "keep me signed in"
+   box, was once offered nothing, and the password alone filled.
 4. Within a minute, open the page again (or sign out and back to it) and
    tap the username field: the strip (or the list) names the login, by
    title and username, before "Open Secret Manager…". Choose it: both

@@ -615,14 +615,38 @@ class AutofillTest {
     }
 
     /** The split page's two fields, the ID and the password, once the page has both. */
-    private fun splitPageFields(): List<UiObject2> {
+    private fun splitPageFields(): List<UiObject2> = pageFields(2)
+
+    /** A page's [count] fields, in the page's order, once it has them all. */
+    private fun pageFields(count: Int): List<UiObject2> {
         val deadline = System.currentTimeMillis() + 30_000
         while (System.currentTimeMillis() < deadline) {
             val fields = device.findObjects(By.clazz("android.widget.EditText").pkg(FIXTURE))
-            if (fields.size >= 2) return fields
+            if (fields.size >= count) return fields
             Thread.sleep(200)
         }
-        fail("the page's two fields")
+        fail("the page's $count fields")
+    }
+
+    @Test
+    fun aPageThatTellsItsPasswordFirstIsOfferedOnTheIdThatSaysItIsTheUsername() {
+        // Firefox told a library's sign-in so: the password, then the box
+        // to keep signed in, named a login, then the ID, which it said is
+        // the username. The ID is offered the fill, and the login fills both.
+        Requester.trustedForTests += FIXTURE
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.WebLoginActivity --es origin https://mail.example.test --es page reordered")
+        val id = pageFields(3)[2]
+        id.click()
+        val offer = device.wait(Until.findObject(OFFER), 30_000) ?: run {
+            id.click()
+            find(OFFER, 30_000)
+        }
+        offer.click()
+        find(mine("password"), 60_000).text = password
+        find(mine("unlock")).click()
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
     }
 
     @Test

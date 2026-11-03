@@ -17,7 +17,8 @@ import android.widget.TextView
  * in a web view, or, with the extra `page` set to `code`, a page that asks
  * for a one-time code, or set to `split`, a page whose ID and password are
  * each in a form of their own, which a web view reports to autofill one at
- * a time, or set to `card`, a checkout page's card form (see [CARD_PAGE]),
+ * a time, or set to `reordered`, a page that tells its password before its
+ * ID (see [REORDERED_PAGE]), or set to `card`, a checkout page's card form (see [CARD_PAGE]),
  * or set to `signup`, `signup-plain`, or `change`, a sign-up or a change of
  * password (see [SIGNUP_PAGE], [PLAIN_SIGNUP_PAGE], [CHANGE_PAGE]). The page is served from here, so no network is needed;
  * the web view still navigates to the address and reports its domain.
@@ -45,6 +46,7 @@ class WebLoginActivity : Activity() {
         val html = when (intent.getStringExtra("page")) {
             "code" -> CODE_PAGE
             "split" -> SPLIT_PAGE
+            "reordered" -> REORDERED_PAGE
             "card" -> CARD_PAGE
             "signup" -> SIGNUP_PAGE
             "signup-plain" -> PLAIN_SIGNUP_PAGE
@@ -102,6 +104,27 @@ class WebLoginActivity : Activity() {
             <style>input { display: block; width: 90%; font-size: 22px; margin: 16px 0; }</style>
             <form id="id-form"><input id="userId" type="text" name="userId" placeholder="아이디"></form>
             <form id="pw-form"><input id="userPw" type="password" name="userPw" placeholder="비밀번호"></form>
+            <script>
+              setInterval(() => fixture.report(userId.value, userPw.value), 200);
+            </script>
+        """.trimIndent()
+
+        /**
+         * A sign-in told to autofill as Firefox told a library's: the
+         * password first, then the box to keep signed in (`autoLogin`, here a
+         * text field, as Firefox reported it), then the ID, which says it is
+         * the username. The page shows the ID first. It reports `ID|password`.
+         */
+        val REORDERED_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>form { display: flex; flex-direction: column; } input { width: 90%; font-size: 22px; margin: 16px 0; }
+              #userId { order: -1; } #autoLogin { width: 20%; }</style>
+            <form id="member_login" method="post" action="/login">
+              <input id="userPw" type="password" name="userPw" placeholder="비밀번호를 입력해주세요">
+              <input id="autoLogin" type="text" name="autoLogin">
+              <input id="userId" type="text" name="userId" autocomplete="username" placeholder="아이디를 입력해주세요">
+            </form>
             <script>
               setInterval(() => fixture.report(userId.value, userPw.value), 200);
             </script>
