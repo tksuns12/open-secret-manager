@@ -4,6 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -70,6 +71,24 @@ class DeviceTest {
             fails<MobileException.NoOneTimeCode> { device.oneTimeCode("fixture-mail") }
             fails<MobileException.NotFound> { device.item("no such item") }
 
+            // What fills a form: a page gets only the logins for its origin,
+            // an app only a login the owner chose for it, which it keeps.
+            val mailPage = Requester.Page(listOf("https://mail.example.test"))
+            assertEquals(listOf("Mail"), device.offer(mailPage, Asks.LOGIN).logins.map { it.title })
+            fails<MobileException.InvalidOrigin> { device.offer(Requester.Page(listOf("http://mail.example.test")), Asks.LOGIN) }
+            val filled = device.fill(mailPage, "fixture-mail", Asks.LOGIN)
+            assertEquals("owner@example.test", filled.credentials?.username)
+            assertEquals("third password, with ünïcödé", filled.credentials?.password)
+            assertNull(filled.oneTimeCode)
+            fails<MobileException.NotForThisPage> { device.fill(mailPage, "fixture-bank", Asks.LOGIN) }
+            val app = Requester.App("org.example.app:AB12", listOf("example.test"))
+            fails<MobileException.NotChosen> { device.fill(app, "fixture-bank", Asks.LOGIN) }
+            assertEquals("account 42", device.fillChosen(app, "fixture-bank", Asks.LOGIN).credentials?.username)
+            assertEquals(listOf("Bank"), device.offer(app, Asks.LOGIN).logins.map { it.title })
+            device.importAppChoices(mapOf("org.example.other:CD34" to listOf("fixture-mail")))
+            assertEquals(listOf("Mail"), device.offer(Requester.App("org.example.other:CD34", emptyList()), Asks.LOGIN).logins.map { it.title })
+            assertTrue(device.offer(Requester.Unnamed, Asks.LOGIN).logins.isEmpty())
+
             // An item's history, and a deleted note, come back.
             val history = device.history("fixture-mail")
             assertEquals(listOf("password", "notes"), history[0].changed)
@@ -80,10 +99,11 @@ class DeviceTest {
             assertEquals("gone", device.item(note.id).notes)
 
             // A one-time code goes only where its login would.
-            assertEquals(listOf("Bank"), device.withOneTimeCodes(device.items().map { it.id }).map { it.title })
-            assertEquals(6, device.oneTimeCodeForWeb("fixture-bank", "https://bank.example.test:8443").length)
-            fails<MobileException.NotForThisPage> { device.oneTimeCodeForWeb("fixture-bank", "https://bank.example.test") }
-            fails<MobileException.NoOneTimeCode> { device.oneTimeCodeForWeb("fixture-mail", "https://mail.example.test") }
+            assertEquals(listOf("Bank"), device.loginsToChoose(Asks.ONE_TIME_CODE).map { it.title })
+            val bankPage = Requester.Page(listOf("https://bank.example.test:8443"))
+            assertEquals(6, device.fill(bankPage, "fixture-bank", Asks.ONE_TIME_CODE).oneTimeCode?.length)
+            fails<MobileException.NotForThisPage> { device.fill(Requester.Page(listOf("https://bank.example.test")), "fixture-bank", Asks.ONE_TIME_CODE) }
+            fails<MobileException.NoOneTimeCode> { device.fill(mailPage, "fixture-mail", Asks.ONE_TIME_CODE) }
 
             // The owner's edits cross the other way, unicode and all.
             val draft = ItemDraft(
@@ -100,15 +120,19 @@ class DeviceTest {
             fails<MobileException.ChangedElsewhere> { device.updateItem(created, read.revision, renamed) }
             fails<MobileException.NotEditableHere> { device.createItem(draft.copy(kind = ItemKind.IDENTITY)) }
             // What a form submitted goes into a login the form could fill, as its password only.
-            val forum = device.loginsForWeb("https://forum.example.test").map { it.id }
-            val candidates = device.saveCandidates(forum, "someone else", "新しい 🔑 \"pass\"")
+            val forum = Requester.Page(listOf("https://forum.example.test"))
+            val candidates = device.saveCandidatesFor(forum, "someone else", "新しい 🔑 \"pass\"")
             assertEquals(listOf(true), candidates.map { it.hasThisPassword })
-            assertTrue(device.saveCandidates(forum, "another", "x").isEmpty())
-            device.updatePassword(created, candidates[0].revision, "次の 🔑")
+            assertTrue(device.saveCandidatesFor(forum, "another", "x").isEmpty())
+            fails<MobileException.NotForThisForm> { device.updateSaved(mailPage, created, candidates[0].revision, "someone else", "x") }
+            device.updateSaved(forum, created, candidates[0].revision, "someone else", "次の 🔑")
             assertEquals("次の 🔑", device.password(created))
             assertEquals("someone else", device.item(created).username)
             device.deleteItem(created, device.item(created).revision)
             fails<MobileException.NotFound> { device.item(created) }
+            val saved = device.saveNew(forum, "Forum again", "me", "x")
+            assertEquals("https://forum.example.test", device.item(saved).url)
+            device.deleteItem(saved, device.item(saved).revision)
             assertEquals(24, generatePassword(defaultPasswordOptions().copy(length = 24u)).length)
 
             // A copy of a vault is not a device of its vault's devices.

@@ -2,8 +2,9 @@ import AuthenticationServices
 import XCTest
 
 /// How the AutoFill extension reads who asks (Shared/FillRequester.swift),
-/// and what the vault offers each origin, on a copy of the frozen vault: the
-/// cases the simulator's own requests do not reach, such as Safari's pages.
+/// and hands it to the vault: the cases the simulator's own requests do not
+/// reach, such as Safari's pages. What the vault then offers each is proved
+/// in crates/mobile/tests/fill.rs.
 final class FillRequestTests: XCTestCase {
     private func requester(_ identifiers: (String, ASCredentialServiceIdentifier.IdentifierType)...) -> FillRequester {
         FillRequester(identifiers.map { ASCredentialServiceIdentifier(identifier: $0.0, type: $0.1) })
@@ -22,36 +23,17 @@ final class FillRequestTests: XCTestCase {
         XCTAssertEqual(requester(("http://mail.example.test/", .URL), ("mail.example.test", .domain)), .origins(["https://mail.example.test"]))
         XCTAssertEqual(requester(), .unnamed)
         XCTAssertEqual(requester(("not a url", .URL)), .unnamed)
+        // As the vault is told: an http address is told nothing.
+        XCTAssertEqual(requester(("mail.example.test", .domain), ("bank.example.test", .domain)).asked, .page(origins: ["https://mail.example.test", "https://bank.example.test"]))
+        XCTAssertEqual(requester().asked, .unnamed)
+        XCTAssertNil(requester(("http://mail.example.test/", .URL)).asked)
         if #available(iOS 26.2, *) {
             let app = ASCredentialServiceIdentifier(identifier: "ABCDE12345.org.example.app", type: .app, displayName: "Example")
             XCTAssertEqual(FillRequester([app]), .app(id: "ABCDE12345.org.example.app", name: "Example"))
+            XCTAssertEqual(FillRequester([app]).asked, .app(key: "ABCDE12345.org.example.app", linkedDomains: []))
             // As a save request names it.
             let saving = ASCredentialServiceIdentifier(identifier: "app://ABCDE12345.org.example.app", type: .app, displayName: "Example")
             XCTAssertEqual(FillRequester([saving]), .app(id: "ABCDE12345.org.example.app", name: "Example"))
         }
-    }
-
-    func testAnOriginIsOfferedOnlyTheLoginsSavedForIt() throws {
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: folder) }
-        try FileManager.default.copyItem(at: URL(fileURLWithPath: frozenVault), to: folder.appendingPathComponent("vault.sqlite3"))
-        let device = try Device.open(folder: folder.path, keystore: KeychainKeystore.shared)
-        try device.unlock(password: fixturePassword)
-
-        func offered(_ requester: FillRequester) throws -> [String] {
-            guard case let .origins(origins) = requester else { return [] }
-            return try origins.flatMap { try device.loginsForWeb(origin: $0) }.map(\.title)
-        }
-        XCTAssertEqual(try offered(requester(("https://mail.example.test/login", .URL))), ["Mail"])
-        XCTAssertEqual(try offered(requester(("https://bank.example.test:8443/", .URL))), ["Bank"])
-        XCTAssertEqual(try offered(requester(("bank.example.test", .domain))), [])
-        XCTAssertEqual(try offered(requester(("https://login.mail.example.test/", .URL))), [])
-        let filled = try device.fillForWeb(id: "fixture-mail", origin: "https://mail.example.test")
-        XCTAssertEqual(filled.username, "owner@example.test")
-        XCTAssertThrowsError(try device.fillForWeb(id: "fixture-bank", origin: "https://mail.example.test")) { error in
-            guard case MobileError.NotForThisPage = error else { return XCTFail("\(error)") }
-        }
-        device.lock()
     }
 }

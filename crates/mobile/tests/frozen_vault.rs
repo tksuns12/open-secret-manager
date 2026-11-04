@@ -5,7 +5,9 @@
 
 use std::path::PathBuf;
 
-use osm_mobile::{CardDraft, Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncState};
+use osm_mobile::{
+    Asks, CardDraft, Device, DeviceState, ItemDraft, ItemKind, MobileError, Requester, SyncState,
+};
 
 const PASSWORD: &str = "fixture password, not a secret";
 /// The test vector of RFC 6238 as a base32 secret.
@@ -81,41 +83,6 @@ fn the_frozen_vault_reads_through_the_interface() {
         device.item("no such item".into()),
         Err(MobileError::NotFound)
     ));
-
-    // Filling: a page gets only the logins for exactly its origin.
-    let titles = |origin: &str| -> Vec<String> {
-        device
-            .logins_for_web(origin.into())
-            .unwrap()
-            .into_iter()
-            .map(|item| item.title)
-            .collect()
-    };
-    assert_eq!(titles("https://mail.example.test"), ["Mail"]);
-    assert_eq!(titles("https://bank.example.test:8443"), ["Bank"]);
-    assert!(titles("https://bank.example.test").is_empty());
-    assert!(titles("https://login.mail.example.test").is_empty());
-    assert!(matches!(
-        device.logins_for_web("http://mail.example.test".into()),
-        Err(MobileError::InvalidOrigin)
-    ));
-    let filled = device
-        .fill_for_web("fixture-mail".into(), "https://mail.example.test".into())
-        .unwrap();
-    assert_eq!(
-        (filled.username.as_str(), filled.password.as_str()),
-        ("owner@example.test", "third password, with ünïcödé")
-    );
-    assert!(matches!(
-        device.fill_for_web("fixture-bank".into(), "https://mail.example.test".into()),
-        Err(MobileError::NotForThisPage)
-    ));
-    assert_eq!(format!("{filled:?}"), "FillCredentials { .. }");
-    // An app has no origin: the login the owner chose for it.
-    assert_eq!(
-        device.fill_for_app("fixture-bank".into()).unwrap().username,
-        "account 42"
-    );
 
     // A copy of a vault is not a device of its vault's devices.
     assert!(matches!(
@@ -257,175 +224,6 @@ fn an_items_history_shows_its_versions_and_a_login_or_a_note_comes_back() {
 }
 
 #[test]
-fn a_one_time_code_goes_only_where_its_login_would() {
-    let (_dir, folder) = copy_of_the_frozen_vault();
-    let device = Device::open_listening_on(folder, 0).unwrap();
-    device.unlock(PASSWORD.into()).unwrap();
-    let ids: Vec<String> = device
-        .items()
-        .unwrap()
-        .into_iter()
-        .map(|item| item.id)
-        .chain(["no such item".to_owned()])
-        .collect();
-    let with_codes: Vec<String> = device
-        .with_one_time_codes(ids)
-        .unwrap()
-        .into_iter()
-        .map(|item| item.title)
-        .collect();
-    assert_eq!(with_codes, ["Bank"]);
-
-    let code = device
-        .one_time_code_for_web(
-            "fixture-bank".into(),
-            "https://bank.example.test:8443".into(),
-        )
-        .unwrap();
-    assert!(code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()));
-    assert!(matches!(
-        device.one_time_code_for_web("fixture-bank".into(), "https://bank.example.test".into()),
-        Err(MobileError::NotForThisPage)
-    ));
-    assert!(matches!(
-        device.one_time_code_for_web(
-            "fixture-bank".into(),
-            "http://bank.example.test:8443".into()
-        ),
-        Err(MobileError::InvalidOrigin)
-    ));
-    assert!(matches!(
-        device.one_time_code_for_web("fixture-mail".into(), "https://mail.example.test".into()),
-        Err(MobileError::NoOneTimeCode)
-    ));
-    device.lock();
-    assert!(matches!(
-        device.one_time_code_for_web(
-            "fixture-bank".into(),
-            "https://bank.example.test:8443".into()
-        ),
-        Err(MobileError::Locked)
-    ));
-}
-
-#[test]
-fn what_a_form_submitted_goes_only_into_a_login_it_could_be_filled_with() {
-    let (_dir, folder) = copy_of_the_frozen_vault();
-    let device = Device::open_listening_on(folder, 0).unwrap();
-    device.unlock(PASSWORD.into()).unwrap();
-    let ids = |origin: &str| -> Vec<String> {
-        device
-            .logins_for_web(origin.into())
-            .unwrap()
-            .into_iter()
-            .map(|item| item.id)
-            .collect()
-    };
-    let candidates = |ids: Vec<String>, username: &str, password: &str| {
-        device
-            .save_candidates(ids, username.into(), password.into())
-            .unwrap()
-            .into_iter()
-            .map(|candidate| (candidate.title, candidate.has_this_password))
-            .collect::<Vec<_>>()
-    };
-    let mail = ids("https://mail.example.test");
-    assert_eq!(
-        candidates(mail.clone(), " owner@example.test ", "a new password"),
-        [("Mail".to_owned(), false)]
-    );
-    assert_eq!(
-        candidates(
-            mail.clone(),
-            "owner@example.test",
-            "third password, with ünïcödé"
-        ),
-        [("Mail".to_owned(), true)]
-    );
-    // Another username is another account; a form without one could be
-    // any of the page's.
-    assert!(candidates(mail.clone(), "someone else", "a new password").is_empty());
-    assert_eq!(
-        candidates(mail.clone(), "", "x"),
-        [("Mail".to_owned(), false)]
-    );
-    // Only logins, not in conflict, still in the vault.
-    let items = device.items().unwrap();
-    let all = device
-        .save_candidates(
-            items
-                .iter()
-                .map(|item| item.id.clone())
-                .chain(["no such item".to_owned()])
-                .collect(),
-            String::new(),
-            "x".into(),
-        )
-        .unwrap();
-    let logins = items
-        .iter()
-        .filter(|item| item.kind == ItemKind::Login && !item.conflict);
-    assert_eq!(
-        all.iter()
-            .map(|candidate| &candidate.id)
-            .collect::<Vec<_>>(),
-        logins.map(|item| &item.id).collect::<Vec<_>>()
-    );
-    assert!(items
-        .iter()
-        .any(|item| item.conflict && item.kind == ItemKind::Login));
-
-    // The password changes, and nothing else.
-    let bank = device.item("fixture-bank".into()).unwrap();
-    device
-        .update_password(
-            "fixture-bank".into(),
-            bank.revision.clone(),
-            "a new password".into(),
-        )
-        .unwrap();
-    let updated = device.item("fixture-bank".into()).unwrap();
-    assert_eq!(
-        device.password("fixture-bank".into()).unwrap(),
-        "a new password"
-    );
-    assert_eq!(
-        (
-            updated.username.as_str(),
-            updated.notes.as_str(),
-            updated.has_one_time_code
-        ),
-        ("account 42", "line one\nline two", true)
-    );
-    assert!(matches!(
-        device.update_password("fixture-bank".into(), bank.revision, "again".into()),
-        Err(MobileError::ChangedElsewhere)
-    ));
-    assert!(matches!(
-        device.update_password("fixture-bank".into(), updated.revision.clone(), "".into()),
-        Err(MobileError::InvalidItem { .. })
-    ));
-    let mut note = draft("Recovery codes", ItemKind::SecureNote);
-    note.notes = "one".into();
-    let note = device.item(device.create_item(note).unwrap()).unwrap();
-    assert!(matches!(
-        device.update_password(note.id, note.revision, "x".into()),
-        Err(MobileError::NotALogin)
-    ));
-    let conflicted = device
-        .items()
-        .unwrap()
-        .into_iter()
-        .find(|item| item.conflict)
-        .unwrap();
-    let conflicted = device.item(conflicted.id).unwrap();
-    assert!(matches!(
-        device.update_password(conflicted.id, conflicted.revision, "x".into()),
-        Err(MobileError::InConflict)
-    ));
-}
-
-#[test]
 fn logins_notes_and_cards_are_created_edited_and_deleted_and_the_rest_is_left_to_a_computer() {
     let (_dir, folder) = copy_of_the_frozen_vault();
     let device = Device::open_listening_on(folder, 0).unwrap();
@@ -444,11 +242,11 @@ fn logins_notes_and_cards_are_created_edited_and_deleted_and_the_rest_is_left_to
         ("Forum", "https://forum.example.test", ItemKind::Login)
     );
     assert_eq!(device.password(id.clone()).unwrap(), "first password");
+    let forum_page = Requester::Page {
+        origins: vec!["https://forum.example.test".into()],
+    };
     assert_eq!(
-        device
-            .logins_for_web("https://forum.example.test".into())
-            .unwrap()
-            .len(),
+        device.offer(forum_page, Asks::Login).unwrap().logins.len(),
         1
     );
 
@@ -737,8 +535,18 @@ fn an_edit_or_a_saved_password_keeps_the_fields_of_a_later_build() {
         .update_item("later".into(), later.revision, edit)
         .unwrap();
     let later = device.item("later".into()).unwrap();
+    // A save of a form on its page (the edit gave it the draft's), which
+    // leaves the field alone too.
     device
-        .update_password("later".into(), later.revision, "saved password".into())
+        .update_saved(
+            Requester::Page {
+                origins: vec!["https://forum.example.test".into()],
+            },
+            "later".into(),
+            later.revision,
+            "someone else".into(),
+            "saved password".into(),
+        )
         .unwrap();
     drop(device);
 
@@ -976,7 +784,7 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
         (Some("1111"), Some("Visa"))
     );
     // Filled whole, as it is kept, only for a card.
-    let filled = device.card_fill(card.clone()).unwrap();
+    let filled = device.fill_card(card.clone()).unwrap();
     assert_eq!(
         (
             filled.cardholder.as_str(),
@@ -989,7 +797,7 @@ fn an_items_other_fields_are_named_and_given_one_at_a_time() {
     );
     assert_eq!(format!("{filled:?}"), "CardFill { .. }");
     assert!(matches!(
-        device.card_fill("fixture-bank".into()),
+        device.fill_card("fixture-bank".into()),
         Err(MobileError::NotACard)
     ));
     // An identity is still not edited here.

@@ -1,8 +1,10 @@
 //! What a phone fills and saves, decided in one place: a page gets only the
 //! logins for its origins, an app only those the owner chose for it, and a
 //! save goes only into a login the same form could be filled with. These
-//! rules are proved here; the tests on the emulator and the simulator keep
-//! one case for each way a fill or a save reaches the app.
+//! rules are proved here. The Kotlin and Swift tests of the bindings
+//! (`DeviceTest.kt`, `ios/Tests/main.swift`) make each of these calls once,
+//! for what the bindings carry; the app tests on the emulator and the
+//! simulator keep one case for each way a fill or a save reaches the app.
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -621,6 +623,50 @@ fn a_save_goes_only_into_a_login_the_same_form_could_be_filled_with() {
             "".into()
         ),
         Err(MobileError::InvalidItem { .. })
+    ));
+    // Nothing else of the login changes.
+    let bank_page = page(&["https://bank.example.test:8443"]);
+    device
+        .update_saved(
+            bank_page.clone(),
+            "fixture-bank".into(),
+            bank.revision.clone(),
+            "account 42".into(),
+            "a new bank password".into(),
+        )
+        .unwrap();
+    let bank_now = device.item("fixture-bank".into()).unwrap();
+    assert_eq!(
+        device.password("fixture-bank".into()).unwrap(),
+        "a new bank password"
+    );
+    assert_eq!(
+        (
+            bank_now.username.as_str(),
+            bank_now.notes.as_str(),
+            bank_now.has_one_time_code,
+            bank_now.favorite
+        ),
+        ("account 42", "line one\nline two", true, true)
+    );
+    // Only a login.
+    let note = device
+        .create_item(ItemDraft {
+            title: "Recovery codes".into(),
+            kind: ItemKind::SecureNote,
+            username: String::new(),
+            url: "https://bank.example.test:8443".into(),
+            notes: "one".into(),
+            favorite: false,
+            password: None,
+            one_time_code_secret: None,
+            card: None,
+        })
+        .unwrap();
+    let note = device.item(note).unwrap();
+    assert!(matches!(
+        device.update_saved(bank_page, note.id, note.revision, String::new(), "x".into()),
+        Err(MobileError::NotALogin)
     ));
     let shared = device.item("fixture-shared".into()).unwrap();
     assert!(matches!(

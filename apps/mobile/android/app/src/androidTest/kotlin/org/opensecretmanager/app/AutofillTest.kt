@@ -1184,13 +1184,8 @@ class AutofillTest {
         find(mine("fill:Codes")).click()
         assertFilledWithCodeOf(BANK_CODE_SECRET)
         assertLockedAgain()
-
-        // Mail is for its page but has no code: nothing is offered.
-        askToFill("WebLoginActivity", "https://mail.example.test", extras = " --es page code")
-        find(mine("no-logins"))
-        assertNull(device.findObject(mine("fill:Mail")))
-        find(mine("cancel")).click()
-        assertLockedAgain()
+        // That a page's login without a code is offered nothing for a code
+        // is the vault's rule, proved in crates/mobile/tests/fill.rs.
     }
 
     /** The vault with a card (and an identity), for the tests of card forms: Visa, 4111 1111 1111 1111, 12/2030, code 123, Owner. */

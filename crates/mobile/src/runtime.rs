@@ -34,9 +34,9 @@ use zeroize::Zeroizing;
 
 use crate::{
     fill::{self, AppChoices, Asks, Filled, Offer, Requester},
-    CardDetail, CardFill, DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail,
-    ItemDraft, ItemSummary, MobileError, PasskeyCaller, PasskeyChoice, PasskeyCreation,
-    PasskeyRefusal, PasskeySignIn, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
+    CardDetail, CardFill, DeletedEntry, DeviceState, HistoryEntry, ItemDetail, ItemDraft,
+    ItemSummary, MobileError, PasskeyCaller, PasskeyChoice, PasskeyCreation, PasskeyRefusal,
+    PasskeySignIn, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
 };
 
 /// The first eight hex digits of a device's ID, as the screens name it.
@@ -589,72 +589,6 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) async fn save_candidates(
-        &self,
-        ids: &[String],
-        username: &str,
-        password: &str,
-    ) -> Result<Vec<SaveCandidate>, MobileError> {
-        let vault = self.vault.lock().await;
-        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        let username = username.trim();
-        let mut candidates = Vec::new();
-        for id in ids {
-            let found = match vault.get(id) {
-                Ok(found) => found,
-                Err(osm_vault_core::Error::NotFound) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let item = &found.item;
-            if found.conflict || item.kind != ItemKind::Login {
-                continue;
-            }
-            if !username.is_empty() && item.username.trim() != username {
-                continue;
-            }
-            candidates.push(SaveCandidate {
-                id: item.id.clone(),
-                title: item.title.clone(),
-                username: item.username.clone(),
-                revision: found.revision.clone(),
-                has_this_password: item.password == password,
-            });
-        }
-        Ok(candidates)
-    }
-
-    pub(crate) async fn update_password(
-        self: &Arc<Self>,
-        id: &str,
-        revision: &str,
-        password: String,
-    ) -> Result<(), MobileError> {
-        let mut password = Zeroizing::new(password);
-        if password.is_empty() {
-            return Err(MobileError::InvalidItem {
-                reason: "there is no password to save".into(),
-            });
-        }
-        {
-            let mut vault = self.vault.lock().await;
-            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
-            let VaultItem {
-                mut item, conflict, ..
-            } = vault.get(id)?;
-            if conflict {
-                return Err(MobileError::InConflict);
-            }
-            if item.kind != ItemKind::Login {
-                return Err(MobileError::NotALogin);
-            }
-            // Into the item, which wipes it when it goes.
-            item.password = std::mem::take(&mut *password);
-            vault.update(item, revision)?;
-        }
-        self.sync_soon();
-        Ok(())
-    }
-
     /// After a change here, online: syncs at once rather than at the next
     /// interval, without making the caller wait.
     fn sync_soon(self: &Arc<Self>) {
@@ -687,84 +621,6 @@ impl Runtime {
             return Err(MobileError::NoOneTimeCode);
         }
         Ok(vault.item_totp_code(id, now())?)
-    }
-
-    pub(crate) async fn logins_for_web(
-        &self,
-        origin: &str,
-    ) -> Result<Vec<ItemSummary>, MobileError> {
-        let origin = Origin::parse(origin).ok_or(MobileError::InvalidOrigin)?;
-        let vault = self.vault.lock().await;
-        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        Ok(vault
-            .logins_for_origin(&origin)?
-            .into_iter()
-            .map(ItemSummary::from)
-            .collect())
-    }
-
-    pub(crate) async fn fill_for_web(
-        &self,
-        id: &str,
-        origin: &str,
-    ) -> Result<FillCredentials, MobileError> {
-        let origin = Origin::parse(origin).ok_or(MobileError::InvalidOrigin)?;
-        let vault = self.vault.lock().await;
-        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        let found = vault.credentials_for_origin(id, &origin)?;
-        Ok(FillCredentials {
-            username: found.username.clone(),
-            password: found.password.clone(),
-        })
-    }
-
-    pub(crate) async fn with_one_time_codes(
-        &self,
-        ids: &[String],
-    ) -> Result<Vec<ItemSummary>, MobileError> {
-        let vault = self.vault.lock().await;
-        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        let mut found = Vec::new();
-        for id in ids {
-            let item = match vault.get(id) {
-                Ok(item) => item,
-                Err(osm_vault_core::Error::NotFound) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if item.item.kind == ItemKind::Login && item.item.totp_secret.is_some() {
-                found.push(osm_vault_core::ItemSummary::from(item).into());
-            }
-        }
-        Ok(found)
-    }
-
-    pub(crate) async fn one_time_code_for_web(
-        &self,
-        id: &str,
-        origin: &str,
-    ) -> Result<String, MobileError> {
-        let origin = Origin::parse(origin).ok_or(MobileError::InvalidOrigin)?;
-        let vault = self.vault.lock().await;
-        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        // The one rule for what goes into a page, as for its password.
-        drop(vault.credentials_for_origin(id, &origin)?);
-        if vault.get(id)?.item.totp_secret.is_none() {
-            return Err(MobileError::NoOneTimeCode);
-        }
-        Ok(vault.item_totp_code(id, now())?)
-    }
-
-    pub(crate) async fn fill_for_app(&self, id: &str) -> Result<FillCredentials, MobileError> {
-        let vault = self.vault.lock().await;
-        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        let found = vault.get(id)?;
-        if found.item.kind != ItemKind::Login {
-            return Err(MobileError::NotALogin);
-        }
-        Ok(FillCredentials {
-            username: found.item.username.clone(),
-            password: found.item.password.clone(),
-        })
     }
 
     pub(crate) async fn passkey_creation(
@@ -1012,34 +868,6 @@ impl Runtime {
         earlier: std::collections::HashMap<String, Vec<String>>,
     ) -> Result<(), MobileError> {
         Ok(self.app_choices.import(earlier)?)
-    }
-
-    pub(crate) async fn card_fill(&self, id: &str) -> Result<CardFill, MobileError> {
-        use osm_vault_core::card;
-        let vault = self.vault.lock().await;
-        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
-        let found = vault.get(id)?;
-        if found.item.kind != ItemKind::Card {
-            return Err(MobileError::NotACard);
-        }
-        if found.conflict {
-            return Err(MobileError::InConflict);
-        }
-        let field = |name: &str| {
-            found
-                .item
-                .custom_fields
-                .get(name)
-                .cloned()
-                .unwrap_or_default()
-        };
-        Ok(CardFill {
-            cardholder: field(card::CARDHOLDER),
-            number: field(card::NUMBER),
-            expiry_month: field(card::EXPIRY_MONTH),
-            expiry_year: field(card::EXPIRY_YEAR),
-            security_code: field(card::SECURITY_CODE),
-        })
     }
 
     pub(crate) async fn join_start(self: &Arc<Self>, code: &str) -> Result<String, MobileError> {

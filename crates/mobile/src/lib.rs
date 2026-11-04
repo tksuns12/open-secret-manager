@@ -947,26 +947,6 @@ impl Device {
         self.tokio.block_on(self.inner.field(&id, &name))
     }
 
-    /// The logins for a page of `origin` (`https://host` or
-    /// `https://host:port`), by the one rule the desktop's browser fill
-    /// uses: HTTPS, the exact host, and the exact port.
-    pub fn logins_for_web(&self, origin: String) -> Result<Vec<ItemSummary>, MobileError> {
-        self.tokio.block_on(self.inner.logins_for_web(&origin))
-    }
-
-    /// The user name and password of the login the owner chose for a page
-    /// of `origin`; refused unless the login is for exactly that origin.
-    pub fn fill_for_web(&self, id: String, origin: String) -> Result<FillCredentials, MobileError> {
-        self.tokio.block_on(self.inner.fill_for_web(&id, &origin))
-    }
-
-    /// The user name and password of the login the owner chose for an app,
-    /// which has no origin to check: only after the owner picked it for
-    /// that app.
-    pub fn fill_for_app(&self, id: String) -> Result<FillCredentials, MobileError> {
-        self.tokio.block_on(self.inner.fill_for_app(&id))
-    }
-
     /// Reads and checks a site's request to make a passkey
     /// (`PublicKeyCredentialCreationOptionsJSON`), for [`caller`], and says
     /// what the owner is to be asked. Refused with
@@ -1031,29 +1011,6 @@ impl Device {
             &credential_id,
             verified,
         ))
-    }
-
-    /// The fields of the card the owner chose for a card form, in an app or
-    /// on a page; refused for an item that is not a card, and for a card two
-    /// devices changed at once, until a computer settles which version is
-    /// meant.
-    pub fn card_fill(&self, id: String) -> Result<CardFill, MobileError> {
-        self.tokio.block_on(self.inner.card_fill(&id))
-    }
-
-    /// For a form that asks for a one-time code: of the logins in `ids`,
-    /// which are those the form could be filled with, the ones that have a
-    /// one-time code. Unknown IDs are skipped.
-    pub fn with_one_time_codes(&self, ids: Vec<String>) -> Result<Vec<ItemSummary>, MobileError> {
-        self.tokio.block_on(self.inner.with_one_time_codes(&ids))
-    }
-
-    /// The current one-time code of the login the owner chose for a page of
-    /// `origin`; refused unless the login is for exactly that origin. For
-    /// an app, [`Device::one_time_code`] gives it.
-    pub fn one_time_code_for_web(&self, id: String, origin: String) -> Result<String, MobileError> {
-        self.tokio
-            .block_on(self.inner.one_time_code_for_web(&id, &origin))
     }
 
     /// The logins `requester` is offered for a form that `asks` for them:
@@ -1254,34 +1211,6 @@ impl Device {
     ) -> Result<(), MobileError> {
         self.tokio
             .block_on(self.inner.restore(&id, &revision, &heads))
-    }
-
-    /// For saving what a login form submitted: of the logins in `ids`,
-    /// which are those the form could be filled with, the ones with the
-    /// form's `username` (every one, if the form had none), and whether each
-    /// has the form's `password` already. Logins in conflict are left out.
-    pub fn save_candidates(
-        &self,
-        ids: Vec<String>,
-        username: String,
-        password: String,
-    ) -> Result<Vec<SaveCandidate>, MobileError> {
-        let password = Zeroizing::new(password);
-        self.tokio
-            .block_on(self.inner.save_candidates(&ids, &username, &password))
-    }
-
-    /// Changes only the password of the login `id`, as read at `revision`;
-    /// refused if it changed since, or is in conflict. Online, it syncs at
-    /// once.
-    pub fn update_password(
-        &self,
-        id: String,
-        revision: String,
-        password: String,
-    ) -> Result<(), MobileError> {
-        self.tokio
-            .block_on(self.inner.update_password(&id, &revision, password))
     }
 
     /// Connects to the inviting device from an invitation and returns the
