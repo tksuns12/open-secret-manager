@@ -125,7 +125,11 @@ final class VaultModel: ObservableObject {
             #if DEBUG
             TestSupport.prepareOnce(folder)
             #endif
-            device = try await onQueue { try Device.open(folder: folder.path, keystore: KeychainKeystore.shared) }
+            device = try await onQueue {
+                let opened = try Device.open(folder: folder.path, keystore: KeychainKeystore.shared)
+                EarlierAppLogins.move(into: opened)
+                return opened
+            }
             await refresh()
         } catch MobileError.UnreadableVault(let reason) {
             screen = .unreadable

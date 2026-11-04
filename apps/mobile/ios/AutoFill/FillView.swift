@@ -119,7 +119,7 @@ private struct Logins: View {
                     query.isEmpty || login.title.localizedCaseInsensitiveContains(query)
                         || login.username.localizedCaseInsensitiveContains(query)
                         || login.url.localizedCaseInsensitiveContains(query)
-                }, onChoose: model.fill)
+                }, onChoose: model.fillChosen)
             } else if case .app = model.requester {
                 Button(model.offered.isEmpty ? "Choose a login for this app…" : "Choose another login…") {
                     Task { await model.chooseAny() }

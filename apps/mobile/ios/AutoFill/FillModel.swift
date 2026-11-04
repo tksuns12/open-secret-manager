@@ -45,8 +45,6 @@ final class FillModel: ObservableObject {
     private var askedAtOnce = false
     /// A face or a finger is being asked for: a second ask would cancel it.
     private var asking = false
-    /// For each offered login, the origin it is filled for.
-    private var originOf: [String: String] = [:]
     private let onFill: (FillCredentials) -> Void
     private let onCode: (String) -> Void
     private let onSaved: () -> Void
@@ -100,7 +98,13 @@ final class FillModel: ObservableObject {
         do {
             let folder = try DeviceFolder.url()
             let opened = try await withCheckedThrowingContinuation { continuation in
-                queue.async { continuation.resume(with: Result { try Device.open(folder: folder.path, keystore: KeychainKeystore.shared) }) }
+                queue.async {
+                    continuation.resume(with: Result {
+                        let device = try Device.open(folder: folder.path, keystore: KeychainKeystore.shared)
+                        EarlierAppLogins.move(into: device)
+                        return device
+                    })
+                }
             }
             guard !closed else { return }
             device = opened
@@ -165,33 +169,16 @@ final class FillModel: ObservableObject {
             stage = .unlocked
             return
         }
-        let requester = requester
-        let oneTimeCode = oneTimeCode
-        let found: ([ItemSummary], [String: String])? = await call { device in
-            switch requester {
-            case let .origins(origins):
-                var logins: [ItemSummary] = []
-                var originOf: [String: String] = [:]
-                for origin in origins {
-                    var forOrigin = try device.loginsForWeb(origin: origin)
-                    if oneTimeCode { forOrigin = try device.withOneTimeCodes(ids: forOrigin.map(\.id)) }
-                    for login in forOrigin where originOf[login.id] == nil {
-                        logins.append(login)
-                        originOf[login.id] = origin
-                    }
-                }
-                return (logins, originOf)
-            case let .app(id, _):
-                let chosen = AppLogins().chosen(id)
-                let logins = try device.items().filter { $0.kind == .login && chosen.contains($0.id) }
-                return (oneTimeCode ? try device.withOneTimeCodes(ids: logins.map(\.id)) : logins, [:])
-            case .unnamed, .notHTTPS:
-                return ([], [:])
-            }
+        // The vault's offer: a page's logins for its origins, an app's chosen
+        // logins, nothing for no one named.
+        let asked = requester.asked
+        let asks = asks
+        let found: [ItemSummary]? = await call { device in
+            guard let asked else { return [] }
+            return try device.offer(requester: asked, asks: asks).logins
         }
         guard let found else { return }
-        offered = found.0.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        originOf = found.1
+        offered = found.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         if saving != nil {
             await listCandidates()
         }
@@ -201,52 +188,51 @@ final class FillModel: ObservableObject {
 
     /// Of the logins the form could be filled with, those its save could go into.
     private func listCandidates() async {
-        guard let saving else { return }
-        let ids = offered.map(\.id)
+        guard let saving, let asked = requester.asked else { return }
         candidates = await call { device in
-            try device.saveCandidates(ids: ids, username: saving.username, password: saving.password)
+            try device.saveCandidatesFor(requester: asked, username: saving.username, password: saving.password)
         }?.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending } ?? []
     }
 
     /// Every login (with a one-time code, for a code), for an app the owner
     /// chooses one for.
     func chooseAny() async {
-        let oneTimeCode = oneTimeCode
+        let asks = asks
         all = await call { device in
-            let logins = try device.items().filter { $0.kind == .login }
-            return try (oneTimeCode ? device.withOneTimeCodes(ids: logins.map(\.id)) : logins)
+            try device.loginsToChoose(asks: asks)
                 .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         }
     }
 
+    /// What the form asks for: a login, or a one-time code.
+    private var asks: Asks { oneTimeCode ? .oneTimeCode : .login }
+
+    /// Fills a login the vault offered this requester.
     func fill(_ login: ItemSummary) {
-        let origin = originOf[login.id]
-        let requester = requester
-        // A page or an app of an origin gets only a login offered for it.
-        if case .origins = requester, origin == nil {
-            notice = describe(MobileError.NotForThisPage)
-            return
-        }
-        if oneTimeCode {
-            Task {
-                guard let code = await call(nil, { device -> String in
-                    if let origin { return try device.oneTimeCodeForWeb(id: login.id, origin: origin) }
-                    return try device.oneTimeCode(id: login.id)
-                }) else { return }
-                if case let .app(id, _) = requester { AppLogins().remember(id, login.id) }
-                close()
-                onCode(code)
-            }
-            return
-        }
+        fill(login, chosenNow: false)
+    }
+
+    /// Fills a login the owner chose among every login: for an app, which
+    /// the vault then keeps it for, or for a request that names no one.
+    func fillChosen(_ login: ItemSummary) {
+        fill(login, chosenNow: true)
+    }
+
+    private func fill(_ login: ItemSummary, chosenNow: Bool) {
+        guard let asked = requester.asked else { return }
+        let asks = asks
         Task {
-            guard let credentials = await call(nil, { device -> FillCredentials in
-                if let origin { return try device.fillForWeb(id: login.id, origin: origin) }
-                return try device.fillForApp(id: login.id)
+            guard let filled = await call(nil, { device -> Filled in
+                try chosenNow
+                    ? device.fillChosen(requester: asked, id: login.id, asks: asks)
+                    : device.fill(requester: asked, id: login.id, asks: asks)
             }) else { return }
-            if case let .app(id, _) = requester { AppLogins().remember(id, login.id) }
             close()
-            onFill(credentials)
+            if let code = filled.oneTimeCode {
+                onCode(code)
+            } else if let credentials = filled.credentials {
+                onFill(credentials)
+            }
         }
     }
 
@@ -286,17 +272,12 @@ final class FillModel: ObservableObject {
     /// Saves the form's login as a new one: for the page's origin, or for
     /// the app the system names.
     func saveNew(title: String) {
-        guard let saving else { return }
-        let url: String
-        if case let .origins(origins) = requester { url = origins.first ?? "" } else { url = "" }
-        let draft = ItemDraft(
-            title: title, kind: .login, username: saving.username, url: url,
-            notes: "", favorite: false, password: saving.password, oneTimeCodeSecret: nil, card: nil
-        )
-        let requester = requester
+        // For the page's origin, or for the app, which the vault keeps it for.
+        guard let saving, let asked = requester.asked else { return }
         Task {
-            guard let id = await call("Saving…", { try $0.createItem(draft: draft) }) else { return }
-            if case let .app(app, _) = requester { AppLogins().remember(app, id) }
+            guard await call("Saving…", {
+                try $0.saveNew(requester: asked, title: title, username: saving.username, password: saving.password)
+            }) != nil else { return }
             finishSave()
         }
     }
@@ -304,7 +285,7 @@ final class FillModel: ObservableObject {
     /// Puts the form's password into `candidate`, as it was read. If it
     /// changed since, it is read again for the owner to choose again.
     func update(_ candidate: SaveCandidate) {
-        guard let saving else { return }
+        guard let saving, let asked = requester.asked else { return }
         Task {
             do {
                 busy = "Saving…"
@@ -313,7 +294,10 @@ final class FillModel: ObservableObject {
                     queue.async { [device] in
                         guard let device else { return continuation.resume(throwing: MobileError.NoVault) }
                         continuation.resume(with: Result {
-                            try device.updatePassword(id: candidate.id, revision: candidate.revision, password: saving.password)
+                            try device.updateSaved(
+                                requester: asked, id: candidate.id, revision: candidate.revision,
+                                username: saving.username, password: saving.password
+                            )
                         })
                     }
                 }

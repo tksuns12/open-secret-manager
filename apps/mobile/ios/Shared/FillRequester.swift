@@ -59,20 +59,34 @@ enum FillRequester: Equatable {
     }
 }
 
-/// Which logins the owner chose for which app, on this phone only, by the
-/// App ID the system gives: an app has no origin to match a login's address
-/// against.
-struct AppLogins {
-    private let defaults = UserDefaults(suiteName: DeviceFolder.appGroup)
-    private let key = "app-logins"
-
-    func chosen(_ app: String) -> Set<String> {
-        Set((defaults?.dictionary(forKey: key)?[app] as? [String]) ?? [])
+extension FillRequester {
+    /// Who asks, as the vault decides what it is offered, filled, and saved
+    /// into: an app by its App ID, which the vault keeps the logins the
+    /// owner chose for it by. None for an address that is not https, which
+    /// is filled nothing.
+    var asked: Requester? {
+        switch self {
+        case let .origins(origins): return .page(origins: origins)
+        case let .app(id, _): return .app(key: id, linkedDomains: [])
+        case .unnamed: return .unnamed
+        case .notHTTPS: return nil
+        }
     }
+}
 
-    func remember(_ app: String, _ itemId: String) {
-        var all = defaults?.dictionary(forKey: key) ?? [:]
-        all[app] = Array(chosen(app).union([itemId])).sorted()
-        defaults?.set(all, forKey: key)
+/// Where builds before the vault kept them, the extension held the logins
+/// the owner chose for each app: in the shared user defaults, by App ID,
+/// the key the vault keeps them by now. They move into the device once, as
+/// the app or the extension opens it, and are then gone from there.
+enum EarlierAppLogins {
+    private static let key = "app-logins"
+
+    static func move(into device: Device) {
+        guard let defaults = UserDefaults(suiteName: DeviceFolder.appGroup),
+              let earlier = defaults.dictionary(forKey: key) else { return }
+        let chosen = earlier.compactMapValues { $0 as? [String] }
+        // Only once the device has them: a failure leaves them for the next open.
+        if !chosen.isEmpty, (try? device.importAppChoices(chosen: chosen)) == nil { return }
+        defaults.removeObject(forKey: key)
     }
 }
