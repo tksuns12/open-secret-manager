@@ -24,6 +24,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -745,6 +746,40 @@ class AutofillTest {
         find(mine("choose-another"))
         assertNull(device.findObject(mine("fill:Mail")))
         find(mine("cancel")).click()
+        assertLockedAgain()
+    }
+
+    @Test
+    fun aTrustedBrowsersPageOverHttpIsOfferedNothing() {
+        Requester.trustedForTests += FIXTURE
+        // Over https, the offer comes, as the page's.
+        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+        // Over http, nothing: no login, no password to make, no save.
+        device.wakeUp()
+        shell("am start -W -S -n $FIXTURE/.WebLoginActivity --es origin http://mail.example.test")
+        find(By.clazz("android.widget.EditText").pkg(FIXTURE), 30_000).click()
+        assertFalse(device.wait(Until.hasObject(OFFER), 15_000) == true)
+        assertNull(device.findObject(By.textStartsWith("Open Secret Manager")))
+    }
+
+    @Test
+    fun theLoginsAnEarlierBuildKeptAsChosenForAnAppAreStillItsOwn() {
+        // As a build before the vault kept them: in this app's preferences.
+        val earlier = context.getSharedPreferences("app-logins", 0)
+        val certificate = Requester.certificates(context, FIXTURE).first()
+        earlier.edit().putStringSet("$FIXTURE:$certificate", setOf("fixture-mail")).commit()
+        session.reopenForTests { folder ->
+            instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
+                File(folder, "vault.sqlite3").outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+        // The device has them now, and the preferences none.
+        assertTrue(earlier.all.isEmpty())
+        askToFill("NativeLoginActivity")
+        find(mine("fill:Mail"))
+        assertNull(device.findObject(mine("fill:Bank")))
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
         assertLockedAgain()
     }
 

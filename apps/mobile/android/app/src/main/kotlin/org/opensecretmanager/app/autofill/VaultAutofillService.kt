@@ -53,7 +53,8 @@ class VaultAutofillService : AutofillService() {
         // A card form, or a card's field on a screen with a login form too.
         val card = structure?.let(CardForm::parse)
         if (card != null && card.packageName != packageName && (form == null || card.focused)) {
-            offerCards(request, card, callback)
+            // As for a login, nothing for a requester that cannot be told.
+            if (Requester.of(this, card) == null) callback.onSuccess(null) else offerCards(request, card, callback)
             return
         }
         if (form == null) {
@@ -66,7 +67,13 @@ class VaultAutofillService : AutofillService() {
             return
         }
         val usernameEarlier = form.username == null && earlierUsername(request.fillContexts, form) != null
+        // One that cannot be told, or a trusted browser's page over http:
+        // nothing is offered, to fill or to save.
         val requester = Requester.of(this, form)
+        if (requester == null) {
+            callback.onSuccess(null)
+            return
+        }
         val codeOnly = form.codeOnly
         val strip = if (Build.VERSION.SDK_INT >= 30) request.inlineSuggestionsRequest?.let { Strip(this, it) } else null
         val respond = { logins: List<ItemSummary>? ->
@@ -107,11 +114,7 @@ class VaultAutofillService : AutofillService() {
             callback.onSuccess(response.build())
         }
         // What a fill would offer, if the vault is unlocked.
-        when (requester) {
-            null -> respond(null)
-            is Requester.Web -> session().offered(requester.origin, emptySet(), codeOnly, respond)
-            is Requester.App -> session().offered(null, AppLogins(this).chosen(requester), codeOnly, respond)
-        }
+        session().offered(requester.asked(), form.asks, respond)
     }
 
     private fun session() = (application as VaultApp).session

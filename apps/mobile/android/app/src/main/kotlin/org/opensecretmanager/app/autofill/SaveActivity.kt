@@ -51,8 +51,6 @@ import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
 import org.opensecretmanager.app.VaultSession
 import org.opensecretmanager.app.screenState
-import org.opensecretmanager.vault.ItemDraft
-import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.SaveCandidate
 
 /**
@@ -91,7 +89,6 @@ class SaveActivity : FragmentActivity() {
                     save = save,
                     requester = requester,
                     session = session,
-                    appLogins = AppLogins(this),
                     biometric = biometric,
                     prompts = prompts,
                     onSaved = ::saved,
@@ -123,7 +120,6 @@ private fun SaveScreen(
     save: PendingSave.Save?,
     requester: Requester?,
     session: VaultSession,
-    appLogins: AppLogins,
     biometric: BiometricUnlock,
     prompts: FingerprintPrompts,
     onSaved: (String?) -> Unit,
@@ -172,7 +168,7 @@ private fun SaveScreen(
                             Text(save.username.ifEmpty { "None" }, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.testTag("save-username"))
                             Text("The password the form sent is not shown.", style = MaterialTheme.typography.bodySmall)
                         }
-                        SaveChoices(save.username, save.password, requester, session, appLogins, state.busy == null, made = false, onSaved)
+                        SaveChoices(save.username, save.password, requester, session, state.busy == null, made = false, onSaved)
                     }
                 }
                 state.screen == Screen.REMOVED -> Message("This phone was removed from the vault")
@@ -198,7 +194,6 @@ internal fun SaveChoices(
     password: String,
     requester: Requester,
     session: VaultSession,
-    appLogins: AppLogins,
     idle: Boolean,
     made: Boolean,
     onSaved: (String?) -> Unit,
@@ -207,9 +202,7 @@ internal fun SaveChoices(
     // Read again after an update found its login changed, and as the username changes.
     var reads by remember { mutableIntStateOf(0) }
     LaunchedEffect(reads, username) {
-        val origin = (requester as? Requester.Web)?.origin
-        val chosen = (requester as? Requester.App)?.let(appLogins::chosen).orEmpty()
-        session.saveCandidates(origin, chosen, username, password) { candidates = it }
+        session.saveCandidates(requester.asked(), username, password) { candidates = it }
     }
     val shown = candidates ?: return
     var title by remember { mutableStateOf(requester.title) }
@@ -230,7 +223,7 @@ internal fun SaveChoices(
             shown.forEach { candidate ->
                 OutlinedButton(
                     onClick = {
-                        session.updatePassword(candidate, password) { saved ->
+                        session.updateSaved(requester.asked(), candidate, username, password) { saved ->
                             if (saved) onSaved("Password updated in ${candidate.title}") else reads++
                         }
                     },
@@ -257,19 +250,9 @@ internal fun SaveChoices(
         )
         Button(
             onClick = {
-                val draft = ItemDraft(
-                    title = title,
-                    kind = ItemKind.LOGIN,
-                    username = username,
-                    url = (requester as? Requester.Web)?.origin.orEmpty(),
-                    notes = "",
-                    favorite = false,
-                    password = password,
-                    oneTimeCodeSecret = null,
-                    card = null,
-                )
-                session.saveNew(draft) { id ->
-                    if (requester is Requester.App) appLogins.remember(requester, id)
+                // For the page's origin, or for the app, which the vault
+                // remembers it for.
+                session.saveNew(requester.asked(), title, username, password) {
                     onSaved(
                         if (made) "Saved as $title · if the sign-up does not go through, delete it in Open Secret Manager"
                         else "Saved in Open Secret Manager",

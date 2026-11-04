@@ -57,17 +57,19 @@ import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
 import org.opensecretmanager.app.VaultSession
 import org.opensecretmanager.app.screenState
+import org.opensecretmanager.vault.Asks
 import org.opensecretmanager.vault.FillCredentials
-import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
+import org.opensecretmanager.vault.Offer
 
 /**
  * Where the owner fills a login into another app or a page, after choosing
- * "unlock to fill" in it: unlock, see who asks, choose the login. A page of
- * a trusted browser is offered the logins saved for its origin and nothing
- * else; an app is offered the logins the owner chose for it before, is
- * suggested those saved for a site that names it as its app ([LinkedSites]),
- * or the owner chooses one, warned. A form that asks for a one-time code is offered
+ * "unlock to fill" in it: unlock, see who asks, choose the login. What each
+ * is offered and filled is the vault's to decide: a page of a trusted
+ * browser is offered the logins saved for its origin and nothing else; an
+ * app is offered the logins the owner chose for it before, is suggested
+ * those saved for a site that names it as its app ([LinkedSites]), or the
+ * owner chooses one, warned. A form that asks for a one-time code is offered
  * only logins that have one, and gets the login's current code; a form with
  * a password field and a code field gets both. A login the owner chose in
  * the system's list while the vault was unlocked ([ITEM]) is filled without
@@ -91,37 +93,32 @@ class FillActivity : FragmentActivity() {
         if (savedInstanceState == null) session.askAtOnceNext()
         val requester = Requester.of(this, form)
         this.requester = requester
-        val appLogins = AppLogins(this)
-        // Chosen in the list: for an app, only a login the owner chose for it.
-        val chosen = intent.getStringExtra(ITEM)?.takeIf { item ->
-            requester is Requester.Web || (requester is Requester.App && item in appLogins.chosen(requester))
-        }
-        if (chosen == null) return show(session, requester, appLogins, null)
+        // Chosen in the list: filled only if the vault would offer it here.
+        val chosen = intent.getStringExtra(ITEM)?.takeIf { requester != null }
+        if (requester == null || chosen == null) return show(session, requester, null)
         // Nothing drawn while it fills: the app that asked stays in sight.
         val background = window.decorView.background
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-        session.fillChosen(chosen, (requester as? Requester.Web)?.origin, login = !form.codeOnly, code = form.oneTimeCode != null) { filled ->
+        session.fillListed(requester.asked(), chosen, form.asks) { filled ->
             if (filled != null) {
-                finishWith(filled.first, filled.second)
+                finishWith(filled.credentials, filled.oneTimeCode)
             } else {
                 window.setBackgroundDrawable(background)
-                show(session, requester, appLogins, chosen)
+                show(session, requester, chosen)
             }
         }
     }
 
-    private fun show(session: VaultSession, requester: Requester?, appLogins: AppLogins, chosen: String?) {
+    private fun show(session: VaultSession, requester: Requester?, chosen: String?) {
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 FillScreen(
                     requester = requester,
-                    codeOnly = form.codeOnly,
-                    withCode = form.oneTimeCode != null,
+                    asks = form.asks,
                     chosen = chosen,
                     session = session,
-                    appLogins = appLogins,
                     biometric = biometric,
                     prompts = prompts,
                     onFill = ::finishWith,
@@ -189,11 +186,9 @@ class FillActivity : FragmentActivity() {
 @Composable
 private fun FillScreen(
     requester: Requester?,
-    codeOnly: Boolean,
-    withCode: Boolean,
+    asks: Asks,
     chosen: String?,
     session: VaultSession,
-    appLogins: AppLogins,
     biometric: BiometricUnlock,
     prompts: FingerprintPrompts,
     onFill: (FillCredentials?, String?) -> Unit,
@@ -215,19 +210,23 @@ private fun FillScreen(
         val item = pending ?: return@LaunchedEffect
         if (state.screen != Screen.UNLOCKED || requester == null) return@LaunchedEffect
         pending = null
-        session.fill(item, (requester as? Requester.Web)?.origin, login = !codeOnly, code = withCode, done = onFill)
+        session.fill(requester.asked(), item, asks, chosenNow = false) { filled -> onFill(filled.credentials, filled.oneTimeCode) }
     }
-    // Fills what the form asks for from a login; one chosen for an app from
-    // every login is remembered for it, and the owner told so, as nothing
-    // asks to save a login that was filled.
+    // Fills what the form asks for from a login; one the owner chose for an
+    // app here, of its suggestions or of every login, the vault remembers
+    // for it, and the owner is told so, as nothing asks to save a login
+    // that was filled.
     val context = LocalContext.current
-    val fill: (ItemSummary, String?, Boolean) -> Unit = { item, origin, chosenNow ->
-        session.fill(item.id, origin, login = !codeOnly, code = withCode) { credentials, code ->
-            if (chosenNow && requester is Requester.App) {
-                appLogins.remember(requester, item.id)
-                Toast.makeText(context.applicationContext, "${item.title} is offered in ${requester.label} from now on", Toast.LENGTH_LONG).show()
+    val codeOnly = asks == Asks.ONE_TIME_CODE
+    val fill: (ItemSummary, Boolean) -> Unit = { item, chosenNow ->
+        val asked = requester?.asked()
+        if (asked != null) {
+            session.fill(asked, item.id, asks, chosenNow) { filled ->
+                if (chosenNow && requester is Requester.App) {
+                    Toast.makeText(context.applicationContext, "${item.title} is offered in ${requester.label} from now on", Toast.LENGTH_LONG).show()
+                }
+                onFill(filled.credentials, filled.oneTimeCode)
             }
-            onFill(credentials, code)
         }
     }
     Scaffold(
@@ -256,8 +255,8 @@ private fun FillScreen(
                 state.screen == Screen.UNLOCKED -> Column {
                     Asker(requester)
                     when (requester) {
-                        is Requester.Web -> WebLogins(requester, codeOnly, session) { fill(it, requester.origin, false) }
-                        is Requester.App -> AppLoginsList(requester, state.items, codeOnly, appLogins, session, fill)
+                        is Requester.Web -> WebLogins(requester, asks, session) { fill(it, false) }
+                        is Requester.App -> AppLoginsList(requester, state.items, asks, session, fill)
                     }
                 }
                 state.screen == Screen.REMOVED -> Message("This phone was removed from the vault")
@@ -299,18 +298,16 @@ internal fun Asker(requester: Requester) {
 }
 
 @Composable
-private fun WebLogins(requester: Requester.Web, codeOnly: Boolean, session: VaultSession, onChoose: (ItemSummary) -> Unit) {
+private fun WebLogins(requester: Requester.Web, asks: Asks, session: VaultSession, onChoose: (ItemSummary) -> Unit) {
     var logins by remember(requester) { mutableStateOf<List<ItemSummary>?>(null) }
     LaunchedEffect(requester) {
-        session.loginsForWeb(requester.origin) { found ->
-            if (codeOnly) session.withOneTimeCodes(found) { logins = it } else logins = found
-        }
+        session.offering(requester.asked(), asks) { logins = it.logins }
     }
     val shown = logins ?: return
     if (shown.isEmpty()) {
         Column(Modifier.padding(24.dp)) {
             Text(
-                if (codeOnly) "No login with a one-time code for this site" else "No login for this site",
+                if (asks == Asks.ONE_TIME_CODE) "No login with a one-time code for this site" else "No login for this site",
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.testTag("no-logins"),
             )
@@ -329,28 +326,26 @@ private fun WebLogins(requester: Requester.Web, codeOnly: Boolean, session: Vaul
 private fun AppLoginsList(
     requester: Requester.App,
     items: List<ItemSummary>,
-    codeOnly: Boolean,
-    appLogins: AppLogins,
+    asks: Asks,
     session: VaultSession,
-    fill: (ItemSummary, String?, Boolean) -> Unit,
+    fill: (ItemSummary, Boolean) -> Unit,
 ) {
-    var logins by remember(requester) { mutableStateOf<List<ItemSummary>?>(null) }
-    LaunchedEffect(items, codeOnly) {
-        val all = items.filter { it.kind == ItemKind.LOGIN }
-        if (codeOnly) session.withOneTimeCodes(all) { logins = it } else logins = all
-    }
     val context = LocalContext.current
-    val sites = remember(requester) { LinkedSites.of(context, requester.packageName) }
-    val offered = logins ?: return
-    val chosen = appLogins.chosen(requester)
-    val remembered = offered.filter { it.id in chosen }
+    val asked = remember(requester) { requester.asked(LinkedSites.of(context, requester.packageName).toList()) }
+    // Read again as the vault's items change.
+    var offer by remember(requester) { mutableStateOf<Offer?>(null) }
+    LaunchedEffect(items, asks) { session.offering(asked, asks) { offer = it } }
+    var all by remember(requester) { mutableStateOf<List<ItemSummary>?>(null) }
+    LaunchedEffect(items, asks) { session.loginsToChoose(asks) { all = it } }
+    val offered = offer ?: return
+    val remembered = offered.logins
     // Saved for a site that says this app is its own: suggested, and the
     // app's once the owner chooses one.
-    val linked = offered.filter { it.id !in chosen && LinkedSites.cover(sites, it.url) }
+    val linked = offered.suggested
     var choosing by remember(requester) { mutableStateOf(false) }
     if (!choosing) {
         Column {
-            LoginRows(remembered, Modifier.weight(1f, fill = false)) { item -> fill(item, null, false) }
+            LoginRows(remembered, Modifier.weight(1f, fill = false)) { item -> fill(item, false) }
             if (linked.isNotEmpty()) {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp)) {
                     Text(
@@ -363,7 +358,7 @@ private fun AppLoginsList(
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
-                LoginRows(linked, Modifier.weight(1f, fill = false)) { item -> fill(item, null, true) }
+                LoginRows(linked, Modifier.weight(1f, fill = false)) { item -> fill(item, true) }
             }
             TextButton(
                 onClick = { choosing = true },
@@ -373,7 +368,7 @@ private fun AppLoginsList(
         return
     }
     var query by remember(requester) { mutableStateOf("") }
-    val shown = offered.filter {
+    val shown = all.orEmpty().filter {
         query.isBlank() || it.title.contains(query, ignoreCase = true) || it.username.contains(query, ignoreCase = true) ||
             it.url.contains(query, ignoreCase = true)
     }
@@ -392,7 +387,7 @@ private fun AppLoginsList(
             singleLine = true,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).testTag("fill-search"),
         )
-        LoginRows(shown) { item -> fill(item, null, true) }
+        LoginRows(shown) { item -> fill(item, true) }
     }
 }
 

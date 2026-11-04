@@ -58,6 +58,7 @@ import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
 import org.opensecretmanager.app.VaultSession
 import org.opensecretmanager.app.screenState
+import org.opensecretmanager.vault.Asks
 import org.opensecretmanager.vault.PasswordOptions
 import org.opensecretmanager.vault.generatePassword
 
@@ -98,7 +99,6 @@ class GenerateActivity : FragmentActivity() {
                     requester = requester,
                     typed = typed,
                     session = session,
-                    appLogins = AppLogins(this),
                     biometric = biometric,
                     prompts = prompts,
                     onSaved = ::finishWith,
@@ -131,7 +131,6 @@ private fun GenerateScreen(
     requester: Requester?,
     typed: String,
     session: VaultSession,
-    appLogins: AppLogins,
     biometric: BiometricUnlock,
     prompts: FingerprintPrompts,
     onSaved: (String, String, String?) -> Unit,
@@ -170,7 +169,7 @@ private fun GenerateScreen(
                 }
                 state.screen == Screen.UNLOCKED -> Column {
                     Asker(requester)
-                    Made(form, requester, typed, session, appLogins, state.busy == null, onSaved)
+                    Made(form, requester, typed, session, state.busy == null, onSaved)
                 }
                 state.screen == Screen.REMOVED -> Message("This phone was removed from the vault")
                 state.screen == Screen.UNREADABLE -> Message("The vault on this phone cannot be opened", state.unreadable)
@@ -193,7 +192,6 @@ private fun Made(
     requester: Requester,
     typed: String,
     session: VaultSession,
-    appLogins: AppLogins,
     idle: Boolean,
     onSaved: (String, String, String?) -> Unit,
 ) {
@@ -229,9 +227,7 @@ private fun Made(
                 // of password.
                 var accounts by remember { mutableStateOf(emptyList<String>()) }
                 LaunchedEffect(requester) {
-                    val origin = (requester as? Requester.Web)?.origin
-                    val chosen = (requester as? Requester.App)?.let(appLogins::chosen).orEmpty()
-                    session.offered(origin, chosen, codeOnly = false) { logins ->
+                    session.offered(requester.asked(), Asks.LOGIN) { logins ->
                         accounts = logins.orEmpty().map { it.username }.filter { it.isNotEmpty() }.distinct()
                     }
                 }
@@ -269,7 +265,7 @@ private fun Made(
                 password = make(it)
             }
         }
-        SaveChoices(username, password, requester, session, appLogins, idle, made = true) { told ->
+        SaveChoices(username, password, requester, session, idle, made = true) { told ->
             onSaved(username, password, told)
         }
     }

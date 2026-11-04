@@ -27,21 +27,24 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.opensecretmanager.app.autofill.EarlierAppLogins
+import org.opensecretmanager.vault.Asks
 import org.opensecretmanager.vault.CardFill
 import org.opensecretmanager.vault.DeletedEntry
 import org.opensecretmanager.vault.AndroidKeystore
 import org.opensecretmanager.vault.Device
 import org.opensecretmanager.vault.DeviceState
-import org.opensecretmanager.vault.FillCredentials
+import org.opensecretmanager.vault.Filled
 import org.opensecretmanager.vault.HistoryEntry
 import org.opensecretmanager.vault.ItemDetail
 import org.opensecretmanager.vault.PasskeyCaller
 import org.opensecretmanager.vault.PasskeyDetail
 import org.opensecretmanager.vault.PasskeySignIn
 import org.opensecretmanager.vault.ItemDraft
-import org.opensecretmanager.vault.ItemKind
 import org.opensecretmanager.vault.ItemSummary
 import org.opensecretmanager.vault.MobileException
+import org.opensecretmanager.vault.Offer
+import org.opensecretmanager.vault.Requester
 import org.opensecretmanager.vault.SaveCandidate
 import org.opensecretmanager.vault.SyncStatus
 
@@ -155,7 +158,12 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     private fun openDevice() = run(null) {
         try {
-            device = Device.open(folder.path, AndroidKeystore)
+            val opened = Device.open(folder.path, AndroidKeystore)
+            device = opened
+            // The logins an earlier build kept as chosen for each app, which
+            // the device keeps from now on; tried again at the next open if
+            // it fails.
+            runCatching { EarlierAppLogins.moveInto(context, opened) }
             refresh()
         } finally {
             opened.complete(Unit)
@@ -553,66 +561,50 @@ class VaultSession(private val context: Context, private val folder: File) {
         _state.update { it.copy(notice = "$name copied · cleared in 30 seconds") }
     }
 
-    /** The logins saved for [origin]'s pages; then, on the main thread, [done]. */
-    fun loginsForWeb(origin: String, done: (List<ItemSummary>) -> Unit) = run(null) {
-        val logins = device!!.loginsForWeb(origin).sortedBy { it.title.lowercase() }
-        withContext(Dispatchers.Main) { done(logins) }
-    }
-
-    /** Of [logins], those with a one-time code, in their order; then, on the main thread, [done]. */
-    fun withOneTimeCodes(logins: List<ItemSummary>, done: (List<ItemSummary>) -> Unit) = run(null) {
-        val found = device!!.withOneTimeCodes(logins.map { it.id })
-        withContext(Dispatchers.Main) { done(found) }
+    /**
+     * What the vault offers [requester] for a form that [asks]: for a page,
+     * its origin's logins; for an app, those chosen for it, and apart, those
+     * of the sites its links were verified for. Each by title. Then, on the
+     * main thread, [done].
+     */
+    fun offering(requester: Requester, asks: Asks, done: (Offer) -> Unit) = run(null) {
+        val offer = device!!.offer(requester, asks).let { offer ->
+            offer.copy(logins = offer.logins.byTitle(), suggested = offer.suggested.byTitle())
+        }
+        withContext(Dispatchers.Main) { done(offer) }
     }
 
     /**
-     * What fills a form from a login: its username and password if [login],
-     * and its current one-time code if [code]. Into a page of [origin], which
-     * the login must be saved for, or, without an origin, into an app the
-     * owner chose the login for. A form that asks for the password too is
-     * filled without a code when the login has none. Then, on the main
-     * thread, [done].
+     * Every login a form that [asks] could be filled with, by title, for the
+     * owner to choose one for an app; then, on the main thread, [done].
      */
-    fun fill(id: String, origin: String?, login: Boolean, code: Boolean, done: (FillCredentials?, String?) -> Unit) = run(null) {
-        val (credentials, oneTimeCode) = filling(device!!, id, origin, login, code)
-        withContext(Dispatchers.Main) { done(credentials, oneTimeCode) }
+    fun loginsToChoose(asks: Asks, done: (List<ItemSummary>) -> Unit) = run(null) {
+        val logins = device!!.loginsToChoose(asks).byTitle()
+        withContext(Dispatchers.Main) { done(logins) }
     }
 
-    private fun filling(device: Device, id: String, origin: String?, login: Boolean, code: Boolean): Pair<FillCredentials?, String?> {
-        val credentials = when {
-            !login -> null
-            origin != null -> device.fillForWeb(id, origin)
-            else -> device.fillForApp(id)
-        }
-        val oneTimeCode = if (!code) {
-            null
-        } else {
-            try {
-                if (origin != null) device.oneTimeCodeForWeb(id, origin) else device.oneTimeCode(id)
-            } catch (error: MobileException.NoOneTimeCode) {
-                if (login) null else throw error
-            }
-        }
-        return credentials to oneTimeCode
+    /**
+     * What fills a form that [asks] from the login [id], for [requester]:
+     * only a login the vault offers it, unless the owner [chosenNow] chose
+     * it on the fill screen, for an app, which the vault then remembers for
+     * it. Then, on the main thread, [done].
+     */
+    fun fill(requester: Requester, id: String, asks: Asks, chosenNow: Boolean, done: (Filled) -> Unit) = run(null) {
+        val device = device!!
+        val filled = if (chosenNow) device.fillChosen(requester, id, asks) else device.fill(requester, id, asks)
+        withContext(Dispatchers.Main) { done(filled) }
     }
 
     /**
      * For the system's list under another app's field, while the vault is
-     * unlocked: the logins a fill would offer, which are those saved for
-     * [origin]'s pages or, without an origin, those in [chosen] (the logins
-     * the owner chose for an app), and of them only those with a one-time
-     * code if [codeOnly]. Null while the vault is locked, as [offer] tells.
-     * Nothing is shown meanwhile. Then, on the main thread, [done].
+     * unlocked: the logins a fill would offer [requester] for a form that
+     * [asks], by title, which fill at once: for a page, its origin's; for an
+     * app, those the owner chose for it. Null while the vault is locked, as
+     * [offer] tells. Nothing is shown meanwhile. Then, on the main thread,
+     * [done].
      */
-    fun offered(origin: String?, chosen: Set<String>, codeOnly: Boolean, done: (List<ItemSummary>?) -> Unit) =
-        offer({ device ->
-            val logins = if (origin != null) {
-                device.loginsForWeb(origin)
-            } else {
-                device.items().filter { it.kind == ItemKind.LOGIN && it.id in chosen }
-            }.sortedBy { it.title.lowercase() }
-            if (codeOnly) device.withOneTimeCodes(logins.map { it.id }) else logins
-        }, done)
+    fun offered(requester: Requester, asks: Asks, done: (List<ItemSummary>?) -> Unit) =
+        offer({ device -> device.offer(requester, asks).logins.byTitle() }, done)
 
     /**
      * For the system's list under a card form's field, while the vault is
@@ -620,9 +612,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      * the vault is locked, as [offer] tells. Then, on the main thread, [done].
      */
     fun offeredCards(done: (List<ItemSummary>?) -> Unit) =
-        offer({ device ->
-            device.items().filter { it.kind == ItemKind.CARD && !it.conflict }.sortedBy { it.title.lowercase() }
-        }, done)
+        offer({ device -> device.offerCards().byTitle() }, done)
 
     /**
      * What [read] finds for a list the system shows, while the vault is
@@ -657,7 +647,7 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     /** The fields of the card the owner chose; then, on the main thread, [done]. */
     fun fillCard(id: String, done: (CardFill) -> Unit) = run(null) {
-        val card = device!!.cardFill(id)
+        val card = device!!.fillCard(id)
         withContext(Dispatchers.Main) { done(card) }
     }
 
@@ -671,7 +661,7 @@ class VaultSession(private val context: Context, private val folder: File) {
             val filled = calls.withLock {
                 runCatching {
                     lockIfDue()
-                    device?.takeIf { it.state() == DeviceState.UNLOCKED }?.cardFill(id)
+                    device?.takeIf { it.state() == DeviceState.UNLOCKED }?.fillCard(id)
                 }.getOrNull()
             }
             withContext(Dispatchers.Main) { done(filled) }
@@ -709,17 +699,17 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     /**
      * As [fill], for a login the owner chose in the system's list while the
-     * vault was unlocked: [done] with what fills the form, or with null if
-     * the vault is locked by now or the login does not fill this form, for
-     * the fill screen to take over. Nothing is shown meanwhile.
+     * vault was unlocked, which the vault offered [requester]: [done] with
+     * what fills the form, or with null if the vault is locked by now or the
+     * login does not fill this form, for the fill screen to take over.
+     * Nothing is shown meanwhile.
      */
-    fun fillChosen(id: String, origin: String?, login: Boolean, code: Boolean, done: (Pair<FillCredentials?, String?>?) -> Unit) {
+    fun fillListed(requester: Requester, id: String, asks: Asks, done: (Filled?) -> Unit) {
         scope.launch {
             val filled = calls.withLock {
                 runCatching {
                     lockIfDue()
-                    val device = device?.takeIf { it.state() == DeviceState.UNLOCKED } ?: return@runCatching null
-                    filling(device, id, origin, login, code)
+                    device?.takeIf { it.state() == DeviceState.UNLOCKED }?.fill(requester, id, asks)
                 }.getOrNull()
             }
             withContext(Dispatchers.Main) { done(filled) }
@@ -727,38 +717,38 @@ class VaultSession(private val context: Context, private val folder: File) {
     }
 
     /**
-     * For saving what a form submitted: the logins it could go into, among
-     * those saved for [origin]'s pages or, without an origin, those in
-     * [chosen] (the logins the owner chose for an app). Then, on the main
-     * thread, [done].
+     * For saving what a form of [requester] submitted: the logins it could
+     * go into, which the vault tells (those the form could be filled with,
+     * under its [username]), by title. Then, on the main thread, [done].
      */
     fun saveCandidates(
-        origin: String?,
-        chosen: Set<String>,
+        requester: Requester,
         username: String,
         password: String,
         done: (List<SaveCandidate>) -> Unit,
     ) = run(null) {
-        val device = device!!
-        val ids = if (origin != null) device.loginsForWeb(origin).map { it.id } else chosen.toList()
-        val candidates = device.saveCandidates(ids, username, password).sortedBy { it.title.lowercase() }
+        val candidates = device!!.saveCandidatesFor(requester, username, password).sortedBy { it.title.lowercase() }
         withContext(Dispatchers.Main) { done(candidates) }
     }
 
-    /** Saves a new login from [draft]; then, on the main thread, [done] with its ID. */
-    fun saveNew(draft: ItemDraft, done: (String) -> Unit) = run("Saving…") {
-        val id = device!!.createItem(draft)
+    /**
+     * Saves what a form of [requester] submitted as a new login: for a
+     * page's origin, or for the app, which the vault remembers it for. Then,
+     * on the main thread, [done] with its ID.
+     */
+    fun saveNew(requester: Requester, title: String, username: String, password: String, done: (String) -> Unit) = run("Saving…") {
+        val id = device!!.saveNew(requester, title, username, password)
         withContext(Dispatchers.Main) { done(id) }
     }
 
     /**
-     * Changes the password of the login [candidate] as it was read; then, on
-     * the main thread, [done] with whether it did. A login that changed
-     * since is left alone.
+     * Puts the password a form of [requester] submitted under [username]
+     * into the login [candidate], as it was read; then, on the main thread,
+     * [done] with whether it did. A login that changed since is left alone.
      */
-    fun updatePassword(candidate: SaveCandidate, password: String, done: (Boolean) -> Unit) = run("Saving…") {
+    fun updateSaved(requester: Requester, candidate: SaveCandidate, username: String, password: String, done: (Boolean) -> Unit) = run("Saving…") {
         val saved = try {
-            device!!.updatePassword(candidate.id, candidate.revision, password)
+            device!!.updateSaved(requester, candidate.id, candidate.revision, username, password)
             true
         } catch (error: MobileException.ChangedElsewhere) {
             _state.update { it.copy(notice = "That login changed since this screen read it · choose again") }
@@ -936,3 +926,6 @@ class VaultSession(private val context: Context, private val folder: File) {
 @Composable
 fun VaultSession.screenState(): State<UiState> =
     state.collectAsStateWithLifecycle(context = Dispatchers.Main.immediate)
+
+/** As the fill and save screens list logins and cards: by title. */
+private fun List<ItemSummary>.byTitle() = sortedBy { it.title.lowercase() }

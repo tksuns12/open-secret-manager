@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.text.InputType
 import android.view.View
 import android.view.autofill.AutofillId
+import org.opensecretmanager.vault.Asks
 
 /**
  * What a fill request found on the screen that asks: the fields a login
@@ -37,6 +38,14 @@ data class Form(
     /** Asks for a one-time code, and neither a username nor a password. */
     val codeOnly: Boolean
         get() = username == null && password == null
+
+    /** What the vault fills it with: a login, a code, or both. */
+    val asks: Asks
+        get() = when {
+            codeOnly -> Asks.ONE_TIME_CODE
+            oneTimeCode != null -> Asks.LOGIN_AND_ONE_TIME_CODE
+            else -> Asks.LOGIN
+        }
 
     fun toBundle() = Bundle().apply {
         putString(PACKAGE, packageName)

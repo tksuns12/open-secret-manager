@@ -11,8 +11,21 @@ import org.opensecretmanager.app.R
  * on the list of those trusted to report it, checked by its signing
  * certificate as installed: any app can claim a domain in its own views.
  * Every other request is an app's, known by its package and certificate.
+ * What each is offered, filled, and saved into is the vault's to decide
+ * ([asked]).
  */
 sealed interface Requester {
+    /**
+     * Who asks, as the vault decides by: a page by its origin, an app by
+     * its [App.key]. [linkedDomains], for an app, are the domains of its
+     * links that Android verified ([LinkedSites]), whose logins the fill
+     * screen suggests.
+     */
+    fun asked(linkedDomains: List<String> = emptyList()): org.opensecretmanager.vault.Requester = when (this) {
+        is Web -> org.opensecretmanager.vault.Requester.Page(listOf(origin))
+        is App -> org.opensecretmanager.vault.Requester.App(key, linkedDomains)
+    }
+
     /**
      * What a new login from here is called at first: the page's host, or
      * the domain an app says it shows, without `www.`, or else the app's
@@ -42,7 +55,10 @@ sealed interface Requester {
      * [claimedDomain] is the web domain it says it shows, if any: not
      * believed, it only narrows which logins the owner chose are offered.
      */
-    data class App(val packageName: String, val label: String, val certificate: String, val claimedDomain: String?) : Requester
+    data class App(val packageName: String, val label: String, val certificate: String, val claimedDomain: String?) : Requester {
+        /** What the vault keeps the logins chosen for this app by, on this phone only. */
+        val key: String get() = "$packageName:$certificate" + (claimedDomain?.let { ":$it" } ?: "")
+    }
 
     companion object {
         /** Packages trusted as browsers in tests only, whatever their certificate. */
@@ -59,9 +75,10 @@ sealed interface Requester {
                 val manager = context.packageManager
                 manager.getApplicationLabel(manager.getApplicationInfo(packageName, 0)).toString()
             }.getOrDefault(packageName)
-            // Pages over https only, as on the desktop.
-            if (domain != null && webScheme == "https" && trusts(context, packageName, certificates)) {
-                return Web("https://${domain.lowercase()}", packageName, label)
+            // Pages over https only, as on the desktop and on iOS: a trusted
+            // browser's page over http is filled, saved, and offered nothing.
+            if (domain != null && trusts(context, packageName, certificates)) {
+                return if (webScheme == "https") Web("https://${domain.lowercase()}", packageName, label) else null
             }
             // The original certificate, which stays first in its history when
             // the app moves to a new one: the app keeps its identity here.
