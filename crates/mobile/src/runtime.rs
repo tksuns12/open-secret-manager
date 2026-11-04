@@ -33,6 +33,7 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::{
+    fill::{self, AppChoices, Asks, Filled, Offer, Requester},
     CardDetail, CardFill, DeletedEntry, DeviceState, FillCredentials, HistoryEntry, ItemDetail,
     ItemDraft, ItemSummary, MobileError, PasskeyCaller, PasskeyChoice, PasskeyCreation,
     PasskeyRefusal, PasskeySignIn, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
@@ -125,6 +126,7 @@ pub(crate) struct Runtime {
     status: StdMutex<SyncStatus>,
     removed: AtomicBool,
     syncing: AtomicBool,
+    app_choices: AppChoices,
 }
 
 /// Who asks for a passkey, read: the page whose domains it may use, the
@@ -257,6 +259,7 @@ impl Runtime {
             }),
             removed: AtomicBool::new(removed),
             syncing: AtomicBool::new(false),
+            app_choices: AppChoices::in_folder(&directory),
             directory,
         })
     }
@@ -892,6 +895,123 @@ impl Runtime {
             now(),
         )?;
         Ok(assertion.response_json(&client_data))
+    }
+
+    pub(crate) async fn offer(
+        &self,
+        requester: &Requester,
+        asks: Asks,
+    ) -> Result<Offer, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        fill::offer(vault, &self.app_choices, requester, asks)
+    }
+
+    pub(crate) async fn fill(
+        &self,
+        requester: &Requester,
+        id: &str,
+        asks: Asks,
+        owner_chose: bool,
+    ) -> Result<Filled, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        fill::fill(
+            vault,
+            &self.app_choices,
+            requester,
+            id,
+            asks,
+            owner_chose,
+            now(),
+        )
+    }
+
+    pub(crate) async fn logins_to_choose(
+        &self,
+        asks: Asks,
+    ) -> Result<Vec<ItemSummary>, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        fill::logins_to_choose(vault, asks)
+    }
+
+    pub(crate) async fn offer_cards(&self) -> Result<Vec<ItemSummary>, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        fill::offer_cards(vault)
+    }
+
+    pub(crate) async fn fill_card(&self, id: &str) -> Result<CardFill, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        fill::fill_card(vault, id)
+    }
+
+    pub(crate) async fn save_candidates_for(
+        &self,
+        requester: &Requester,
+        username: &str,
+        password: &str,
+    ) -> Result<Vec<SaveCandidate>, MobileError> {
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        fill::save_candidates(vault, &self.app_choices, requester, username, password)
+    }
+
+    pub(crate) async fn update_saved(
+        self: &Arc<Self>,
+        requester: &Requester,
+        id: &str,
+        revision: &str,
+        username: &str,
+        password: String,
+    ) -> Result<(), MobileError> {
+        {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            fill::update_saved(
+                vault,
+                &self.app_choices,
+                requester,
+                id,
+                revision,
+                username,
+                password,
+            )?;
+        }
+        self.sync_soon();
+        Ok(())
+    }
+
+    pub(crate) async fn save_new(
+        self: &Arc<Self>,
+        requester: &Requester,
+        title: String,
+        username: String,
+        password: String,
+    ) -> Result<String, MobileError> {
+        let id = {
+            let mut vault = self.vault.lock().await;
+            let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
+            fill::save_new(
+                vault,
+                &self.app_choices,
+                requester,
+                title,
+                username,
+                password,
+            )?
+        };
+        self.sync_soon();
+        Ok(id)
+    }
+
+    pub(crate) fn import_app_choices(
+        &self,
+        earlier: std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<(), MobileError> {
+        Ok(self.app_choices.import(earlier)?)
     }
 
     pub(crate) async fn card_fill(&self, id: &str) -> Result<CardFill, MobileError> {

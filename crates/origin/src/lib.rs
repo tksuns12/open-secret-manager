@@ -50,6 +50,11 @@ impl Origin {
     pub fn host(&self) -> &str {
         &self.host
     }
+
+    /// The effective port: 443 when none is written.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 impl fmt::Display for Origin {

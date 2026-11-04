@@ -23,12 +23,14 @@
 
 #![deny(unsafe_code)]
 
+mod fill;
 mod runtime;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use zeroize::Zeroizing;
 
+pub use crate::fill::{Asks, Filled, Offer, Requester};
 use crate::runtime::Runtime;
 
 uniffi::setup_scaffolding!();
@@ -72,6 +74,17 @@ pub enum MobileError {
     NotALogin,
     #[error("that item is not a card")]
     NotACard,
+    /// The login was not chosen for the app that asks, which is filled only
+    /// one the owner chose for it.
+    #[error("that login was not chosen for this app")]
+    NotChosen,
+    /// A save went to a login that the form could not be filled with, or
+    /// one under another username.
+    #[error("that login is not one this form could be saved into")]
+    NotForThisForm,
+    /// A requester with no origin, or an app with no key.
+    #[error("that request names no one a login could go to")]
+    InvalidRequester,
     /// A site's request for a passkey that is not answered here (see
     /// [`PasskeyRefusal`]): another provider, or the browser, may answer it.
     #[error("{reason}")]
@@ -1041,6 +1054,130 @@ impl Device {
     pub fn one_time_code_for_web(&self, id: String, origin: String) -> Result<String, MobileError> {
         self.tokio
             .block_on(self.inner.one_time_code_for_web(&id, &origin))
+    }
+
+    /// The logins `requester` is offered for a form that `asks` for them:
+    /// for a page, those saved for its origins; for an app, those the owner
+    /// chose for it, and apart from them, the logins of the sites its links
+    /// were verified for; for no one named, none. For a code alone, only
+    /// logins with a one-time code.
+    pub fn offer(&self, requester: Requester, asks: Asks) -> Result<Offer, MobileError> {
+        self.tokio.block_on(self.inner.offer(&requester, asks))
+    }
+
+    /// What fills the form `requester` shows from the login `id`, of what
+    /// it `asks` for: for a page, only a login saved for its origins; for
+    /// an app, only one the owner chose for it ([`MobileError::NotChosen`]
+    /// otherwise); for no one named, nothing. A form that asks for a code
+    /// with the password is filled without one when the login has none.
+    pub fn fill(
+        &self,
+        requester: Requester,
+        id: String,
+        asks: Asks,
+    ) -> Result<Filled, MobileError> {
+        self.tokio
+            .block_on(self.inner.fill(&requester, &id, asks, false))
+    }
+
+    /// As [`Device::fill`], for a login the owner chose on this phone's
+    /// screen just now, for an app or a requester that names no one: it may
+    /// be any login, and for an app it is remembered, to be offered to that
+    /// app from now on. A page is still filled only the logins for its
+    /// origins.
+    pub fn fill_chosen(
+        &self,
+        requester: Requester,
+        id: String,
+        asks: Asks,
+    ) -> Result<Filled, MobileError> {
+        self.tokio
+            .block_on(self.inner.fill(&requester, &id, asks, true))
+    }
+
+    /// Every login a form that `asks` could be filled with (for a code
+    /// alone, those with a one-time code), for the owner to choose one from
+    /// on this phone's screen for an app or a requester that names no one,
+    /// with [`Device::fill_chosen`].
+    pub fn logins_to_choose(&self, asks: Asks) -> Result<Vec<ItemSummary>, MobileError> {
+        self.tokio.block_on(self.inner.logins_to_choose(asks))
+    }
+
+    /// The cards a card form is offered: every card not in conflict, for
+    /// any app or page.
+    pub fn offer_cards(&self) -> Result<Vec<ItemSummary>, MobileError> {
+        self.tokio.block_on(self.inner.offer_cards())
+    }
+
+    /// The fields of the card the owner chose for a card form, in an app or
+    /// on a page; refused for an item that is not a card, and for a card two
+    /// devices changed at once, until a computer settles which version is
+    /// meant.
+    pub fn fill_card(&self, id: String) -> Result<CardFill, MobileError> {
+        self.tokio.block_on(self.inner.fill_card(&id))
+    }
+
+    /// For saving what a form of `requester` submitted: the logins it could
+    /// go into, which are those the form could be filled with (and for a
+    /// requester that names no one, none), with the form's `username`
+    /// (every one, if the form had none), not in conflict; and whether each
+    /// has the form's `password` already.
+    pub fn save_candidates_for(
+        &self,
+        requester: Requester,
+        username: String,
+        password: String,
+    ) -> Result<Vec<SaveCandidate>, MobileError> {
+        let password = Zeroizing::new(password);
+        self.tokio.block_on(
+            self.inner
+                .save_candidates_for(&requester, &username, &password),
+        )
+    }
+
+    /// Changes only the password of the login `id`, as read at `revision`,
+    /// to the one a form of `requester` submitted under `username`; refused
+    /// unless the login is one of [`Device::save_candidates_for`]
+    /// ([`MobileError::NotForThisForm`]), or if it changed since. Online,
+    /// it syncs at once.
+    pub fn update_saved(
+        &self,
+        requester: Requester,
+        id: String,
+        revision: String,
+        username: String,
+        password: String,
+    ) -> Result<(), MobileError> {
+        self.tokio.block_on(
+            self.inner
+                .update_saved(&requester, &id, &revision, &username, password),
+        )
+    }
+
+    /// Saves what a form of `requester` submitted as a new login titled
+    /// `title`, and returns its ID: for a page, saved for its first origin;
+    /// for an app, with no address, and remembered for that app; for a
+    /// requester that names no one, with no address. Online, it syncs at
+    /// once.
+    pub fn save_new(
+        &self,
+        requester: Requester,
+        title: String,
+        username: String,
+        password: String,
+    ) -> Result<String, MobileError> {
+        self.tokio
+            .block_on(self.inner.save_new(&requester, title, username, password))
+    }
+
+    /// Adds the logins an earlier build of the app kept as chosen for each
+    /// app, by the app's key, to those this device keeps; what is here
+    /// already stays. Once it returns, the app may forget its own copy.
+    pub fn import_app_choices(
+        &self,
+        chosen: HashMap<String, Vec<String>>,
+    ) -> Result<(), MobileError> {
+        self.inner.import_app_choices(chosen)
     }
 
     /// Makes a login or a secure note from `draft`, and returns its ID.
