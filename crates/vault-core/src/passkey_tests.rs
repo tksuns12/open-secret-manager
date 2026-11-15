@@ -452,7 +452,7 @@ fn the_passkey_encodings_are_the_frozen_ones() {
         PublicKey::from(vector_key().verifying_key()),
         "the public key is the private key's"
     );
-    let point = p256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&public_key, false);
+    let point = p256::elliptic_curve::sec1::ToSec1Point::to_sec1_point(&public_key, false);
     let mut cose = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
     cose.extend_from_slice(point.x().unwrap());
     cose.extend_from_slice(&[0x22, 0x58, 0x20]);

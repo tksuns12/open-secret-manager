@@ -38,6 +38,6 @@ zeroize = "1.8.2"
 [dev-dependencies]
 base64ct = { version = "1.8.3", features = ["alloc"] }
 # Checks the signatures of the passkeys made through the interface.
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
-rusqlite = { version = "0.40.2", default-features = false }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+rusqlite = { version = "0.41.1", default-features = false }
 tempfile = "3.24.0"

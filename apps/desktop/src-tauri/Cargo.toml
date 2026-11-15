@@ -50,7 +50,7 @@ osm-vault-browser = { path = "../../../crates/vault-browser" }
 
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
-rusqlite = { version = "0.40.2", default-features = false }
+rusqlite = { version = "0.41.1", default-features = false }
 tauri = { version = "2.0.0", features = ["test"] }
 tempfile = "3.24.0"
 tokio = { version = "1.53.1", features = ["io-util"] }

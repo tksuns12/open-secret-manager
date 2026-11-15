@@ -23,6 +23,7 @@ use std::{collections::BTreeMap, fmt};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
+    elliptic_curve::Generate,
     pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
     PublicKey, SecretKey,
 };
@@ -642,12 +643,9 @@ impl Registering {
     pub fn create(&self, verified: bool, now: u64) -> Result<Created> {
         let mut credential_id = [0_u8; CREDENTIAL_ID_LEN];
         OsRng.fill_bytes(&mut credential_id);
-        self.create_with(
-            &SigningKey::random(&mut OsRng),
-            &credential_id,
-            verified,
-            now,
-        )
+        // From the system's random source, as OsRng is.
+        let key = SigningKey::try_generate().map_err(|_| Error::Crypto)?;
+        self.create_with(&key, &credential_id, verified, now)
     }
 
     pub(crate) fn create_with(
@@ -657,7 +655,7 @@ impl Registering {
         verified: bool,
         now: u64,
     ) -> Result<Created> {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let (Some(x), Some(y)) = (point.x(), point.y()) else {
             return Err(Error::Crypto);
         };

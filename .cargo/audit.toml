@@ -17,4 +17,19 @@ ignore = [
     "RUSTSEC-2025-0081",
     "RUSTSEC-2025-0098",
     "RUSTSEC-2025-0100",
+    # basic-toml is unmaintained. askama's macros read their configuration
+    # with it inside uniffi-bindgen, the tool that writes the phone apps'
+    # Kotlin and Swift bindings at build time (`--features bindgen`);
+    # nothing it builds goes into an app. uniffi 0.32.2 and askama 0.16.1
+    # are the newest.
+    "RUSTSEC-2026-0374",
+    # zbus 4, zbus_names, and zvariant are unmaintained. They are in the
+    # desktop app's lockfile only because keyring's crypto-rust feature
+    # names secret-service?/crypto-rust, and Cargo locks a dependency
+    # named so although nothing turns it on: the app uses keyring's
+    # sync-secret-service, over libdbus, and `cargo tree -i zbus --target
+    # all` finds nothing that depends on zbus.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
