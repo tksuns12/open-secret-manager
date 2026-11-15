@@ -1,0 +1,1 @@
+A password manager whose devices sync with each other: no account, no server

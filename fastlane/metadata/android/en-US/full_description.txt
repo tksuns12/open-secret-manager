@@ -1,0 +1,19 @@
+<p>Open Secret Manager is a password manager in which every device keeps its own encrypted vault and the devices sync with each other directly. There is no account, no server to sync through, and no telemetry.</p>
+
+<p><b>It needs a computer.</b> A vault is made on a computer with the desktop app (macOS; the Linux package is not yet tried on a Linux desktop), from the project's page. The phone joins it from there: scan the QR code the computer shows, compare a six-digit code on both screens, and give the phone a password of its own.</p>
+
+<p>On the phone:</p>
+<ul>
+<li>Unlock with the phone's password, or with a fingerprint or the face if you turn that on. The vault locks when you leave the app, at once or after a time you choose.</li>
+<li>See and copy what the vault holds, and create and edit logins, notes, and cards.</li>
+<li>Fill logins, one-time codes, and cards into other apps and into pages in browsers, through Android's autofill, only after you unlock and choose. A page is offered only the logins saved for its exact address (HTTPS, the same host and port); an app only the logins you chose for it.</li>
+<li>Save a login that an app or a page sent, where you choose.</li>
+<li>Passkeys, on Android 14 and later.</li>
+<li>Sync with your other devices while the app is open, and now and then while it is closed, unless you turn that off (without unlocking: what arrives waits, encrypted, for the next unlock). On the local network, over your own VPN, or through a relay you run yourself, always end to end, with each device's certificate pinned.</li>
+</ul>
+
+<p>Permissions: the camera, only to scan an invitation's QR code (you can paste the invitation instead); the network, to reach your own devices; fingerprint or face, only if you turn it on. An accessibility service, off until you turn it on in Android's settings, fills the other field of a login on a page that told autofill of one field only.</p>
+
+<p><b>Status.</b> This is a young project, and nobody outside it has reviewed its design or code yet: keep a copy of your passwords elsewhere too. The threat model, the storage and sync formats, and the evidence for each part are in the repository.</p>
+
+<p>The app is in English.</p>

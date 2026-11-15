@@ -1,0 +1,1 @@
+First release. Join a vault from a computer, unlock with a password, fingerprint or face, see and edit logins, notes and cards, fill and save logins, codes and cards through autofill, passkeys on Android 14 and later, and sync with your own devices while the app is open and now and then while it is closed.
