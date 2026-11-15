@@ -7,6 +7,31 @@ reach each other directly can go through a relay the owner runs themselves
 (`osm-relay`), which passes their end-to-end TLS along and can read nothing
 of it ([reaching devices](docs/reaching-devices.md)).
 
+**Status.** A young project. Its maintainer uses it on their own computer
+and phone, but nobody outside the project has reviewed its design or code
+yet ([the review packet](docs/review-packet.md) is the request): keep a copy
+of your passwords elsewhere too. To report a weakness, see
+[SECURITY.md](SECURITY.md).
+
+## Getting it
+
+A vault is made on a computer; phones join it from there.
+
+| Where | How |
+| --- | --- |
+| macOS 14 or later, Apple Silicon | The disk image from [Releases](https://github.com/tksuns12/open-secret-manager/releases). It is not notarized, so macOS refuses to open it the first time; choose **Open Anyway** in System Settings › Privacy & Security. [Check the download](docs/release.md#how-to-verify-a-download) first. |
+| Linux, x86_64 | The `.deb` from Releases. Built in a container, not yet tried on a Linux desktop. |
+| Android 9 or later, 64-bit ARM | [F-Droid](https://f-droid.org/packages/org.opensecretmanager.app/) once it is accepted there, or the APK from Releases. Both are the same APK, signed with the project's key ([its certificate](docs/release.md#supported-configurations)): F-Droid builds the app from source itself and publishes the signed APK only if its build is the same, file for file. |
+| iOS 17 or later | No download: build it with Xcode and sign it with an Apple developer team of your own ([how](docs/phone-trial.md#getting-the-app-onto-the-phone)). |
+| Windows | Not supported: the app has never been built for Windows. |
+
+The project does not join app stores' or platform vendors' paid programs,
+so nothing it publishes depends on one: no Apple notarization, no App
+Store, no Google Play. The Android app reaches people through F-Droid,
+which builds it from this repository.
+
+## How it is built
+
 The repository is deliberately split at the security boundary:
 
 - `crates/vault-core` owns the encrypted local vault, unlock state, revisions,
@@ -174,3 +199,8 @@ device, a malicious enrolled consensus participant, or secrets that were
 already displayed or copied. Raft-style membership control handles crashes and
 partitions; it is not Byzantine fault tolerance. A public stable release must
 complete an independent security review.
+
+## License
+
+GNU General Public License, version 3 only (`GPL-3.0-only`); the text is in
+[LICENSE](LICENSE).

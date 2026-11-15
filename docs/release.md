@@ -8,10 +8,21 @@ evidence behind each statement is in
 
 ## What the first release is
 
-Version 0.1.0 of the desktop app, for macOS, with the browser extension for
-Chromium-based browsers and Firefox. It has not been reviewed by anyone
-outside the project ([review-packet.md](review-packet.md) is the request),
-and it must not be described as audited.
+Version 0.1.0 of the desktop app, for macOS (and as a Linux package not yet
+tried on a Linux desktop), with the browser extension for Chromium-based
+browsers and Firefox; and version 0.1.0 of the Android app. It has not been
+reviewed by anyone outside the project ([review-packet.md](review-packet.md)
+is the request), and it must not be described as audited. Each platform's
+release is tagged on its own: `desktop-v0.1.0`, `android-v0.1.0`.
+
+The project joins no app store's or platform vendor's paid program, so that
+nothing it publishes depends on one. The macOS app is therefore not
+notarized: macOS refuses a downloaded copy until the owner chooses Open
+Anyway in System Settings › Privacy & Security. iOS has no release: whoever
+wants the app builds it with an Apple developer team of their own
+([phone-trial.md](phone-trial.md#getting-the-app-onto-the-phone)). The
+Android app is published on GitHub and through F-Droid, which builds it from
+this repository ([F-Droid](#f-droid)).
 
 There is no updater in the app. An update is a new package, downloaded and
 installed over the old one. Vaults written by this release (vault format 7,
@@ -28,8 +39,8 @@ before the release are upgraded when opened.
 | Linux, x86_64 (`.deb`) | **Built, not verified.** Made in a container from Ubuntu 22.04, so it needs no newer system libraries than 22.04 has. No Linux desktop has run it. Locking when the computer sleeps or the screen locks, and keeping copied codes out of clipboard history, exist on macOS and, since Phase 10, on Linux (through logind and the clipboard's password-manager hint), where they were tried in a container against a stand-in for logind, not on a Linux desktop. Under Wayland, copies are made through the compositor's data-control protocol where it offers one, as wlroots compositors do (Sway was tried in a container); elsewhere, as on GNOME, they go through Xwayland, untried. |
 | Linux, arm64 | The packaging script builds it on request; not built for the release. A build of the Phase 9 code ran in an Ubuntu 22.04 container under a virtual display with a window manager: a vault made, a login added, Firefox 157 connected and filled through its extension. Not a desktop session (no GNOME or KDE), and the same limits as x86_64. |
 | Windows | **Not supported.** The app was never built for Windows, and its browser fill does not exist there. |
-| Android (9 and later, 64-bit ARM) | **Not yet a release.** The release build, shrunk and signed as it ships, joined a desktop-side device and synced on an Android 16 emulator; the owner's Galaxy S23 Ultra runs it since 2026-10-14, after a debug build there since 2026-10-12, and no other phone has ([phone-trial.md](phone-trial.md) is what is left). It is signed with the owner's key, certificate SHA-256 `17:26:C7:48:A0:13:35:9D:39:E8:81:18:23:05:19:F0:86:8A:E8:05:EC:1F:9D:86:E2:8C:B5:D5:47:0F:B9:E2`. Other kinds of phone refuse to install it. Passkeys need Android 14 or later (Phase 18); before 14 everything else works, and the phone offers none. |
-| iOS (17 and later, iPhone) | **Not yet a release.** Built for iPhones unsigned; tested only in iOS simulators (iOS 26.5 most recently). Running it on any iPhone needs an Apple developer team, which the project does not have yet. Inserting an item's field as text, a card's number for one, needs iOS 18 or later (Phase 17). |
+| Android (9 and later, 64-bit ARM) | **Released as 0.1.0**, on GitHub and, once it is accepted there, F-Droid. The release build, shrunk and signed as it ships, joined a desktop-side device and synced on an Android 16 emulator; the owner's Galaxy S23 Ultra runs it since 2026-10-14, after a debug build there since 2026-10-12, and no other phone has ([phone-trial.md](phone-trial.md) is what is left). It is signed with the owner's key, certificate SHA-256 `17:26:C7:48:A0:13:35:9D:39:E8:81:18:23:05:19:F0:86:8A:E8:05:EC:1F:9D:86:E2:8C:B5:D5:47:0F:B9:E2`. Other kinds of phone refuse to install it. Passkeys need Android 14 or later (Phase 18); before 14 everything else works, and the phone offers none. |
+| iOS (17 and later, iPhone) | **No release.** Built for iPhones unsigned; tested only in iOS simulators (iOS 26.5 most recently). Running it on any iPhone needs an Apple developer team; the project joins no paid program, so whoever wants it builds it with their own. Inserting an item's field as text, a card's number for one, needs iOS 18 or later (Phase 17). |
 | Browsers | Chromium-based browsers and Firefox 128 or later (for passkeys, since Phase 18), tested headless (Chrome for Testing 153, Firefox 157; passkeys in Playwright's Chromium and Firefox 158). The extension is not published in either store: in Chromium it loads unpacked under its development ID, and in Firefox only as a temporary add-on. |
 | Networks | Devices reach each other directly by address: on a network they share, over a VPN such as Tailscale, or at an open IPv6 address. An invitation names up to four of the inviter's addresses, and each device tells the others its own whenever they connect, so devices that have synced once on a network they share reach each other afterwards over a VPN they both use. Across real networks this was tried only with the owner's Android phone on its mobile network and this Mac at home, over Tailscale. Where nothing can be reached directly, the app can use a relay the owner runs (`osm-relay`), which passes the devices' own encrypted connections along; it was tried on this Mac and in a container, never on a server. There is no discovery, hole punching, or port mapping. |
 | Devices in a vault | Tested with up to four. With two, both must be online to add or remove a device; with three or more, one can be away. |
@@ -41,10 +52,9 @@ evidence in the delivery matrix and the threat model.
 
 **Review and packaging**
 - No outside review of the design or the code.
-- Until packages are signed with a developer identity and notarized, macOS
-  refuses a downloaded copy unless the owner overrides it, and nothing but
-  the file system guards the app's files, the native host inside it
-  included.
+- The macOS app is signed ad hoc and not notarized: macOS refuses a
+  downloaded copy unless the owner overrides it, and nothing but the file
+  system guards the app's files, the native host inside it included.
 - 603 crates and two sets of npm packages are trusted without review of
   what their code does. Their advisories and licenses are checked.
 
@@ -139,9 +149,11 @@ Each release folder has `SHA256SUMS`, `app-contents.sha256`, and
 
 ## How a phone release is built
 
-Neither phone app is released yet; these build what a release would be.
+The Android app is released; the iOS build only shows that a release would
+build.
 
-- `scripts/release-android.sh` builds the APK and the bundle for Google Play
+- `scripts/release-android.sh` builds the APK, and an app bundle nothing
+  publishes,
   from an export of the commit at `/private/tmp/open-secret-manager-android-release`,
   shrunk with R8 (the rules that keep what JNA calls by name are in
   `apps/mobile/android/vault/consumer-rules.pro`), into `dist/android/<commit>/`
@@ -152,6 +164,11 @@ Neither phone app is released yet; these build what a release would be.
   they are unsigned. An update must be signed with the same key, so the
   keystore is kept as carefully as a Developer ID.
   `scripts/reproduce-android.sh` builds twice and compares the file lists.
+  The shared code's library is put in place by
+  `apps/mobile/android/prepare-release.sh`, with the Rust and the NDK it
+  names and without the folders of the machine that builds it or the names
+  of the compilers that made it, and Gradle strips no library, so that
+  F-Droid's Linux build server can make the same APK as this Mac.
   `scripts/test-mobile-join.sh android-release` signs the release with a key
   made for the run and has it join a desktop-side device on an emulator.
 - `scripts/release-ios.sh` builds from an export at
@@ -178,6 +195,32 @@ iPhones link `/usr/lib/libsqlite3.dylib`, contain no SQLite of their own,
 and call neither function. iOS 17 has SQLite 3.39, which
 has everything the vault uses (strict tables from 3.37, dropping columns
 from 3.35); the shared code's tests ran against the simulator's.
+
+## F-Droid
+
+F-Droid builds the Android app from this repository, with the recipe in its
+own repository (`metadata/org.opensecretmanager.app.yml` in
+[fdroiddata](https://gitlab.com/fdroid/fdroiddata)) and the listing in
+`fastlane/metadata/android/` here. It publishes the APK signed with the
+project's key from the GitHub release, and only if the APK it built itself
+is the same once the signature is set aside; otherwise it publishes nothing.
+The project's key therefore stays the only one that signs the app, and an
+APK from GitHub and one from F-Droid update each other.
+
+A new Android version:
+
+1. Raise `versionCode` and `versionName` in
+   `apps/mobile/android/app/build.gradle.kts`, and write what changed in
+   `fastlane/metadata/android/<language>/changelogs/<versionCode>.txt`.
+2. Commit, and build that commit with `scripts/release-android.sh` and the
+   project's key.
+3. Tag the commit `android-v<versionName>`, push the tag, and publish a
+   GitHub release of it with `Open-Secret-Manager-<versionName>-android-arm64.apk`,
+   `SHA256SUMS`, `apk-contents.sha256`, and `build-info.txt`.
+4. F-Droid finds the tag itself, builds it, and compares.
+
+The recipe installs the Rust that `prepare-release.sh` names; a change to
+the NDK there is also a change to the recipe's `ndk`.
 
 ## How a release is built
 
