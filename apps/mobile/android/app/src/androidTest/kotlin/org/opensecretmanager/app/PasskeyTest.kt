@@ -136,10 +136,16 @@ class PasskeyTest {
         }
     }
 
-    /** In the system's sheet, the button that goes on with this app's entry. */
+    /**
+     * In the system's sheet, the button that goes on with this app's entry.
+     * The sheet is waited for by that button: Google Play services named the
+     * app in an entry of its own until 26.44, and since then names it only
+     * when a passkey is made ("On all your devices with …"), not when the
+     * one passkey offered signs in. What comes back is signed with the
+     * vault's key, which says whose entry it was.
+     */
     private fun goOn() {
-        find(By.text("Open Secret Manager").pkg(SHEET), 30_000)
-        find(By.text("Continue").pkg(SHEET)).click()
+        find(By.text("Continue").pkg(SHEET), 30_000).click()
     }
 
     /** What the stand-in received: the response, or its error. */
