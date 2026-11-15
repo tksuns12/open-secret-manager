@@ -152,16 +152,15 @@ Each release folder has `SHA256SUMS`, `app-contents.sha256`, and
 The Android app is released; the iOS build only shows that a release would
 build.
 
-- `scripts/release-android.sh` builds the APK, and an app bundle nothing
-  publishes,
+- `scripts/release-android.sh` builds the APK
   from an export of the commit at `/private/tmp/open-secret-manager-android-release`,
   shrunk with R8 (the rules that keep what JNA calls by name are in
   `apps/mobile/android/vault/consumer-rules.pro`), into `dist/android/<commit>/`
-  with their SHA-256, the list of the APK's files without its signature
+  with its SHA-256, the list of the APK's files without its signature
   (`apk-contents.sha256`), and `build-info.txt`. With `OSM_ANDROID_KEYSTORE`,
   `OSM_ANDROID_KEYSTORE_PASSWORD`, `OSM_ANDROID_KEY_ALIAS`, and
-  `OSM_ANDROID_KEY_PASSWORD` both are signed with that key; without them
-  they are unsigned. An update must be signed with the same key, so the
+  `OSM_ANDROID_KEY_PASSWORD` it is signed with that key; without them it
+  is unsigned. An update must be signed with the same key, so the
   keystore is kept as carefully as a Developer ID.
   `scripts/reproduce-android.sh` builds twice and compares the file lists.
   The shared code's library is put in place by

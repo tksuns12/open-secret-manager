@@ -1,15 +1,14 @@
 #!/bin/sh
 # Builds the Android release of the phone app from the current commit and
-# puts in dist/android/<commit>/: the APK to install and the bundle for
-# Google Play, their SHA-256, the list of the APK's files without its
-# signature (apk-contents.sha256, what a rebuild is compared with), and what
+# puts in dist/android/<commit>/: the APK to install, its SHA-256, the list
+# of the APK's files without its signature (apk-contents.sha256, what a rebuild is compared with), and what
 # built it. See docs/release.md.
 #
 #   scripts/release-android.sh
 #
 # OSM_ANDROID_KEYSTORE  the owner's keystore, with OSM_ANDROID_KEYSTORE_PASSWORD,
 #                       OSM_ANDROID_KEY_ALIAS, and OSM_ANDROID_KEY_PASSWORD.
-#                       Without it the APK and the bundle are unsigned, and
+#                       Without it the APK is unsigned, and
 #                       no phone installs the APK until it is signed.
 # OSM_ALLOW_CHANGES=1   build although the working tree has changes, which
 #                       are then built too; the result is not a release.
@@ -43,7 +42,7 @@ fi
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "$commit")
 export SOURCE_DATE_EPOCH
 "$build/apps/mobile/android/prepare-release.sh"
-(cd "$build/apps/mobile/android" && ./gradlew --quiet --no-build-cache :app:assembleRelease :app:bundleRelease)
+(cd "$build/apps/mobile/android" && ./gradlew --quiet --no-build-cache :app:assembleRelease)
 
 outputs="$build/apps/mobile/android/app/build/outputs"
 signed=no
@@ -55,7 +54,6 @@ else
 fi
 name="Open-Secret-Manager-$version-android-arm64"
 cp "$apk" "$out/$name.apk"
-cp "$outputs/bundle/release/app-release.aab" "$out/$name.aab"
 
 # Each file in the APK with its SHA-256, the signature's own files left out.
 unzip -Z1 "$out/$name.apk" | grep -Ev '^META-INF/([^/]+\.(SF|RSA|EC|DSA)|MANIFEST\.MF)$' | LC_ALL=C sort |
@@ -63,7 +61,7 @@ unzip -Z1 "$out/$name.apk" | grep -Ev '^META-INF/([^/]+\.(SF|RSA|EC|DSA)|MANIFES
         printf '%s  %s\n' "$(unzip -p "$out/$name.apk" "$entry" | shasum -a 256 | cut -d' ' -f1)" "$entry"
     done >"$out/apk-contents.sha256"
 
-(cd "$out" && shasum -a 256 -- *.apk *.aab > SHA256SUMS)
+(cd "$out" && shasum -a 256 -- *.apk > SHA256SUMS)
 rust=$(sed -n 's/^rust=//p' apps/mobile/android/prepare-release.sh)
 ndk=$(sed -n 's/^ndk=//p' apps/mobile/android/prepare-release.sh)
 {
