@@ -27,8 +27,6 @@ version=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' apps/mobile/android/app/bui
 out="$root/dist/android/$short"
 rm -rf "$out"
 mkdir -p "$out"
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 
 # From an export of the commit at one fixed path, as the macOS release.
 build=/private/tmp/open-secret-manager-android-release
@@ -41,13 +39,10 @@ if [ "${OSM_ALLOW_CHANGES:-}" = 1 ]; then
         xargs -0 -I{} sh -c 'mkdir -p "$(dirname "$1/{}")" && cp -p "{}" "$1/{}"' _ "$build"
 fi
 
-# No clock and no home folder in the shared code's library.
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+# The shared code's library as F-Droid's build server makes it too.
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "$commit")
 export SOURCE_DATE_EPOCH
-export CARGO_INCREMENTAL=0
-sep=$(printf '\037')
-export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$build=/osm$sep--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-"$build/apps/mobile/android/prepare.sh" "$work" release
+"$build/apps/mobile/android/prepare-release.sh"
 (cd "$build/apps/mobile/android" && ./gradlew --quiet --no-build-cache :app:assembleRelease :app:bundleRelease)
 
 outputs="$build/apps/mobile/android/app/build/outputs"
@@ -69,7 +64,8 @@ unzip -Z1 "$out/$name.apk" | grep -Ev '^META-INF/([^/]+\.(SF|RSA|EC|DSA)|MANIFES
     done >"$out/apk-contents.sha256"
 
 (cd "$out" && shasum -a 256 -- *.apk *.aab > SHA256SUMS)
-ndk=${ANDROID_NDK_HOME:-$(ls -d "${ANDROID_HOME:-$HOME/Library/Android/sdk}"/ndk/* | tail -1)}
+rust=$(sed -n 's/^rust=//p' apps/mobile/android/prepare-release.sh)
+ndk=$(sed -n 's/^ndk=//p' apps/mobile/android/prepare-release.sh)
 {
     echo "commit $commit"
     if [ -n "$(git status --porcelain)" ]; then echo "with uncommitted changes: not a release"; fi
@@ -78,11 +74,11 @@ ndk=${ANDROID_NDK_HOME:-$(ls -d "${ANDROID_HOME:-$HOME/Library/Android/sdk}"/ndk
     echo "built at $build"
     echo "signed $signed"
     echo "source date $SOURCE_DATE_EPOCH"
-    echo "NDK $(basename "$ndk")"
+    echo "NDK $ndk"
     sed -n 's/^distributionUrl=.*gradle-\(.*\)-all.zip/Gradle \1/p' apps/mobile/android/gradle/wrapper/gradle-wrapper.properties
     java -version 2>&1 | head -1
-    rustc --version
-    cargo --version
+    RUSTUP_TOOLCHAIN="$rust" rustc --version
+    RUSTUP_TOOLCHAIN="$rust" cargo --version
 } > "$out/build-info.txt"
 echo "Built into $out"
 cat "$out/SHA256SUMS"

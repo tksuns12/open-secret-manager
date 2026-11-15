@@ -69,6 +69,11 @@ android {
         jniLibs {
             // The shared code's library is loaded from the APK as it is.
             useLegacyPackaging = false
+            // Every library goes in as it comes (prepare.sh strips the
+            // shared code's): stripped here, it would depend on which NDK
+            // the machine that builds has, and a build elsewhere would
+            // differ.
+            keepDebugSymbols += "**/*.so"
         }
     }
 }

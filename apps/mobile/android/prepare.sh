@@ -6,7 +6,9 @@
 #
 #   apps/mobile/android/prepare.sh <scratch folder> [release]
 #
-# release  the library built optimized, as a release has it.
+# release  the library built optimized, as a release has it, and no vaults
+#          for the tests, which a release is not tested with. A release to
+#          publish is prepared by prepare-release.sh, which runs this.
 set -eu
 cd "$(dirname "$0")"
 android=$PWD
@@ -30,8 +32,12 @@ fi
 
 libs="$android/vault/src/main/jniLibs/arm64-v8a"
 mkdir -p "$libs"
-# Without debug information, which makes it several times smaller.
-"$tools/llvm-strip" --strip-debug -o "$libs/libosm_mobile.so" \
+# Without debug information, which makes it several times smaller, and
+# without the names of the compilers and the linker that made it, which
+# differ with the system the NDK runs on (the linker's names the folder it
+# was built in at Google): a Mac and a Linux build server then make the
+# same library.
+"$tools/llvm-strip" --strip-debug --remove-section=.comment -o "$libs/libosm_mobile.so" \
     "target/aarch64-linux-android/$profile/libosm_mobile.so"
 
 library=target/debug/libosm_mobile.dylib
@@ -41,6 +47,7 @@ cargo run --locked -q -p osm-mobile --features bindgen --bin uniffi-bindgen -- \
 mkdir -p "$android/vault/src/main/java/org/opensecretmanager/vault"
 cp "$work/kotlin/org/opensecretmanager/vault/osm_mobile.kt" \
     "$android/vault/src/main/java/org/opensecretmanager/vault/"
+[ "$profile" = release ] && exit 0
 
 # A sealed vault with an earlier version of Mail taken out of its file, as
 # anyone who can write the file could, for the screens that say so.
