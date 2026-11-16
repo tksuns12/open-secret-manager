@@ -1,10 +1,14 @@
 #!/bin/sh
 # Puts in place what a release of the Android app is built from, as
-# prepare.sh does, in such a way that any machine builds the same library
-# from the same commit: this Mac, for scripts/release-android.sh, and
-# F-Droid's build server, which builds the app from source and publishes
-# the APK the owner signed only if what it built is the same, file for file
+# prepare.sh does, in such a way that two x86_64 Linux machines build the
+# same library from the same commit: the container of
+# scripts/release-android.sh (packaging/android/Dockerfile), and F-Droid's
+# build server, which builds the app from source and publishes the APK the
+# owner signed only if what it built is the same, file for file
 # (docs/release.md). `./gradlew :app:assembleRelease` then builds the APK.
+# Another kind of machine builds another library: Cargo puts the machine's
+# kind into every crate's hash, and rustc orders functions by names that
+# carry those hashes.
 #
 #   apps/mobile/android/prepare-release.sh
 set -eu

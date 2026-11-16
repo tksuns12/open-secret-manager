@@ -152,22 +152,29 @@ Each release folder has `SHA256SUMS`, `app-contents.sha256`, and
 The Android app is released; the iOS build only shows that a release would
 build.
 
-- `scripts/release-android.sh` builds the APK
-  from an export of the commit at `/private/tmp/open-secret-manager-android-release`,
-  shrunk with R8 (the rules that keep what JNA calls by name are in
-  `apps/mobile/android/vault/consumer-rules.pro`), into `dist/android/<commit>/`
-  with its SHA-256, the list of the APK's files without its signature
-  (`apk-contents.sha256`), and `build-info.txt`. With `OSM_ANDROID_KEYSTORE`,
-  `OSM_ANDROID_KEYSTORE_PASSWORD`, `OSM_ANDROID_KEY_ALIAS`, and
-  `OSM_ANDROID_KEY_PASSWORD` it is signed with that key; without them it
-  is unsigned. An update must be signed with the same key, so the
-  keystore is kept as carefully as a Developer ID.
-  `scripts/reproduce-android.sh` builds twice and compares the file lists.
-  The shared code's library is put in place by
-  `apps/mobile/android/prepare-release.sh`, with the Rust and the NDK it
-  names and without the folders of the machine that builds it or the names
-  of the compilers that made it, and Gradle strips no library, so that
-  F-Droid's Linux build server can make the same APK as this Mac.
+- `scripts/release-android.sh` builds the APK from an archive of the
+  commit, in a container that is x86_64 Debian 12 as F-Droid's build
+  server is (`packaging/android/Dockerfile`: its OpenJDK 17, the Android
+  SDK, and the Rust and NDK that `apps/mobile/android/prepare-release.sh`
+  names), shrunk with R8 (the rules that keep what JNA calls by name are in
+  `apps/mobile/android/vault/consumer-rules.pro`), into
+  `dist/android/<commit>/` with its SHA-256, the list of the APK's files
+  without its signature (`apk-contents.sha256`), and `build-info.txt`. With
+  `OSM_ANDROID_KEYSTORE`, `OSM_ANDROID_KEYSTORE_PASSWORD`,
+  `OSM_ANDROID_KEY_ALIAS`, and `OSM_ANDROID_KEY_PASSWORD` it signs the APK
+  with that key on the Mac, after the build (the key never goes into the
+  container); without them the APK is unsigned. An update must be signed
+  with the same key, so the keystore is kept as carefully as a Developer
+  ID. `scripts/reproduce-android.sh` builds twice and compares the file
+  lists. The Docker context (`OSM_DOCKER_CONTEXT`) must run linux/amd64
+  containers; on an Apple Silicon Mac, a colima machine with Rosetta does.
+  A release is never built on the Mac itself: the APK's other files come
+  out the same there, but not the shared code's library, as Cargo puts the
+  kind of machine that builds into every crate's hash and rustc orders the
+  library's functions by names that carry those hashes. Within Linux,
+  `prepare-release.sh` takes the build machine's folders and the
+  compilers' names out of the library, and Gradle strips no library, so
+  that F-Droid's server makes the same APK as the container.
   `scripts/test-mobile-join.sh android-release` signs the release with a key
   made for the run and has it join a desktop-side device on an emulator.
 - `scripts/release-ios.sh` builds from an export at

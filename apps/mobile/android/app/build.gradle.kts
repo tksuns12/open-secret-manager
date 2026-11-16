@@ -30,19 +30,9 @@ android {
         buildConfig = true
     }
 
-    // A release is signed with the owner's key when OSM_ANDROID_KEYSTORE
-    // names its keystore (with OSM_ANDROID_KEYSTORE_PASSWORD,
-    // OSM_ANDROID_KEY_ALIAS, and OSM_ANDROID_KEY_PASSWORD); without it the
-    // release is left unsigned. See docs/release.md.
-    val keystore = System.getenv("OSM_ANDROID_KEYSTORE")
-    if (keystore != null) {
-        signingConfigs.create("release") {
-            storeFile = file(keystore)
-            storePassword = System.getenv("OSM_ANDROID_KEYSTORE_PASSWORD")
-            keyAlias = System.getenv("OSM_ANDROID_KEY_ALIAS")
-            keyPassword = System.getenv("OSM_ANDROID_KEY_PASSWORD")
-        }
-    }
+    // A release is built unsigned: scripts/release-android.sh signs it with
+    // the owner's key after building it in a container. See
+    // docs/release.md.
 
     buildTypes {
         debug {
@@ -56,7 +46,6 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            signingConfig = signingConfigs.findByName("release")
         }
     }
 
