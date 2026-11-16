@@ -23,7 +23,7 @@ use std::{
 };
 
 use osm_browser_link::{
-    endpoint, CardField, Ceremony, Origin, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, HOST_NAME,
+    endpoint, CardField, Ceremony, Origin, CHROMIUM_EXTENSION_IDS, FIREFOX_EXTENSION_ID, HOST_NAME,
 };
 use osm_vault_browser::{bind, serve, Config, Desk, Refused};
 use osm_vault_core::{passkey::UserVerification, ItemKind, Vault};
@@ -142,8 +142,9 @@ impl Known {
         home.join(self.hosts).join(format!("{HOST_NAME}.json"))
     }
 
-    /// The manifest that lets this browser's one allowed extension start
-    /// the host.
+    /// The manifest that lets this browser's allowed extensions start the
+    /// host: in Firefox the one, in a Chromium browser the copy loaded
+    /// unpacked and the Chrome Web Store's.
     fn manifest(&self, host: &Path) -> serde_json::Value {
         let mut manifest = serde_json::json!({
             "name": HOST_NAME,
@@ -154,8 +155,9 @@ impl Known {
         if self.firefox {
             manifest["allowed_extensions"] = serde_json::json!([FIREFOX_EXTENSION_ID]);
         } else {
-            manifest["allowed_origins"] =
-                serde_json::json!([format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")]);
+            manifest["allowed_origins"] = serde_json::json!(
+                CHROMIUM_EXTENSION_IDS.map(|id| format!("chrome-extension://{id}/"))
+            );
         }
         manifest
     }

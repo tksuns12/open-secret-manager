@@ -11,8 +11,10 @@ It does three things:
 - It checks each request: the protocol version, the form of the request and
   document IDs, that the request is for the page itself and not a frame
   inside it, and that the origin is an HTTPS origin exactly as a browser
-  writes one. It answers only the one allowed extension of each browser,
-  which the browser names on the command line.
+  writes one. It answers only the project's extension, which the browser
+  names on the command line: in Firefox its one ID, in a Chromium browser
+  the copy loaded unpacked or the Chrome Web Store's, each with an ID of
+  its own.
 - It passes a checked request to the desktop session over the session's
   socket and hands back only a response that answers that request: the same
   request ID and, for a login, the same tab, frame, document, and origin.

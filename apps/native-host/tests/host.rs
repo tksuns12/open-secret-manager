@@ -18,7 +18,7 @@ use std::{
 use osm_browser_link::{
     endpoint,
     frame::{Prefix, MAX_FRAME},
-    Caller, Forwarded, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID,
+    Caller, Forwarded, CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID,
 };
 use osm_vault_browser::{bind, serve, Choices, Config, Desk, Refused};
 use osm_vault_core::{Item, Vault};
@@ -410,6 +410,14 @@ fn only_the_allowed_extension_reaches_the_desktop_session() {
         forwarded.caller,
         Caller::Firefox(FIREFOX_EXTENSION_ID.into())
     );
+
+    // The Chrome Web Store's copy of the Chromium extension, with an ID of
+    // its own.
+    let store = format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/");
+    let mut host = Host::start(home.path(), &[store.as_str()]);
+    host.send(&asked);
+    let (_connection, forwarded) = session.request();
+    assert_eq!(forwarded.caller, Caller::Chromium(store));
 }
 
 #[test]

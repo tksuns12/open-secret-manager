@@ -62,8 +62,9 @@ From the stores once it is accepted there: Firefox's add-ons site
 (addons.mozilla.org) and the Chrome Web Store. Then, in the desktop app,
 open Browser and connect that browser, so that it knows where the native
 messaging host is. The copy from the Chrome Web Store has an ID of its own,
-which the native messaging host accepts only once a desktop release names
-it; until then, a Chromium browser needs the copy loaded unpacked (below).
+which the desktop app accepts from version 0.1.1 on; a Chromium browser
+connected with an earlier version is shown as connected to something else
+until it is connected again.
 
 ## Building and loading
 

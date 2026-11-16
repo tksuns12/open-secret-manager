@@ -29,9 +29,17 @@ pub const MAX_PASSKEY_OPTIONS: usize = 32 * 1024;
 /// The name browsers know the native messaging host by.
 pub const HOST_NAME: &str = "org.opensecretmanager.native";
 
-/// The one Chromium extension the host answers. It follows from the `key`
-/// in the extension's Chromium manifest.
+/// The Chromium extension loaded unpacked, as its README says. Its ID
+/// follows from the `key` in the extension's Chromium manifest.
 pub const CHROMIUM_EXTENSION_ID: &str = "hjgekjgkjnakgmiopldddikdkcjhnmge";
+
+/// The same extension from the Chrome Web Store, which gives an extension
+/// an ID of its own and keeps its key.
+pub const CHROMIUM_STORE_EXTENSION_ID: &str = "pnjdoenkfffomcidikbkcegcpgipdjog";
+
+/// The Chromium extensions the host answers: the copy loaded unpacked and
+/// the Chrome Web Store's.
+pub const CHROMIUM_EXTENSION_IDS: [&str; 2] = [CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID];
 
 /// The one Firefox extension the host answers: the ID in the extension's
 /// Firefox manifest.
@@ -565,14 +573,15 @@ impl Caller {
         }
     }
 
-    /// Whether this is the extension the host and the desktop session
-    /// answer.
+    /// Whether this is an extension the host and the desktop session
+    /// answer: in Firefox the one, in a Chromium browser the copy loaded
+    /// unpacked or the Chrome Web Store's.
     pub fn is_allowed(&self) -> bool {
         match self {
             Self::Chromium(origin) => origin
                 .strip_prefix("chrome-extension://")
                 .and_then(|rest| rest.strip_suffix('/'))
-                .is_some_and(|id| id == CHROMIUM_EXTENSION_ID),
+                .is_some_and(|id| CHROMIUM_EXTENSION_IDS.contains(&id)),
             Self::Firefox(extension) => extension == FIREFOX_EXTENSION_ID,
         }
     }
@@ -1014,6 +1023,11 @@ mod tests {
         .unwrap();
         assert_eq!(firefox, Caller::Firefox(FIREFOX_EXTENSION_ID.into()));
         assert!(firefox.is_allowed());
+        // The Chrome Web Store's copy, with its own ID.
+        let store = format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/");
+        assert!(Caller::from_args(&arguments(&[&store]))
+            .unwrap()
+            .is_allowed());
 
         for forged in [
             arguments(&["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"]),
@@ -1022,6 +1036,11 @@ mod tests {
             arguments(&[&format!(
                 "chrome-extension://{CHROMIUM_EXTENSION_ID}.evil.test/"
             )]),
+            arguments(&[&format!(
+                "chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}.evil.test/"
+            )]),
+            arguments(&[&format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}")]),
+            arguments(&["/path/to/manifest.json", CHROMIUM_STORE_EXTENSION_ID]),
             arguments(&["/path/to/manifest.json", "another@example.org"]),
             arguments(&["/path/to/manifest.json", &chromium]),
             arguments(&[FIREFOX_EXTENSION_ID, "another@example.org"]),

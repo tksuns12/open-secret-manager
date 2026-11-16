@@ -13,7 +13,8 @@ use osm_browser_link::{
     frame::{self, Prefix},
     Caller, CardField, CardFrame, CardRequest, Ceremony, FillRequest, Forwarded, ForwardedCard,
     ForwardedPasskey, PasskeyRequest, Refusal, Response, Waiting, CARD_VERSION,
-    CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, PASSKEY_VERSION, VERSION,
+    CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID, PASSKEY_VERSION,
+    VERSION,
 };
 use osm_vault_core::{Item, ItemKind, Vault};
 use tauri::{
@@ -804,7 +805,10 @@ fn a_browser_is_connected_by_writing_the_hosts_manifest_into_its_folder() {
                 "description": "Open Secret Manager native messaging host",
                 "path": host,
                 "type": "stdio",
-                "allowed_origins": [format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")],
+                "allowed_origins": [
+                    format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"),
+                    format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"),
+                ],
             })
         );
         browser::connect_browser("firefox".into(), handle.state())
