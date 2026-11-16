@@ -57,7 +57,11 @@ export SOURCE_DATE_EPOCH
 export CARGO_INCREMENTAL=0
 export ZERO_AR_DATE=1
 sep=$(printf '\037')
-export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$build=/osm$sep--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo$sep-Clink-arg=-Wl,-oso_prefix,$build/"
+# And without chained fixups: with the app's minimum macOS (14.0, which
+# Tauri gives the build as MACOSX_DEPLOYMENT_TARGET), Xcode 27.2's linker
+# writes the proc macros' libraries with them, and Rust 1.95 then refuses
+# its own macro libraries ("can't find crate for `zeroize_derive`").
+export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$build=/osm$sep--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo$sep-Clink-arg=-Wl,-oso_prefix,$build/$sep-Clink-arg=-Wl,-no_fixup_chains"
 if [ -n "${OSM_SIGNING_IDENTITY:-}" ]; then
     # Tauri signs the app and the host inside it, with the hardened runtime.
     export APPLE_SIGNING_IDENTITY="$OSM_SIGNING_IDENTITY"
