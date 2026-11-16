@@ -56,12 +56,28 @@ It does not save logins or cards, fill on its own, or fill one-time codes,
 and it fills a login only into the page itself, never into a frame. A
 login is offered only for the exact origin of its stored address; see [the format contract](../../docs/formats.md#implemented-fill-protocol-phase-5-stop-1).
 
+## Installing
+
+From the stores once it is accepted there: Firefox's add-ons site
+(addons.mozilla.org) and the Chrome Web Store. Then, in the desktop app,
+open Browser and connect that browser, so that it knows where the native
+messaging host is. The copy from the Chrome Web Store has an ID of its own,
+which the native messaging host accepts only once a desktop release names
+it; until then, a Chromium browser needs the copy loaded unpacked (below).
+
 ## Building and loading
 
+With Node 24 (the version the project builds with) and npm:
+
 ```text
-npm install
+npm ci
 npm run build        # dist/chromium and dist/firefox
 ```
+
+`scripts/package-extension.sh` makes what the stores take from a commit,
+in `dist/extension/<commit>/`: the Firefox add-on, the Chromium extension
+without the `key` (the Chrome Web Store sets the ID), and this folder's
+source, from which `npm ci && npm run build` makes `dist/firefox` again.
 
 In a Chromium browser, open `chrome://extensions`, turn on Developer mode,
 choose Load unpacked, and pick `dist/chromium`. The `key` in the Chromium
@@ -71,9 +87,8 @@ browser, so that it knows where the host is.
 
 In Firefox, open `about:debugging`, choose This Firefox, then Load
 Temporary Add-on, and pick `dist/firefox/manifest.json`. A temporary add-on
-is gone when Firefox quits; installing it for good needs it signed by
-Mozilla, which has not been done. Then connect Firefox in the app's Browser
-panel.
+is gone when Firefox quits; the copy on Firefox's add-ons site, signed by
+Mozilla, stays. Then connect Firefox in the app's Browser panel.
 
 ## Checks
 
