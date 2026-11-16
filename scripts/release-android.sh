@@ -65,12 +65,14 @@ docker cp "$container:/src/apps/mobile/android/app/build/outputs/apk/release/app
 name="Open-Secret-Manager-$version-android-arm64"
 signed=no
 if [ -n "${OSM_ANDROID_KEYSTORE:-}" ]; then
-    # Signature schemes 2 and 3, as Gradle signs an app for Android 9 and
-    # later: the APK's own files are left as built.
+    # Signature schemes 2 and 3 (Gradle used 2 alone for the releases
+    # before), and no v4 file beside the APK, which nothing publishes: the
+    # APK's own files are left as built.
     tools="${ANDROID_HOME:-$HOME/Library/Android/sdk}/build-tools/35.0.0"
     "$tools/apksigner" sign --ks "$OSM_ANDROID_KEYSTORE" --ks-key-alias "$OSM_ANDROID_KEY_ALIAS" \
         --ks-pass env:OSM_ANDROID_KEYSTORE_PASSWORD --key-pass env:OSM_ANDROID_KEY_PASSWORD \
-        --v1-signing-enabled false --out "$out/$name.apk" "$work/unsigned.apk"
+        --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true \
+        --v4-signing-enabled false --out "$out/$name.apk" "$work/unsigned.apk"
     "$tools/apksigner" verify "$out/$name.apk"
     signed=yes
 else
