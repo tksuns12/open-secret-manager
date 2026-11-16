@@ -13,6 +13,17 @@ yet ([the review packet](docs/review-packet.md) is the request): keep a copy
 of your passwords elsewhere too. To report a weakness, see
 [SECURITY.md](SECURITY.md).
 
+<p>
+  <img src="docs/images/desktop-vault.png" alt="The desktop app: the vault's items, and one login" width="610">
+  <img src="fastlane/metadata/android/en-US/images/phoneScreenshots/3.png" alt="The Android app: a login" width="175">
+</p>
+
+The desktop window on its sample data, and the Android app. A page's
+request [waits in the window](docs/images/desktop-passkey.png) until you
+choose; [the Devices panel](docs/images/desktop-devices.png) lists your
+devices and invites new ones. What the apps keep and send:
+[PRIVACY.md](PRIVACY.md).
+
 ## Getting it
 
 A vault is made on a computer; phones join it from there.
@@ -23,6 +34,7 @@ A vault is made on a computer; phones join it from there.
 | Linux, x86_64 | The `.deb` from Releases. Built in a container, not yet tried on a Linux desktop. |
 | Android 9 or later, 64-bit ARM | [F-Droid](https://f-droid.org/packages/org.opensecretmanager.app/) once it is accepted there, or the APK from Releases. Both are the same APK, signed with the project's key ([its certificate](docs/release.md#supported-configurations)): F-Droid builds the app from source itself and publishes the signed APK only if its build is the same, file for file. |
 | iOS 17 or later | No download: build it with Xcode and sign it with an Apple developer team of your own ([how](docs/phone-trial.md#getting-the-app-onto-the-phone)). |
+| Browsers: Chromium-based, Firefox 128 or later | The extension, which needs the desktop app: from Firefox's add-ons site and the Chrome Web Store once it is accepted there; until then, built and loaded as [its README](apps/browser-extension/README.md#building-and-loading) says. |
 | Windows | Not supported: the app has never been built for Windows. |
 
 The project does not join app stores' or platform vendors' paid programs,
