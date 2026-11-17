@@ -75,10 +75,12 @@ phone sold since 2019 is):
 
 - Switch to another app and back within a minute: the vault is still
   unlocked. Stay away longer than a minute, and come back: it is locked.
-- In the list, set "Lock once the app is left" to "At once": switching to
-  another app and back locks it. Set it back to "After 1 minute".
-- Lock the phone's screen with the app open, and unlock: the vault is
-  locked. The same within the minute with another app in front.
+- In the list, set "Lock once the app is left or the screen is off" to "At
+  once": switching to another app and back locks it. Set it back to "After
+  1 minute".
+- Lock the phone's screen with the app open, and unlock it within the
+  minute: the vault is still unlocked. Lock it for longer than a minute,
+  and unlock: the vault is locked. The same with another app in front.
 - Leave the app for an hour, then open it: it is locked, and after unlocking
   it syncs again (the line under the list says when it last did).
 - Restart the phone, then open the app: it opens locked, the vault intact.
@@ -168,7 +170,7 @@ and whether the phone synced at home after both apps were updated.
    tap the username field: the strip (or the list) names the login, by
    title and username, before "Open Secret Manager…". Choose it: both
    fields fill at once, with no screen of the app's. A minute after
-   leaving, or once the screen was off, it says "unlock to fill" again.
+   leaving, the screen on or off, it says "unlock to fill" again.
    Note any field where the login is named but choosing it fills nothing.
 5. In another app's login screen, the same entry appears, and the keyboard
    stays up; the first time the owner chooses a login for that app, after

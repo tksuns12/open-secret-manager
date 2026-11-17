@@ -70,8 +70,9 @@ evidence in the delivery matrix and the threat model.
   keystore was set back with it, as restoring the whole home folder does.
   On Linux without a Secret Service, and on the phones, a file set back is
   not found.
-- The vault locks after five minutes without input and when its window is
-  hidden; on macOS and Linux also on sleep, screen lock, and user switch.
+- The vault locks after five minutes without input (the owner can choose
+  from a minute to 4 hours), hidden or not; on macOS and Linux also on
+  sleep, screen lock, and user switch.
   Those last locks were checked through the code (on Linux also in a
   container with a stand-in for logind), not with a real sleep or lock. A
   computer can go to sleep before a vault operation in progress finishes,

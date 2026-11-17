@@ -17,6 +17,7 @@ import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -111,6 +112,74 @@ class AppTest {
         waitFor("locked")
     }
 
+    /**
+     * Back from an item found with the search, by its back button or the
+     * system's back, the list is still narrowed by the search; it is let go
+     * of when the vault locks.
+     */
+    @Test
+    fun theSearchIsKeptWhileAnItemIsOpen() {
+        withTheFrozenVault()
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Mail")
+        compose.onNodeWithTag("search").performTextInput("ban")
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag("item:Mail").fetchSemanticsNodes().isEmpty() }
+
+        compose.onNodeWithTag("item:Bank").performClick()
+        waitFor("detail-username")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Bank")
+        compose.onNodeWithTag("search").assert(hasText("ban"))
+        compose.onAllNodesWithTag("item:Mail").assertCountEquals(0)
+
+        compose.onNodeWithTag("item:Bank").performClick()
+        waitFor("detail-username")
+        compose.activityRule.scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
+        waitFor("item:Bank")
+        compose.onNodeWithTag("search").assert(hasText("ban"))
+        compose.onAllNodesWithTag("item:Mail").assertCountEquals(0)
+
+        // The system's back steps out of the deleted items too.
+        compose.onNodeWithTag("recently-deleted").performClick()
+        waitFor("deleted-hint")
+        compose.activityRule.scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
+        waitFor("item:Bank")
+        compose.onNodeWithTag("search").assert(hasText("ban"))
+
+        compose.onNodeWithTag("lock").performClick()
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Mail")
+        waitFor("item:Bank")
+    }
+
+    /**
+     * Locked while the app is away from the screen, and unlocked again
+     * elsewhere (a fill screen does), the vault comes back with the search
+     * let go of.
+     */
+    @Test
+    fun aLockAwayFromTheScreenLetsGoOfTheSearch() {
+        withTheFrozenVault()
+        waitFor("locked")
+        compose.onNodeWithTag("password").performTextInput(password)
+        compose.onNodeWithTag("unlock").performClick()
+        waitFor("item:Mail")
+        compose.onNodeWithTag("search").performTextInput("ban")
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag("item:Mail").fetchSemanticsNodes().isEmpty() }
+
+        compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
+        compose.waitUntil(10_000) { session.state.value.screen == Screen.LOCKED }
+        instrumentation.runOnMainSync { session.unlock(password) }
+        compose.waitUntil(30_000) { session.state.value.screen == Screen.UNLOCKED }
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        waitFor("item:Mail")
+        waitFor("item:Bank")
+    }
+
     @Test
     fun theVaultStaysUnlockedAfterTheAppIsLeftForTheTimeChosen() {
         withTheFrozenVault()
@@ -122,8 +191,10 @@ class AppTest {
         waitFor("item:Bank")
 
         // A minute: left and back within it, the vault is still unlocked.
+        // The longest choice is four hours.
         compose.onNodeWithTag("stay-unlocked").performClick()
         waitFor("stay-unlocked:1")
+        compose.onNodeWithTag("stay-unlocked:240").assertTextEquals("After 4 hours")
         compose.onNodeWithTag("stay-unlocked:1").performClick()
         assertEquals(1, StayUnlocked.minutes(context))
         compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)

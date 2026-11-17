@@ -135,7 +135,7 @@ export type BackupAge = {
 
 /** What the owner sets on this device. */
 export type Settings = {
-  /** Minutes without activity before the window locks the vault: 1, 5, 15, or 60. */
+  /** Minutes without activity before the window locks the vault: 1, 5, 15, 60, or 240. */
   autoLockMinutes: number;
   generator: GeneratorChoice;
 };
@@ -429,6 +429,8 @@ export type DesktopBridge = {
   unlock: (password: string) => Promise<void>;
   createVault: (password: string) => Promise<string>;
   lock: () => Promise<void>;
+  /** Hands the rest of the time without activity to the native side while the window is hidden; null takes it back. */
+  lockWhenIdle: (milliseconds: number | null) => Promise<void>;
   generatePassword: (choice: GeneratorChoice) => Promise<string>;
   /** Copies a password the generator made, for 30 seconds. */
   copyGenerated: (value: string) => Promise<void>;

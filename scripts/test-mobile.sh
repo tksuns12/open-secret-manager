@@ -31,8 +31,10 @@
 # for the run in a device set of its own and deleted. Android needs `rustup target add
 # aarch64-linux-android` and the Android SDK and NDK. OSM_DEVICE_PIN
 # unlocks a device or emulator that has a screen lock, before the tests and
-# in the one that turns the screen off (skipped on such a device without
-# it); scripts/make-test-emulator.sh makes the emulator the tests expect.
+# in the ones that turn the screen off (skipped on such a device without
+# it; the one that keeps the vault unlocked through it is skipped as well
+# on a device without a screen lock); scripts/make-test-emulator.sh makes
+# the emulator the tests expect.
 set -eu
 cd "$(dirname "$0")/.."
 root=$PWD

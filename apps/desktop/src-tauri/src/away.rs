@@ -1,8 +1,8 @@
 //! Locking when the owner's session goes away from the app: the computer
 //! going to sleep, the displays sleeping, the screen locking, the screen
-//! saver starting, or another user taking the screen. The window's own
-//! timer and its being covered are the interface's to watch; these the
-//! system tells the app, on macOS and, through logind, on Linux.
+//! saver starting, or another user taking the screen. The time without
+//! input is the window's to keep, and `idle`'s while it is hidden; these
+//! the system tells the app, on macOS and, through logind, on Linux.
 
 use osm_desktop_session::Away;
 use tauri::{AppHandle, Emitter, Manager, Runtime};

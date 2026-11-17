@@ -19,7 +19,8 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
   restoring a login or note from either, and changes its own password. It
   stops taking part when it
   leaves the screen and locks then, or after the time the owner chose (a
-  minute unless changed), and at once when the screen turns off; it keeps
+  minute unless changed), and the same when the screen turns off (at once
+  on a phone without a screen lock); it keeps
   the vault out of screenshots; while
   it is closed it syncs now and then without unlocking, unless that is
   turned off. Once picked as the phone's autofill service, it fills

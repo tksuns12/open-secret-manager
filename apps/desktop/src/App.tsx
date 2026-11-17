@@ -9,9 +9,9 @@ const filters = ["All items", "Favorites", "Logins", "Cards", "Secure notes"] as
 /** The sign before each filter in the sidebar. */
 const FILTER_ICONS = { "All items": "⌂", Favorites: "★", Logins: "↗", Cards: "▭", "Secure notes": "▤" } as const;
 /** How long without input in the window locks the vault, as the owner may set it. */
-const AUTO_LOCK_CHOICES = [1, 5, 15, 60];
+const AUTO_LOCK_CHOICES = [1, 5, 15, 60, 240];
 function minutesText(minutes: number): string {
-  return minutes === 60 ? "an hour" : minutes === 1 ? "a minute" : `${minutes} minutes`;
+  return minutes === 1 ? "a minute" : minutes === 60 ? "an hour" : minutes % 60 === 0 ? `${minutes / 60} hours` : `${minutes} minutes`;
 }
 /** What an item of a kind is called where it has no username to show. */
 function kindLabel(kind: EntryKind): string {
@@ -107,6 +107,12 @@ function App() {
   /** The generator's choice kept on this device, once read. */
   const [generator, setGenerator] = useState<GeneratorChoice | null>(null);
   const autoLockRef = useRef(autoLockMinutes);
+  // When the vault locks for want of activity, by the clock. Hidden or
+  // covered, the window leaves the vault unlocked for that time as well, but
+  // its timers can run late then: it hands the rest of the time to the
+  // native side, which locks on time, and its coming back and a browser's
+  // request check the clock first.
+  const lockDue = useRef(Infinity);
   // The open item's details: its notes and which secrets it has.
   const [shown, setShown] = useState<EntryDetail | null>(null);
   // A request from a browser extension that waits for a decision here.
@@ -117,9 +123,8 @@ function App() {
   const fillDecided = useRef<string | null>(null);
   // A device joining with the vault it has must stay unlocked to finish.
   const [rejoining, setRejoining] = useState(false);
-  // Pairing sends the owner to another device or window. While it is in
-  // progress, covering this window does not lock the vault; the idle timer
-  // still does, so the vault stays open at most that long unattended.
+  // Pairing sends the owner to another device or window, for no longer
+  // than the time without activity: the lock then ends it.
   const pairing = Boolean(invite) || rejoining;
   const pairingRef = useRef(pairing);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -150,7 +155,10 @@ function App() {
     loadFill();
     const subscriptions = [
       // A request arrived from a browser, or the one waiting ended.
-      bridge.listen("fill-request", loadFill),
+      bridge.listen("fill-request", () => {
+        const locking = lockIfDue();
+        if (locking) void locking.then(loadFill, loadFill); else loadFill();
+      }),
       bridge.listen<SyncStatus>("sync-status", setSync),
       bridge.listen("devices-changed", loadDevices),
       // This device's copy of the vault was put away, because it learned
@@ -171,6 +179,7 @@ function App() {
       // The system said the owner's session went away, and the app locked.
       // A pairing needs the owner here, so it ends too.
       bridge.listen<string>("vault-locked", (reason) => {
+        if (reason === "idle") { showIdleLocked(); return; }
         showLocked();
         const cancelled = endPairing();
         setNotice(`Vault locked because ${AWAY[reason] ?? "the session went away"}${cancelled ? " · the pairing was cancelled" : ""}`);
@@ -206,9 +215,20 @@ function App() {
   function showLocked() {
     setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false); setArchivesOpen(false); setImportOpen(false); setShown(null); setHistory(null); setDeleted(null);
   }
-  function lockQuietly() {
-    void bridge.lock(); showLocked();
+  /** A lock for want of activity, which says nothing unless it ends a pairing. */
+  function showIdleLocked() {
+    lockDue.current = Infinity;
+    showLocked();
     if (endPairing()) setNotice(`Vault locked after ${minutesText(autoLockRef.current)} without activity · the pairing was cancelled`);
+  }
+  function lockQuietly() {
+    const locking = bridge.lock();
+    showIdleLocked();
+    return locking;
+  }
+  /** Locks if the time without activity has run out, as the timer, late, would have. */
+  function lockIfDue() {
+    return Date.now() >= lockDue.current ? lockQuietly() : null;
   }
   useEffect(() => {
     void bridge.settings().then((settings) => { setAutoLockMinutes(settings.autoLockMinutes); setGenerator(settings.generator); }).catch(() => {});
@@ -216,22 +236,28 @@ function App() {
   useEffect(() => {
     autoLockRef.current = autoLockMinutes;
     const wait = autoLockMinutes * 60 * 1000;
-    let timer = window.setTimeout(lockQuietly, wait);
-    const reset = () => { window.clearTimeout(timer); timer = window.setTimeout(lockQuietly, wait); };
-    const onVisibility = () => {
-      if (document.visibilityState !== "hidden") reset();
-      else if (!pairingRef.current) lockQuietly();
+    let timer = 0;
+    const reset = () => {
+      window.clearTimeout(timer); lockDue.current = Date.now() + wait; timer = window.setTimeout(lockQuietly, wait);
+      // Input while hidden, should a system give it: the native side's time starts again too.
+      if (document.visibilityState === "hidden") void bridge.lockWhenIdle(wait).catch(() => {});
     };
+    // Only input counts as activity: not the window being shown again, which
+    // a browser's request does too.
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        if (Number.isFinite(lockDue.current)) void bridge.lockWhenIdle(Math.max(0, lockDue.current - Date.now())).catch(() => {});
+        return;
+      }
+      void bridge.lockWhenIdle(null).catch(() => {});
+      lockIfDue();
+    };
+    reset();
     for (const event of ["pointerdown", "keydown", "touchstart"]) window.addEventListener(event, reset, { passive: true });
     document.addEventListener("visibilitychange", onVisibility);
     return () => { window.clearTimeout(timer); for (const event of ["pointerdown", "keydown", "touchstart"]) window.removeEventListener(event, reset); document.removeEventListener("visibilitychange", onVisibility); };
   }, [autoLockMinutes]);
-  useEffect(() => {
-    pairingRef.current = pairing;
-    // Pairing ended while the window was covered: lock now, as covering it
-    // would have.
-    if (!pairing && document.visibilityState === "hidden") lockQuietly();
-  }, [pairing]);
+  useEffect(() => { pairingRef.current = pairing; }, [pairing]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n" && !locked) { event.preventDefault(); setEditor({ mode: "create" }); }
@@ -875,7 +901,7 @@ function DevicesPanel({ sync, devices, invite, locked, onInvite, onAnswer, onCan
       <p className="review-hint">For {invite.votes ? "a computer that is usually on: it will vote" : "a phone, or a computer often off: it will not vote"}. {invite.votes ? "On the other device, choose “Join a vault from another device” and paste this invitation." : "On a phone, choose Scan the QR code and point it here; on a computer, choose “Join a vault from another device” and paste this invitation."} It works once and expires in 15 minutes.</p>
       {!invite.votes && <InvitationQr qr={invite.qr} />}
       <div className="generated-value"><code>{invite.code}</code><button onClick={() => onCopy(invite.code)} title="Copy invitation"><Copy size={16} /></button></div>
-      <p className="review-hint">Waiting for the other device… Until this pairing ends, switching to another window does not lock the vault here; it still locks after the time without activity set in Settings.</p>
+      <p className="review-hint">Waiting for the other device… The vault stays unlocked here meanwhile for the time without activity set in Settings; locking it ends the pairing.</p>
       <div className="form-actions"><button className="secondary" onClick={onCancelInvite}>Cancel</button></div>
     </div>;
   }
@@ -1595,7 +1621,7 @@ function DeletedPanel({ items, onRestore }: { items: DeletedEntry[]; onRestore: 
 function SettingsPanel({ minutes, locked, onChange, onNotice }: { minutes: number; locked: boolean; onChange: (minutes: number) => void; onNotice: (text: string) => void }) {
   return <div className="entry-form">
     <label>Lock the vault after<select aria-label="Lock the vault after" value={minutes} onChange={(event) => onChange(Number(event.target.value))}>{AUTO_LOCK_CHOICES.map((choice) => <option key={choice} value={choice}>{minutesText(choice)} without activity</option>)}</select></label>
-    <p className="review-hint">Hiding or covering the window, the computer going to sleep, and the screen locking lock the vault at once, whatever this says. This setting stays on this computer; your other devices keep their own.</p>
+    <p className="review-hint">Hiding or covering the window leaves the vault unlocked for this long too. The computer going to sleep and the screen locking lock it at once, whatever this says. This setting stays on this computer; your other devices keep their own.</p>
     {locked ? <p className="review-hint">Unlock the vault to change this device's password.</p> : <ChangePassword onNotice={onNotice} />}
   </div>;
 }

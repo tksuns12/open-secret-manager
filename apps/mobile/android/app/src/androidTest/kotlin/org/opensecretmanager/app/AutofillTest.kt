@@ -113,6 +113,7 @@ class AutofillTest {
         forgetLinks()
         PendingSave.forgetForTests()
         StayUnlocked.millisForTests = 0L
+        StayUnlocked.lockScreenForTests = null
         session.reopenForTests { folder ->
             BiometricUnlock(context).disable()
             instrumentation.context.assets.open("format-7-vault.sqlite3").use { input ->
@@ -129,6 +130,7 @@ class AutofillTest {
         forgetLinks()
         PendingSave.forgetForTests()
         StayUnlocked.millisForTests = null
+        StayUnlocked.lockScreenForTests = null
         shell("am force-stop $FIXTURE")
         turnOffOtherField()
         keyboard.putBack()
@@ -381,24 +383,112 @@ class AutofillTest {
         assertNull(device.findObject(mine("asker")))
     }
 
+    /**
+     * On a phone with a lock screen, the screen turning off leaves the vault
+     * unlocked for the time chosen, as leaving the app does: woken and
+     * unlocked within it, the list under the field still names the login.
+     */
     @Test
-    fun turningTheScreenOffLocksAtOnce() {
-        // The screen is unlocked again with the device's PIN, if it has one.
-        val keyguard = context.getSystemService(KeyguardManager::class.java)
+    fun turningTheScreenOffLeavesTheVaultUnlockedForTheTimeChosen() {
         val pin = InstrumentationRegistry.getArguments().getString("pin")
-        assumeTrue("the device has a PIN, and the run was not given it", !keyguard.isDeviceSecure || pin != null)
+        assumeTrue(
+            "the device has no PIN, or the run was not given it",
+            context.getSystemService(KeyguardManager::class.java).isDeviceSecure && pin != null,
+        )
         StayUnlocked.millisForTests = 60_000L
+        fillMailAndTurnTheScreenOff()
+        wakeAndUnlockTheScreen(pin)
+        assertEquals(Screen.UNLOCKED, session.state.value.screen)
+        openAndFind(By.text("Mail"), "WebLoginActivity", "https://mail.example.test")
+        assertNull(device.findObject(OFFER))
+    }
+
+    /** On a phone without a lock screen, the screen turning off locks the vault at once. */
+    @Test
+    fun withoutALockScreenTurningTheScreenOffLocksAtOnce() {
+        StayUnlocked.lockScreenForTests = false
+        StayUnlocked.millisForTests = 60_000L
+        fillMailAndTurnTheScreenOff()
+        assertLockedAgain()
+        wakeAndUnlockTheScreen(InstrumentationRegistry.getArguments().getString("pin"))
+        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+    }
+
+    /**
+     * The time chosen runs out while the screen is off: woken after, the
+     * vault is locked, by its timer on a phone awake meanwhile, as an
+     * emulator stays, or as the screen turns on on one that slept.
+     */
+    @Test
+    fun theTimeChosenRunsOutWhileTheScreenIsOff() {
+        StayUnlocked.lockScreenForTests = true
+        StayUnlocked.millisForTests = 8_000L
+        fillMailAndTurnTheScreenOff()
+        assertEquals(Screen.UNLOCKED, session.state.value.screen)
+        Thread.sleep(10_000)
+        wakeAndUnlockTheScreen(InstrumentationRegistry.getArguments().getString("pin"))
+        assertLockedAgain()
+        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+    }
+
+    /**
+     * The timer that locks the vault does not run while a phone sleeps. The
+     * screen turning on once the time has run out shows the vault locked at
+     * once, though the lock itself waits for its turn, and the list under a
+     * field names nothing meanwhile.
+     */
+    @Test
+    fun theScreenTurningOnOnceTheTimeRanOutShowsTheVaultLockedAtOnce() {
+        StayUnlocked.millisForTests = 5_000L
         Requester.trustedForTests += FIXTURE
         askToFill("WebLoginActivity", "https://mail.example.test")
         find(mine("fill:Mail")).click()
         assertFilled("owner@example.test|third password, with ünïcödé")
-        assertStillUnlocked()
-        val power = context.getSystemService(PowerManager::class.java)
-        device.sleep()
+        // The fill screen has left, and the time starts once Android says so
+        // (some 700 ms after); then the timer's lock is held back, as a
+        // sleeping phone holds it, until well past the time.
+        Thread.sleep(1_500)
+        val release = session.holdCallsForTests().also(holds::add)
+        Thread.sleep(9_000)
+        assertEquals(Screen.UNLOCKED, session.state.value.screen)
+        instrumentation.runOnMainSync { session.onScreenOn() }
+        assertEquals(Screen.LOCKED, session.state.value.screen)
+        assertTrue(session.state.value.items.isEmpty())
+        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+        assertNull(device.findObject(By.text("Mail")))
+        release()
         assertLockedAgain()
-        // Woken too soon after, the screen stayed off and locked.
+    }
+
+    /**
+     * Fills Mail from the fill screen, which leaves the vault unlocked, and
+     * turns the phone's screen off. The form's app is stopped first: the
+     * screen turning off on its filled form made Android offer to update
+     * the login, and that offer stayed over the next form.
+     */
+    private fun fillMailAndTurnTheScreenOff() {
+        val keyguard = context.getSystemService(KeyguardManager::class.java)
+        assumeTrue(
+            "the device has a PIN, and the run was not given it",
+            !keyguard.isDeviceSecure || InstrumentationRegistry.getArguments().getString("pin") != null,
+        )
+        Requester.trustedForTests += FIXTURE
+        askToFill("WebLoginActivity", "https://mail.example.test")
+        find(mine("fill:Mail")).click()
+        assertFilled("owner@example.test|third password, with ünïcödé")
+        shell("am force-stop $FIXTURE")
+        Thread.sleep(1_000)
+        assertEquals(Screen.UNLOCKED, session.state.value.screen)
+        device.sleep()
+        val power = context.getSystemService(PowerManager::class.java)
         waitUntil("the screen turns off") { !power.isInteractive }
         Thread.sleep(1_000)
+    }
+
+    /** Turns the screen on and unlocks it, with the device's PIN, if it has one. */
+    private fun wakeAndUnlockTheScreen(pin: String?) {
+        val keyguard = context.getSystemService(KeyguardManager::class.java)
+        val power = context.getSystemService(PowerManager::class.java)
         for (attempt in 1..3) {
             device.wakeUp()
             waitUntil("the screen turns on") { power.isInteractive }
@@ -415,10 +505,9 @@ class AutofillTest {
             shell("wm dismiss-keyguard")
             val deadline = System.currentTimeMillis() + 10_000
             while (keyguard.isKeyguardLocked && System.currentTimeMillis() < deadline) Thread.sleep(100)
-            if (!keyguard.isKeyguardLocked) break
-            if (attempt == 3) fail("the screen stayed locked")
+            if (!keyguard.isKeyguardLocked) return
         }
-        openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
+        fail("the screen stayed locked")
     }
 
     /**
@@ -445,8 +534,10 @@ class AutofillTest {
         mail.click()
         assertFilled("owner@example.test|third password, with ünïcödé")
 
-        // The screen turned off while the calls are held: the lock waits for
-        // them, the list does not, and names nothing.
+        // The screen turned off, on a phone without a lock screen, while the
+        // calls are held: the lock waits for them, the list does not, and
+        // names nothing.
+        StayUnlocked.lockScreenForTests = false
         session.holdCallsForTests().also(holds::add)
         instrumentation.runOnMainSync { session.onScreenOff() }
         openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")

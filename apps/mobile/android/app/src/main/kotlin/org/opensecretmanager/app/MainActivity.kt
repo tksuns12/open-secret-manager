@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
@@ -128,6 +129,9 @@ fun VaultScreen(
 ) {
     val state by session.screenState()
     val snackbar = remember { SnackbarHostState() }
+    // Kept while an item or another screen of the vault is open, and let go
+    // of when it locks.
+    val place = remember(state.screen == Screen.UNLOCKED, state.locks) { ListPlace() }
     LaunchedEffect(state.notice) {
         state.notice?.let {
             snackbar.showSnackbar(it)
@@ -185,7 +189,7 @@ fun VaultScreen(
                         ?: state.deleted?.let { DeletedList(it, session) }
                         ?: state.passwordChange.takeIf { it }?.let { PasswordChange(state, session) }
                         ?: state.detail?.let { Detail(it, session) }
-                        ?: Items(state, session)
+                        ?: Items(state, session, place)
                     Screen.REMOVED -> Message(
                         "This phone was removed from the vault",
                         "Your other devices moved to a new key that this phone never received. What it already held stays readable here.",
@@ -451,9 +455,15 @@ internal fun Unlock(
     }
 }
 
+/** Where the item list was: its search, and how far it was scrolled. */
+private class ListPlace {
+    var query by mutableStateOf("")
+    val scroll = LazyListState()
+}
+
 @Composable
-private fun Items(state: UiState, session: VaultSession) {
-    var query by remember { mutableStateOf("") }
+private fun Items(state: UiState, session: VaultSession, place: ListPlace) {
+    val query = place.query
     val shown = state.items.filter {
         query.isBlank() || it.title.contains(query, ignoreCase = true) || it.username.contains(query, ignoreCase = true) ||
             it.url.contains(query, ignoreCase = true)
@@ -462,12 +472,12 @@ private fun Items(state: UiState, session: VaultSession) {
         if (state.rowsChanged) RowsChanged(session)
         OutlinedTextField(
             value = query,
-            onValueChange = { query = it },
+            onValueChange = { place.query = it },
             label = { Text("Search") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth().testTag("search"),
         )
-        LazyColumn(Modifier.weight(1f)) {
+        LazyColumn(Modifier.weight(1f), state = place.scroll) {
             items(shown, key = { it.id }) { item -> ItemRow(item) { session.open(item.id) } }
         }
         TextButton(onClick = session::openDeleted, modifier = Modifier.testTag("recently-deleted")) { Text("Recently deleted…") }
@@ -481,21 +491,24 @@ private fun Items(state: UiState, session: VaultSession) {
 }
 
 /**
- * How long the vault stays unlocked once the app is left, for filling other
- * apps' fields from the system's list without unlocking again.
+ * How long the vault stays unlocked once the app is left or the phone's
+ * screen turns off, for filling other apps' fields from the system's list
+ * without unlocking again.
  */
 @Composable
 private fun StayUnlockedChoice() {
     val context = LocalContext.current
     var minutes by remember { mutableIntStateOf(StayUnlocked.minutes(context)) }
     var choosing by remember { mutableStateOf(false) }
-    fun describe(choice: Int) = when (choice) {
-        0 -> "At once"
-        1 -> "After 1 minute"
+    fun describe(choice: Int) = when {
+        choice == 0 -> "At once"
+        choice == 1 -> "After 1 minute"
+        choice == 60 -> "After 1 hour"
+        choice % 60 == 0 -> "After ${choice / 60} hours"
         else -> "After $choice minutes"
     }
     Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("Lock once the app is left", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        Text("Lock once the app is left or the screen is off", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
         Box {
             TextButton(onClick = { choosing = true }, modifier = Modifier.testTag("stay-unlocked")) { Text(describe(minutes)) }
             DropdownMenu(expanded = choosing, onDismissRequest = { choosing = false }) {
@@ -650,6 +663,7 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
     var confirmingDelete by remember(detail.id) { mutableStateOf(false) }
     var removing by remember(detail.id) { mutableStateOf<PasskeyDetail?>(null) }
     val editable = detail.kind != ItemKind.IDENTITY && !detail.conflict
+    BackHandler(onBack = session::close)
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -808,6 +822,7 @@ private fun said(version: HistoryEntry): String = when {
 private fun HistoryList(history: History, session: VaultSession) {
     var confirming by remember(history) { mutableStateOf<HistoryEntry?>(null) }
     val restorable = restoresHere(history.detail.kind) && history.versions.count { it.current } == 1
+    BackHandler(onBack = session::closeHistory)
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
             TextButton(onClick = session::closeHistory, modifier = Modifier.testTag("back")) { Text("‹ ${history.detail.title}") }
@@ -874,6 +889,7 @@ private fun HistoryList(history: History, session: VaultSession) {
 /** The items deleted on any device, which can be brought back as they were. */
 @Composable
 private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
+    BackHandler(onBack = session::closeDeleted)
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
             TextButton(onClick = session::closeDeleted, modifier = Modifier.testTag("back")) { Text("‹ All items") }

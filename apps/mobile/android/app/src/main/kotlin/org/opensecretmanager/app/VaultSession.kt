@@ -73,6 +73,12 @@ data class UiState(
     val rowsChanged: Boolean = false,
     /** The screen that changes this phone's password is open. */
     val passwordChange: Boolean = false,
+    /**
+     * How many times the vault was locked since the app started: what the
+     * screens keep of it, a search for one, is let go of at each, even one
+     * that came and went while the app was not on the screen.
+     */
+    val locks: Int = 0,
 )
 
 /** The versions of [detail], newest first. */
@@ -270,6 +276,7 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     /** Reads where the device stands, and what an unlocked vault holds. */
     private fun refresh() {
+        lockIfDue()
         val device = device ?: return
         val screen = when (device.state()) {
             DeviceState.NO_VAULT -> Screen.NO_VAULT
@@ -344,7 +351,7 @@ class VaultSession(private val context: Context, private val folder: File) {
     private fun lockVault(device: Device) {
         device.lock()
         unlockedNow = false
-        _state.update { it.copy(detail = null, editor = null, history = null, deleted = null, passwordChange = false) }
+        _state.update { it.copy(detail = null, editor = null, history = null, deleted = null, passwordChange = false, locks = it.locks + 1) }
     }
 
     /** Locks an unlocked vault: not one being joined. Under [calls]. */
@@ -358,10 +365,28 @@ class VaultSession(private val context: Context, private val folder: File) {
      * the phone sleeps. Under [calls].
      */
     private fun lockIfDue() {
-        val at = lockAt ?: return
-        if (SystemClock.elapsedRealtime() < at) return
+        if (!lockDue()) return
         lockAt = null
         device?.let(::lockIfUnlocked)
+    }
+
+    /** Whether the time the vault stays unlocked for after the app left has run out. */
+    private fun lockDue(): Boolean = lockAt?.let { SystemClock.elapsedRealtime() >= it } == true
+
+    /**
+     * Shows the vault locked at once if that time has run out, ahead of the
+     * lock itself, which waits for its turn among the [calls]: the app's
+     * screen, coming back, then shows nothing of the vault meanwhile. On the
+     * main thread.
+     */
+    private fun showLockedIfDue() {
+        if (!lockDue()) return
+        _state.update {
+            it.copy(
+                screen = Screen.LOCKED, items = emptyList(), detail = null, editor = null, history = null,
+                deleted = null, passwordChange = false, rowsChanged = false,
+            )
+        }
     }
 
     // A join reaches other devices, in [network]'s turn: going offline there
@@ -628,7 +653,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      */
     private fun <T> offer(read: (Device) -> T, done: (T?) -> Unit) {
         val device = device
-        val due = lockAt?.let { SystemClock.elapsedRealtime() >= it } == true
+        val due = lockDue()
         if (due) run(null) { lockIfDue(); refresh() }
         if (device == null || !unlockedNow || locksAsked.get() > 0 || due) {
             scope.launch(Dispatchers.Main.immediate) { done(null) }
@@ -776,6 +801,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      */
     fun onForeground() {
         inFront = true
+        showLockedIfDue()
         lockLater?.cancel()
         lockLater = null
         run(null) {
@@ -845,9 +871,15 @@ class VaultSession(private val context: Context, private val folder: File) {
         }
     }
 
-    /** The phone's screen turned off: lock at once, whatever the time the vault would stay unlocked for. */
+    /**
+     * The phone's screen turned off. With a time chosen and a lock screen on
+     * the phone ([StayUnlocked.throughScreenOff]), the vault stays unlocked
+     * for that time, from when the app left the screen ([onBackground],
+     * which follows if it was in front); otherwise it locks at once.
+     */
     fun onScreenOff() {
         askAtOnce.set(true)
+        if (StayUnlocked.throughScreenOff(context)) return
         locksAsked.incrementAndGet()
         lockLater?.cancel()
         lockLater = null
@@ -860,6 +892,19 @@ class VaultSession(private val context: Context, private val folder: File) {
                 locksAsked.decrementAndGet()
             }
         }
+    }
+
+    /**
+     * The phone's screen turned on. The timer that locks the vault once the
+     * time chosen has run out ([onBackground]) does not run while the phone
+     * sleeps, which it may do for most of the time the screen is off: the
+     * vault locks now if that time has run out, before the phone's own lock
+     * screen can be passed.
+     */
+    fun onScreenOn() {
+        if (lockAt == null) return
+        showLockedIfDue()
+        run(null) { refresh() }
     }
 
     /**

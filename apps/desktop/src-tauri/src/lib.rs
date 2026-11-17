@@ -13,6 +13,7 @@ mod browser;
 #[cfg(all(test, unix))]
 mod browser_tests;
 mod history;
+mod idle;
 mod import;
 #[cfg(test)]
 mod import_tests;
@@ -970,6 +971,7 @@ pub fn run() {
     let browser = browser::Browser::open(&path);
     tauri::Builder::default()
         .manage(StartupProblem(None))
+        .manage(idle::IdleLock::default())
         .manage(AppState {
             vault: Mutex::new(Vault::open(&path).ok()),
             archive: Mutex::new(None),
@@ -994,6 +996,7 @@ pub fn run() {
             vault_status,
             vault_problem,
             lock_vault,
+            idle::lock_when_idle,
             list_entries,
             generate_password,
             copy_generated,

@@ -229,6 +229,9 @@ const PREVIEW_INVITATION_QR = {
  * The preview keeps the interface useful in a browser. Tauri injects the
  * command bridge in production; no secret is placed in this fallback data.
  */
+/** The turn of the last call handing the time without activity over (lockWhenIdle). */
+let handOverTurn = 0;
+
 export const bridge: DesktopBridge = {
   async status() {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
@@ -245,6 +248,16 @@ export const bridge: DesktopBridge = {
   async lock() {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) await invoke("lock_vault");
+  },
+  async lockWhenIdle(milliseconds) {
+    const invoke = native();
+    // The time of the call orders it among the others, which the native
+    // side can take out of order; two in the same millisecond are kept apart.
+    handOverTurn = Math.max(performance.timeOrigin + performance.now(), handOverTurn + 0.001);
+    if (invoke) await invoke("lock_when_idle", { milliseconds, turn: handOverTurn });
+    // The preview has no native side: what it would have been handed is
+    // kept where the window's tests can read it.
+    else (globalThis as { osmHandedOver?: number | null }).osmHandedOver = milliseconds;
   },
   async unlock(password) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;

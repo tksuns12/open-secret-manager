@@ -85,8 +85,9 @@ locks when its app leaves the screen, and can keep its password behind the
 phone's biometrics, which it asks for by itself when it shows the vault
 locked, as the app comes back or a fill, save, or passkey screen opens,
 though not after the owner's own Lock (Phase 19); on Android the owner can have it stay unlocked for 1,
-5, or 15 minutes after the app is left (a minute unless changed), and the
-screen turning off locks it at once. Its autofill fills only after the
+5, or 15 minutes, an hour, or 4 hours after the app is left or the screen
+turns off (a minute unless changed), though on a phone without a lock
+screen the screen turning off locks it at once (2026-11-17). Its autofill fills only after the
 owner unlocks and chooses on the app's own screen; on Android, while the
 vault stays unlocked, the system's list under a field, or the keyboard's
 strip, names the logins offered there, and choosing one fills it. That list is read without waiting for

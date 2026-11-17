@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{AppState, CommandError};
 
 /// The waits the owner can choose, in minutes.
-pub const AUTO_LOCK_CHOICES: [u32; 4] = [1, 5, 15, 60];
+pub const AUTO_LOCK_CHOICES: [u32; 5] = [1, 5, 15, 60, 240];
 const DEFAULT_AUTO_LOCK: u32 = 5;
 
 /// The lengths the generator offers.
@@ -143,7 +143,7 @@ pub(crate) fn set_auto_lock_at(vault: &Path, minutes: u32) -> Result<Settings, C
     if !AUTO_LOCK_CHOICES.contains(&minutes) {
         return Err(CommandError {
             code: "invalid_setting",
-            message: format!("lock after 1, 5, 15, or 60 minutes, not {minutes}"),
+            message: format!("lock after 1, 5, 15, 60, or 240 minutes, not {minutes}"),
         });
     }
     let settings = Settings {
@@ -190,10 +190,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_auto_lock_time_is_one_of_four_and_kept_beside_the_vault() {
+    fn the_auto_lock_time_is_one_of_five_and_kept_beside_the_vault() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault.sqlite3");
         assert_eq!(read(&vault).auto_lock_minutes, 5);
+        assert_eq!(
+            set_auto_lock_at(&vault, 240).unwrap().auto_lock_minutes,
+            240
+        );
+        assert_eq!(read(&vault).auto_lock_minutes, 240);
         assert_eq!(set_auto_lock_at(&vault, 15).unwrap().auto_lock_minutes, 15);
         assert_eq!(read(&vault).auto_lock_minutes, 15);
         assert_eq!(

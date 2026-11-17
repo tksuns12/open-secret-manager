@@ -274,6 +274,101 @@ test("the time after which the vault locks is kept", async () => {
   await page.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: /Settings/ }).click();
   assert.equal(await page.getByLabel("Lock the vault after").inputValue(), "15");
+  assert.deepEqual(
+    await page.getByLabel("Lock the vault after").locator("option").allTextContents(),
+    ["a minute", "5 minutes", "15 minutes", "an hour", "4 hours"].map((time) => `${time} without activity`),
+  );
+  assert.deepEqual(errors, []);
+});
+
+/** Tells the window it was hidden or covered ("hidden"), or shown again ("visible"), as WebKit does. */
+async function seen(page, state) {
+  await page.evaluate((state) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, state);
+}
+
+/** Moves the window's clock on without running its timers, as a hidden window's can be held back. */
+async function laterWithoutTimers(page, milliseconds) {
+  await page.clock.setSystemTime(await page.evaluate(() => Date.now()) + milliseconds);
+}
+
+test("hidden or covered, the window leaves the vault unlocked for the time without input, and coming back checks it", async () => {
+  const { page, errors } = await window.open();
+  await page.clock.install();
+  await page.reload();
+  await page.locator(".entry-row", { hasText: "Proton Mail" }).waitFor();
+  const password = page.getByLabel("Vault password");
+
+  // Five minutes unless changed. Hidden, the window hands what is left of
+  // them to the native side, and takes it back once shown.
+  const handedOver = () => page.evaluate(() => globalThis.osmHandedOver);
+  await seen(page, "hidden");
+  const left = await handedOver();
+  assert.ok(left > 4 * 60_000 && left <= 5 * 60_000, `${left}`);
+  await seen(page, "visible");
+  assert.equal(await handedOver(), null);
+  // Hidden for four, it is still unlocked.
+  await seen(page, "hidden");
+  await page.clock.fastForward(4 * 60_000);
+  assert.equal(await password.count(), 0);
+  // Its timer runs out while hidden: locked.
+  await page.clock.fastForward(61_000);
+  await password.waitFor();
+  await password.fill("any password, in the preview");
+  await page.getByRole("button", { name: /Unlock/ }).click();
+  await seen(page, "visible");
+  await page.locator(".entry-row", { hasText: "Proton Mail" }).waitFor();
+
+  // Shown again within the time, it is still unlocked, but being shown is
+  // not input: the time still runs from the Unlock click.
+  await seen(page, "hidden");
+  await laterWithoutTimers(page, 4 * 60_000);
+  await seen(page, "visible");
+  assert.equal(await password.count(), 0);
+  // Hidden past it while its timer was held back: coming back locks it.
+  await seen(page, "hidden");
+  await laterWithoutTimers(page, 2 * 60_000);
+  assert.equal(await password.count(), 0);
+  await seen(page, "visible");
+  await password.waitFor();
+  assert.deepEqual(await titles(page), []);
+  assert.deepEqual(errors, []);
+});
+
+/** The shell's events, given to the preview as the shell gives them; with no way to call the shell, the window stays the preview. */
+async function withShellEvents(page) {
+  await page.addInitScript(() => {
+    const listeners = {};
+    globalThis.osmEmit = (event, payload) => { for (const handler of listeners[event] ?? []) handler({ payload }); };
+    globalThis.__TAURI__ = { event: { listen: async (event, handler) => { (listeners[event] ??= []).push(handler); return () => {}; } } };
+  });
+}
+
+test("the native side's lock for want of activity, while the window was hidden, shows it locked and says nothing", async () => {
+  const { page, errors } = await window.open();
+  await withShellEvents(page);
+  await page.reload();
+  await page.locator(".entry-row", { hasText: "Proton Mail" }).waitFor();
+  await page.evaluate(() => globalThis.osmEmit("vault-locked", "idle"));
+  await page.getByLabel("Vault password").waitFor();
+  assert.deepEqual(await titles(page), []);
+  assert.equal(await page.locator(".toast").count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test("a browser's request to a hidden window whose time without activity ran out finds the vault locked", async () => {
+  const { page, errors } = await window.open("?login-fill");
+  await withShellEvents(page);
+  await page.clock.install();
+  await page.reload();
+  await page.locator(".entry-row", { hasText: "Proton Mail" }).waitFor();
+  await seen(page, "hidden");
+  await laterWithoutTimers(page, 6 * 60_000);
+  await page.evaluate(() => globalThis.osmEmit("fill-request"));
+  await page.getByLabel("Vault password").waitFor();
+  assert.deepEqual(await titles(page), []);
   assert.deepEqual(errors, []);
 });
 
