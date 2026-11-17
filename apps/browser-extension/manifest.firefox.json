@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Open Secret Manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fills a login, card, or passkey you choose in the Open Secret Manager app into the page you are on. Nothing leaves your devices.",
   "icons": {
     "16": "icons/icon-16.png",

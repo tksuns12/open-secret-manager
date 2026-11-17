@@ -1,0 +1,1 @@
+A new icon: a shield with a keyhole, and three devices joined around it. On Android 13 and later it can take the colors of your theme. Nothing else changed.
