@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The adaptive icon's background, from scripts/icons.mjs. -->
+<resources>
+    <color name="ic_launcher_background">#DDA45B</color>
+</resources>

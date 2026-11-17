@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArrowDownToLine, ChevronRight, HardDriveDownload, CircleAlert, Clock3, Copy, Eraser, Eye, EyeOff, Fingerprint, Globe, KeyRound, LockKeyhole, Plus, Search, Settings as SettingsIcon, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, UnlockKeyhole, Wifi, X } from "lucide-react";
 import { bridge, hasNativeBridge, previewHasDevices } from "./bridge";
+import { BrandMark } from "./BrandMark";
 import { cardBrand, cardDigits, passesCardCheck } from "./card";
 import type { ArchivedItem, ArchiveInfo, BackupAge, BrowserInfo, BrowserStatus, CardFieldName, DeletedEntry, DevicesInfo, EntryDetail, EntryInput, EntryKind, FillAsked, FillCardChoice, FillLogin, GeneratorChoice, HeldChange, HistoryEntry, ImportFormat, ImportSummary, InviteQr, MemberInfo, PasskeyAsked, PasskeyChoice, PasskeySummary, Restored, SavedBackup, SyncState, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
@@ -719,7 +720,7 @@ function App() {
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark"><KeyRound size={17} strokeWidth={2.5} /></div><span>open secret</span><span className="brand-dot">·</span></div>
+        <div className="brand"><div className="brand-mark"><BrandMark size={27} /></div><span>open secret</span><span className="brand-dot">·</span></div>
         <div className="vault-chip"><div className="vault-emblem"><ShieldCheck size={16} /></div><div><strong>Personal vault</strong><span>{previewMode ? "Development preview · local only" : sync.state === "removed" ? "Removed from this vault" : sync.devices > 0 ? `Owner device · ${sync.devices + 1} devices` : "Owner device · local only"}</span></div></div>
         <button className="new-item" onClick={() => { if (!locked) setEditor({ mode: "create" }); }} disabled={locked}><Plus size={17} /> New item <span>⌘ N</span></button>
         <nav className="nav-list" aria-label="Vault filters">

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Drawn by scripts/icons.mjs: change it there. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:translateX="13.04" android:translateY="13.06" android:scaleX="0.04" android:scaleY="0.04">
+        <path android:fillColor="#17130E" android:pathData="M1024 341Q774 520 424 555C420 1205 544 1471 1024 1706C1504 1471 1628 1205 1624 555Q1274 520 1024 341Z" />
+        <group android:pivotX="1024" android:pivotY="1041" android:scaleX="0.8" android:scaleY="0.8">
+            <path android:strokeColor="#DDA45B" android:strokeWidth="42.5" android:pathData="M1024 341Q774 520 424 555C420 1205 544 1471 1024 1706C1504 1471 1628 1205 1624 555Q1274 520 1024 341Z" />
+        </group>
+        <path android:fillColor="#17130E" android:pathData="M924,508a100,100 0 1,0 200,0a100,100 0 1,0 -200,0M473,1285a97,97 0 1,0 194,0a97,97 0 1,0 -194,0M1381,1285a97,97 0 1,0 194,0a97,97 0 1,0 -194,0" />
+        <path android:strokeColor="#F4ECE0" android:strokeWidth="24" android:strokeLineJoin="round" android:pathData="M1024 508L570 1285H1478Z" />
+        <path android:fillColor="#F4ECE0" android:pathData="M967,508a57,57 0 1,0 114,0a57,57 0 1,0 -114,0M513,1285a57,57 0 1,0 114,0a57,57 0 1,0 -114,0M1421,1285a57,57 0 1,0 114,0a57,57 0 1,0 -114,0" />
+        <path android:fillColor="#DDA45B" android:pathData="M972 1026A111 111 0 1 1 1076 1026L1119 1228H929Z" />
+    </group>
+</vector>

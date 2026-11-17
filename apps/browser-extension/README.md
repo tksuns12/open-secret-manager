@@ -137,5 +137,7 @@ the app's Browser panel first.
 With `OSM_HOST` naming the host inside a packaged app, the Chromium check
 registers that host, which checks the package as a whole.
 
-The icons in `icons/` are the desktop app's icon at the sizes browsers ask
-for. `node icons.mjs` draws them again if that icon changes.
+The icons in `icons/` are the project's icon at the sizes browsers ask for
+(at 16 px, the shield and its keyhole alone), and `store/` holds the Chrome
+Web Store's icon, tile, and screenshots. `node scripts/icons.mjs`, at the
+repository's root, draws them again with every other size of the icon.

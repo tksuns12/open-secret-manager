@@ -1,3 +1,5 @@
+<p align="center"><img src="packaging/icon/icon.svg" width="112" alt="The Open Secret Manager icon: a shield with a keyhole, and three devices joined around it"></p>
+
 # Open Secret Manager
 
 Open Secret Manager is an owner-controlled, peer-to-peer password manager for
