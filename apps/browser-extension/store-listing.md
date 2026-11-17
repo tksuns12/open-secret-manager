@@ -16,9 +16,13 @@ from `scripts/package-extension.sh`.
 - **Support:** https://github.com/tksuns12/open-secret-manager/issues
 - **Privacy policy:** https://github.com/tksuns12/open-secret-manager/blob/main/PRIVACY.md
 - **License:** GPL-3.0-only
-- **Screenshots** (1280×800, the desktop window's preview on sample data):
-  `docs/images/desktop-vault.png`, `docs/images/desktop-passkey.png`,
-  `docs/images/desktop-card.png`. The icon is `icons/icon-128.png`.
+- **Screenshots** (1280×800 JPEG, a caption over the desktop window's
+  preview on sample data), in this order: `store/screenshot-1-login.jpg`,
+  `store/screenshot-2-passkey.jpg`, `store/screenshot-3-card.jpg`,
+  `store/screenshot-4-vault.jpg`, `store/screenshot-5-devices.jpg`.
+- **Store icon:** `store/icon-store-128.png` (96 px in 128). **Small promo
+  tile:** `store/promo-tile-440x280.jpg`. All drawn by
+  `node scripts/icons.mjs`, except the screenshots.
 
 ## Description (English)
 

@@ -63,6 +63,12 @@ const previewConflict: VersionSummary[] = [
   { revision: "preview-conflict-there", deleted: false, title: "GitHub", username: "northstar-ops", url: "github.com", device: "3f9a1c2e", thisDevice: false, differs: ["username", "password", "passkeys"] },
 ];
 
+/** With `?login-fill`: a sign-in page asking for the login saved for its address. */
+let previewLoginFill: FillAsked | null = previewAsks("login-fill") ? {
+  requestId: "preview-login-fill", origin: "https://github.com", browser: "Chromium", secondsLeft: 120, session: "preview",
+  logins: [{ id: "2", title: "GitHub", username: "northstar-labs", url: "https://github.com", conflict: false }], notOffered: [],
+} : null;
+
 /** With `?card-fill`: a checkout page asking for a card, its number and code in a payment provider's frame. */
 let previewCardFill: FillAsked | null = previewAsks("card-fill") ? {
   requestId: "preview-card-fill", origin: "https://shop.example", browser: "Chromium", secondsLeft: 120, session: "preview",
@@ -420,12 +426,18 @@ export const bridge: DesktopBridge = {
   },
   deleteArchive: (name) => nativeOnly("delete_archive", { name }),
   // Requests come from a browser through the native shell; the preview
-  // has one only when its address asks (`?card-fill`).
+  // has one only when its address asks (`?login-fill`, `?card-fill`,
+  // `?passkey-create`, `?passkey-get`).
   async fillRequest() {
     const invoke = native();
-    return invoke ? ((await invoke("fill_request")) as FillAsked | null) : previewCardFill ?? previewPasskey;
+    return invoke ? ((await invoke("fill_request")) as FillAsked | null) : previewLoginFill ?? previewCardFill ?? previewPasskey;
   },
-  approveFill: (requestId, itemId, session) => nativeOnly("approve_fill", { requestId, itemId, session }),
+  async approveFill(requestId, itemId, session) {
+    const invoke = native();
+    if (invoke) { await invoke("approve_fill", { requestId, itemId, session }); return; }
+    if (!previewLoginFill) throw new Error("preview");
+    previewLoginFill = null;
+  },
   async approveCard(requestId, itemId, session) {
     const invoke = native();
     if (invoke) { await invoke("approve_card", { requestId, itemId, session }); return; }
@@ -451,6 +463,7 @@ export const bridge: DesktopBridge = {
   async denyFill(requestId) {
     const invoke = native();
     if (invoke) { await invoke("deny_fill", { requestId }); return; }
+    if (previewLoginFill) { previewLoginFill = null; return; }
     if (previewCardFill) { previewCardFill = null; return; }
     if (previewPasskey) { previewPasskey = null; return; }
     throw new Error("preview");

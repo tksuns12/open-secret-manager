@@ -352,6 +352,21 @@ test("locking hides the items until the vault is unlocked again", async () => {
   assert.deepEqual(errors, []);
 });
 
+test("a page's request offers the login saved for its address and sends the one chosen", async () => {
+  const { page, errors } = await window.open("?login-fill");
+  const dialog = page.getByRole("dialog", { name: "Fill a login" });
+  const choice = dialog.locator(".fill-choice");
+  await choice.first().waitFor();
+  // The only login for the address is chosen already.
+  assert.equal(await choice.count(), 1);
+  assert.equal(await choice.getAttribute("aria-pressed"), "true");
+  await choice.getByText("northstar-labs").waitFor();
+  await dialog.getByRole("button", { name: "Fill GitHub" }).click();
+  await dialog.waitFor({ state: "detached" });
+  await toast(page).filter({ hasText: "GitHub was sent to the page · the form was not submitted" }).waitFor();
+  assert.deepEqual(errors, []);
+});
+
 test("a card's fill says where each of its fields goes and sends the card chosen", async () => {
   const { page, errors } = await window.open("?card-fill");
   const dialog = page.getByRole("dialog", { name: "Fill a card" });
