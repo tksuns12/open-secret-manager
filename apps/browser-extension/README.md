@@ -58,8 +58,11 @@ login is offered only for the exact origin of its stored address; see [the forma
 
 ## Installing
 
-From the stores once it is accepted there: Firefox's add-ons site
-(addons.mozilla.org) and the Chrome Web Store. Then, in the desktop app,
+For Chromium-based browsers, from the
+[Chrome Web Store](https://chromewebstore.google.com/detail/pnjdoenkfffomcidikbkcegcpgipdjog);
+for Firefox, from Firefox's add-ons site (`addons.mozilla.org`) once it is
+accepted there (until then, build and load it as a temporary add-on as
+below). Then, in the desktop app,
 open Browser and connect that browser, so that it knows where the native
 messaging host is. The copy from the Chrome Web Store has an ID of its own,
 which the desktop app accepts from version 0.1.1 on; a Chromium browser

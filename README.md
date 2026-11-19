@@ -36,7 +36,7 @@ A vault is made on a computer; phones join it from there.
 | Linux, x86_64 | The `.deb` from Releases. Built in a container, not yet tried on a Linux desktop. |
 | Android 9 or later, 64-bit ARM | [F-Droid](https://f-droid.org/packages/org.opensecretmanager.app/) once it is accepted there, or the APK from Releases. Both are the same APK, signed with the project's key ([its certificate](docs/release.md#supported-configurations)): F-Droid builds the app from source itself and publishes the signed APK only if its build is the same, file for file. |
 | iOS 17 or later | No download: build it with Xcode and sign it with an Apple developer team of your own ([how](docs/phone-trial.md#getting-the-app-onto-the-phone)). |
-| Browsers: Chromium-based, Firefox 128 or later | The extension, which needs the desktop app: from Firefox's add-ons site and the Chrome Web Store once it is accepted there; until then, built and loaded as [its README](apps/browser-extension/README.md#building-and-loading) says. |
+| Browsers: Chromium-based, Firefox 128 or later | The extension, which needs the desktop app: for Chromium-based browsers from the [Chrome Web Store](https://chromewebstore.google.com/detail/pnjdoenkfffomcidikbkcegcpgipdjog) (needs version 0.1.1 or later of the desktop app); for Firefox from Firefox's add-ons site once it is accepted there, or built and loaded as [its README](apps/browser-extension/README.md#building-and-loading) says. |
 | Windows | Not supported: the app has never been built for Windows. |
 
 The project does not join app stores' or platform vendors' paid programs,
