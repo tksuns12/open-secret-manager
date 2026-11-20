@@ -1,0 +1,1 @@
+A new look, in the desktop app's warm colors, light and dark. Items have a mark and filters (favorites, logins, cards, notes). Settings are on a screen of their own: recently deleted, this phone's password, filling in other apps, sync.

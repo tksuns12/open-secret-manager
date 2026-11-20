@@ -15,8 +15,8 @@ android {
         applicationId = "org.opensecretmanager.app"
         minSdk = 28
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.1.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // The shared code is built for arm64 only: a phone of another kind
         // refuses to install the app rather than failing to open the vault.
