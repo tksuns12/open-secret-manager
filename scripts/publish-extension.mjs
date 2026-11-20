@@ -22,12 +22,14 @@
 //   Chrome Web Store:              OSM_CWS_PUBLISHER_ID, OSM_CWS_CLIENT_ID,
 //                                  OSM_CWS_CLIENT_SECRET, OSM_CWS_REFRESH_TOKEN
 //
-// OSM_AMO_BASE, OSM_CWS_BASE, OSM_OAUTH_URL and OSM_PUBLISH_POLL_MS exist for
-// the script's own test (scripts/publish-extension.test.mjs), which runs it
-// against stand-in servers.
+// OSM_AMO_BASE, OSM_CWS_BASE, OSM_OAUTH_URL, OSM_PUBLISH_POLL_MS and
+// OSM_NO_KEYCHAIN exist for the script's own test
+// (scripts/publish-extension.test.mjs), which runs it against stand-in
+// servers and must not touch the owner's keychain. The script says so when
+// the first three are set: they would send the keys elsewhere.
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -59,8 +61,16 @@ const NAMES = {
   chromium: ["OSM_CWS_PUBLISHER_ID", "OSM_CWS_CLIENT_ID", "OSM_CWS_CLIENT_SECRET", "OSM_CWS_REFRESH_TOKEN"],
 };
 
+// What must never be printed: every credential this run has read.
+const known = new Set();
+export function redact(text) {
+  let shown = String(text);
+  for (const secret of known) if (secret.length >= 4) shown = shown.split(secret).join("…");
+  return shown;
+}
+
 function keychain(name) {
-  if (process.platform !== "darwin") return undefined;
+  if (process.platform !== "darwin" || process.env.OSM_NO_KEYCHAIN === "1") return undefined;
   try {
     return execFileSync("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name, "-w"], {
       encoding: "utf8",
@@ -77,8 +87,10 @@ export function credentials(store) {
   const missing = [];
   for (const name of NAMES[store]) {
     const value = process.env[name] || keychain(name);
-    if (value) found[name] = value;
-    else missing.push(name);
+    if (value) {
+      found[name] = value;
+      known.add(value);
+    } else missing.push(name);
   }
   if (missing.length) {
     throw new PublishError(
@@ -107,9 +119,9 @@ export function amoToken(issuer, secret, now = Math.floor(Date.now() / 1000)) {
 async function call(method, url, { headers = {}, body } = {}) {
   let response;
   try {
-    response = await fetch(url, { method, headers, body });
+    response = await fetch(url, { method, headers, body, signal: AbortSignal.timeout(120_000) });
   } catch (error) {
-    throw new PublishError(`${method} ${new URL(url).pathname}: ${error.cause?.code ?? error.message}`);
+    throw new PublishError(redact(`${method} ${new URL(url).pathname}: ${error.cause?.code ?? error.message}`));
   }
   const text = await response.text();
   let data = text;
@@ -120,7 +132,7 @@ async function call(method, url, { headers = {}, body } = {}) {
   }
   if (!response.ok) {
     const shown = (typeof data === "string" ? data : JSON.stringify(data)).slice(0, 1500);
-    throw new PublishError(`${method} ${new URL(url).pathname} answered ${response.status}: ${shown}`);
+    throw new PublishError(redact(`${method} ${new URL(url).pathname} answered ${response.status}: ${shown}`));
   }
   return data;
 }
@@ -157,20 +169,30 @@ export function isNewer(candidate, published) {
   return false;
 }
 
+/** The version in the manifest.json inside a package. */
+function manifestVersion(zip) {
+  try {
+    const manifest = execFileSync("unzip", ["-p", zip, "manifest.json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return String(JSON.parse(manifest).version);
+  } catch {
+    throw new PublishError(`${basename(zip)} has no readable manifest.json.`);
+  }
+}
+
 /**
  * The files of a packaged folder, checked against its SHA256SUMS: what
  * package-extension.sh made, and not changed since.
  */
 export function readPackage(dir) {
-  if (!existsSync(join(dir, "SHA256SUMS"))) {
-    throw new PublishError(`${dir} has no SHA256SUMS: run scripts/package-extension.sh first.`);
+  if (!existsSync(join(dir, "SHA256SUMS")) || !existsSync(join(dir, "build-info.txt"))) {
+    throw new PublishError(`${dir} has no SHA256SUMS and build-info.txt: run scripts/package-extension.sh first.`);
   }
   const sums = new Map();
   for (const line of readFileSync(join(dir, "SHA256SUMS"), "utf8").split("\n")) {
     const match = /^([0-9a-f]{64})\s+\*?(.+)$/.exec(line.trim());
     if (match) sums.set(match[2], match[1]);
   }
-  const info = existsSync(join(dir, "build-info.txt")) ? readFileSync(join(dir, "build-info.txt"), "utf8") : "";
+  const info = readFileSync(join(dir, "build-info.txt"), "utf8");
   if (/uncommitted changes/.test(info)) {
     throw new PublishError("This package was built with uncommitted changes: it is not a release.");
   }
@@ -178,11 +200,25 @@ export function readPackage(dir) {
   for (const [name, hash] of sums) {
     const match = /^open-secret-manager-(firefox|chromium|extension)-(\d+(?:\.\d+)+)(?:-source)?\.zip$/.exec(name);
     if (!match) continue;
+    if (!existsSync(join(dir, name))) throw new PublishError(`${name} is in SHA256SUMS but not in ${dir}: package again.`);
     const bytes = readFileSync(join(dir, name));
     if (createHash("sha256").update(bytes).digest("hex") !== hash) {
       throw new PublishError(`${name} is not what SHA256SUMS says: package again.`);
     }
-    files[match[1] === "extension" ? "source" : match[1]] = { name, version: match[2], bytes };
+    const kind = match[1] === "extension" ? "source" : match[1];
+    if (files[kind]) throw new PublishError(`SHA256SUMS lists two ${kind} packages.`);
+    files[kind] = { name, version: match[2], bytes };
+  }
+  // The version a package says is the one in its manifest, not in its name:
+  // package-extension.sh names both after the Firefox manifest's.
+  for (const kind of ["firefox", "chromium"]) {
+    if (!files[kind]) continue;
+    const inside = manifestVersion(join(dir, files[kind].name));
+    if (inside !== files[kind].version) {
+      throw new PublishError(
+        `${files[kind].name} holds version ${inside} in its manifest: keep the two manifests at one version and package again.`,
+      );
+    }
   }
   const versions = new Set(Object.values(files).map((file) => file.version));
   if (versions.size > 1) throw new PublishError(`The packages are of different versions: ${[...versions].join(", ")}.`);
@@ -251,6 +287,7 @@ class Amo {
 
     // The notes are a field of their own: a multipart request cannot hold the
     // complex fields, and this one goes the way the others do.
+    const warnings = [];
     try {
       await call("PATCH", this.api(`addons/addon/${AMO_SLUG}/versions/${made.id}/`), {
         headers: this.headers({ "Content-Type": "application/json" }),
@@ -258,12 +295,12 @@ class Amo {
       });
       console.log("  told the reviewers how to build it");
     } catch (error) {
-      console.error(
-        `  WARNING: the version is made, but the notes for the reviewers were not saved (${error.message}).\n` +
-          "  Add them on the version's page on addons.mozilla.org.",
+      warnings.push(
+        `Firefox: the version is made, but the notes for the reviewers were not saved (${error.message}). ` +
+          "Add them on the version's page on addons.mozilla.org: how to build it is in apps/browser-extension/store-listing.md.",
       );
     }
-    return made;
+    return warnings;
   }
 }
 
@@ -314,18 +351,31 @@ class Cws {
     console.log(`  uploaded ${file.name} (${uploaded.uploadState ?? "no state"})`);
     if (uploaded.uploadState === "FAILED") throw new PublishError("The Chrome Web Store refused the upload.");
     if (uploaded.uploadState !== "SUCCEEDED") {
-      await until("the Chrome Web Store to take the upload", async () => {
-        const state = (await this.status()).lastAsyncUploadState;
-        if (state === "IN_PROGRESS") return undefined;
-        if (state !== "SUCCEEDED") throw new PublishError(`The upload ended as ${state}.`);
-        return state;
-      });
+      // A state that is missing, or still the last upload's, is not an answer:
+      // it counts only once it is the same twice running.
+      let before;
+      try {
+        await until("the Chrome Web Store to take the upload", async () => {
+          const state = (await this.status()).lastAsyncUploadState;
+          if (state === "FAILED" || state === "NOT_FOUND") throw new PublishError(`The upload ended as ${state}.`);
+          const settled = state === "SUCCEEDED" && before === "SUCCEEDED";
+          before = state;
+          return settled ? state : undefined;
+        });
+      } catch (error) {
+        throw new PublishError(`${error.message}\n  The package was uploaded but not submitted: nothing is in review. Run publish chromium again.`);
+      }
     }
 
-    const answer = await call("POST", this.item("publish"), {
-      headers: { ...headers, "Content-Type": "application/json" },
-      body: JSON.stringify({ publishType: staged ? "STAGED_PUBLISH" : "DEFAULT_PUBLISH" }),
-    });
+    let answer;
+    try {
+      answer = await call("POST", this.item("publish"), {
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ publishType: staged ? "STAGED_PUBLISH" : "DEFAULT_PUBLISH" }),
+      });
+    } catch (error) {
+      throw new PublishError(`${error.message}\n  The package was uploaded but not submitted: nothing is in review. Run publish chromium again.`);
+    }
     console.log(`  submitted for review (${answer.state ?? "no state"})`);
     return answer;
   }
@@ -338,7 +388,10 @@ function parse(argv) {
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--dir") options.dir = argv[++i];
+    if (arg === "--dir") {
+      options.dir = argv[++i];
+      if (!options.dir) throw new PublishError("--dir needs a folder.");
+    }
     else if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--staged") options.staged = true;
     else if (arg === "--yes") options.yes = true;
@@ -346,6 +399,7 @@ function parse(argv) {
     else rest.push(arg);
   }
   options.command = rest[0];
+  if (rest.length > 2) throw new PublishError(`Too many words: ${rest.slice(2).join(" ")}`);
   if (rest[1]) options.target = rest[1];
   if (!["check", "status", "publish"].includes(options.command)) {
     throw new PublishError("Usage: publish-extension.mjs check | status | publish [firefox|chromium|all] [--dir F] [--dry-run] [--staged] [--yes]");
@@ -357,8 +411,9 @@ function parse(argv) {
 const storesOf = (target) => (target === "all" ? ["firefox", "chromium"] : [target]);
 
 function defaultDir() {
-  const short = execFileSync("git", ["rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
-  return resolve(fileURLToPath(new URL("..", import.meta.url)), "dist", "extension", short);
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const short = execFileSync("git", ["rev-parse", "--short", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  return resolve(root, "dist", "extension", short);
 }
 
 async function confirm(summary, options) {
@@ -392,6 +447,9 @@ export async function main(argv) {
     return;
   }
 
+  for (const name of ["OSM_AMO_BASE", "OSM_CWS_BASE", "OSM_OAUTH_URL"]) {
+    if (process.env[name]) console.error(`NOTE: ${name} is set (${process.env[name]}): the keys go there, not to the store.`);
+  }
   const pack = readPackage(resolve(options.dir ?? defaultDir()));
   const have = stores.filter((store) => pack.files[store]);
   if (have.length !== stores.length) {
@@ -423,17 +481,36 @@ export async function main(argv) {
   }
   await confirm(lines.join("\n"), options);
 
+  const sent = [];
+  const warnings = [];
   for (const store of stores) {
     console.log(store === "firefox" ? "Firefox:" : "Chrome Web Store:");
-    if (store === "firefox") await amo.publish(pack);
-    else await cws.publish(pack, { staged: options.staged });
+    try {
+      if (store === "firefox") warnings.push(...(await amo.publish(pack)));
+      else await cws.publish(pack, { staged: options.staged });
+      sent.push(store);
+    } catch (error) {
+      const left = stores.filter((s) => s !== store && !sent.includes(s));
+      throw new PublishError(
+        `${error.message}\n` +
+          (sent.length ? `Already sent and in review: ${sent.join(", ")}. Do not send ${sent.join(", ")} again. ` : "") +
+          (left.length || sent.length ? `Still to send: ${[store, ...left].join(", ")}: run publish ${store === "firefox" && !left.length ? "firefox" : [store, ...left].length === 1 ? store : "<store>"} again.` : ""),
+      );
+    }
   }
-  console.log("Done. Both stores review it before it is public; their mail says when.");
+  if (warnings.length) {
+    console.error(`Sent ${sent.join(" and ")}, but:\n  ${warnings.join("\n  ")}`);
+    return 2;
+  }
+  console.log(`Done: ${sent.join(" and ")} ${sent.length > 1 ? "review" : "reviews"} it before it is public; the store's mail says when.`);
+  return 0;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main(process.argv.slice(2)).catch((error) => {
-    console.error(error instanceof PublishError ? error.message : error);
-    process.exit(1);
-  });
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+  main(process.argv.slice(2))
+    .then((code) => process.exit(code ?? 0))
+    .catch((error) => {
+      console.error(redact(error instanceof PublishError ? error.message : (error.stack ?? error)));
+      process.exit(1);
+    });
 }

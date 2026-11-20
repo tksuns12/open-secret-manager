@@ -107,15 +107,23 @@ the version before it is public.
    `scripts/publish-extension.mjs publish --dry-run`.
 3. Upload: `scripts/publish-extension.mjs publish`. It shows the version, the
    files and their hashes and asks for a `yes`; `--yes` skips the question
-   (a terminal is needed otherwise, so not from Claude Code's `!`).
+   (a terminal is needed otherwise, so not from Claude Code's `!`). If the
+   first store is sent and the second fails, the message says which is in
+   review: send only the other one again. A run that sent a version but could
+   not save a detail (Firefox's notes for the reviewers) ends with exit
+   status 2 and says what to add by hand.
    `publish firefox` or `publish chromium` does one store. `--staged` has the
    Chrome Web Store hold the approved version, for the owner to publish.
 4. `scripts/publish-extension.mjs status` says what each store holds.
 
 Firefox's copy is sent as a listed version with the source archive and the
-notes for the reviewers (how to build it); a version not newer than the one
-published is refused. Descriptions, screenshots and the Chrome Web Store's
-privacy answers are not sent: they are changed in the stores' dashboards.
+notes for the reviewers (how to build it). The script refuses a Firefox
+version that is not newer than the one approved there (the Chrome Web Store
+refuses one whose version was not raised, by itself), and a package whose
+manifest has another version than its name. Even `--dry-run` asks Google for
+an access token (a POST to its token endpoint); nothing is uploaded.
+Descriptions, screenshots and the Chrome Web Store's privacy answers are not
+sent: they are changed in the stores' dashboards.
 
 ### The keys, made once
 
@@ -126,10 +134,11 @@ them can put a version in the stores, so they are not kept in the
 repository. In a Terminal, for each name below:
 
 ```text
-security add-generic-password -s osm-extension-publish -a OSM_AMO_JWT_ISSUER -w
+security add-generic-password -U -s osm-extension-publish -a OSM_AMO_JWT_ISSUER -w
 ```
 
-(it asks for the value; it is not typed on the command line).
+(it asks for the value; it is not typed on the command line; `-U` replaces a
+key that is there already).
 
 - **Firefox:** `OSM_AMO_JWT_ISSUER` and `OSM_AMO_JWT_SECRET`, from the
   add-on developer hub's "Manage API Keys" page on addons.mozilla.org.
@@ -138,8 +147,13 @@ security add-generic-password -s osm-extension-publish -a OSM_AMO_JWT_ISSUER -w
   "Desktop app" (`OSM_CWS_CLIENT_ID`, `OSM_CWS_CLIENT_SECRET`); a refresh
   token for the scope `https://www.googleapis.com/auth/chromewebstore`, which
   comes from signing in once as the account that owns the extension
-  (`OSM_CWS_REFRESH_TOKEN`); and the publisher ID shown on the developer
-  dashboard's account page (`OSM_CWS_PUBLISHER_ID`).
+  (`OSM_CWS_REFRESH_TOKEN`; Google's OAuth 2.0 Playground, set to use your own
+  OAuth credentials, gives one); and the publisher ID shown on the developer
+  dashboard's account page (`OSM_CWS_PUBLISHER_ID`). While the OAuth consent
+  screen of the project is in "Testing", Google lets a refresh token expire
+  after seven days: publish the app (to "In production"; it stays private to
+  the owner's own account) or make the token again when `check` says
+  `invalid_grant`.
 
 `scripts/publish-extension.mjs check` says whether they work. The script's
 own test, which runs it against stand-ins of the two stores, is

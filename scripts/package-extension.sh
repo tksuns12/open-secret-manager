@@ -23,6 +23,11 @@ fi
 commit=$(git rev-parse HEAD)
 short=$(git rev-parse --short HEAD)
 version=$(node -p 'require("./apps/browser-extension/manifest.firefox.json").version')
+chromium_version=$(node -p 'require("./apps/browser-extension/manifest.chromium.json").version')
+if [ "$version" != "$chromium_version" ]; then
+    echo "The manifests have two versions (Firefox $version, Chromium $chromium_version): make them one." >&2
+    exit 1
+fi
 out="$root/dist/extension/$short"
 rm -rf "$out"
 mkdir -p "$out"
