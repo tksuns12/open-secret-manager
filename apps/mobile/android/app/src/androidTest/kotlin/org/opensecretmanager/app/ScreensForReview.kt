@@ -110,6 +110,13 @@ class ScreensForReview {
         compose.onNodeWithTag("new-password-again").performClick()
         Thread.sleep(1500)
         capture("12-password-keyboard")
+        // A wrong current password, sent with the keyboard still up: where the notice sits.
+        compose.onNodeWithTag("current-password").performTextInput("not the password")
+        compose.onNodeWithTag("new-password").performTextInput("a new password, long enough")
+        compose.onNodeWithTag("new-password-again").performTextInput("a new password, long enough")
+        compose.onNodeWithTag("save-password").performScrollTo().performClick()
+        Thread.sleep(700)
+        capture("12b-password-notice")
         compose.onNodeWithTag("cancel-password").performScrollTo().performClick()
         waitFor("back")
         compose.onNodeWithTag("back").performClick()

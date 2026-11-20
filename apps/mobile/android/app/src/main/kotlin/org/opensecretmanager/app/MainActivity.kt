@@ -221,7 +221,6 @@ fun VaultScreen(
                 ) { Text("+  New item", fontWeight = FontWeight.Bold) }
             }
         },
-        snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         // The keyboard's own room: edge to edge, the window no longer shrinks for it.
         Column(Modifier.padding(padding).consumeWindowInsets(padding).imePadding().fillMaxSize()) {
@@ -246,6 +245,9 @@ fun VaultScreen(
                 }
                 state.busy?.let { Busy(it) }
             }
+            // A row of its own under the screen, inside the keyboard's room: over the screen it would cover
+            // a button and swallow its taps, and in the Scaffold's own place the keyboard can be over it.
+            SnackbarHost(snackbar)
         }
     }
 }
