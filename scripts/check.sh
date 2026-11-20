@@ -73,6 +73,7 @@ step "Desktop interface"
 
 step "Browser extension"
 (cd apps/browser-extension && npm run --silent typecheck && npm test && npm run --silent build)
+node --test scripts/publish-extension.test.mjs
 
 step "Dependencies"
 if [ "$network" = yes ]; then

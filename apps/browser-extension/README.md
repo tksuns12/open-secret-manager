@@ -94,6 +94,57 @@ Temporary Add-on, and pick `dist/firefox/manifest.json`. A temporary add-on
 is gone when Firefox quits; the copy on Firefox's add-ons site, signed by
 Mozilla, stays. Then connect Firefox in the app's Browser panel.
 
+## Publishing a new version
+
+`scripts/publish-extension.mjs` uploads what `scripts/package-extension.sh`
+made to Firefox's add-ons site and the Chrome Web Store. Both stores review
+the version before it is public.
+
+1. Raise `version` in both manifests (`manifest.firefox.json` and
+   `manifest.chromium.json`), commit, and package that commit:
+   `scripts/package-extension.sh`.
+2. Check the package and the credentials, with nothing uploaded:
+   `scripts/publish-extension.mjs publish --dry-run`.
+3. Upload: `scripts/publish-extension.mjs publish`. It shows the version, the
+   files and their hashes and asks for a `yes`; `--yes` skips the question
+   (a terminal is needed otherwise, so not from Claude Code's `!`).
+   `publish firefox` or `publish chromium` does one store. `--staged` has the
+   Chrome Web Store hold the approved version, for the owner to publish.
+4. `scripts/publish-extension.mjs status` says what each store holds.
+
+Firefox's copy is sent as a listed version with the source archive and the
+notes for the reviewers (how to build it); a version not newer than the one
+published is refused. Descriptions, screenshots and the Chrome Web Store's
+privacy answers are not sent: they are changed in the stores' dashboards.
+
+### The keys, made once
+
+The script takes them from the environment, else from the macOS keychain
+(service `osm-extension-publish`, the variable's name as the account); they
+are not read from the command line, and are never printed. Anyone who has
+them can put a version in the stores, so they are not kept in the
+repository. In a Terminal, for each name below:
+
+```text
+security add-generic-password -s osm-extension-publish -a OSM_AMO_JWT_ISSUER -w
+```
+
+(it asks for the value; it is not typed on the command line).
+
+- **Firefox:** `OSM_AMO_JWT_ISSUER` and `OSM_AMO_JWT_SECRET`, from the
+  add-on developer hub's "Manage API Keys" page on addons.mozilla.org.
+- **Chrome Web Store:** the API (version 2) needs a Google Cloud project
+  with the Chrome Web Store API turned on and an OAuth client of the type
+  "Desktop app" (`OSM_CWS_CLIENT_ID`, `OSM_CWS_CLIENT_SECRET`); a refresh
+  token for the scope `https://www.googleapis.com/auth/chromewebstore`, which
+  comes from signing in once as the account that owns the extension
+  (`OSM_CWS_REFRESH_TOKEN`); and the publisher ID shown on the developer
+  dashboard's account page (`OSM_CWS_PUBLISHER_ID`).
+
+`scripts/publish-extension.mjs check` says whether they work. The script's
+own test, which runs it against stand-ins of the two stores, is
+`node --test scripts/publish-extension.test.mjs`.
+
 ## Checks
 
 ```text
