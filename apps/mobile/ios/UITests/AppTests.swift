@@ -137,7 +137,8 @@ final class AppTests: UITestCase {
         let newPassword = "eleven char and more"
         unlock(in: app)
         XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
-        app.buttons["change-password"].tap()
+        app.buttons["settings"].tap()
+        app.buttons["change-password"].waitAndTap()
         let current = app.secureTextFields["current-password"]
         XCTAssert(current.waitForExistence(timeout: 15))
 
@@ -163,7 +164,8 @@ final class AppTests: UITestCase {
         current.tap()
         current.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 16) + fixturePassword)
         app.buttons["save-password"].tap()
-        XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
+        // The change closes its screen, back to the settings it was opened from.
+        XCTAssert(app.buttons["change-password"].waitForExistence(timeout: 30))
         capture("app-password-changed")
 
         // From the next unlock on, only the new one opens the vault.

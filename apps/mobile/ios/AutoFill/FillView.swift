@@ -20,6 +20,7 @@ struct FillView: View {
                 }
                 .padding()
             }
+            .osmScreen()
             // Locked, Face ID or Touch ID is asked for at once.
             .task(id: model.stage) { if model.stage == .locked { model.askAtOnce() } }
             .navigationTitle(model.saving != nil ? "Save a login" : model.inserting ? "Insert text" : model.oneTimeCode ? "Fill a one-time code" : "Fill a login")
@@ -30,6 +31,7 @@ struct FillView: View {
                 }
             }
         }
+        .tint(OSM.accent)
         .overlay { if let busy = model.busy { BusyCover(what: busy) } }
         .overlay(alignment: .bottom) { NoticeBanner(notice: $model.notice) }
     }

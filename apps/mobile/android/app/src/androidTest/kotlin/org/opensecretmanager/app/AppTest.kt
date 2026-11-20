@@ -142,9 +142,12 @@ class AppTest {
         compose.onAllNodesWithTag("item:Mail").assertCountEquals(0)
 
         // The system's back steps out of the deleted items too.
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("recently-deleted").performClick()
         waitFor("deleted-hint")
         compose.activityRule.scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
+        waitFor("recently-deleted")
+        compose.onNodeWithTag("back").performClick()
         waitFor("item:Bank")
         compose.onNodeWithTag("search").assert(hasText("ban"))
 
@@ -192,11 +195,13 @@ class AppTest {
 
         // A minute: left and back within it, the vault is still unlocked.
         // The longest choice is four hours.
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("stay-unlocked").performClick()
         waitFor("stay-unlocked:1")
         compose.onNodeWithTag("stay-unlocked:240").assertTextEquals("After 4 hours")
         compose.onNodeWithTag("stay-unlocked:1").performClick()
         assertEquals(1, StayUnlocked.minutes(context))
+        compose.onNodeWithTag("back").performClick()
         compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
         Thread.sleep(3_000)
         assertEquals(Screen.UNLOCKED, session.state.value.screen)
@@ -204,6 +209,7 @@ class AppTest {
         waitFor("item:Bank")
 
         // At once: leaving locks it.
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("stay-unlocked").performClick()
         waitFor("stay-unlocked:0")
         compose.onNodeWithTag("stay-unlocked:0").performClick()
@@ -223,6 +229,7 @@ class AppTest {
         compose.onNodeWithTag("password").performTextInput(password)
         compose.onNodeWithTag("unlock").performClick()
         waitFor("item:Bank")
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("change-password").performClick()
         waitFor("current-password")
 
@@ -244,7 +251,7 @@ class AppTest {
         compose.onNodeWithTag("current-password").performTextClearance()
         compose.onNodeWithTag("current-password").performTextInput(password)
         compose.onNodeWithTag("save-password").performClick()
-        waitFor("item:Bank")
+        waitFor("change-password")
 
         // From the next unlock on, only the new one opens the vault.
         compose.onNodeWithTag("lock").performClick()
@@ -391,6 +398,7 @@ class AppTest {
         compose.onNodeWithTag("password").performTextInput(password)
         compose.onNodeWithTag("unlock").performClick()
         waitFor("item:Bank")
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("background-sync").assertIsOn().performClick()
         compose.waitUntil(10_000) { !scheduled() }
         assertFalse(BackgroundSync.enabled(context))

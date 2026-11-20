@@ -11,6 +11,7 @@ import android.view.WindowManager
 import android.view.autofill.AutofillManager
 import android.view.autofill.AutofillValue
 import android.widget.Toast
+import org.opensecretmanager.app.OsmTheme
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -113,7 +114,7 @@ class FillActivity : FragmentActivity() {
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            OsmTheme {
                 FillScreen(
                     requester = requester,
                     asks = form.asks,

@@ -10,6 +10,7 @@ import android.text.format.DateUtils
 import android.view.WindowManager
 import android.view.autofill.AutofillManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
@@ -24,6 +25,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -35,6 +39,19 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.graphics.Color
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -48,11 +65,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Surface
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -65,9 +83,11 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -96,6 +116,8 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Status and navigation bars drawn to suit the theme, light or dark.
+        enableEdgeToEdge()
         // Nothing of the vault in screenshots, screen recordings, or the
         // preview of recent apps. Only a debug build made for reviewing the
         // screens leaves this out (see app/build.gradle.kts).
@@ -106,7 +128,7 @@ class MainActivity : FragmentActivity() {
         biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session)
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            OsmTheme {
                 VaultScreen(
                     session = session,
                     biometric = biometric,
@@ -141,42 +163,68 @@ fun VaultScreen(
     val fields = state.editor?.takeIf { state.screen == Screen.UNLOCKED }?.let { editor ->
         remember(editor) { EditorFields(editor.detail, editor.draft, editor.generated) }
     }
+    val atItems = fields == null && state.screen == Screen.UNLOCKED && state.detail == null && state.history == null &&
+        state.deleted == null && !state.passwordChange
+    val inSettings = atItems && place.settings
+    // An item shown on its own, as after restoring one, is closed to the list, not to the settings it came from.
+    LaunchedEffect(state.detail != null) { if (state.detail != null) place.settings = false }
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
                 title = {
-                    Text(
-                        when {
-                            fields == null && state.history != null -> "History"
-                            fields == null && state.deleted != null -> "Recently deleted"
-                            fields == null && state.passwordChange -> "Change password"
-                            fields == null -> "Open Secret Manager"
-                            state.editor?.detail == null -> "New item"
-                            else -> "Edit item"
-                        },
-                    )
+                    val heading = when {
+                        fields == null && state.history != null -> "History"
+                        fields == null && state.deleted != null -> "Recently deleted"
+                        fields == null && state.passwordChange -> "Change password"
+                        inSettings -> "Settings"
+                        fields == null -> null
+                        state.editor?.detail == null -> "New item"
+                        else -> "Edit item"
+                    }
+                    if (heading != null) {
+                        Text(heading, style = MaterialTheme.typography.titleLarge)
+                    } else if (state.screen == Screen.UNLOCKED) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            BrandMark(26.dp)
+                            Text("Open Secret Manager", style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
                 },
                 actions = {
                     if (fields != null) {
                         // Up here, where no notice covers them.
                         TextButton(onClick = session::closeEditor, modifier = Modifier.testTag("cancel-edit")) { Text("Cancel") }
-                        TextButton(
+                        Button(
                             onClick = { session.save(fields.draft()) },
                             enabled = fields.title.isNotBlank() && state.busy == null,
                             modifier = Modifier.testTag("save"),
                         ) { Text("Save") }
+                        Spacer(Modifier.width(8.dp))
                     } else if (state.screen == Screen.UNLOCKED) {
-                        if (state.detail == null && state.history == null && state.deleted == null && !state.passwordChange) {
-                            TextButton(onClick = session::startNew, modifier = Modifier.testTag("new-item")) { Text("New") }
+                        if (atItems && !inSettings) {
+                            TextButton(onClick = { place.settings = true }, modifier = Modifier.testTag("settings")) { Text("Settings") }
                         }
                         TextButton(onClick = session::lock, modifier = Modifier.testTag("lock")) { Text("Lock") }
                     }
                 },
             )
         },
+        floatingActionButton = {
+            if (atItems && !inSettings && state.busy == null) {
+                ExtendedFloatingActionButton(
+                    onClick = session::startNew,
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    modifier = Modifier.testTag("new-item"),
+                ) { Text("+  New item", fontWeight = FontWeight.Bold) }
+            }
+        },
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
-        Column(Modifier.padding(padding).fillMaxSize()) {
+        // The keyboard's own room: edge to edge, the window no longer shrinks for it.
+        Column(Modifier.padding(padding).consumeWindowInsets(padding).imePadding().fillMaxSize()) {
             if (fields == null && (state.screen == Screen.LOCKED || state.screen == Screen.UNLOCKED)) WaitingSave()
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when (state.screen) {
@@ -189,7 +237,7 @@ fun VaultScreen(
                         ?: state.deleted?.let { DeletedList(it, session) }
                         ?: state.passwordChange.takeIf { it }?.let { PasswordChange(state, session) }
                         ?: state.detail?.let { Detail(it, session) }
-                        ?: Items(state, session, place)
+                        ?: if (place.settings) SettingsScreen(state, session, place) else Items(state, session, place)
                     Screen.REMOVED -> Message(
                         "This phone was removed from the vault",
                         "Your other devices moved to a new key that this phone never received. What it already held stays readable here.",
@@ -245,11 +293,13 @@ private fun WaitingSave() {
 
 @Composable
 internal fun Message(title: String, detail: String? = null) {
-    Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
+    Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        BrandMark(56.dp)
+        Spacer(Modifier.height(16.dp))
         Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.testTag("message"))
         detail?.let {
             Spacer(Modifier.height(8.dp))
-            Text(it, style = MaterialTheme.typography.bodyMedium)
+            Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -291,8 +341,12 @@ private fun JoinStart(state: UiState, session: VaultSession) {
         )
         return
     }
-    Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Join your vault", style = MaterialTheme.typography.titleLarge)
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        BrandMark(44.dp)
+        Text("Join your vault", style = MaterialTheme.typography.headlineMedium)
         Text(
             if (hasCamera) {
                 "On your computer, open Devices, choose Invite a device, and pick a phone. Scan the QR code it shows, or paste the invitation here."
@@ -300,6 +354,7 @@ private fun JoinStart(state: UiState, session: VaultSession) {
                 "On your computer, open Devices, choose Invite a device, and pick a phone. Paste the invitation here."
             },
             style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         if (hasCamera) {
             Button(
@@ -308,7 +363,7 @@ private fun JoinStart(state: UiState, session: VaultSession) {
                     if (allowed) scanning = true else askCamera.launch(Manifest.permission.CAMERA)
                 },
                 enabled = state.busy == null,
-                modifier = Modifier.testTag("join-scan"),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("join-scan"),
             ) { Text("Scan the QR code") }
         }
         OutlinedTextField(
@@ -317,11 +372,13 @@ private fun JoinStart(state: UiState, session: VaultSession) {
             label = { Text("Invitation") },
             modifier = Modifier.fillMaxWidth().testTag("invitation"),
             minLines = 3,
+            shape = MaterialTheme.shapes.medium,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = MaterialTheme.osm.mono),
         )
         Button(
             onClick = { session.joinStart(invitation) },
             enabled = invitation.isNotBlank() && state.busy == null,
-            modifier = Modifier.testTag("join-continue"),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("join-continue"),
         ) { Text("Continue") }
     }
 }
@@ -330,26 +387,44 @@ private fun JoinStart(state: UiState, session: VaultSession) {
 private fun JoinConfirm(state: UiState, session: VaultSession) {
     var password by remember { mutableStateOf("") }
     var again by remember { mutableStateOf("") }
-    Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Compare the codes", style = MaterialTheme.typography.titleLarge)
-        Text("Your computer shows a code too. Continue only if they are identical.", style = MaterialTheme.typography.bodyMedium)
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Text("Compare the codes", style = MaterialTheme.typography.headlineMedium)
         Text(
-            state.joinCode ?: "",
-            fontFamily = FontFamily.Monospace,
-            fontSize = 34.sp,
-            modifier = Modifier.testTag("join-code"),
+            "Your computer shows a code too. Continue only if they are identical.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Text("This phone's password: at least 12 characters. Your other devices keep their own.", style = MaterialTheme.typography.bodyMedium)
+        Card {
+            Text(
+                state.joinCode ?: "",
+                fontFamily = MaterialTheme.osm.mono,
+                fontWeight = FontWeight.Bold,
+                fontSize = 34.sp,
+                color = MaterialTheme.colorScheme.primary,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp).testTag("join-code"),
+            )
+        }
+        Text(
+            "This phone's password: at least 12 characters. Your other devices keep their own.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         SecretField(password, { password = it }, "New password for this phone", "new-password")
         SecretField(again, { again = it }, "The same again", "new-password-again")
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = session::cancelJoin, enabled = state.busy == null) { Text("They differ") }
-            Button(
-                onClick = { session.joinFinish(password) },
-                enabled = password.length >= 12 && password == again && state.busy == null,
-                modifier = Modifier.testTag("join-finish"),
-            ) { Text("Codes match · join") }
-        }
+        Button(
+            onClick = { session.joinFinish(password) },
+            enabled = password.length >= 12 && password == again && state.busy == null,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("join-finish"),
+        ) { Text("Codes match · join") }
+        OutlinedButton(
+            onClick = session::cancelJoin,
+            enabled = state.busy == null,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+        ) { Text("They differ") }
     }
 }
 
@@ -360,6 +435,7 @@ private fun SecretField(value: String, onChange: (String) -> Unit, label: String
         onValueChange = onChange,
         label = { Text(label) },
         singleLine = true,
+        shape = MaterialTheme.shapes.medium,
         visualTransformation = PasswordVisualTransformation(),
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
         modifier = Modifier.fillMaxWidth().testTag(tag),
@@ -376,8 +452,8 @@ private fun PasswordChange(state: UiState, session: VaultSession) {
     // In characters, as the shared code counts them.
     val long = new.codePointCount(0, new.length) >= 12
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         SecretField(current, { current = it }, "Current password", "current-password")
         SecretField(new, { new = it }, "New password, at least 12 characters", "new-password")
@@ -393,15 +469,17 @@ private fun PasswordChange(state: UiState, session: VaultSession) {
             "Only this phone's password changes: your other devices keep their own, and the recovery key opens the vault as before. " +
                 "Unlocking with a fingerprint is turned off, to be turned on again at the next unlock.",
             style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = session::closePasswordChange, modifier = Modifier.testTag("cancel-password")) { Text("Cancel") }
-            Button(
-                onClick = { session.changePassword(current, new) },
-                enabled = current.isNotEmpty() && long && again == new && state.busy == null,
-                modifier = Modifier.testTag("save-password"),
-            ) { Text("Change password") }
-        }
+        Button(
+            onClick = { session.changePassword(current, new) },
+            enabled = current.isNotEmpty() && long && again == new && state.busy == null,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("save-password"),
+        ) { Text("Change password") }
+        OutlinedButton(
+            onClick = session::closePasswordChange,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("cancel-password"),
+        ) { Text("Cancel") }
     }
 }
 
@@ -422,11 +500,21 @@ internal fun Unlock(
         if (session.takeAskAtOnce() && biometric.available && biometric.enabled) onUnlockWithBiometric()
         onPauseOrDispose { }
     }
-    Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Vault locked", style = MaterialTheme.typography.titleLarge, modifier = Modifier.testTag("locked"))
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        BrandMark(72.dp)
+        Text("Vault locked", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.testTag("locked"))
+        Text(
+            "Enter this phone's password to open your vault.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         SecretField(password, { password = it }, "This phone's password", "password")
         if (biometric.available && !biometric.enabled) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(
                     checked = keepForFingerprint,
                     onCheckedChange = { keepForFingerprint = it },
@@ -435,21 +523,20 @@ internal fun Unlock(
                 Text("Unlock with a fingerprint next time")
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(
-                onClick = {
-                    val typed = password
-                    password = ""
-                    session.unlock(typed, onUnlocked = if (keepForFingerprint) ({ onRememberWithBiometric(typed) }) else null)
-                },
-                enabled = password.isNotEmpty() && state.busy == null,
-                modifier = Modifier.testTag("unlock"),
-            ) { Text("Unlock") }
-            if (biometric.available && biometric.enabled) {
-                OutlinedButton(onClick = onUnlockWithBiometric, modifier = Modifier.testTag("unlock-biometric")) {
-                    Text("Use a fingerprint")
-                }
-            }
+        Button(
+            onClick = {
+                val typed = password
+                password = ""
+                session.unlock(typed, onUnlocked = if (keepForFingerprint) ({ onRememberWithBiometric(typed) }) else null)
+            },
+            enabled = password.isNotEmpty() && state.busy == null,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("unlock"),
+        ) { Text("Unlock", style = MaterialTheme.typography.labelLarge) }
+        if (biometric.available && biometric.enabled) {
+            OutlinedButton(
+                onClick = onUnlockWithBiometric,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("unlock-biometric"),
+            ) { Text("Use a fingerprint") }
         }
         SyncLine(state.sync, session)
     }
@@ -459,34 +546,113 @@ internal fun Unlock(
 private class ListPlace {
     var query by mutableStateOf("")
     val scroll = LazyListState()
+    var settings by mutableStateOf(false)
+    var filter by mutableStateOf(ItemFilter.ALL)
+}
+
+private enum class ItemFilter(val label: String, val tag: String) {
+    ALL("All", "filter-all"),
+    FAVORITES("Favorites", "filter-favorites"),
+    LOGINS("Logins", "filter-logins"),
+    CARDS("Cards", "filter-cards"),
+    NOTES("Notes", "filter-notes"),
 }
 
 @Composable
 private fun Items(state: UiState, session: VaultSession, place: ListPlace) {
     val query = place.query
+    val filter = place.filter
     val shown = state.items.filter {
-        query.isBlank() || it.title.contains(query, ignoreCase = true) || it.username.contains(query, ignoreCase = true) ||
-            it.url.contains(query, ignoreCase = true)
+        (query.isBlank() || it.title.contains(query, ignoreCase = true) || it.username.contains(query, ignoreCase = true) ||
+            it.url.contains(query, ignoreCase = true)) &&
+            when (filter) {
+                ItemFilter.ALL -> true
+                ItemFilter.FAVORITES -> it.favorite
+                ItemFilter.LOGINS -> it.kind == ItemKind.LOGIN
+                ItemFilter.CARDS -> it.kind == ItemKind.CARD
+                ItemFilter.NOTES -> it.kind == ItemKind.SECURE_NOTE
+            }
     }
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        if (state.rowsChanged) RowsChanged(session)
-        OutlinedTextField(
-            value = query,
-            onValueChange = { place.query = it },
-            label = { Text("Search") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth().testTag("search"),
-        )
-        LazyColumn(Modifier.weight(1f), state = place.scroll) {
-            items(shown, key = { it.id }) { item -> ItemRow(item) { session.open(item.id) } }
+    Column(Modifier.fillMaxSize()) {
+        Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (state.rowsChanged) RowsChanged(session)
+            OutlinedTextField(
+                value = query,
+                onValueChange = { place.query = it },
+                placeholder = { Text("Search ${state.items.size} items") },
+                singleLine = true,
+                shape = androidx.compose.foundation.shape.CircleShape,
+                colors = OutlinedTextFieldDefaults.colors(
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,
+                ),
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Search items" }.testTag("search"),
+            )
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ItemFilter.entries.forEach { choice ->
+                    FilterChip(
+                        selected = filter == choice,
+                        onClick = { place.filter = choice },
+                        label = { Text(choice.label) },
+                        shape = androidx.compose.foundation.shape.CircleShape,
+                        modifier = Modifier.testTag(choice.tag),
+                    )
+                }
+            }
         }
-        TextButton(onClick = session::openDeleted, modifier = Modifier.testTag("recently-deleted")) { Text("Recently deleted…") }
-        TextButton(onClick = session::openPasswordChange, modifier = Modifier.testTag("change-password")) { Text("Change this phone's password…") }
+        LazyColumn(
+            Modifier.weight(1f),
+            state = place.scroll,
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            items(shown, key = { it.id }) { item -> ItemRow(item) { session.open(item.id) } }
+            if (shown.isEmpty()) {
+                item {
+                    Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            if (state.items.isEmpty()) "Nothing here yet" else "No match",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            if (state.items.isEmpty()) "Add an item, or sync with your computer." else "Try another word or filter.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        // Clear of the floating button, which would otherwise cover "Sync now".
+        Box(Modifier.padding(start = 16.dp, end = 168.dp)) { SyncLine(state.sync, session) }
+    }
+}
+
+/** What the list's toolbar and the old bottom of the list held: the phone's own settings. */
+@Composable
+private fun SettingsScreen(state: UiState, session: VaultSession, place: ListPlace) {
+    BackHandler { place.settings = false }
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        TextButton(onClick = { place.settings = false }, modifier = Modifier.testTag("back")) { Text("‹ All items") }
+        SectionLabel("Vault")
+        CardRows(
+            listOf(
+                { SettingRow("Recently deleted", "Bring back what any device deleted", Modifier.clickable(onClick = session::openDeleted).testTag("recently-deleted")) { Chevron() } },
+                { SettingRow("Change this phone's password", null, Modifier.clickable(onClick = session::openPasswordChange).testTag("change-password")) { Chevron() } },
+                { Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) { SyncLine(state.sync, session) } },
+            ),
+        )
+        SectionLabel("Security")
+        CardRows(listOf({ StayUnlockedChoice() }))
+        SectionLabel("Filling and syncing")
+        CardRows(listOf({ BackgroundSyncSwitch() }))
         AutofillOffer()
         OtherFieldChoice()
-        BackgroundSyncSwitch()
-        StayUnlockedChoice()
-        SyncLine(state.sync, session)
+        Spacer(Modifier.height(24.dp))
     }
 }
 
@@ -507,8 +673,7 @@ private fun StayUnlockedChoice() {
         choice % 60 == 0 -> "After ${choice / 60} hours"
         else -> "After $choice minutes"
     }
-    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("Lock once the app is left or the screen is off", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+    SettingRow("Lock once the app is left or the screen is off") {
         Box {
             TextButton(onClick = { choosing = true }, modifier = Modifier.testTag("stay-unlocked")) { Text(describe(minutes)) }
             DropdownMenu(expanded = choosing, onDismissRequest = { choosing = false }) {
@@ -533,8 +698,7 @@ private fun StayUnlockedChoice() {
 private fun BackgroundSyncSwitch() {
     val context = LocalContext.current
     var on by remember { mutableStateOf(BackgroundSync.enabled(context)) }
-    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("Sync now and then while the app is closed", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+    SettingRow("Sync now and then while the app is closed") {
         Switch(
             checked = on,
             onCheckedChange = {
@@ -557,12 +721,17 @@ private fun AutofillOffer() {
         onPauseOrDispose { }
     }
     if (enabled || !manager.isAutofillSupported) return
-    TextButton(
-        onClick = {
-            context.startActivity(Intent(Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE, Uri.parse("package:${context.packageName}")))
-        },
-        modifier = Modifier.testTag("turn-on-autofill"),
-    ) { Text("Fill logins in other apps…") }
+    CardRows(
+        listOf({
+            SettingRow(
+                "Fill logins in other apps",
+                "Choose this app as Android's autofill service",
+                Modifier.clickable {
+                    context.startActivity(Intent(Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE, Uri.parse("package:${context.packageName}")))
+                }.testTag("turn-on-autofill"),
+            ) { Chevron() }
+        }),
+    )
 }
 
 /**
@@ -583,7 +752,7 @@ private fun OtherFieldChoice() {
         onPauseOrDispose { }
     }
     if (!filling) return
-    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+    Card { Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "Fill the ID and the password together, in apps that show them to autofill one at a time",
@@ -601,40 +770,63 @@ private fun OtherFieldChoice() {
                     "Android may first say the setting is restricted for an app installed from a file: " +
                     "allow it in this app's App info, in the ⋮ menu.",
                 style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-    }
+    } }
 }
 
 /** An unlock found records taken out of the vault's file or changed in it. */
 @Composable
 private fun RowsChanged(session: VaultSession) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("rows-changed")) {
-        Text(
-            "Something in this vault's file was taken out or changed",
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.error,
-        )
-        Text(
-            "Since this phone last wrote to it, something outside the app removed or changed records in the vault's file: " +
-                "an item, an edit, or a device's keys. Your other devices send back what they have at the next sync.",
-            style = MaterialTheme.typography.bodySmall,
-        )
-        TextButton(onClick = session::confirmRowsChanged, modifier = Modifier.testTag("rows-changed-ok")) { Text("I understand") }
-        HorizontalDivider()
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.errorContainer,
+        modifier = Modifier.fillMaxWidth().testTag("rows-changed"),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Something in this vault's file was taken out or changed",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Text(
+                "Since this phone last wrote to it, something outside the app removed or changed records in the vault's file: " +
+                    "an item, an edit, or a device's keys. Your other devices send back what they have at the next sync.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            TextButton(onClick = session::confirmRowsChanged, modifier = Modifier.testTag("rows-changed-ok")) { Text("I understand") }
+        }
     }
 }
 
 @Composable
 private fun ItemRow(item: ItemSummary, onClick: () -> Unit) {
-    Column(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp).testTag("item:${item.title}"),
+    Row(
+        Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 10.dp).testTag("item:${item.title}"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Text(item.title + if (item.conflict) " · needs a decision on your computer" else "", style = MaterialTheme.typography.titleMedium)
-        val below = if (item.kind == ItemKind.CARD) cardLine(item.brand, item.cardEnding) else loginLine(item.username, item.passkeys)
-        if (below.isNotEmpty()) Text(below, style = MaterialTheme.typography.bodySmall)
+        ItemAvatar(item.title, item.kind)
+        Column(Modifier.weight(1f)) {
+            Text(item.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val below = if (item.kind == ItemKind.CARD) cardLine(item.brand, item.cardEnding) else loginLine(item.username, item.passkeys)
+            if (item.conflict) {
+                Text("Needs a decision on your computer", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            } else if (below.isNotEmpty()) {
+                Text(
+                    below,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        if (item.favorite) Text("★", color = MaterialTheme.colorScheme.primary, modifier = Modifier.semantics { contentDescription = "Favorite" })
     }
-    HorizontalDivider()
 }
 
 /** Copies one of an item's other fields, which is not shown. */
@@ -665,22 +857,28 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
     val editable = detail.kind != ItemKind.IDENTITY && !detail.conflict
     BackHandler(onBack = session::close)
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         TextButton(onClick = session::close, modifier = Modifier.testTag("back")) { Text("‹ All items") }
-        Text(detail.title, style = MaterialTheme.typography.headlineSmall)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            ItemAvatar(detail.title, detail.kind, 56.dp)
+            Text(detail.title, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+        }
         if (detail.conflict) {
-            Text(
-                "Two devices changed this at once. Choose which version to keep on your computer.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.error,
-            )
+            Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.errorContainer) {
+                Text(
+                    "Two devices changed this at once. Choose which version to keep on your computer.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
         }
         if (editable) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClick = { session.startEdit(detail) }, modifier = Modifier.testTag("edit")) { Text("Edit") }
-                OutlinedButton(onClick = { confirmingDelete = true }, modifier = Modifier.testTag("delete")) { Text("Delete…") }
+                Button(onClick = { session.startEdit(detail) }, modifier = Modifier.weight(1f).height(48.dp).testTag("edit")) { Text("Edit") }
+                OutlinedButton(onClick = { confirmingDelete = true }, modifier = Modifier.weight(1f).height(48.dp).testTag("delete")) { Text("Delete…") }
             }
         } else if (!detail.conflict) {
             Text(
@@ -823,46 +1021,72 @@ private fun HistoryList(history: History, session: VaultSession) {
     var confirming by remember(history) { mutableStateOf<HistoryEntry?>(null) }
     val restorable = restoresHere(history.detail.kind) && history.versions.count { it.current } == 1
     BackHandler(onBack = session::closeHistory)
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = 24.dp),
+    ) {
         item {
             TextButton(onClick = session::closeHistory, modifier = Modifier.testTag("back")) { Text("‹ ${history.detail.title}") }
             Text(
                 "Newest first. Restoring a version makes it the newest; the others stay. Each time is by the clock of the device that saved the version; versions saved before times were kept have none.",
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp),
             )
             if (!restorable) {
                 Text(
                     "Identities, and items in conflict, are restored on your computer.",
                     style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(top = 8.dp).testTag("restore-elsewhere"),
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp).testTag("restore-elsewhere"),
                 )
             }
         }
         itemsIndexed(history.versions, key = { _, version -> version.revision }) { index, version ->
-            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("version-$index")) {
-                Text(
-                    (if (version.thisDevice) "This phone" else "Device ${version.device}") + if (version.current) " · current" else "",
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                Text(
-                    version.savedAt?.let(::savedTime) ?: "Time not recorded",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.testTag("time-$index"),
-                )
-                Text(said(version), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("said-$index"))
-                if (!version.deleted) {
+            Card(Modifier.testTag("version-$index")) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            if (version.thisDevice) "This phone" else "Device ${version.device}",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        if (version.current) {
+                            Text(
+                                "CURRENT",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier
+                                    .background(MaterialTheme.colorScheme.primaryContainer, CircleShape)
+                                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
                     Text(
-                        listOf(version.title, version.username, version.url).filter { it.isNotEmpty() }.joinToString(" · "),
+                        version.savedAt?.let(::savedTime) ?: "Time not recorded",
                         style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.testTag("time-$index"),
                     )
-                }
-                if (restorable && !version.current && !version.deleted) {
-                    TextButton(onClick = { confirming = version }, modifier = Modifier.testTag("restore-$index")) {
-                        Text("Restore this version…")
+                    Text(
+                        said(version),
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(top = 6.dp).testTag("said-$index"),
+                    )
+                    if (!version.deleted) {
+                        Text(
+                            listOf(version.title, version.username, version.url).filter { it.isNotEmpty() }.joinToString(" · "),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (restorable && !version.current && !version.deleted) {
+                        OutlinedButton(
+                            onClick = { confirming = version },
+                            modifier = Modifier.padding(top = 8.dp).testTag("restore-$index"),
+                        ) { Text("Restore this version…") }
                     }
                 }
             }
-            HorizontalDivider()
         }
     }
     confirming?.let { version ->
@@ -890,9 +1114,13 @@ private fun HistoryList(history: History, session: VaultSession) {
 @Composable
 private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
     BackHandler(onBack = session::closeDeleted)
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = 24.dp),
+    ) {
         item {
-            TextButton(onClick = session::closeDeleted, modifier = Modifier.testTag("back")) { Text("‹ All items") }
+            TextButton(onClick = session::closeDeleted, modifier = Modifier.testTag("back")) { Text("‹ Settings") }
             Text(
                 if (deleted.isEmpty()) {
                     "Nothing has been deleted."
@@ -900,29 +1128,36 @@ private fun DeletedList(deleted: List<DeletedEntry>, session: VaultSession) {
                     "Deleted on any of your devices, most recently first. Restoring one brings it back on all of them, as it was before it was deleted."
                 },
                 style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.testTag("deleted-hint"),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp).testTag("deleted-hint"),
             )
         }
         items(deleted, key = { it.id }) { entry ->
-            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("deleted:${entry.title}")) {
-                Text(entry.title, style = MaterialTheme.typography.titleMedium)
-                listOf(entry.username, entry.url).filter { it.isNotEmpty() }.takeIf { it.isNotEmpty() }?.let {
-                    Text(it.joinToString(" · "), style = MaterialTheme.typography.bodySmall)
-                }
-                Text(
-                    "Deleted on " + (if (entry.thisDevice) "this phone" else "device ${entry.device}") +
-                        (entry.deletedAt?.let { " · " + savedTime(it) } ?: ""),
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                if (restoresHere(entry.kind)) {
-                    TextButton(onClick = { session.restoreDeleted(entry) }, modifier = Modifier.testTag("restore:${entry.title}")) {
-                        Text("Restore")
+            Card(Modifier.testTag("deleted:${entry.title}")) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ItemAvatar(entry.title, entry.kind)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(entry.title, style = MaterialTheme.typography.titleMedium)
+                        listOf(entry.username, entry.url).filter { it.isNotEmpty() }.takeIf { it.isNotEmpty() }?.let {
+                            Text(it.joinToString(" · "), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Text(
+                            "Deleted on " + (if (entry.thisDevice) "this phone" else "device ${entry.device}") +
+                                (entry.deletedAt?.let { " · " + savedTime(it) } ?: ""),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (restoresHere(entry.kind)) {
+                            OutlinedButton(
+                                onClick = { session.restoreDeleted(entry) },
+                                modifier = Modifier.padding(top = 8.dp).testTag("restore:${entry.title}"),
+                            ) { Text("Restore") }
+                        } else {
+                            Text("Identities are restored on your computer.", style = MaterialTheme.typography.bodySmall)
+                        }
                     }
-                } else {
-                    Text("Identities are restored on your computer.", style = MaterialTheme.typography.bodySmall)
                 }
             }
-            HorizontalDivider()
         }
     }
 }
@@ -998,21 +1233,27 @@ class EditorFields(detail: ItemDetail?, draft: ItemDraft? = null, generated: Str
 private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, changedElsewhere: List<String>, session: VaultSession) {
     BackHandler(onBack = session::closeEditor)
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        if (detail != null) Text(detail.title, style = MaterialTheme.typography.titleLarge)
+        if (detail != null) Text(detail.title, style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(horizontal = 4.dp))
         if (changedElsewhere.isNotEmpty()) {
-            Column(Modifier.fillMaxWidth().testTag("changed-elsewhere")) {
+            Column(
+                Modifier.fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.errorContainer, MaterialTheme.shapes.medium)
+                    .padding(16.dp)
+                    .testTag("changed-elsewhere"),
+            ) {
                 Text(
                     "Another device changed this item while you edited it",
                     style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.error,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
                 )
                 Text(
                     "It changed its ${changedElsewhere.joinToString(", ")}. What you typed is kept, on top of the item as it is " +
                         "now; nothing is saved until you save.",
                     style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
                 )
             }
         }
@@ -1122,10 +1363,13 @@ private fun ItemEditor(fields: EditorFields, detail: ItemDetail?, changedElsewhe
             minLines = if (fields.kind == ItemKind.SECURE_NOTE) 6 else 3,
             modifier = Modifier.fillMaxWidth().testTag("edit-notes"),
         )
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(checked = fields.favorite, onCheckedChange = { fields.favorite = it }, modifier = Modifier.testTag("edit-favorite"))
-            Text("Favorite")
+        Card {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = fields.favorite, onCheckedChange = { fields.favorite = it }, modifier = Modifier.testTag("edit-favorite"))
+                Text("Favorite", style = MaterialTheme.typography.bodyLarge)
+            }
         }
+        Spacer(Modifier.height(16.dp))
     }
 }
 
@@ -1220,17 +1464,18 @@ private fun EditField(value: String, onChange: (String) -> Unit, label: String, 
     )
 }
 
-/** A labelled value, with an action beside it. */
+/** A labelled value, with an action beside it, in a card of its own. */
 @Composable
 private fun Field(label: String, value: String, tag: String? = null, action: @Composable () -> Unit = {}) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(value, style = MaterialTheme.typography.bodyLarge, modifier = tag?.let { Modifier.testTag(it) } ?: Modifier)
+    Card {
+        Row(Modifier.fillMaxWidth().padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(value, style = MaterialTheme.typography.bodyLarge, modifier = tag?.let { Modifier.testTag(it) } ?: Modifier)
+            }
+            action()
         }
-        action()
     }
-    HorizontalDivider()
 }
 
 @Composable

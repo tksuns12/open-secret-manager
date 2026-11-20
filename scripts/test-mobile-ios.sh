@@ -14,7 +14,8 @@
 # build's hooks for the tests. OSM_IOS_ROOT_CERT names a certificate
 # authority for the simulator to trust, and OSM_IOS_RUNTIME an iOS runtime
 # other than the newest; OSM_IOS_AUTOFILL_ON=1 turns AutoFill on before
-# the tests (see below). Needs Xcode, an iOS simulator runtime, and
+# the tests (see below). OSM_IOS_DARK=1 sets the simulator to the dark
+# appearance, to look at the screens (OSM_TEST_SCREENS). Needs Xcode, an iOS simulator runtime, and
 # `rustup target add aarch64-apple-ios-sim aarch64-apple-ios`.
 set -eu
 cd "$(dirname "$0")/.."
@@ -61,6 +62,10 @@ device=$(xcrun simctl --set "$set_dir" create "Open Secret Manager UI tests" \
     com.apple.CoreSimulator.SimDeviceType.iPhone-17 "$runtime")
 xcrun simctl --set "$set_dir" boot "$device"
 xcrun simctl --set "$set_dir" bootstatus "$device" -b >/dev/null
+# The screens in the dark appearance, for a person to look at.
+if [ "${OSM_IOS_DARK:-}" = 1 ]; then
+    xcrun simctl --set "$set_dir" ui "$device" appearance dark
+fi
 # The keyboard's tip about sliding to type, which iOS 27 shows once over
 # the keyboard and which takes the tap on its Passwords key, as seen.
 xcrun simctl --set "$set_dir" spawn "$device" defaults write com.apple.keyboard.preferences \

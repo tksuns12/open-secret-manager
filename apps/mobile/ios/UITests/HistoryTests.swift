@@ -69,13 +69,16 @@ final class HistoryTests: UITestCase {
 
     func testADeletedNoteComesBackAsItWas() {
         let app = unlocked()
+        app.buttons["settings"].waitAndTap()
         reveal(app.buttons["recently-deleted"], in: app)
         XCTAssert(app.staticTexts["deleted:A note that was deleted"].waitForExistence(timeout: 20))
         capture("history-3-deleted")
         app.buttons["restore:A note that was deleted"].waitAndTap()
         XCTAssert(app.staticTexts["detail-notes"].waitForLabel("gone", timeout: 20))
         app.buttons["back"].waitAndTap()
+        // The restored item was opened on its own: closing it is back at the list.
         XCTAssert(app.buttons["item:A note that was deleted"].waitForExistence(timeout: 20))
+        app.buttons["settings"].waitAndTap()
         reveal(app.buttons["recently-deleted"], in: app)
         XCTAssert(app.staticTexts["deleted-hint"].waitForLabel("Nothing has been deleted.", timeout: 20))
     }

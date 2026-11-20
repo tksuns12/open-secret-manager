@@ -87,12 +87,15 @@ class BiometricTest {
 
         // The password changed, the one kept for the fingerprint is gone,
         // and the next unlock offers to keep the new one.
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("change-password").performClick()
         waitFor("current-password")
         compose.onNodeWithTag("current-password").performTextInput("fixture password, not a secret")
         compose.onNodeWithTag("new-password").performTextInput("a new password for this phone")
         compose.onNodeWithTag("new-password-again").performTextInput("a new password for this phone")
         compose.onNodeWithTag("save-password").performClick()
+        waitFor("recently-deleted")
+        compose.onNodeWithTag("back").performClick()
         waitFor("item:Bank")
         compose.waitUntil(30_000) { !biometric.enabled }
         compose.onNodeWithTag("lock").performClick()

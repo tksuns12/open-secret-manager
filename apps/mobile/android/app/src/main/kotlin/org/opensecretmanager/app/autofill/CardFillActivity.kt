@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.service.autofill.Dataset
 import android.view.WindowManager
 import android.view.autofill.AutofillManager
+import org.opensecretmanager.app.OsmTheme
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -98,7 +99,7 @@ class CardFillActivity : FragmentActivity() {
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            OsmTheme {
                 CardFillScreen(form, requester, chosen, session, biometric, prompts, onFill = ::finishWith, onCancel = ::finish)
             }
         }

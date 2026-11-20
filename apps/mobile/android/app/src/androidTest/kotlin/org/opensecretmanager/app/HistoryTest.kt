@@ -96,13 +96,16 @@ class HistoryTest {
     @Test
     fun aDeletedNoteComesBackAsItWas() {
         unlocked()
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("recently-deleted").performClick()
         waitFor("deleted:A note that was deleted")
         compose.onNodeWithTag("restore:A note that was deleted").performClick()
         waitFor("detail-notes")
         assertEquals("gone", text("detail-notes"))
+        // The restored item is shown on its own: closing it lands at the list.
         compose.onNodeWithTag("back").performClick()
         waitFor("item:A note that was deleted")
+        compose.onNodeWithTag("settings").performClick()
         compose.onNodeWithTag("recently-deleted").performClick()
         waitFor("deleted-hint")
         assertEquals("Nothing has been deleted.", text("deleted-hint"))

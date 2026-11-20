@@ -47,6 +47,8 @@ final class VaultModel: ObservableObject {
     @Published private(set) var rowsChanged = false
     /// The screen that changes this phone's password is open.
     @Published private(set) var passwordChange = false
+    /// The settings list is open: what is not about one item.
+    @Published private(set) var settings = false
     let biometric = BiometricUnlock()
 
     private let queue = DispatchQueue(label: "org.opensecretmanager.device")
@@ -116,6 +118,7 @@ final class VaultModel: ObservableObject {
             history = nil
             deleted = nil
             passwordChange = false
+            settings = false
         }
     }
 
@@ -181,6 +184,7 @@ final class VaultModel: ObservableObject {
             history = nil
             deleted = nil
             passwordChange = false
+            settings = false
             await call { $0.lock() }
         }
     }
@@ -350,6 +354,14 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    func openSettings() {
+        settings = true
+    }
+
+    func closeSettings() {
+        settings = false
+    }
+
     func openDeleted() {
         Task {
             if let items = await call(nil, { try $0.deletedItems() }) { deleted = items }
@@ -408,6 +420,8 @@ final class VaultModel: ObservableObject {
                 return try device.item(id: entry.id)
             }) else { return }
             deleted = nil
+            // The restored item is shown on its own, and closing it returns to the list.
+            settings = false
             detail = now
             notice = "\(entry.title) restored"
         }
@@ -483,6 +497,7 @@ final class VaultModel: ObservableObject {
         history = nil
         deleted = nil
         passwordChange = false
+        settings = false
         if joinCode != nil {
             joinCode = nil
             notice = "The join stopped when the app left the screen · start again from your computer"

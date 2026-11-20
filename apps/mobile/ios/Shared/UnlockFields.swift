@@ -11,26 +11,26 @@ struct UnlockFields: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Vault locked").font(.title2).accessibilityIdentifier("locked")
+            BrandMark(size: 44)
+            Text("Vault locked").font(.largeTitle.bold()).accessibilityIdentifier("locked")
             SecureField("This phone's password", text: $password)
-                .textFieldStyle(.roundedBorder)
+                .osmField()
                 .submitLabel(.go)
                 .onSubmit(unlock)
                 .accessibilityIdentifier("password")
             if biometric.available && !biometric.enabled {
                 Toggle("Unlock with \(biometric.name) next time", isOn: $keepForBiometrics)
+                    .tint(OSM.accent)
                     .accessibilityIdentifier("remember-biometric")
             }
-            HStack(spacing: 12) {
-                Button("Unlock", action: unlock)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(password.isEmpty || busy)
-                    .accessibilityIdentifier("unlock")
-                if biometric.available && biometric.enabled {
-                    Button("Use \(biometric.name)", action: onBiometrics)
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("unlock-biometric")
-                }
+            Button("Unlock", action: unlock)
+                .buttonStyle(.wide)
+                .disabled(password.isEmpty || busy)
+                .accessibilityIdentifier("unlock")
+            if biometric.available && biometric.enabled {
+                Button("Use \(biometric.name)", action: onBiometrics)
+                    .buttonStyle(.wideQuiet)
+                    .accessibilityIdentifier("unlock-biometric")
             }
         }
     }
@@ -53,7 +53,7 @@ struct BusyCover: View {
             Text(what).accessibilityIdentifier("busy")
         }
         .padding(24)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
@@ -66,7 +66,8 @@ struct NoticeBanner: View {
             Text(notice)
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(OSM.hairline, lineWidth: 1))
                 .padding()
                 .accessibilityIdentifier("notice")
                 .task(id: notice) {

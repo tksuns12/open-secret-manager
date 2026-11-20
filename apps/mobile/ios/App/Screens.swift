@@ -3,25 +3,89 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var model: VaultModel
+    /// Kept here, not in the list, so that it outlasts an item or the settings being open; let go of at a lock.
+    @State private var filter = ItemFilter.all
+
+    /// Where in the unlocked app the owner is. Each is a state of the model,
+    /// not a pushed screen, so that locking drops them all at once.
+    private enum Route { case items, settings, detail, history, deleted, password, editor }
+
+    private var route: Route {
+        if model.editor != nil { return .editor }
+        if model.history != nil { return .history }
+        if model.deleted != nil { return .deleted }
+        if model.passwordChange { return .password }
+        if model.detail != nil { return .detail }
+        if model.settings { return .settings }
+        return .items
+    }
+
+    private var title: String {
+        guard model.screen == .unlocked else { return "" }
+        switch route {
+        case .settings: return "Settings"
+        case .history: return "History"
+        case .deleted: return "Recently deleted"
+        case .password: return "Change password"
+        default: return ""
+        }
+    }
+
+    /// The way back from the open screen, and what it is called.
+    private var back: (name: String, action: () -> Void)? {
+        switch route {
+        case .detail: ("Items", model.close)
+        case .settings: ("Items", model.closeSettings)
+        case .history: (model.history?.detail.title ?? "Item", model.closeHistory)
+        case .deleted: ("Settings", model.closeDeleted)
+        case .password: ("Settings", model.closePasswordChange)
+        case .items, .editor: nil
+        }
+    }
 
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle("Open Secret Manager")
+                .navigationTitle(title)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    if model.screen == .unlocked && model.editor == nil {
-                        if model.detail == nil && model.history == nil && model.deleted == nil && !model.passwordChange {
-                            ToolbarItem(placement: .topBarLeading) {
-                                Button("New", action: model.startNew).accessibilityIdentifier("new-item")
+                    if model.screen == .unlocked && route == .items {
+                        ToolbarItem(placement: .principal) {
+                            HStack(spacing: 6) {
+                                BrandMark(size: 20)
+                                Text("Open Secret Manager").font(.headline)
                             }
+                            .accessibilityElement(children: .combine)
                         }
+                    }
+                    if model.screen == .unlocked, let back {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button(action: back.action) {
+                                Label(back.name, systemImage: "chevron.backward").labelStyle(.titleAndIcon)
+                            }
+                            .accessibilityIdentifier("back")
+                        }
+                    }
+                    if model.screen == .unlocked && route == .items {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button(action: model.startNew) { Label("New", systemImage: "plus") }
+                                .accessibilityIdentifier("new-item")
+                        }
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button(action: model.openSettings) { Label("Settings", systemImage: "gearshape") }
+                                .accessibilityIdentifier("settings")
+                        }
+                    }
+                    if model.screen == .unlocked && route != .editor {
                         ToolbarItem(placement: .primaryAction) {
-                            Button("Lock", action: model.lock).accessibilityIdentifier("lock")
+                            Button(action: model.lock) { Label("Lock", systemImage: "lock") }
+                                .accessibilityIdentifier("lock")
                         }
                     }
                 }
         }
+        .tint(OSM.accent)
+        .onChange(of: model.screen) { _, screen in if screen != .unlocked { filter = .all } }
         .overlay { if let busy = model.busy { BusyCover(what: busy) } }
         .overlay(alignment: .bottom) { NoticeBanner(notice: $model.notice) }
     }
@@ -47,21 +111,25 @@ struct RootView: View {
                 }
                 .padding(24)
             }
+            .osmScreen()
         case .unlocked:
-            if let editor = model.editor {
+            switch route {
+            case .editor:
                 // A new editor, as after a save that met a change made
                 // elsewhere, starts from what it holds.
-                ItemEditor(model: model, editor: editor).id(editor)
-            } else if let history = model.history {
-                HistoryList(model: model, history: history)
-            } else if let deleted = model.deleted {
-                DeletedList(model: model, deleted: deleted)
-            } else if model.passwordChange {
+                if let editor = model.editor { ItemEditor(model: model, editor: editor).id(editor) }
+            case .history:
+                if let history = model.history { HistoryList(model: model, history: history) }
+            case .deleted:
+                if let deleted = model.deleted { DeletedList(model: model, deleted: deleted) }
+            case .password:
                 PasswordChange(model: model)
-            } else if let detail = model.detail {
-                Detail(model: model, detail: detail)
-            } else {
-                Items(model: model)
+            case .detail:
+                if let detail = model.detail { Detail(model: model, detail: detail) }
+            case .settings:
+                SettingsList(model: model)
+            case .items:
+                Items(model: model, filter: $filter)
             }
         case .removed:
             Message(
@@ -79,12 +147,14 @@ private struct Message: View {
     var detail: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.title2).accessibilityIdentifier("message")
-            if let detail { Text(detail) }
+        VStack(spacing: 12) {
+            BrandMark(size: 56)
+            Text(title).font(.title2.bold()).multilineTextAlignment(.center).accessibilityIdentifier("message")
+            if let detail { Text(detail).foregroundStyle(.secondary).multilineTextAlignment(.center) }
         }
         .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .osmScreen()
     }
 }
 
@@ -106,10 +176,12 @@ private struct JoinStart: View {
 
     private var asked: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Join your vault").font(.title2)
+            VStack(alignment: .leading, spacing: 14) {
+                BrandMark(size: 44)
+                Text("Join your vault").font(.largeTitle.bold())
                 if InvitationScanner.available {
                     Text("On your computer, open Devices, choose Invite a device, and pick a phone. Scan the QR code it shows, or paste the invitation here.")
+                        .foregroundStyle(.secondary)
                     // The camera is asked for only when the owner chooses to scan.
                     Button("Scan the QR code") {
                         Task {
@@ -120,25 +192,28 @@ private struct JoinStart: View {
                             }
                         }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.wide)
                     .disabled(model.busy != nil)
                     .accessibilityIdentifier("join-scan")
                 } else {
                     Text("On your computer, open Devices, choose Invite a device, and pick a phone. Paste the invitation here.")
+                        .foregroundStyle(.secondary)
                 }
                 TextField("Invitation", text: $invitation, axis: .vertical)
                     .lineLimit(3...6)
-                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .osmField()
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                     .accessibilityIdentifier("invitation")
                 Button("Continue") { model.joinStart(invitation) }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.wide)
                     .disabled(invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy != nil)
                     .accessibilityIdentifier("join-continue")
             }
             .padding(24)
         }
+        .osmScreen()
     }
 }
 
@@ -149,30 +224,71 @@ private struct JoinConfirm: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Compare the codes").font(.title2)
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Compare the codes").font(.largeTitle.bold())
                 Text("Your computer shows a code too. Continue only if they are identical.")
+                    .foregroundStyle(.secondary)
                 Text(model.joinCode ?? "")
-                    .font(.system(size: 34, design: .monospaced))
+                    .font(.system(size: 34, weight: .bold, design: .monospaced))
+                    .foregroundStyle(OSM.accent)
+                    .minimumScaleFactor(0.6)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 22)
+                    .background(OSM.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .accessibilityIdentifier("join-code")
                 Text("This phone's password: at least 12 characters. Your other devices keep their own.")
+                    .foregroundStyle(.secondary)
                 SecureField("New password for this phone", text: $password)
-                    .textFieldStyle(.roundedBorder)
+                    .osmField()
                     .accessibilityIdentifier("new-password")
                 SecureField("The same again", text: $again)
-                    .textFieldStyle(.roundedBorder)
+                    .osmField()
                     .accessibilityIdentifier("new-password-again")
-                HStack(spacing: 12) {
-                    Button("They differ", action: model.cancelJoin)
-                        .buttonStyle(.bordered)
-                        .disabled(model.busy != nil)
-                    Button("Codes match · join") { model.joinFinish(password) }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(password.count < 12 || password != again || model.busy != nil)
-                        .accessibilityIdentifier("join-finish")
-                }
+                Button("Codes match · join") { model.joinFinish(password) }
+                    .buttonStyle(.wide)
+                    .disabled(password.count < 12 || password != again || model.busy != nil)
+                    .accessibilityIdentifier("join-finish")
+                Button("They differ", action: model.cancelJoin)
+                    .buttonStyle(.wideQuiet)
+                    .disabled(model.busy != nil)
             }
             .padding(24)
+        }
+        .osmScreen()
+    }
+}
+
+/// Which items the list shows.
+private enum ItemFilter: CaseIterable {
+    case all, favorites, logins, cards, notes
+
+    var label: String {
+        switch self {
+        case .all: "All"
+        case .favorites: "Favorites"
+        case .logins: "Logins"
+        case .cards: "Cards"
+        case .notes: "Notes"
+        }
+    }
+
+    var identifier: String {
+        switch self {
+        case .all: "filter-all"
+        case .favorites: "filter-favorites"
+        case .logins: "filter-logins"
+        case .cards: "filter-cards"
+        case .notes: "filter-notes"
+        }
+    }
+
+    func admits(_ item: ItemSummary) -> Bool {
+        switch self {
+        case .all: true
+        case .favorites: item.favorite
+        case .logins: item.kind == .login
+        case .cards: item.kind == .card
+        case .notes: item.kind == .secureNote
         }
     }
 }
@@ -180,15 +296,13 @@ private struct JoinConfirm: View {
 private struct Items: View {
     @ObservedObject var model: VaultModel
     @State private var query = ""
-    /// Whether this app fills logins in other apps: unknown until the system says.
-    @State private var autofill: Bool?
-    @Environment(\.scenePhase) private var scenePhase
+    @Binding var filter: ItemFilter
 
     private var shown: [ItemSummary] {
-        guard !query.isEmpty else { return model.items }
-        return model.items.filter {
-            $0.title.localizedCaseInsensitiveContains(query) || $0.username.localizedCaseInsensitiveContains(query)
-                || $0.url.localizedCaseInsensitiveContains(query)
+        model.items.filter { item in
+            filter.admits(item) && (query.isEmpty
+                || item.title.localizedCaseInsensitiveContains(query) || item.username.localizedCaseInsensitiveContains(query)
+                || item.url.localizedCaseInsensitiveContains(query))
         }
     }
 
@@ -205,14 +319,38 @@ private struct Items: View {
                     .accessibilityIdentifier("rows-changed")
                     Button("I understand", action: model.confirmRowsChanged).accessibilityIdentifier("rows-changed-ok")
                 }
+                .listRowBackground(OSM.card)
             }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(ItemFilter.allCases, id: \.self) { option in
+                        Button(option.label) { filter = option }
+                            .buttonStyle(ChipStyle(selected: filter == option))
+                            .accessibilityIdentifier(option.identifier)
+                            .accessibilityAddTraits(filter == option ? .isSelected : [])
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
             ForEach(shown, id: \.id) { item in
                 Button { model.open(item.id) } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title + (item.conflict ? " · needs a decision on your computer" : ""))
-                        let below = item.kind == .card ? cardLine(brand: item.brand, ending: item.cardEnding) : loginLine(username: item.username, passkeys: item.passkeys)
-                        if !below.isEmpty {
-                            Text(below).font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        ItemAvatar(title: item.title, kind: item.kind)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.title).font(.body.weight(.semibold))
+                            let below = item.conflict ? "Needs a decision on your computer"
+                                : item.kind == .card ? cardLine(brand: item.brand, ending: item.cardEnding)
+                                : loginLine(username: item.username, passkeys: item.passkeys)
+                            if !below.isEmpty {
+                                Text(below).font(.subheadline).foregroundStyle(item.conflict ? Color.red : Color.secondary)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        if item.favorite {
+                            Image(systemName: "star.fill").foregroundStyle(OSM.accent).accessibilityLabel("Favorite")
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -220,17 +358,90 @@ private struct Items: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("item:\(item.title)")
+                .listRowBackground(Color.clear)
+                .listRowSeparatorTint(OSM.hairline)
             }
-            Section {
-                Button("Recently deleted…", action: model.openDeleted).accessibilityIdentifier("recently-deleted")
-                Button("Change this phone's password…", action: model.openPasswordChange).accessibilityIdentifier("change-password")
-                if autofill == false { AutofillOffer(enabled: $autofill) }
+            if shown.isEmpty {
+                Text(model.items.isEmpty ? "No items yet" : "Nothing matches")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 32)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+            SyncLine(model: model)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(OSM.background)
+        .searchable(text: $query)
+    }
+}
+
+/// A filter's pill.
+private struct ChipStyle: ButtonStyle {
+    let selected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .foregroundStyle(selected ? Color(light: 0xFFFBF5, dark: 0x1D160E) : Color.primary)
+            .background(selected ? OSM.accent : OSM.card, in: Capsule())
+            .overlay(Capsule().stroke(selected ? Color.clear : OSM.hairline, lineWidth: 1))
+            .opacity(configuration.isPressed ? 0.8 : 1)
+    }
+}
+
+/// What is not about one item: the lists that bring things back, this phone's
+/// password, filling in other apps.
+private struct SettingsList: View {
+    @ObservedObject var model: VaultModel
+    /// Whether this app fills logins in other apps: unknown until the system says.
+    @State private var autofill: Bool?
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        List {
+            Section("Vault") {
+                row("Recently deleted", "Bring back what any device deleted", model.openDeleted)
+                    .accessibilityIdentifier("recently-deleted")
+                row("Change this phone's password", "Only this phone's: other devices keep their own", model.openPasswordChange)
+                    .accessibilityIdentifier("change-password")
+            }
+            .listRowBackground(OSM.card)
+            Section("Filling and syncing") {
+                if autofill == false {
+                    AutofillOffer(enabled: $autofill)
+                } else if autofill == true {
+                    Label("Filling logins in other apps is on", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(OSM.good)
+                }
                 SyncLine(model: model)
             }
+            .listRowBackground(OSM.card)
         }
-        .searchable(text: $query)
+        .scrollContentBackground(.hidden)
+        .background(OSM.background)
         .task(id: scenePhase) {
             if scenePhase == .active { autofill = await ASCredentialIdentityStore.shared.state().isEnabled }
+        }
+    }
+
+    private func row(_ title: String, _ help: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).foregroundStyle(.primary)
+                    Text(help).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
         }
     }
 }
@@ -267,10 +478,14 @@ private struct Detail: View {
     var body: some View {
         List {
             Section {
-                Button("‹ All items", action: model.close).accessibilityIdentifier("back")
+                HStack(spacing: 14) {
+                    ItemAvatar(title: detail.title, kind: detail.kind, size: 52)
+                    Text(detail.title).font(.title2.bold())
+                }
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 8, leading: 4, bottom: 8, trailing: 4))
             }
             Section {
-                Text(detail.title).font(.title2)
                 if detail.conflict {
                     Text("Two devices changed this at once. Choose which version to keep on your computer.")
                         .foregroundStyle(.red)
@@ -281,6 +496,8 @@ private struct Detail: View {
                         Button("Delete…") { confirmingDelete = true }.accessibilityIdentifier("delete")
                     }
                     .buttonStyle(.bordered)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 8, trailing: 4))
                 } else if !detail.conflict {
                     Text("Identities are edited on your computer.").accessibilityIdentifier("edit-elsewhere")
                 }
@@ -341,11 +558,15 @@ private struct Detail: View {
                 }
                 if !detail.notes.isEmpty { Field(label: "Notes", value: detail.notes, identifier: "detail-notes") {} }
             }
+            .listRowBackground(OSM.card)
             Section {
                 Button("History: every version, and which device made it") { model.openHistory(detail) }
                     .accessibilityIdentifier("history")
             }
+            .listRowBackground(OSM.card)
         }
+        .scrollContentBackground(.hidden)
+        .background(OSM.background)
         .alert("Delete \(detail.title)?", isPresented: $confirmingDelete) {
             Button("Delete", role: .destructive) { model.delete(detail) }.accessibilityIdentifier("confirm-delete")
             Button("Keep", role: .cancel) {}.accessibilityIdentifier("keep")
@@ -401,9 +622,7 @@ private struct HistoryList: View {
 
     var body: some View {
         List {
-            Section {
-                Button("‹ \(history.detail.title)", action: model.closeHistory).accessibilityIdentifier("back")
-            }
+          Group {
             Section {
                 Text("Newest first. Restoring a version makes it the newest; the others stay. Each time is by the clock of the device that saved the version; versions saved before times were kept have none.")
                 if !restorable {
@@ -413,8 +632,18 @@ private struct HistoryList: View {
             }
             ForEach(Array(history.versions.enumerated()), id: \.element.revision) { index, version in
                 Section {
-                    Text((version.thisDevice ? "This phone" : "Device \(version.device)") + (version.current ? " · current" : ""))
-                        .font(.headline)
+                  VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(version.thisDevice ? "This phone" : "Device \(version.device)").font(.headline)
+                        if version.current {
+                            Text("CURRENT")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 2)
+                                .foregroundStyle(OSM.accent)
+                                .background(OSM.accent.opacity(0.16), in: Capsule())
+                        }
+                    }
                     Text(version.savedAt.map(savedTime) ?? "Time not recorded")
                         .font(.caption)
                         .accessibilityIdentifier("time-\(index)")
@@ -425,11 +654,18 @@ private struct HistoryList: View {
                             .foregroundStyle(.secondary)
                     }
                     if restorable && !version.current && !version.deleted {
-                        Button("Restore this version…") { confirming = version }.accessibilityIdentifier("restore-\(index)")
+                        Button("Restore this version…") { confirming = version }
+                            .buttonStyle(.borderless)
+                            .padding(.top, 4)
+                            .accessibilityIdentifier("restore-\(index)")
                     }
+                  }
                 }
             }
+          }
+          .listRowBackground(OSM.card)
         }
+        .osmList()
         .alert("Restore this version?", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
             Button("Restore") { if let version = confirming { model.restore(version) } }.accessibilityIdentifier("confirm-restore")
             Button("Keep the current", role: .cancel) {}.accessibilityIdentifier("keep")
@@ -458,30 +694,30 @@ private struct PasswordChange: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Button("‹ All items", action: model.closePasswordChange).accessibilityIdentifier("back")
-                Text("Change this phone's password").font(.title2)
+            VStack(alignment: .leading, spacing: 14) {
                 SecureField("Current password", text: $current)
-                    .textFieldStyle(.roundedBorder)
+                    .osmField()
                     .accessibilityIdentifier("current-password")
                 SecureField("New password, at least 12 characters", text: $newPassword)
-                    .textFieldStyle(.roundedBorder)
+                    .osmField()
                     .accessibilityIdentifier("new-password")
                 SecureField("New password again", text: $again)
-                    .textFieldStyle(.roundedBorder)
+                    .osmField()
                     .accessibilityIdentifier("new-password-again")
                 if let problem {
                     Text(problem).font(.caption).foregroundStyle(.red).accessibilityIdentifier("password-problem")
                 }
                 Text("Only this phone's password changes: your other devices keep their own, and the recovery key opens the vault as before. Unlocking with \(model.biometric.name) is turned off, to be turned on again at the next unlock.")
                     .font(.caption)
+                    .foregroundStyle(.secondary)
                 Button("Change password") { model.changePassword(current: current, newPassword: newPassword) }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.wide)
                     .disabled(current.isEmpty || !long || again != newPassword || model.busy != nil)
                     .accessibilityIdentifier("save-password")
             }
             .padding(24)
         }
+        .osmScreen()
     }
 }
 
@@ -491,30 +727,41 @@ private struct DeletedList: View {
 
     var body: some View {
         List {
-            Section {
-                Button("‹ All items", action: model.closeDeleted).accessibilityIdentifier("back")
-            }
+          Group {
             Section {
                 Text(deleted.isEmpty
                     ? "Nothing has been deleted."
                     : "Deleted on any of your devices, most recently first. Restoring one brings it back on all of them, as it was before it was deleted.")
+                    .foregroundStyle(.secondary)
                     .accessibilityIdentifier("deleted-hint")
             }
+            .listRowBackground(Color.clear)
             ForEach(deleted, id: \.id) { entry in
                 Section {
-                    Text(entry.title).font(.headline).accessibilityIdentifier("deleted:\(entry.title)")
-                    let shown = [entry.username, entry.url].filter { !$0.isEmpty }
-                    if !shown.isEmpty { Text(shown.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary) }
-                    Text("Deleted on " + (entry.thisDevice ? "this phone" : "device \(entry.device)")
-                        + (entry.deletedAt.map { " · " + savedTime($0) } ?? "")).font(.caption)
-                    if restoresHere(entry.kind) {
-                        Button("Restore") { model.restoreDeleted(entry) }.accessibilityIdentifier("restore:\(entry.title)")
-                    } else {
-                        Text("Identities are restored on your computer.").font(.caption)
+                    HStack(alignment: .top, spacing: 12) {
+                        ItemAvatar(title: entry.title, kind: entry.kind)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(entry.title).font(.headline).accessibilityIdentifier("deleted:\(entry.title)")
+                            let shown = [entry.username, entry.url].filter { !$0.isEmpty }
+                            if !shown.isEmpty { Text(shown.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary) }
+                            Text("Deleted on " + (entry.thisDevice ? "this phone" : "device \(entry.device)")
+                                + (entry.deletedAt.map { " · " + savedTime($0) } ?? "")).font(.caption).foregroundStyle(.secondary)
+                            if restoresHere(entry.kind) {
+                                Button("Restore") { model.restoreDeleted(entry) }
+                                    .buttonStyle(.bordered)
+                                    .padding(.top, 4)
+                                    .accessibilityIdentifier("restore:\(entry.title)")
+                            } else {
+                                Text("Identities are restored on your computer.").font(.caption)
+                            }
+                        }
                     }
                 }
             }
+          }
+          .listRowBackground(OSM.card)
         }
+        .osmList()
     }
 }
 
@@ -609,6 +856,7 @@ private struct ItemEditor: View {
 
     var body: some View {
         Form {
+          Group {
             if !changedElsewhere.isEmpty {
                 Section {
                     VStack(alignment: .leading, spacing: 4) {
@@ -766,7 +1014,10 @@ private struct ItemEditor: View {
                     .accessibilityIdentifier("edit-notes")
                 Toggle("Favorite", isOn: $favorite).accessibilityIdentifier("edit-favorite")
             }
+          }
+          .listRowBackground(OSM.card)
         }
+        .osmList()
         .navigationTitle(detail == nil ? "New item" : "Edit item")
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {

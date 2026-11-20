@@ -6,6 +6,7 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -56,6 +57,11 @@ class ScreensForReview {
         compose.onNodeWithTag("unlock").performClick()
         waitFor("item:Bank")
         capture("3-items")
+        compose.onNodeWithTag("settings").performClick()
+        waitFor("recently-deleted")
+        capture("3b-settings")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Bank")
         compose.onNodeWithTag("item:Bank").performClick()
         waitFor("copy-password")
         capture("4-item")
@@ -77,5 +83,43 @@ class ScreensForReview {
         waitFor("kind-note")
         compose.onNodeWithTag("kind-note").performClick()
         capture("8-new-note")
+        compose.onNodeWithTag("kind-card").performClick()
+        capture("8b-new-card")
+        compose.onNodeWithTag("cancel-edit").performClick()
+        waitFor("item:Bank")
+        compose.onNodeWithTag("item:Mail").performClick()
+        waitFor("history")
+        compose.onNodeWithTag("history").performScrollTo().performClick()
+        waitFor("version-0")
+        capture("9-history")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("back")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("settings")
+        compose.onNodeWithTag("settings").performClick()
+        waitFor("recently-deleted")
+        compose.onNodeWithTag("recently-deleted").performClick()
+        waitFor("deleted-hint")
+        capture("10-deleted")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("change-password")
+        compose.onNodeWithTag("change-password").performClick()
+        waitFor("current-password")
+        capture("11-password")
+        // With the keyboard up on the lowest field: it must not cover it or the button.
+        compose.onNodeWithTag("new-password-again").performClick()
+        Thread.sleep(1500)
+        capture("12-password-keyboard")
+        compose.onNodeWithTag("cancel-password").performScrollTo().performClick()
+        waitFor("back")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Bank")
+        compose.onNodeWithTag("item:Bank").performClick()
+        waitFor("edit")
+        compose.onNodeWithTag("edit").performClick()
+        waitFor("edit-notes")
+        compose.onNodeWithTag("edit-notes").performScrollTo().performClick()
+        Thread.sleep(1500)
+        capture("13-notes-keyboard")
     }
 }

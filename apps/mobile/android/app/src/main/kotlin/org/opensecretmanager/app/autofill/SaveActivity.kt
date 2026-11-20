@@ -3,6 +3,7 @@ package org.opensecretmanager.app.autofill
 import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
+import org.opensecretmanager.app.OsmTheme
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -84,7 +85,7 @@ class SaveActivity : FragmentActivity() {
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            OsmTheme {
                 SaveScreen(
                     save = save,
                     requester = requester,

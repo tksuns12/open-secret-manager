@@ -8,6 +8,7 @@ import android.view.WindowManager
 import android.view.autofill.AutofillManager
 import android.view.autofill.AutofillValue
 import android.widget.Toast
+import org.opensecretmanager.app.OsmTheme
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -93,7 +94,7 @@ class GenerateActivity : FragmentActivity() {
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session, requester?.said)
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            OsmTheme {
                 GenerateScreen(
                     form = form,
                     requester = requester,

@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.view.WindowManager
+import org.opensecretmanager.app.OsmTheme
 import androidx.activity.compose.setContent
 import androidx.annotation.RequiresApi
 import androidx.biometric.BiometricManager
@@ -134,7 +135,7 @@ class PasskeyActivity : FragmentActivity() {
         val biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session, asked.asker?.requester?.said)
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            OsmTheme {
                 PasskeyScreen(asked, session, biometric, prompts, this)
             }
         }

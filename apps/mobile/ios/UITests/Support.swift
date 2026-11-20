@@ -44,8 +44,13 @@ func unlock(in app: XCUIApplication, password: String = fixturePassword, file: S
 let fixture = XCUIApplication(bundleIdentifier: "org.opensecretmanager.loginfixture")
 
 /// In the unlocked app's list: makes the app the AutoFill provider, if it
-/// is not yet, through the system's own prompt.
+/// is not yet, through the system's own prompt, which is offered in the
+/// settings. Leaves the app at its list again.
 func turnOnAutoFill(in app: XCUIApplication, file: StaticString = #filePath, line: UInt = #line) {
+    let settings = app.buttons["settings"]
+    guard settings.waitForExistence(timeout: 10) else { return }
+    settings.tap()
+    defer { app.buttons["back"].firstMatch.waitAndTap() }
     let turnOn = app.buttons["turn-on-autofill"]
     guard turnOn.waitForExistence(timeout: 10) else { return }
     turnOn.tap()
