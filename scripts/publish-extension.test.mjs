@@ -383,6 +383,129 @@ describe("secrets", () => {
   });
 });
 
+describe("login", () => {
+  let oauth;
+  let base;
+  let tokenRequests;
+  before(async () => {
+    oauth = stand((req) => {
+      if (req.method === "POST" && req.url === "/token") {
+        const form = new URLSearchParams(req.body.toString());
+        tokenRequests.push(form);
+        return { json: form.get("grant_type") === "authorization_code" ? { refresh_token: "new-refresh-token-1", access_token: "a" } : { access_token: "a" } };
+      }
+      if (req.url.endsWith(":fetchStatus")) return { json: { publishedItemRevisionStatus: { state: "PUBLISHED" } } };
+      return { status: 404 };
+    });
+    base = await listen(oauth.server);
+  });
+  after(() => oauth.server.close());
+  beforeEach(() => {
+    tokenRequests = [];
+    process.env.OSM_AUTH_URL = `${base}/auth`;
+    process.env.OSM_OAUTH_URL = `${base}/token`;
+    process.env.OSM_CWS_BASE = base;
+    process.env.OSM_NO_OPEN = "1";
+  });
+
+  /** Starts login and returns what the browser would be sent to, and where it comes back. */
+  async function begin(args) {
+    const done = main(args);
+    done.catch(() => {});
+    let line;
+    for (let i = 0; i < 400 && !line; i++) {
+      line = output.find((l) => l.includes("/auth?client_id="));
+      if (!line) await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(line, "login printed no address");
+    const asked = new URL(line.trim());
+    return { done, asked, params: asked.searchParams };
+  }
+  const comeBack = (params, extra) => {
+    const back = new URL(params.get("redirect_uri"));
+    back.searchParams.set("state", params.get("state"));
+    for (const [k, v] of Object.entries(extra)) back.searchParams.set(k, v);
+    return fetch(back);
+  };
+
+  test("asks Google with the client's ID, offline access and PKCE, and exchanges what comes back", async () => {
+    const { done, params } = await begin(["login", "--print"]);
+    assert.equal(params.get("client_id"), SECRETS.OSM_CWS_CLIENT_ID);
+    assert.equal(params.get("scope"), "https://www.googleapis.com/auth/chromewebstore");
+    assert.equal(params.get("access_type"), "offline");
+    assert.equal(params.get("prompt"), "consent");
+    assert.equal(params.get("code_challenge_method"), "S256");
+    assert.match(params.get("redirect_uri"), /^http:\/\/127\.0\.0\.1:\d+$/);
+
+    // An answer to some other request is not taken.
+    const wrong = new URL(params.get("redirect_uri"));
+    wrong.searchParams.set("code", "stolen");
+    wrong.searchParams.set("state", "not-ours");
+    assert.equal((await fetch(wrong)).status, 400);
+
+    assert.equal((await comeBack(params, { code: "code-1" })).status, 200);
+    await done;
+
+    const exchange = tokenRequests.find((f) => f.get("grant_type") === "authorization_code");
+    assert.equal(exchange.get("code"), "code-1");
+    assert.equal(exchange.get("client_id"), SECRETS.OSM_CWS_CLIENT_ID);
+    assert.equal(exchange.get("client_secret"), SECRETS.OSM_CWS_CLIENT_SECRET);
+    assert.equal(exchange.get("redirect_uri"), params.get("redirect_uri"));
+    assert.equal(createHash("sha256").update(exchange.get("code_verifier")).digest("base64url"), params.get("code_challenge"));
+    assert.ok(output.join("\n").includes("new-refresh-token-1"), "--print shows the token");
+    // It checked that the token works, with the publisher's ID.
+    assert.ok(oauth.seen.some((r) => r.url.endsWith(":fetchStatus")));
+    assert.match(output.join("\n"), /Chrome Web Store: it works/);
+  });
+
+  test("a refusal at Google says to look at the list of test users", async () => {
+    const { done, params } = await begin(["login", "--print"]);
+    await comeBack(params, { error: "access_denied" });
+    await assert.rejects(done, /access_denied[\s\S]*test users/);
+    assert.equal(tokenRequests.length, 0);
+  });
+
+  test("an answer without a refresh token is said", async () => {
+    const none = stand((req) => (req.url === "/token" ? { json: { access_token: "a" } } : { status: 404 }));
+    process.env.OSM_OAUTH_URL = `${await listen(none.server)}/token`;
+    try {
+      const { done, params } = await begin(["login", "--print"]);
+      await comeBack(params, { code: "c" });
+      await assert.rejects(done, /gave no refresh token/);
+    } finally {
+      none.server.close();
+    }
+  });
+
+  test("without --print and without a keychain, the token is not shown but the run says so", async () => {
+    const { done, params } = await begin(["login"]);
+    await comeBack(params, { code: "c" });
+    await assert.rejects(done, /no keychain here/);
+    assert.ok(!output.join("\n").includes("new-refresh-token-1"));
+  });
+
+  // Makes a keychain file of its own: run with OSM_TEST_KEYCHAIN=1.
+  test("the token goes into the keychain without being printed", { skip: process.platform !== "darwin" || process.env.OSM_TEST_KEYCHAIN !== "1" }, async () => {
+    const file = join(temp(), "publish-test.keychain-db");
+    execFileSync("security", ["create-keychain", "-p", "pw", file]);
+    execFileSync("security", ["unlock-keychain", "-p", "pw", file]);
+    try {
+      delete process.env.OSM_NO_KEYCHAIN;
+      process.env.OSM_KEYCHAIN = file;
+      const { done, params } = await begin(["login"]);
+      await comeBack(params, { code: "c" });
+      await done;
+      const stored = execFileSync("security", ["find-generic-password", "-s", "osm-extension-publish", "-a", "OSM_CWS_REFRESH_TOKEN", "-w", file], { encoding: "utf8" }).trim();
+      assert.equal(stored, "new-refresh-token-1");
+      assert.ok(!output.join("\n").includes("new-refresh-token-1"), "the token was printed");
+      assert.match(output.join("\n"), /in the keychain/);
+    } finally {
+      delete process.env.OSM_KEYCHAIN;
+      spawnSync("security", ["delete-keychain", file]);
+    }
+  });
+});
+
 describe("the command line", () => {
   const run = (args, { cwd = tmpdir(), script = SCRIPT } = {}) =>
     spawnSync(process.execPath, [script, ...args], {

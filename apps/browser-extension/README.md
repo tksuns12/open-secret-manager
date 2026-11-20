@@ -143,21 +143,30 @@ key that is there already).
 - **Firefox:** `OSM_AMO_JWT_ISSUER` and `OSM_AMO_JWT_SECRET`, from the
   add-on developer hub's "Manage API Keys" page on addons.mozilla.org.
 - **Chrome Web Store:** the API (version 2) needs a Google Cloud project
-  with the Chrome Web Store API turned on and an OAuth client of the type
-  "Desktop app" (`OSM_CWS_CLIENT_ID`, `OSM_CWS_CLIENT_SECRET`); a refresh
-  token for the scope `https://www.googleapis.com/auth/chromewebstore`, which
-  comes from signing in once as the account that owns the extension
-  (`OSM_CWS_REFRESH_TOKEN`; Google's OAuth 2.0 Playground, set to use your own
-  OAuth credentials, gives one); and the publisher ID shown on the developer
-  dashboard's account page (`OSM_CWS_PUBLISHER_ID`). While the OAuth consent
-  screen of the project is in "Testing", Google lets a refresh token expire
-  after seven days: publish the app (to "In production"; it stays private to
-  the owner's own account) or make the token again when `check` says
+  with the Chrome Web Store API turned on, an OAuth client of the type
+  "Desktop app" (`OSM_CWS_CLIENT_ID`, `OSM_CWS_CLIENT_SECRET`), and the
+  publisher ID shown on the developer dashboard's account page
+  (`OSM_CWS_PUBLISHER_ID`). The account that owns the extension has to be
+  among the test users of the project's OAuth consent screen (Audience).
+  The fourth, `OSM_CWS_REFRESH_TOKEN`, is made by the script, once, with the
+  client's ID and secret already in the keychain:
+
+  ```text
+  scripts/publish-extension.mjs login
+  ```
+
+  The browser opens; sign in as that account and allow it. The answer comes
+  back to a port on this machine, and the token goes into the keychain
+  without being printed (`--print` shows it instead, where there is no
+  keychain). While the consent screen is in "Testing", Google lets a refresh
+  token expire after seven days: publish the app (to "In production"; it
+  stays the owner's own) or run `login` again when `check` says
   `invalid_grant`.
 
 `scripts/publish-extension.mjs check` says whether they work. The script's
 own test, which runs it against stand-ins of the two stores, is
-`node --test scripts/publish-extension.test.mjs`.
+`node --test scripts/publish-extension.test.mjs`; with `OSM_TEST_KEYCHAIN=1`
+it also saves a token into a keychain file of its own (and deletes it).
 
 ## Checks
 
