@@ -2202,14 +2202,6 @@ async fn finish_join<R: Runtime>(
             });
         }
         control.endpoint.announce_all().await;
-        if (deadline - tokio::time::Instant::now()).as_millis() % 10_000 < 500 {
-            eprintln!(
-                "DEBUG enrolling: {}s left; own addresses {:?}; state {:?}",
-                (deadline - tokio::time::Instant::now()).as_secs(),
-                control.endpoint.own_addresses(),
-                control.node.state()
-            );
-        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let committed = control.node.state();

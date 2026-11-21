@@ -16,6 +16,8 @@ jobs:
           node-version: 22
       - run: npm ci && npm run build
         working-directory: apps/desktop
+      - name: The new port test
+        run: cargo test -p osm-vault-peer --locked --lib a_port_in_use
       - name: The test alone, twice
         shell: bash
         run: |
