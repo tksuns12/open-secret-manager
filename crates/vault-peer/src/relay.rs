@@ -313,7 +313,6 @@ async fn serve_device(
         let _ = stream.shutdown().await;
         return Err(Error::RelayRefused);
     }
-    eprintln!("TRACE relay server: registered {:02x?}", &pin[..3]);
     write_frame(&mut stream, &FromRelay::Registered).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let writing = tokio::spawn(async move {
@@ -360,10 +359,7 @@ async fn serve_device(
                                 ticket: mine,
                             }
                         }
-                        _ => {
-                            eprintln!("TRACE relay server: dial to {:02x?} absent; have {:02x?}", &to[..3], relayed.devices.keys().map(|k| [k[0], k[1], k[2]]).collect::<Vec<_>>());
-                            FromRelay::Absent { request }
-                        }
+                        _ => FromRelay::Absent { request },
                     }
                 }
             };
@@ -373,11 +369,6 @@ async fn serve_device(
         }
     }
     .await;
-    eprintln!(
-        "TRACE relay server: device {:02x?} connection ended: {:?}",
-        &pin[..3],
-        outcome.as_ref().err()
-    );
     {
         let mut relayed = state
             .lock()
@@ -529,12 +520,6 @@ async fn keep_connected(
 ) {
     loop {
         let outcome = registered(&code, &identity, &mut requests, &incoming, &connected).await;
-        eprintln!(
-            "TRACE client {} {:02x?} registered() ended: {:?}",
-            code.address,
-            &identity.pin()[..3],
-            outcome.as_ref().err()
-        );
         connected.store(false, Ordering::SeqCst);
         // Its device let go of it.
         if outcome.is_ok() {
@@ -585,7 +570,6 @@ async fn registered(
         FromRelay::Refused => return Err(Error::RelayRefused),
         _ => return Err(Error::ProtocolViolation),
     }
-    eprintln!("TRACE client {:02x?} registered with {}", &identity.pin()[..3], code.address);
     connected.store(true, Ordering::SeqCst);
     let (mut reader, mut writer) = tokio::io::split(stream);
     // Read in a task of its own: a frame half read is not lost when a
