@@ -21,3 +21,26 @@ jobs:
       - name: Desktop program builds
         if: always()
         run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+  relay-loop:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the join tests
+        run: cargo test -p osm-mobile --locked --test join --no-run
+      - name: The relay test alone, ten times
+        shell: bash
+        run: |
+          fails=0
+          for i in $(seq 1 10); do
+            cargo test -p osm-mobile --locked --test join a_phone_takes -- --nocapture > "alone-$i.log" 2>&1 || { fails=$((fails+1)); tail -5 "alone-$i.log"; }
+          done
+          echo "alone: $fails of 10 failed"
+      - name: All the join tests together, six times
+        shell: bash
+        run: |
+          fails=0
+          for i in $(seq 1 6); do
+            cargo test -p osm-mobile --locked --test join > "all-$i.log" 2>&1 || { fails=$((fails+1)); grep -E "FAILED|panicked|Network" "all-$i.log" | head -5; }
+          done
+          echo "together: $fails of 6 failed"
