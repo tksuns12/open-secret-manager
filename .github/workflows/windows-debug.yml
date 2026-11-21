@@ -16,23 +16,10 @@ jobs:
           node-version: 22
       - run: npm ci && npm run build
         working-directory: apps/desktop
-      - name: The test alone, three times
+      - name: The test alone, twice
         shell: bash
         run: |
-          for i in 1 2 3; do
-            cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked a_removed_devices_writes -- --nocapture 2>&1 | grep -E "DEBUG|panicked|test result|never saw|left:|right:|CommandError" | cut -c1-1500
+          for i in 1 2; do
+            cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked a_removed_devices_writes -- --nocapture 2>&1 | grep -E "DEBUG|panicked|test result|never saw|left:|right:|CommandError" | cut -c1-2500
             echo "=== round $i done"
           done
-  relay-loop:
-    runs-on: windows-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: All the join tests together, six times (with the test's own wait)
-        shell: bash
-        run: |
-          fails=0
-          for i in $(seq 1 6); do
-            cargo test -p osm-mobile --locked --test join > "all-$i.log" 2>&1 || { fails=$((fails+1)); grep -E "FAILED|panicked|never saw|Network" "all-$i.log" | head -5; }
-          done
-          echo "together: $fails of 6 failed"
