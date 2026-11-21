@@ -15,6 +15,9 @@ mod message;
 
 #[cfg(unix)]
 pub mod endpoint;
+#[cfg(windows)]
+#[path = "endpoint_windows.rs"]
+pub mod endpoint;
 
 pub use message::{
     Caller, Cancel, CardField, CardFrame, CardReply, CardRequest, CardValues, Ceremony, Failure,

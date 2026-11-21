@@ -25,7 +25,7 @@ jobs:
         working-directory: apps/desktop
       - run: rustc --version && cargo --version
       - name: Shared crates
-        run: cargo test --workspace --exclude osm-native-host --locked --no-fail-fast
+        run: cargo test --workspace --locked --no-fail-fast
       - name: Desktop app
         if: always()
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --workspace --locked --no-fail-fast

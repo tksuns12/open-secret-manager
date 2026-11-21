@@ -12,8 +12,6 @@
 //! in time, or if the connection that brought it closes, which is how the
 //! extension withdraws a request when its page goes away.
 
-#![cfg(unix)]
-
 mod broker;
 mod desk;
 mod listen;
