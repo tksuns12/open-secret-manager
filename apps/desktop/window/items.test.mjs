@@ -160,6 +160,24 @@ async function shownMatches(page, selector, pattern) {
   }, [selector, pattern.source]);
 }
 
+test("a kind unchecked while the length is still settling stays unchecked", async () => {
+  const { page, errors } = await window.open();
+  await page.getByRole("button", { name: /Generator/ }).click();
+  const generator = page.locator(".generator-modal .generator");
+  await generator.getByLabel("Length").focus();
+  await page.keyboard.press("End");
+  await generator.getByLabel("A–Z", { exact: true }).uncheck();
+  // Longer than the length's own delay before it is kept.
+  await page.waitForTimeout(800);
+  assert.equal(await generator.getByLabel("A–Z", { exact: true }).isChecked(), false);
+  await generator.locator(".range-label", { hasText: "64" }).waitFor();
+  await page.locator(".generator-modal").getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: /Generator/ }).click();
+  assert.equal(await generator.getByLabel("A–Z", { exact: true }).isChecked(), false);
+  await generator.locator(".range-label", { hasText: "64" }).waitFor();
+  assert.deepEqual(errors, []);
+});
+
 test("the generator makes a password of the length and kinds chosen, and keeps the choice", async () => {
   const { page, errors } = await window.open();
   await page.getByRole("button", { name: /Generator/ }).click();
@@ -176,8 +194,7 @@ test("the generator makes a password of the length and kinds chosen, and keeps t
 
   // Digits alone, the last kind not to be turned off.
   for (const kind of ["A–Z", "a–z", "!@#$"]) await generator.getByLabel(kind, { exact: true }).uncheck();
-  // The page catches up with the last box a moment after it is unchecked.
-  await generator.getByLabel("0–9").and(page.locator(":disabled")).waitFor();
+  assert.equal(await generator.getByLabel("0–9").isDisabled(), true);
   await shownMatches(page, shown, /^[0-9]{64}$/);
   await page.getByRole("button", { name: /Generate new password/ }).click();
   await shownMatches(page, shown, /^[0-9]{64}$/);

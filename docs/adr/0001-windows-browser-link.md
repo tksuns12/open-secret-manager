@@ -28,7 +28,7 @@ and the host that connects to it would be talking to that account.
   the host connects to that name. *This was the first decision, and review
   found it wrong:* pipe names are listed by `dir \\.\pipe\` for every
   account, so a name is not a secret. While the app runs, nobody can make
-  the pipe first; once it has quit (or been killed, which leaves the file
+  the pipe first; once it has quit (a quit leaves the file
   behind) the name is free, and an account that had read it from the list
   can make a pipe of that name that the host connects to and sends its
   requests to, and whose replies it believes.
@@ -53,11 +53,13 @@ The pipe is also made as its first instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`)
 and with remote clients rejected, the file is written, whole or not at all,
 only after the pipe exists, and the host connects to nothing that is not a
 name of exactly the app's form, with the connection's impersonation level
-left at its default of identification. The file is removed when the session
-stops listening; one left behind by a session that was killed names a pipe
-that cannot prove it is the app's, and is replaced at the next start (the
-start also does not mistake an impostor's pipe for a copy of the app that is
-already running).
+left at its default of identification. The session removes the file when
+it stops listening, but the desktop app ends its process without stopping
+the session, so the file is in practice left behind by every quit and every
+crash. It then names a pipe that nothing proves is the app's, and is replaced
+at the next start (the start does not mistake an impostor's pipe for a copy
+of the app that is already running). That is why the link rests on the
+secret and not on the file being gone.
 
 This is the same shape as the Unix design (a capability in a file in the
 owner's folder), with the secret taking the place of the socket's owner.
@@ -80,7 +82,8 @@ owner's folder), with the secret taking the place of the socket's owner.
   pipe to be gone and starts its own, which replaces the file; the first
   keeps running but can no longer be reached by the host until it restarts.
   Treating a busy pipe as a running copy instead would let any account stop
-  the app from starting, which is worse.
+  the browser link from starting (the app would say another copy is
+  listening), which is worse.
 - Any program running as the owner can read the file and use the pipe, as
   any program running as the owner can use the Unix socket. The owner still
   confirms every fill in the app.

@@ -352,16 +352,10 @@ function App() {
     }
   }
 
-  // Only the last choice's reply is shown: an earlier one that arrives
-  // after a later click would put the box back, and the next click would
-  // build on that.
-  const generatorCalls = useRef(0);
   async function changeGenerator(choice: GeneratorChoice) {
-    const call = ++generatorCalls.current;
     setGenerator(choice);
     try {
-      const saved = (await bridge.setGenerator(choice)).generator;
-      if (call === generatorCalls.current) setGenerator(saved);
+      setGenerator((await bridge.setGenerator(choice)).generator);
     } catch (error) {
       setNotice(commandMessage(error, "The generator's choice was not saved"));
     }
@@ -1884,7 +1878,12 @@ function Generator({ choice, onChoice, onCopy, onUse }: { choice: GeneratorChoic
   latest.current = { choice, length, onChoice };
   useEffect(() => {
     if (length === choice.length) return;
-    const timer = setTimeout(() => onChoice({ ...choice, length }), 300);
+    // The kinds as they are when it fires, not as they were when the slider
+    // moved: a box unchecked meanwhile would be put back.
+    const timer = setTimeout(() => {
+      const { choice, length, onChoice } = latest.current;
+      onChoice({ ...choice, length });
+    }, 300);
     return () => clearTimeout(timer);
   }, [length]);
   useEffect(() => () => {
