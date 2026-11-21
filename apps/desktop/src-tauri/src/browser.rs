@@ -34,7 +34,10 @@ use zeroize::Zeroizing;
 use crate::{AppState, CommandError};
 
 /// The host's file name, beside the app's own program.
+#[cfg(unix)]
 const HOST_PROGRAM: &str = "osm-native-host";
+#[cfg(windows)]
+const HOST_PROGRAM: &str = "osm-native-host.exe";
 
 /// A browser this app knows how to connect.
 struct Known {
@@ -45,7 +48,8 @@ struct Known {
     /// if it has been used on this account, and one of them is.
     profiles: &'static [&'static str],
     /// Where the browser looks for host manifests, relative to the home
-    /// folder.
+    /// folder. On Windows: the registry key, under the current user's, whose
+    /// value is the manifest's file.
     hosts: &'static str,
 }
 
@@ -130,6 +134,45 @@ const BROWSERS: [Known; 5] = [
     },
 ];
 
+#[cfg(windows)]
+const BROWSERS: [Known; 5] = [
+    Known {
+        id: "chrome",
+        name: "Google Chrome",
+        firefox: false,
+        profiles: &["AppData/Local/Google/Chrome/User Data"],
+        hosts: r"Software\Google\Chrome\NativeMessagingHosts",
+    },
+    Known {
+        id: "chromium",
+        name: "Chromium",
+        firefox: false,
+        profiles: &["AppData/Local/Chromium/User Data"],
+        hosts: r"Software\Chromium\NativeMessagingHosts",
+    },
+    Known {
+        id: "brave",
+        name: "Brave",
+        firefox: false,
+        profiles: &["AppData/Local/BraveSoftware/Brave-Browser/User Data"],
+        hosts: r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts",
+    },
+    Known {
+        id: "edge",
+        name: "Microsoft Edge",
+        firefox: false,
+        profiles: &["AppData/Local/Microsoft/Edge/User Data"],
+        hosts: r"Software\Microsoft\Edge\NativeMessagingHosts",
+    },
+    Known {
+        id: "firefox",
+        name: "Firefox",
+        firefox: true,
+        profiles: &["AppData/Roaming/Mozilla/Firefox"],
+        hosts: r"Software\Mozilla\NativeMessagingHosts",
+    },
+];
+
 impl Known {
     /// Whether the browser has been used on this account.
     fn used(&self, home: &Path) -> bool {
@@ -138,8 +181,83 @@ impl Known {
             .any(|profile| home.join(profile).is_dir())
     }
 
+    /// The manifest's file: in the folder the browser looks in, or on
+    /// Windows, where the registry is told to look, in the app's own folder.
+    #[cfg(unix)]
     fn manifest_path(&self, home: &Path) -> PathBuf {
         home.join(self.hosts).join(format!("{HOST_NAME}.json"))
+    }
+
+    #[cfg(windows)]
+    fn manifest_path(&self, _home: &Path) -> PathBuf {
+        self.manifest_folder()
+            .join(format!("{HOST_NAME}-{}.json", self.id))
+    }
+
+    /// Where this account's manifests for Windows' browsers are kept.
+    #[cfg(windows)]
+    fn manifest_folder(&self) -> PathBuf {
+        endpoint::socket_path()
+            .and_then(|file| file.parent().map(|folder| folder.join("native-messaging")))
+            .unwrap_or_default()
+    }
+
+    /// The manifest the browser would read, if it is told of one.
+    #[cfg(unix)]
+    fn found(&self, home: &Path) -> Option<PathBuf> {
+        Some(self.manifest_path(home))
+    }
+
+    #[cfg(windows)]
+    fn found(&self, _home: &Path) -> Option<PathBuf> {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+        let key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(format!(r"{}\{HOST_NAME}", self.hosts))
+            .ok()?;
+        key.get_value::<String, _>("").ok().map(PathBuf::from)
+    }
+
+    /// Tells the browser where the manifest is: writes it, and on Windows
+    /// registers it.
+    fn connect(&self, home: &Path, manifest: &[u8]) -> std::io::Result<()> {
+        let path = self.manifest_path(home);
+        let folder = path.parent().unwrap_or(home);
+        std::fs::create_dir_all(folder)?;
+        // Written beside and moved into place, so that a browser never reads
+        // half of it.
+        let partial = path.with_extension("json.partial");
+        std::fs::write(&partial, manifest)?;
+        std::fs::rename(&partial, &path)?;
+        #[cfg(windows)]
+        {
+            use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+            let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+                .create_subkey(format!(r"{}\{HOST_NAME}", self.hosts))?;
+            key.set_value("", &path.to_string_lossy().into_owned())?;
+        }
+        Ok(())
+    }
+
+    /// Takes the browser's way to the manifest away.
+    fn disconnect(&self, home: &Path) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+            match RegKey::predef(HKEY_CURRENT_USER)
+                .delete_subkey(format!(r"{}\{HOST_NAME}", self.hosts))
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match std::fs::remove_file(self.manifest_path(home)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
     }
 
     /// The manifest that lets this browser's allowed extensions start the
@@ -235,7 +353,9 @@ impl Browser {
     }
 
     fn browser(&self, known: &Known, home: &Path) -> BrowserInfo {
-        let path = known.manifest_path(home);
+        let path = known
+            .found(home)
+            .unwrap_or_else(|| known.manifest_path(home));
         let found = std::fs::read(&path)
             .ok()
             .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default());
@@ -940,19 +1060,12 @@ pub async fn connect_browser(
             message: "the app is running from a place that is gone when it quits".into(),
         });
     }
-    let path = known.manifest_path(home);
-    let folder = path.parent().unwrap_or(home);
-    std::fs::create_dir_all(folder).map_err(storage)?;
     let manifest =
         serde_json::to_vec_pretty(&known.manifest(host)).map_err(|error| CommandError {
             code: "storage",
             message: error.to_string(),
         })?;
-    // Written beside and moved into place, so that a browser never reads
-    // half of it.
-    let partial = path.with_extension("json.partial");
-    std::fs::write(&partial, manifest).map_err(storage)?;
-    std::fs::rename(&partial, &path).map_err(storage)?;
+    known.connect(home, &manifest).map_err(storage)?;
     Ok(state.browser.status())
 }
 
@@ -964,11 +1077,7 @@ pub async fn disconnect_browser(
     state: tauri::State<'_, AppState>,
 ) -> Result<BrowserStatus, CommandError> {
     let (known, home) = state.browser.known(&browser)?;
-    match std::fs::remove_file(known.manifest_path(home)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(storage(error)),
-    }
+    known.disconnect(home).map_err(storage)?;
     Ok(state.browser.status())
 }
 
@@ -997,5 +1106,40 @@ mod tests {
             assert_eq!(known.profiles, firefox.profiles);
             assert_eq!(known.hosts, firefox.hosts);
         }
+    }
+
+    /// A browser's way to the host on Windows is a registry value, under a
+    /// key of the test's own.
+    #[cfg(windows)]
+    #[test]
+    fn a_browser_is_told_where_the_manifest_is_in_the_registry() {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+        let known = Known {
+            id: "test",
+            name: "Test",
+            firefox: false,
+            profiles: &[],
+            hosts: r"Software\OpenSecretManagerTest\NativeMessagingHosts",
+        };
+        let home = tempfile::tempdir().unwrap();
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let _ = root.delete_subkey_all(r"Software\OpenSecretManagerTest");
+
+        assert_eq!(known.found(home.path()), None);
+        known.connect(home.path(), b"{}").unwrap();
+        let path = known.found(home.path()).unwrap();
+        assert_eq!(path, known.manifest_path(home.path()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        // Connecting again replaces it.
+        known.connect(home.path(), b"{\"again\":1}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"again\":1}");
+
+        known.disconnect(home.path()).unwrap();
+        assert_eq!(known.found(home.path()), None);
+        assert!(!path.exists());
+        // Nothing to take away is no error.
+        known.disconnect(home.path()).unwrap();
+        let _ = root.delete_subkey_all(r"Software\OpenSecretManagerTest");
     }
 }
