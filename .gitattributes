@@ -1,0 +1,7 @@
+# Files are checked out as they are committed, on every system: fixtures
+# hold text that tests compare byte for byte, and scripts need LF.
+* text=auto eol=lf
+*.sqlite3 binary
+*.png binary
+*.ico binary
+*.icns binary
