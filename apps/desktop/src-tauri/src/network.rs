@@ -351,6 +351,31 @@ fn archive_vault_files(vault_path: &Path, vault_first: bool) -> std::io::Result<
     Ok(archive)
 }
 
+/// Renames a file of the vault. On Windows a file that is open cannot be
+/// moved, and a store that was just shut down can still be closing as it is
+/// moved (a task that held it ends a moment after it was told to), so a
+/// refusal for that reason is tried again for a few seconds.
+fn rename_when_closed(from: &Path, to: &Path) -> std::io::Result<()> {
+    // The system's "in use by another process" and "access denied".
+    const IN_USE: [i32; 2] = [32, 5];
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error)
+                if cfg!(windows)
+                    && tries < 50
+                    && error
+                        .raw_os_error()
+                        .is_some_and(|code| IN_USE.contains(&code)) =>
+            {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Moves the vault and everything that belongs to it into `archive`. Each
 /// step is a rename, and the steps can be repeated.
 ///
@@ -376,7 +401,7 @@ fn move_vault_files(vault_path: &Path, archive: &Path, vault_first: bool) -> std
             let file = format!("{name}{suffix}");
             let from = directory.join(&file);
             if from.exists() {
-                match std::fs::rename(&from, archive.join(&file)) {
+                match rename_when_closed(&from, &archive.join(&file)) {
                     // SQLite deletes a database's side files when its last
                     // connection closes, which a store just shut down can
                     // still be doing as they are moved.

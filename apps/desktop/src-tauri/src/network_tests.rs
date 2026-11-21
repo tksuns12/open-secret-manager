@@ -1454,8 +1454,10 @@ fn a_device_without_a_vote_syncs_and_when_lost_is_removed_by_the_other_alone() {
         let b_id = devices(&b).await.this_device.unwrap();
         network::shutdown(&b).await;
         network::remove_device(b_id, a.clone()).await.unwrap();
+        // As in the other removals, the epoch is waited for with the rest:
+        // the new keys follow the removal a moment later.
         until_devices(&a, "the phone removed", |info| {
-            info.members.len() == 1 && info.pending.is_none()
+            info.members.len() == 1 && info.pending.is_none() && info.epoch == 2
         })
         .await;
         assert_eq!(current_epoch(&a).await, 2);
