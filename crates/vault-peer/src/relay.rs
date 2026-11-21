@@ -369,6 +369,11 @@ async fn serve_device(
         }
     }
     .await;
+    eprintln!(
+        "TRACE relay server: device {:02x?} connection ended: {:?}",
+        &pin[..3],
+        outcome.as_ref().err()
+    );
     {
         let mut relayed = state
             .lock()
@@ -520,6 +525,12 @@ async fn keep_connected(
 ) {
     loop {
         let outcome = registered(&code, &identity, &mut requests, &incoming, &connected).await;
+        eprintln!(
+            "TRACE client {} {:02x?} registered() ended: {:?}",
+            code.address,
+            &identity.pin()[..3],
+            outcome.as_ref().err()
+        );
         connected.store(false, Ordering::SeqCst);
         // Its device let go of it.
         if outcome.is_ok() {
