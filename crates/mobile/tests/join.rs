@@ -698,6 +698,15 @@ fn a_phone_takes_the_vaults_relay_and_syncs_through_it_while_locked() {
             .any(|item| item.title == "Before the phone")
     });
 
+    // The phone keeps the vault's relay for when it is locked once a sync
+    // has brought it in, a moment after the item is shown. Closing the phone
+    // before that leaves it with no relay to reach the desktop by, which a
+    // slow machine makes happen.
+    eventually("the phone keeps the vault's relay", || {
+        PeerStore::open(folder.join("peers.sqlite3"), Arc::new(NoKeystore))
+            .is_ok_and(|peers| peers.relay_code().ok().flatten().is_some())
+    });
+
     // Away: the desktop cannot be reached directly any more. The phone
     // writes, and is locked and closed.
     desktop.stop_listening();

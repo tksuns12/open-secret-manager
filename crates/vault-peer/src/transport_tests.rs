@@ -127,3 +127,20 @@ async fn a_joiner_refuses_an_inviter_whose_certificate_does_not_match() {
     );
     assert!(matches!(joined, Err(Error::PinMismatch)));
 }
+
+/// Two devices on one machine must not both listen on one port: the second
+/// is refused, and a caller then asks for any free port. (Windows once let
+/// the second bind beside the first, and connections went to the wrong one.)
+#[tokio::test]
+async fn a_port_in_use_is_not_shared() {
+    let first = crate::listen(0).unwrap();
+    let port = first.local_addr().unwrap().port();
+    let second = crate::listen(port);
+    assert_eq!(
+        second.err().map(|error| error.kind()),
+        Some(std::io::ErrorKind::AddrInUse)
+    );
+    // Any free port is still there to be had.
+    let other = crate::listen(0).unwrap();
+    assert_ne!(other.local_addr().unwrap().port(), port);
+}

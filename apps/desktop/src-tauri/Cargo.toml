@@ -14,6 +14,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
+# Browsers reach the app over a Unix socket, or on Windows a named pipe.
+osm-browser-link = { path = "../../../crates/browser-link" }
+osm-vault-browser = { path = "../../../crates/vault-browser" }
 tauri = { version = "2.0.0", features = [] }
 dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -47,11 +50,8 @@ keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"]
 # store that forgets a key as soon as it is stored.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
-
-# Browsers reach the app over a Unix socket.
-[target.'cfg(unix)'.dependencies]
-osm-browser-link = { path = "../../../crates/browser-link" }
-osm-vault-browser = { path = "../../../crates/vault-browser" }
+# Where a browser is told to find the native messaging host: the registry.
+winreg = "0.56"
 
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }

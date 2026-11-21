@@ -176,7 +176,8 @@ test("the generator makes a password of the length and kinds chosen, and keeps t
 
   // Digits alone, the last kind not to be turned off.
   for (const kind of ["A–Z", "a–z", "!@#$"]) await generator.getByLabel(kind, { exact: true }).uncheck();
-  assert.equal(await generator.getByLabel("0–9").isDisabled(), true);
+  // The page catches up with the last box a moment after it is unchecked.
+  await generator.getByLabel("0–9").and(page.locator(":disabled")).waitFor();
   await shownMatches(page, shown, /^[0-9]{64}$/);
   await page.getByRole("button", { name: /Generate new password/ }).click();
   await shownMatches(page, shown, /^[0-9]{64}$/);

@@ -1,7 +1,7 @@
-//! The desk served over a real socket in one process, with real vaults.
+//! The desk served over a real socket (on Windows, a real named pipe) in one
+//! process, with real vaults.
 
 use std::{
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -18,7 +18,6 @@ use osm_vault_core::{Item, ItemKind, Vault};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
     task::JoinHandle,
     time::timeout,
 };
@@ -29,11 +28,58 @@ const PASSWORD: &str = "correct horse battery staple";
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// A folder with a path short enough for a socket.
+#[cfg(unix)]
 fn folder() -> TempDir {
     tempfile::Builder::new()
         .prefix("osm")
         .tempdir_in("/tmp")
         .unwrap()
+}
+
+#[cfg(windows)]
+fn folder() -> TempDir {
+    tempfile::Builder::new().prefix("osm").tempdir().unwrap()
+}
+
+/// The host's end of a connection, as the platform has it.
+#[cfg(unix)]
+type Stream = tokio::net::UnixStream;
+#[cfg(windows)]
+type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Connects to the session whose socket, or file naming its pipe, is
+/// `path`, once it is there to connect to.
+#[cfg(unix)]
+async fn connect_to(path: &Path) -> Stream {
+    Stream::connect(path).await.unwrap()
+}
+
+#[cfg(windows)]
+async fn connect_to(path: &Path) -> Stream {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    timeout(PATIENCE, async {
+        loop {
+            // The file appears once the pipe exists; a pipe whose instance
+            // is taken is free again in a moment.
+            if let Ok(link) = endpoint::read_link(path) {
+                match ClientOptions::new().open(&link.name) {
+                    Ok(mut client) => {
+                        osm_browser_link::handshake::as_host(&mut client, &link.name, &link.secret)
+                            .await
+                            .expect("the session proves it holds the secret");
+                        return client;
+                    }
+                    Err(error) if error.raw_os_error() == Some(231) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the session's pipe is there")
 }
 
 /// A running session: a desk served on a socket.
@@ -91,11 +137,11 @@ impl Drop for Session {
 }
 
 /// The host's end of one connection.
-struct Client(UnixStream);
+struct Client(Stream);
 
 impl Client {
     async fn connect(session: &Session) -> Self {
-        Self(UnixStream::connect(session.socket()).await.unwrap())
+        Self(connect_to(&session.socket()).await)
     }
 
     /// Connects and brings one request.
@@ -694,7 +740,10 @@ async fn what_the_host_would_not_send_is_refused_or_ignored() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(unix)]
 async fn one_session_listens_on_a_socket_and_cleans_up_after_itself() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = folder();
     let path = endpoint::socket_in(&dir.path().join("made").join("on").join("demand"));
     let desk = Desk::new(Config::default());
@@ -708,7 +757,7 @@ async fn one_session_listens_on_a_socket_and_cleans_up_after_itself() {
     let in_use = bind(&path).err().unwrap();
     assert_eq!(in_use.kind(), std::io::ErrorKind::AddrInUse);
     // The refusal did not disturb the first.
-    let mut client = Client(UnixStream::connect(&path).await.unwrap());
+    let mut client = Client(connect_to(&path).await);
     let body = frame::encode(&fill("first", "https://example.com")).unwrap();
     client.send(&Prefix::Socket.frame(&body).unwrap()).await;
     assert_eq!(client.next().await, waiting("first"));
@@ -740,6 +789,122 @@ async fn one_session_listens_on_a_socket_and_cleans_up_after_itself() {
         std::io::ErrorKind::AlreadyExists
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(windows)]
+async fn one_session_listens_on_a_pipe_and_cleans_up_after_itself() {
+    let dir = folder();
+    let path = endpoint::pipe_file_in(&dir.path().join("made").join("on").join("demand"));
+    let desk = Desk::new(Config::default());
+    let bound = bind(&path).unwrap();
+    assert_eq!(bound.path(), path);
+    assert!(endpoint::is_pipe_name(bound.name()));
+    // Nothing names the pipe until it exists.
+    assert!(!path.exists());
+
+    let serving = tokio::spawn(serve(bound, desk.clone()));
+    let mut client = Client(connect_to(&path).await);
+    // A second session is refused while the first one listens.
+    assert_eq!(
+        bind(&path).err().unwrap().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    // The refusal did not disturb the first.
+    let body = frame::encode(&fill("first", "https://example.com")).unwrap();
+    client.send(&Prefix::Socket.frame(&body).unwrap()).await;
+    assert_eq!(client.next().await, waiting("first"));
+
+    // Nobody can make the pipe first, even knowing its name.
+    let link = endpoint::read_link(&path).unwrap();
+    let taken = tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&link.name);
+    assert!(taken.is_err());
+
+    // A host that does not hold the secret is closed on, and its bytes are
+    // not taken for a request.
+    let mut stranger = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&link.name)
+        .unwrap();
+    let wrong = osm_browser_link::handshake::new_secret().unwrap();
+    assert!(
+        osm_browser_link::handshake::as_host(&mut stranger, &link.name, &wrong)
+            .await
+            .is_err()
+    );
+    // And the first session is still serving.
+    let body = frame::encode(&fill("second", "https://example.com")).unwrap();
+    client.send(&Prefix::Socket.frame(&body).unwrap()).await;
+    assert_eq!(client.next().await, waiting("second"));
+
+    // When the session stops, the file goes with it, and the request gets
+    // no answer.
+    serving.abort();
+    assert_eq!(client.last().await, None);
+    timeout(PATIENCE, async {
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the file is removed");
+
+    // A file that names a pipe nobody listens on is replaced.
+    endpoint::Link::new().unwrap().write(&path).unwrap();
+    let bound = bind(&path).unwrap();
+    assert_ne!(bound.name(), endpoint::read_link(&path).unwrap().name);
+}
+
+/// What a session that was killed leaves: a file naming its pipe, which
+/// somebody else can then make. The next session starts regardless, and the
+/// host sends nothing to the impostor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(windows)]
+async fn a_pipe_made_by_someone_else_under_a_left_over_name_is_not_a_session() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::windows::named_pipe::ServerOptions,
+    };
+
+    let dir = folder();
+    let path = endpoint::pipe_file_in(dir.path());
+    let left = endpoint::Link::new().unwrap();
+    left.write(&path).unwrap();
+    // The impostor listens under the name and answers like a session that
+    // does not know the secret.
+    let impostor = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&left.name)
+        .unwrap();
+    let heard = tokio::spawn(async move {
+        impostor.connect().await.unwrap();
+        let mut impostor = impostor;
+        let mut number = [0_u8; 32];
+        impostor.read_exact(&mut number).await.unwrap();
+        impostor.write_all(&[9_u8; 64]).await.unwrap();
+        // Whatever follows the host's number is what the host sent a
+        // session it could not trust.
+        let mut rest = Vec::new();
+        impostor.read_to_end(&mut rest).await.unwrap();
+        rest
+    });
+
+    // The next session is not told another one is listening.
+    let bound = bind(&path).expect("the file's pipe is not a session");
+    assert_ne!(bound.name(), left.name);
+
+    // And a host that follows the file it had read earlier gets nowhere.
+    let mut host = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&left.name)
+        .unwrap();
+    assert!(
+        osm_browser_link::handshake::as_host(&mut host, &left.name, &left.secret)
+            .await
+            .is_err()
+    );
+    drop(host);
+    assert!(heard.await.unwrap().is_empty());
 }
 
 /// A page's request for a passkey: to make one for `example.com`, from a
