@@ -29,6 +29,8 @@ devices and invites new ones. What the apps keep and send:
 ## Getting it
 
 A vault is made on a computer; phones join it from there.
+New here? [Getting started](docs/getting-started.md) goes from nothing to a
+computer, a browser, and a phone sharing one vault.
 
 | Where | How |
 | --- | --- |
@@ -37,7 +39,7 @@ A vault is made on a computer; phones join it from there.
 | Android 9 or later, 64-bit ARM | [F-Droid](https://f-droid.org/packages/org.opensecretmanager.app/) once it is accepted there, or the APK from Releases. Both are the same APK, signed with the project's key ([its certificate](docs/release.md#supported-configurations)): F-Droid builds the app from source itself and publishes the signed APK only if its build is the same, file for file. |
 | iOS 17 or later | No download: build it with Xcode and sign it with an Apple developer team of your own ([how](docs/phone-trial.md#getting-the-app-onto-the-phone)). |
 | Browsers: Chromium-based, Firefox 128 or later | The extension, which needs the desktop app: for Chromium-based browsers from the [Chrome Web Store](https://chromewebstore.google.com/detail/pnjdoenkfffomcidikbkcegcpgipdjog) (needs version 0.1.1 or later of the desktop app); for Firefox from [Firefox's add-ons site](https://addons.mozilla.org/addon/open-secret-manager/), or built and loaded as [its README](apps/browser-extension/README.md#building-and-loading) says. |
-| Windows | Not supported: the app has never been built for Windows. |
+| Windows | Not supported yet. The desktop app's code type-checks for Windows (with the GNU toolchain only), but it has never been linked or run there, and the browser extension does not work with it. |
 
 The project does not join app stores' or platform vendors' paid programs,
 so nothing it publishes depends on one: no Apple notarization, no App
@@ -99,11 +101,11 @@ The repository is deliberately split at the security boundary:
 - `crates/mobile` is the interface the phone apps use, through Kotlin and
   Swift bindings that UniFFI generates: one device of a vault, which joins
   from another device without a vote, unlocks, shows and copies what the
-  vault holds, writes logins and notes, fills logins and saves those
+  vault holds, writes logins, cards and notes, fills logins and saves those
   another app's form sent, and syncs while the app is open.
 - `apps/mobile` holds the Android and iOS apps, which join a vault from a
   computer, unlock with their password or a fingerprint or face, show and
-  copy what the vault holds, create and edit logins and notes, fill logins
+  copy what the vault holds, create and edit logins, cards and notes, fill logins
   into other apps and into pages once the owner unlocks and chooses one,
   save a login another app or a page sent once the owner unlocks and
   chooses where, change their own password, and sync while open.
