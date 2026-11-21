@@ -352,10 +352,16 @@ function App() {
     }
   }
 
+  // Only the last choice's reply is shown: an earlier one that arrives
+  // after a later click would put the box back, and the next click would
+  // build on that.
+  const generatorCalls = useRef(0);
   async function changeGenerator(choice: GeneratorChoice) {
+    const call = ++generatorCalls.current;
     setGenerator(choice);
     try {
-      setGenerator((await bridge.setGenerator(choice)).generator);
+      const saved = (await bridge.setGenerator(choice)).generator;
+      if (call === generatorCalls.current) setGenerator(saved);
     } catch (error) {
       setNotice(commandMessage(error, "The generator's choice was not saved"));
     }
