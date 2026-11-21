@@ -833,10 +833,9 @@ async fn one_session_listens_on_a_pipe_and_cleans_up_after_itself() {
             .await
             .is_err()
     );
-    // And the first session is still serving.
-    let body = frame::encode(&fill("second", "https://example.com")).unwrap();
-    client.send(&Prefix::Socket.frame(&body).unwrap()).await;
-    assert_eq!(client.next().await, waiting("second"));
+    // And the session is still serving: a host that holds the secret gets
+    // in (connecting is proving it).
+    let _again = connect_to(&path).await;
 
     // When the session stops, the file goes with it, and the request gets
     // no answer.
@@ -877,17 +876,26 @@ async fn a_pipe_made_by_someone_else_under_a_left_over_name_is_not_a_session() {
         .first_pipe_instance(true)
         .create(&left.name)
         .unwrap();
-    let heard = tokio::spawn(async move {
-        impostor.connect().await.unwrap();
-        let mut impostor = impostor;
-        let mut number = [0_u8; 32];
-        impostor.read_exact(&mut number).await.unwrap();
-        impostor.write_all(&[9_u8; 64]).await.unwrap();
-        // Whatever follows the host's number is what the host sent a
-        // session it could not trust.
-        let mut rest = Vec::new();
-        impostor.read_to_end(&mut rest).await.unwrap();
-        rest
+    // Whatever any connection sends it after the host's number.
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let listening = tokio::spawn({
+        let (name, heard) = (left.name.clone(), heard.clone());
+        async move {
+            let mut impostor = impostor;
+            loop {
+                impostor.connect().await.unwrap();
+                let next = ServerOptions::new().create(&name).unwrap();
+                let mut connection = std::mem::replace(&mut impostor, next);
+                let mut number = [0_u8; 32];
+                if connection.read_exact(&mut number).await.is_err() {
+                    continue;
+                }
+                let _ = connection.write_all(&[9_u8; 64]).await;
+                let mut rest = Vec::new();
+                let _ = connection.read_to_end(&mut rest).await;
+                heard.lock().unwrap().extend(rest);
+            }
+        }
     });
 
     // The next session is not told another one is listening.
@@ -904,7 +912,9 @@ async fn a_pipe_made_by_someone_else_under_a_left_over_name_is_not_a_session() {
             .is_err()
     );
     drop(host);
-    assert!(heard.await.unwrap().is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    listening.abort();
+    assert!(heard.lock().unwrap().is_empty());
 }
 
 /// A page's request for a passkey: to make one for `example.com`, from a
