@@ -99,32 +99,40 @@ android)
     # A device that does not answer, as an emulator short of memory can
     # stop doing, fails every test at its first wait, which says nothing.
     within() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+    # Each call to the device gives up after 30 seconds: an emulator that stops answering
+    # holds an adb call for ever, and with it the whole run, the cleanup after the tests included.
+    dev() {
+        dev_status=0
+        within 30 "$adb" "$@" || dev_status=$?
+        [ "$dev_status" != 142 ] || echo "The device did not answer 'adb $1' within 30 seconds." >&2
+        return "$dev_status"
+    }
     if [ "$(within 60 "$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != 1 ]; then
         echo "The device did not answer within a minute, or has not finished starting." >&2
         exit 1
     fi
     # The app is tested in front, with the input focus: the screen on and
     # unlocked, and no system dialog over it.
-    "$adb" shell input keyevent KEYCODE_WAKEUP
+    dev shell input keyevent KEYCODE_WAKEUP
     if [ -n "${OSM_DEVICE_PIN:-}" ]; then
-        "$adb" shell input keyevent KEYCODE_MENU
-        "$adb" shell input text "$OSM_DEVICE_PIN"
-        "$adb" shell input keyevent KEYCODE_ENTER
+        dev shell input keyevent KEYCODE_MENU
+        dev shell input text "$OSM_DEVICE_PIN"
+        dev shell input keyevent KEYCODE_ENTER
     fi
-    "$adb" shell wm dismiss-keyguard
-    "$adb" shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
-    "$adb" shell rm -rf /data/local/tmp/osm-failures
+    dev shell wm dismiss-keyguard
+    dev shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
+    dev shell rm -rf /data/local/tmp/osm-failures
     # Autofill's own log in full while the tests run, as it was after: a
     # session the system ends says why only there.
-    log_level=$("$adb" shell cmd autofill get log_level 2>/dev/null | tr -d '\r')
-    "$adb" shell cmd autofill set log_level verbose >/dev/null 2>&1 || true
+    log_level=$(dev shell cmd autofill get log_level 2>/dev/null | tr -d '\r')
+    dev shell cmd autofill set log_level verbose >/dev/null 2>&1 || true
     # Google Play services changes the system's own settings for autofill
     # when it likes, most often soon after the phone starts, and on each
     # change Android ends every autofill session, one waiting on the fill
     # screen included. Such changes wait until the tests end.
-    config_sync=$("$adb" shell device_config get_sync_disabled_for_tests 2>/dev/null | tr -d '\r')
-    "$adb" shell device_config set_sync_disabled_for_tests until_reboot >/dev/null 2>&1 || true
-    since=$("$adb" shell "date '+%m-%d %H:%M:%S.000'" | tr -d '\r')
+    config_sync=$(dev shell device_config get_sync_disabled_for_tests 2>/dev/null | tr -d '\r')
+    dev shell device_config set_sync_disabled_for_tests until_reboot >/dev/null 2>&1 || true
+    since=$(dev shell "date '+%m-%d %H:%M:%S.000'" | tr -d '\r')
     # An emulator's fingerprint sensor, touched until the tests end.
     # Each touch gives up after 20 seconds, as the emulator's console can
     # stop answering.
@@ -139,13 +147,13 @@ android)
     [ "$status" = 142 ] && echo "The Android tests were stopped after $limit seconds: the emulator may have stopped answering." >&2
     kill "$toucher" 2>/dev/null || true
     wait "$toucher" 2>/dev/null || true
-    "$adb" shell cmd autofill set log_level "${log_level:-off}" >/dev/null 2>&1 || true
-    "$adb" shell device_config set_sync_disabled_for_tests "${config_sync:-none}" >/dev/null 2>&1 || true
-    if [ "$status" != 0 ] && [ -n "$("$adb" shell ls /data/local/tmp/osm-failures 2>/dev/null)" ]; then
+    dev shell cmd autofill set log_level "${log_level:-off}" >/dev/null 2>&1 || true
+    dev shell device_config set_sync_disabled_for_tests "${config_sync:-none}" >/dev/null 2>&1 || true
+    if [ "$status" != 0 ] && [ -n "$(dev shell ls /data/local/tmp/osm-failures 2>/dev/null)" ]; then
         if [ -n "${OSM_TEST_FAILURES:-}" ]; then
             mkdir -p "$OSM_TEST_FAILURES/android"
-            "$adb" pull /data/local/tmp/osm-failures/. "$OSM_TEST_FAILURES/android" >/dev/null
-            "$adb" logcat -d -v time -T "$since" >"$OSM_TEST_FAILURES/android/logcat.txt" 2>/dev/null || true
+            within 120 "$adb" pull /data/local/tmp/osm-failures/. "$OSM_TEST_FAILURES/android" >/dev/null
+            within 120 "$adb" logcat -d -v time -T "$since" >"$OSM_TEST_FAILURES/android/logcat.txt" 2>/dev/null || true
             echo "What the screen showed at each failed wait, and the system's log: $OSM_TEST_FAILURES/android" >&2
         else
             echo "What the screen showed at each failed wait is on the device in /data/local/tmp/osm-failures (or set OSM_TEST_FAILURES)." >&2
