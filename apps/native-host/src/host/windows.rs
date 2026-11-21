@@ -85,11 +85,15 @@ impl<W: Write + Send + 'static> Host<W> {
         let framed = Prefix::Socket.frame(body).map_err(unavailable)?;
         let runtime = &self.link.0;
         let session = runtime
-            .block_on(timeout(SEND_LIMIT, async {
-                let mut session = connect(&name).await?;
-                session.write_all(&framed).await?;
-                io::Result::Ok(session)
-            }))
+            .block_on(async {
+                // Made inside the runtime: a timeout needs its clock.
+                timeout(SEND_LIMIT, async {
+                    let mut session = connect(&name).await?;
+                    session.write_all(&framed).await?;
+                    io::Result::Ok(session)
+                })
+                .await
+            })
             .map_err(|_| Refusal::DesktopSessionUnavailable)?
             .map_err(unavailable)?;
         let (withdraw, withdrawn) = oneshot::channel();

@@ -92,7 +92,7 @@ const BROWSERS: [Known; 5] = [
     },
 ];
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const BROWSERS: [Known; 5] = [
     Known {
         id: "chrome",
@@ -1100,7 +1100,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".config/mozilla/firefox")).unwrap();
         assert!(firefox.used(home.path()));
         // Linux's own list has both, and the manifests where Firefox reads them.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             let known = BROWSERS.iter().find(|known| known.id == "firefox").unwrap();
             assert_eq!(known.profiles, firefox.profiles);

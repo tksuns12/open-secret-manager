@@ -1,0 +1,23 @@
+# Temporary: runs only the tests being fixed, for a quicker answer.
+name: Windows debug
+on:
+  push:
+    branches: [windows-ci]
+permissions:
+  contents: read
+jobs:
+  quick:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Host over the pipe
+        run: cargo test -p osm-native-host --locked --test windows -- --nocapture
+      - name: Phone through the relay
+        if: always()
+        run: cargo test -p osm-mobile --locked --test join a_phone_takes -- --nocapture
+        env:
+          RUST_BACKTRACE: "1"
+      - name: Pipe tests
+        if: always()
+        run: cargo test -p osm-vault-browser -p osm-browser-link --locked
