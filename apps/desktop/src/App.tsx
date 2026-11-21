@@ -1142,7 +1142,7 @@ function BrowserPanel({ onNotice }: { onNotice: (text: string) => void }) {
     {!status.host && <p className="review-hint">The program that browsers start to reach this app was not found beside it, so no browser can be connected.</p>}
     {status.temporaryPlace && <p className="review-hint">This app is running from a place that is gone when it quits, so no browser can be pointed at it. Install the app first (on a Mac, move it into Applications and open it from there), then connect the browser.</p>}
     <p className="review-hint">Connecting writes one small file into the browser's own folder. It says where that program is and which one extension may start it. Disconnecting removes the file.</p>
-    <p className="review-hint">The extension is not in any browser's store yet. It is built from this project's source and loaded by hand, and connecting a browser changes nothing you would notice until it is.</p>
+    <p className="review-hint">Install the extension from the Chrome Web Store or Firefox's add-ons site, then connect that browser here. Connecting changes nothing you would notice until the extension is installed.</p>
   </div>;
 }
 

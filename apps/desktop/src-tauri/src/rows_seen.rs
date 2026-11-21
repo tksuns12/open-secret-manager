@@ -34,7 +34,8 @@ pub trait RowsSeen: Send + Sync {
     fn set(&self, device: &[u8], rows: u64) -> Result<(), Unavailable>;
 }
 
-/// The login Keychain on macOS, the Secret Service on Linux.
+/// The login Keychain on macOS, the Secret Service on Linux, the Credential
+/// Manager on Windows (not yet run there).
 pub struct KeychainRowsSeen {
     service: &'static str,
 }

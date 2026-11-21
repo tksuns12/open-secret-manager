@@ -2,6 +2,7 @@
 //! fails as a whole, what was there stays readable, nothing received is
 //! lost, and the vault works again once there is room.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use tempfile::tempdir;
@@ -135,6 +136,8 @@ fn a_full_disk_loses_nothing_received_and_processing_resumes_with_room() {
     assert!(vault.staged_revision_ids().unwrap().is_empty());
 }
 
+// A folder is made unwritable by its Unix mode; Windows has no such mode.
+#[cfg(unix)]
 #[test]
 fn a_folder_the_vault_cannot_write_in_fails_writes_whole() {
     let dir = tempdir().unwrap();

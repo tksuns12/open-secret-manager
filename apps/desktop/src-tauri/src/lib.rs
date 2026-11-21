@@ -47,7 +47,9 @@ struct AppState {
     archive: Mutex<Option<archive::Opened>>,
     path: PathBuf,
     network: network::Network,
-    /// Where a request from a browser waits for the owner.
+    /// Where a request from a browser waits for the owner. Nothing reads it where
+    /// browsers are not served (not on Unix: Windows).
+    #[cfg_attr(not(unix), allow(dead_code))]
     browser: browser::Browser,
     /// The backup the owner picked to restore, until it is restored.
     chosen_backup: std::sync::Mutex<Option<PathBuf>>,

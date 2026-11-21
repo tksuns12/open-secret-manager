@@ -43,6 +43,11 @@ keyring = { version = "3.6.3", features = ["apple-native"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
 
+# The Windows Credential Manager. Without this feature the crate uses a mock
+# store that forgets a key as soon as it is stored.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }
+
 # Browsers reach the app over a Unix socket.
 [target.'cfg(unix)'.dependencies]
 osm-browser-link = { path = "../../../crates/browser-link" }

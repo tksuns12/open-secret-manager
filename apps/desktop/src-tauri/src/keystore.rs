@@ -1,6 +1,7 @@
 //! The system's keystore on the desktop, which seals this device's TLS key
 //! (see `osm_vault_peer::Keystore`): the login Keychain on macOS, the
-//! Secret Service (GNOME Keyring, KWallet) on Linux.
+//! Secret Service (GNOME Keyring, KWallet) on Linux, the Credential Manager
+//! on Windows (not yet run there).
 //!
 //! Each sealing makes a key of its own, kept in the keystore under a random
 //! name, and seals the TLS key under it with XChaCha20-Poly1305. What is

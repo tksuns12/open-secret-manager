@@ -13,10 +13,10 @@
 //! owner's edits cross the other way, into the shared code, which keeps
 //! them only in the vault.
 //!
-//! On a phone the owner creates, edits, deletes, and restores logins and
-//! secure notes, and saves what another app's login form submitted; identities and
-//! cards are read there and edited on a computer, as are conflicts between
-//! devices.
+//! On a phone the owner creates, edits, deletes, and restores logins, secure
+//! notes, and cards, and saves what another app's login form submitted;
+//! identities are read there and edited on a computer, as are conflicts
+//! between devices.
 //!
 //! This crate's own code has no `unsafe`; the foreign function interface
 //! that UniFFI generates around it is made of it.
@@ -1137,7 +1137,7 @@ impl Device {
         self.inner.import_app_choices(chosen)
     }
 
-    /// Makes a login or a secure note from `draft`, and returns its ID.
+    /// Makes a login, a secure note, or a card from `draft`, and returns its ID.
     /// Online, it syncs at once.
     pub fn create_item(&self, draft: ItemDraft) -> Result<String, MobileError> {
         self.tokio.block_on(self.inner.create_item(draft))

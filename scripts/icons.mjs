@@ -2,7 +2,7 @@
 // the apps and stores take, and writes each where its build takes it:
 //
 //   packaging/icon/                    the drawings, as SVG
-//   apps/desktop/src-tauri/icons/      the desktop app: macOS .icns, Linux PNGs
+//   apps/desktop/src-tauri/icons/      the desktop app: macOS .icns, Windows .ico, Linux PNGs
 //   apps/desktop/src/BrandMark.tsx     the mark in the desktop window
 //   apps/browser-extension/icons/      the extension, 16 to 128 px
 //   apps/browser-extension/store/      the Chrome Web Store's icon and tile
@@ -16,7 +16,7 @@
 // Needs Playwright's Chromium (`npm ci` in apps/browser-extension) to draw
 // the PNGs, and macOS's iconutil for the .icns.
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -151,6 +151,32 @@ try {
   await draw(at("apps/desktop/src-tauri/icons/128x128.png"), rounded("full"), 128);
   await draw(at("apps/desktop/src-tauri/icons/128x128@2x.png"), rounded("full"), 256);
   await draw(at("apps/desktop/src-tauri/icons/icon.png"), rounded("full"), 512);
+
+  // Windows takes one .ico with the sizes in it, each as a PNG.
+  // 32 first: Tauri takes the first as the window's own icon on Windows.
+  const sizes = [32, 16, 48, 64, 128, 256];
+  const images = [];
+  for (const size of sizes) {
+    const file = path.join(tmpdir(), `osm-ico-${process.pid}-${size}.png`);
+    await draw(file, rounded(detail(size)), size);
+    images.push(await readFile(file));
+    await rm(file, { force: true });
+  }
+  const header = Buffer.alloc(6 + 16 * sizes.length);
+  header.writeUInt16LE(1, 2);
+  header.writeUInt16LE(sizes.length, 4);
+  let offset = header.length;
+  sizes.forEach((size, i) => {
+    const entry = 6 + 16 * i;
+    header[entry] = size === 256 ? 0 : size;
+    header[entry + 1] = size === 256 ? 0 : size;
+    header.writeUInt16LE(1, entry + 4);
+    header.writeUInt16LE(32, entry + 6);
+    header.writeUInt32LE(images[i].length, entry + 8);
+    header.writeUInt32LE(offset, entry + 12);
+    offset += images[i].length;
+  });
+  await writeFile(at("apps/desktop/src-tauri/icons/icon.ico"), Buffer.concat([header, ...images]));
 
   // The mark in the desktop window's sidebar, as markup: the window's
   // content security policy loads no image from a data: address.
