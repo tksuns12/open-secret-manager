@@ -132,6 +132,51 @@ final class AppTests: UITestCase {
         XCTAssert(fixture.staticTexts["filled"].waitForLabel("0000|"))
     }
 
+    /// The list's filters keep to one kind of item, or to the favorites, and
+    /// hold while an item is opened and closed.
+    func testTheListsFiltersKeepToOneKindOfItem() {
+        let cards = Bundle(for: AppTests.self).path(forResource: "cards-vault", ofType: "sqlite3")!
+        let app = launchApp(vault: cards)
+        unlock(in: app)
+        XCTAssert(app.buttons["item:Bank"].waitForExistence(timeout: 30))
+        func row(_ title: String) -> XCUIElement { app.buttons["item:\(title)"] }
+        func shows(_ titles: String..., file: StaticString = #filePath, line: UInt = #line) {
+            for title in ["Bank", "Mail", "Visa", "Passport"] {
+                if titles.contains(title) {
+                    XCTAssert(row(title).waitForExistence(timeout: 10), "\(title) is not listed", file: file, line: line)
+                } else {
+                    XCTAssert(row(title).waitForNonExistence(timeout: 10), "\(title) is listed", file: file, line: line)
+                }
+            }
+        }
+        func choose(_ filter: String) {
+            app.buttons["filter-\(filter)"].tap()
+            XCTAssert(app.buttons["filter-\(filter)"].isSelected, filter)
+        }
+        shows("Bank", "Mail", "Visa", "Passport")
+        choose("favorites")
+        shows("Bank")
+        choose("logins")
+        shows("Bank", "Mail")
+        choose("cards")
+        shows("Visa")
+
+        // Held while an item is opened and closed.
+        row("Visa").tap()
+        XCTAssert(app.buttons["copy-field:Number"].waitForExistence(timeout: 15))
+        app.buttons["back"].tap()
+        shows("Visa")
+        XCTAssert(app.buttons["filter-cards"].isSelected)
+
+        // A search within the filter: nothing, and All gives it back.
+        let search = app.searchFields.firstMatch
+        search.tap()
+        search.typeText("Bank")
+        shows()
+        choose("all")
+        shows("Bank")
+    }
+
     func testThePasswordChangesGivenTheCurrentOne() {
         let app = launchApp(vault: frozenVault)
         let newPassword = "eleven char and more"

@@ -197,6 +197,62 @@ class EditTest {
     }
 
     /**
+     * The list's filters keep to one kind of item, or to the favorites; they
+     * hold while an item is opened and closed, and go together with a search.
+     */
+    @Test
+    fun theListsFiltersKeepToOneKindOfItem() {
+        unlocked()
+        compose.onNodeWithTag("new-item").performClick()
+        waitFor("edit-title")
+        compose.onNodeWithTag("kind-note").performClick()
+        compose.onNodeWithTag("edit-title").performTextInput("Filter note")
+        compose.onNodeWithTag("edit-notes").performScrollTo().performTextInput("a note")
+        save()
+        waitFor("detail-notes")
+        compose.onNodeWithTag("back").performClick()
+        compose.onNodeWithTag("new-item").performClick()
+        waitFor("edit-title")
+        compose.onNodeWithTag("kind-card").performClick()
+        compose.onNodeWithTag("edit-title").performTextInput("Filter card")
+        compose.onNodeWithTag("edit-number").performTextInput("5555 5555 5555 4444")
+        save()
+        waitFor("card-number")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Filter card")
+
+        fun shows(vararg titles: String) {
+            for (title in listOf("Bank", "Mail", "Filter note", "Filter card")) {
+                val count = if (title in titles) 1 else 0
+                compose.waitUntil(10_000) { compose.onAllNodesWithTag("item:$title").fetchSemanticsNodes().size == count }
+            }
+        }
+        shows("Bank", "Mail", "Filter note", "Filter card")
+        compose.onNodeWithTag("filter-favorites").performClick()
+        shows("Bank")
+        compose.onNodeWithTag("filter-logins").performClick()
+        shows("Bank", "Mail")
+        compose.onNodeWithTag("filter-notes").performClick()
+        shows("Filter note")
+        compose.onNodeWithTag("filter-cards").performClick()
+        shows("Filter card")
+
+        // Held while an item is opened and closed.
+        compose.onNodeWithTag("item:Filter card").performClick()
+        waitFor("card-number")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Filter card")
+        shows("Filter card")
+
+        // With a search: no match is said, and All gives everything back.
+        compose.onNodeWithTag("search").performTextInput("Bank")
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("No match").fetchSemanticsNodes().isNotEmpty() }
+        shows()
+        compose.onNodeWithTag("filter-all").performClick()
+        shows("Bank")
+    }
+
+    /**
      * The generator's options, opened under the password, make the password
      * again at each change, and are kept for the next new item; Clear
      * leaves none.
