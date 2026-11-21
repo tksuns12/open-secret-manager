@@ -39,5 +39,5 @@ jobs:
         shell: bash
         run: |
           for i in 1 2 3; do
-            cargo test -p osm-mobile --locked --test join -- --nocapture > "all-$i.log" 2>&1 || grep -E "TRACE|FAILED|panicked|Network" "all-$i.log" | grep -v "RelayAbsent\|no address is known" | head -40
+            cargo test -p osm-mobile --locked --test join -- --nocapture > "all-$i.log" 2>&1 || grep -E "TRACE|FAILED|panicked|Network" "all-$i.log" | head -80
           done
