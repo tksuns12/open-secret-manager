@@ -4,7 +4,7 @@ name: Windows
 
 on:
   push:
-    branches: [main, windows-ci]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
