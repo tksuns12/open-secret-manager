@@ -18,6 +18,13 @@ jobs:
         working-directory: apps/desktop
       - name: Desktop library tests
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked
+      - name: The test that failed, alone, twice
+        if: always()
+        shell: bash
+        run: |
+          for i in 1 2; do
+            cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked a_removed_devices_writes -- --nocapture 2>&1 | tail -15
+          done
       - name: Desktop program builds
         if: always()
         run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --locked

@@ -187,9 +187,10 @@ fn the_putting_away_note_is_written_and_read_as_frozen() {
     finish_interrupted_recovery(&folder.vault());
     assert_eq!(folder.files_in(&archive), VAULT_FILES);
     assert!(!folder.data().join(PUTTING_AWAY).exists());
+    // As paths: the note keeps the separators it was written with.
     assert_eq!(
-        std::fs::read_to_string(folder.data().join(PutAway::Left.note())).unwrap(),
-        archive.to_string_lossy()
+        Path::new(&std::fs::read_to_string(folder.data().join(PutAway::Left.note())).unwrap()),
+        archive
     );
 }
 
