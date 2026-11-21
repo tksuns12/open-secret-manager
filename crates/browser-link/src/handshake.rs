@@ -205,6 +205,62 @@ mod tests {
         assert!(rest.is_empty(), "the host sent {} bytes more", rest.len());
     }
 
+    /// A host that speaks the protocol by hand, sending `host_proof` made by
+    /// `make` from the session's own proof and the numbers, to see whether
+    /// the session accepts it.
+    async fn session_meets_a_host_sending(
+        secret: &Secret,
+        make: impl FnOnce(&Secret, &[u8; 32], &[u8; 32], &[u8; 32]) -> [u8; 32],
+    ) -> io::Result<()> {
+        let (mut host, mut session) = duplex(1024);
+        let host_nonce = [3_u8; NONCE_BYTES];
+        let session_side = async {
+            let result = as_session(&mut session, NAME, secret).await;
+            // Kept open until the session has judged, so that it is the
+            // proof that is refused and not the end of the stream.
+            result
+        };
+        let host_side = async {
+            host.write_all(&host_nonce).await.unwrap();
+            let mut session_nonce = [0_u8; NONCE_BYTES];
+            host.read_exact(&mut session_nonce).await.unwrap();
+            let mut session_proof = [0_u8; PROOF_BYTES];
+            host.read_exact(&mut session_proof).await.unwrap();
+            let sent = make(secret, &host_nonce, &session_nonce, &session_proof);
+            host.write_all(&sent).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(session_side, host_side);
+        drop(host);
+        result
+    }
+
+    #[tokio::test]
+    async fn the_session_takes_only_the_hosts_own_proof() {
+        let secret = new_secret().unwrap();
+        let right = |secret: &Secret, host: &[u8; 32], session: &[u8; 32], _: &[u8; 32]| {
+            proof(HOST, secret, NAME, host, session)
+                .finalize()
+                .into_bytes()
+                .into()
+        };
+        assert!(session_meets_a_host_sending(&secret, right).await.is_ok());
+        // Nothing, a guess, the session's own proof played back, and a proof
+        // made under the other label.
+        let zero = |_: &Secret, _: &[u8; 32], _: &[u8; 32], _: &[u8; 32]| [0_u8; 32];
+        let echoed = |_: &Secret, _: &[u8; 32], _: &[u8; 32], theirs: &[u8; 32]| *theirs;
+        let relabelled = |secret: &Secret, host: &[u8; 32], session: &[u8; 32], _: &[u8; 32]| {
+            proof(SESSION, secret, NAME, host, session)
+                .finalize()
+                .into_bytes()
+                .into()
+        };
+        assert!(session_meets_a_host_sending(&secret, zero).await.is_err());
+        assert!(session_meets_a_host_sending(&secret, echoed).await.is_err());
+        assert!(session_meets_a_host_sending(&secret, relabelled)
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn a_proof_is_for_one_pipe_name() {
         let secret = new_secret().unwrap();

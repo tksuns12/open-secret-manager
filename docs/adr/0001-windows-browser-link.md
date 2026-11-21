@@ -45,7 +45,7 @@ the host sends a random number; the session answers with its own number and
 an HMAC-SHA-256 of both numbers and the pipe's name under the secret; the
 host checks it, and only then sends its own proof and, after it, the
 request. A pipe that cannot prove it holds the secret has been sent one
-random number and nothing else, and its replies are never read. The session
+random number and nothing else, and what it answers is checked and refused. The session
 in turn serves only a connection whose host proves the same. The two proofs
 carry different labels, so one cannot be played back as the other.
 
@@ -73,6 +73,14 @@ owner's folder), with the secret taking the place of the socket's owner.
   cannot read a request or send one. A pipe closed to other accounts needs
   an access list, which is `unsafe` to set, and is the first option and its
   exception, in its own decision.
+- A copy of the app that starts while another is running tells the two
+  apart by connecting to the first as a host and proving the secret. If it
+  gets no proof back within two seconds, because the running one is busy
+  with eight connections (another account can arrange that), it takes the
+  pipe to be gone and starts its own, which replaces the file; the first
+  keeps running but can no longer be reached by the host until it restarts.
+  Treating a busy pipe as a running copy instead would let any account stop
+  the app from starting, which is worse.
 - Any program running as the owner can read the file and use the pipe, as
   any program running as the owner can use the Unix socket. The owner still
   confirms every fill in the app.

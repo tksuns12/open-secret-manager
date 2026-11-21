@@ -850,9 +850,12 @@ async fn one_session_listens_on_a_pipe_and_cleans_up_after_itself() {
     .expect("the file is removed");
 
     // A file that names a pipe nobody listens on is replaced.
-    endpoint::Link::new().unwrap().write(&path).unwrap();
+    let stale = endpoint::Link::new().unwrap();
+    stale.write(&path).unwrap();
     let bound = bind(&path).unwrap();
-    assert_ne!(bound.name(), endpoint::read_link(&path).unwrap().name);
+    // Not the stale name: the next session chooses its own, and writes it
+    // when it serves.
+    assert_ne!(bound.name(), stale.name);
 }
 
 /// What a session that was killed leaves: a file naming its pipe, which
@@ -878,8 +881,9 @@ async fn a_pipe_made_by_someone_else_under_a_left_over_name_is_not_a_session() {
         .unwrap();
     // Whatever any connection sends it after the host's number.
     let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listening = tokio::spawn({
-        let (name, heard) = (left.name.clone(), heard.clone());
+        let (name, heard, connections) = (left.name.clone(), heard.clone(), connections.clone());
         async move {
             let mut impostor = impostor;
             loop {
@@ -890,6 +894,7 @@ async fn a_pipe_made_by_someone_else_under_a_left_over_name_is_not_a_session() {
                 if connection.read_exact(&mut number).await.is_err() {
                     continue;
                 }
+                connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let _ = connection.write_all(&[9_u8; 64]).await;
                 let mut rest = Vec::new();
                 let _ = connection.read_to_end(&mut rest).await;
@@ -914,6 +919,9 @@ async fn a_pipe_made_by_someone_else_under_a_left_over_name_is_not_a_session() {
     drop(host);
     tokio::time::sleep(Duration::from_millis(300)).await;
     listening.abort();
+    // The impostor was really reached, by the probe and by the host, and
+    // was sent a number each time and nothing after it.
+    assert!(connections.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     assert!(heard.lock().unwrap().is_empty());
 }
 

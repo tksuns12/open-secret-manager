@@ -105,9 +105,21 @@ impl Link {
             self.name,
             &**handshake::secret_to_hex(&self.secret)
         ));
-        let temp = file.with_extension("pipe.tmp");
+        // A name of its own, so that two copies starting together do not
+        // write one file.
+        let temp = file.with_extension(format!("pipe.{}.tmp", std::process::id()));
         std::fs::write(&temp, text.as_bytes())?;
-        std::fs::rename(&temp, file).inspect_err(|_| {
+        // Something that has the file open without letting it be replaced,
+        // a virus scanner for one, lets go in a moment.
+        let mut renamed = std::fs::rename(&temp, file);
+        for _ in 0..20 {
+            if renamed.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            renamed = std::fs::rename(&temp, file);
+        }
+        renamed.inspect_err(|_| {
             let _ = std::fs::remove_file(&temp);
         })
     }
@@ -172,9 +184,10 @@ mod tests {
             // The name alone, as an earlier version wrote it.
             name.clone(),
             format!("{name}\n"),
-            format!(r"\\.\pipe\other\n{secret}\n"),
+            format!("{}\n{secret}\n", r"\\.\pipe\other"),
             format!(
-                r"\\remote\pipe\OpenSecretManager-{}\n{secret}\n",
+                "{}{}\n{secret}\n",
+                r"\\remote\pipe\OpenSecretManager-",
                 "0".repeat(32)
             ),
             format!("{name}0\n{secret}\n"),
@@ -196,7 +209,11 @@ mod tests {
         // A file written by Windows' own tools may have CRLF line ends.
         std::fs::write(&file, format!("{name}\r\n{secret}\r\n")).unwrap();
         assert_eq!(read_link(&file).unwrap().name, link.name);
-        assert!(!file.with_extension("pipe.tmp").exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|ext| ext != "tmp")));
     }
 
     #[test]
