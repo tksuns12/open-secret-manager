@@ -22,8 +22,14 @@ rustix = { version = "1.1", features = ["process"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
 sha2 = "0.10.9"
+hmac = "0.12.1"
+getrandom = "0.3"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "rt"] }
 tempfile = "3.24.0"
 
 [target.'cfg(windows)'.dependencies]
 dirs = "6.0"
 getrandom = "0.3"
+hmac = "0.12.1"
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = ["io-util"] }

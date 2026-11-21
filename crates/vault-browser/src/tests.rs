@@ -62,9 +62,14 @@ async fn connect_to(path: &Path) -> Stream {
         loop {
             // The file appears once the pipe exists; a pipe whose instance
             // is taken is free again in a moment.
-            if let Ok(name) = endpoint::read_pipe_name(path) {
-                match ClientOptions::new().open(&name) {
-                    Ok(client) => return client,
+            if let Ok(link) = endpoint::read_link(path) {
+                match ClientOptions::new().open(&link.name) {
+                    Ok(mut client) => {
+                        osm_browser_link::handshake::as_host(&mut client, &link.name, &link.secret)
+                            .await
+                            .expect("the session proves it holds the secret");
+                        return client;
+                    }
                     Err(error) if error.raw_os_error() == Some(231) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => panic!("{error}"),
@@ -810,12 +815,28 @@ async fn one_session_listens_on_a_pipe_and_cleans_up_after_itself() {
     client.send(&Prefix::Socket.frame(&body).unwrap()).await;
     assert_eq!(client.next().await, waiting("first"));
 
-    // The pipe is not the name's to take by anyone else, even knowing it.
-    let name = endpoint::read_pipe_name(&path).unwrap();
+    // Nobody can make the pipe first, even knowing its name.
+    let link = endpoint::read_link(&path).unwrap();
     let taken = tokio::net::windows::named_pipe::ServerOptions::new()
         .first_pipe_instance(true)
-        .create(&name);
+        .create(&link.name);
     assert!(taken.is_err());
+
+    // A host that does not hold the secret is closed on, and its bytes are
+    // not taken for a request.
+    let mut stranger = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&link.name)
+        .unwrap();
+    let wrong = osm_browser_link::handshake::new_secret().unwrap();
+    assert!(
+        osm_browser_link::handshake::as_host(&mut stranger, &link.name, &wrong)
+            .await
+            .is_err()
+    );
+    // And the first session is still serving.
+    let body = frame::encode(&fill("second", "https://example.com")).unwrap();
+    client.send(&Prefix::Socket.frame(&body).unwrap()).await;
+    assert_eq!(client.next().await, waiting("second"));
 
     // When the session stops, the file goes with it, and the request gets
     // no answer.
@@ -830,9 +851,60 @@ async fn one_session_listens_on_a_pipe_and_cleans_up_after_itself() {
     .expect("the file is removed");
 
     // A file that names a pipe nobody listens on is replaced.
-    std::fs::write(&path, endpoint::new_pipe_name().unwrap()).unwrap();
+    endpoint::Link::new().unwrap().write(&path).unwrap();
     let bound = bind(&path).unwrap();
-    assert_ne!(bound.name(), std::fs::read_to_string(&path).unwrap());
+    assert_ne!(bound.name(), endpoint::read_link(&path).unwrap().name);
+}
+
+/// What a session that was killed leaves: a file naming its pipe, which
+/// somebody else can then make. The next session starts regardless, and the
+/// host sends nothing to the impostor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(windows)]
+async fn a_pipe_made_by_someone_else_under_a_left_over_name_is_not_a_session() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::windows::named_pipe::ServerOptions,
+    };
+
+    let dir = folder();
+    let path = endpoint::pipe_file_in(dir.path());
+    let left = endpoint::Link::new().unwrap();
+    left.write(&path).unwrap();
+    // The impostor listens under the name and answers like a session that
+    // does not know the secret.
+    let impostor = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&left.name)
+        .unwrap();
+    let heard = tokio::spawn(async move {
+        impostor.connect().await.unwrap();
+        let mut impostor = impostor;
+        let mut number = [0_u8; 32];
+        impostor.read_exact(&mut number).await.unwrap();
+        impostor.write_all(&[9_u8; 64]).await.unwrap();
+        // Whatever follows the host's number is what the host sent a
+        // session it could not trust.
+        let mut rest = Vec::new();
+        impostor.read_to_end(&mut rest).await.unwrap();
+        rest
+    });
+
+    // The next session is not told another one is listening.
+    let bound = bind(&path).expect("the file's pipe is not a session");
+    assert_ne!(bound.name(), left.name);
+
+    // And a host that follows the file it had read earlier gets nowhere.
+    let mut host = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&left.name)
+        .unwrap();
+    assert!(
+        osm_browser_link::handshake::as_host(&mut host, &left.name, &left.secret)
+            .await
+            .is_err()
+    );
+    drop(host);
+    assert!(heard.await.unwrap().is_empty());
 }
 
 /// A page's request for a passkey: to make one for `example.com`, from a

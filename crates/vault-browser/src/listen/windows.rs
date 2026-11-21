@@ -1,27 +1,37 @@
-//! The session's named pipe. Its name is made fresh each time the session
-//! starts and written to a file in the account's data folder, which is what
-//! keeps other accounts from finding it (see `osm_browser_link::endpoint`).
+//! The session's named pipe. Its name and a secret are made fresh each time
+//! the session starts and written to a file in the account's data folder.
+//! The name can be seen by any account, so a connection is served only once
+//! the host has proved it holds the secret too (see
+//! `osm_browser_link::handshake` and `osm_browser_link::endpoint`).
 
 use std::{
-    fs::OpenOptions,
     io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use osm_browser_link::endpoint;
-use tokio::{net::windows::named_pipe::ServerOptions, task::JoinSet, time::sleep};
+use osm_browser_link::{
+    endpoint::{self, Link},
+    handshake,
+};
+use tokio::{
+    net::windows::named_pipe::{ClientOptions, ServerOptions},
+    runtime::Builder,
+    task::JoinSet,
+    time::{sleep, timeout},
+};
 
 use super::{converse, MAX_CONNECTIONS};
 use crate::Desk;
 
-/// What Windows says when a pipe exists and no instance is free.
-const ERROR_PIPE_BUSY: i32 = 231;
+/// How long a connection has to prove it holds the secret before it is
+/// closed unanswered.
+const HANDSHAKE_LIMIT: Duration = Duration::from_secs(2);
 
 /// The session's pipe, named and not yet served.
 pub struct Bound {
-    name: String,
+    link: Link,
     file: PathBuf,
 }
 
@@ -33,12 +43,15 @@ impl Bound {
 
     /// The pipe's name, the one the file will hold.
     pub fn name(&self) -> &str {
-        &self.name
+        &self.link.name
     }
 }
 
 /// Removes the file naming the pipe when the session stops listening, if it
-/// still names this session's pipe.
+/// still names this session's pipe. A session that is killed does not get
+/// to: the file it leaves is replaced at the next start, and until then
+/// names a pipe the host will not send anything to unless it holds the
+/// secret.
 struct Unlink {
     file: PathBuf,
     name: String,
@@ -46,29 +59,53 @@ struct Unlink {
 
 impl Drop for Unlink {
     fn drop(&mut self) {
-        if endpoint::read_pipe_name(&self.file).is_ok_and(|named| named == self.name) {
+        if endpoint::read_link(&self.file).is_ok_and(|link| link.name == self.name) {
             let _ = std::fs::remove_file(&self.file);
         }
     }
 }
 
+/// Whether a session answers on `link` as this app's: the pipe is there and
+/// proves it holds the secret. Anything else, a pipe made by another
+/// account included, is not a session of this app.
+fn answers(link: Link) -> bool {
+    let (tell, told) = std::sync::mpsc::channel();
+    // Its own thread and runtime, as this is called outside any.
+    std::thread::spawn(move || {
+        let proved = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .is_ok_and(|runtime| {
+                runtime.block_on(async {
+                    matches!(
+                        timeout(HANDSHAKE_LIMIT, async {
+                            let mut pipe = ClientOptions::new().open(&link.name)?;
+                            handshake::as_host(&mut pipe, &link.name, &link.secret).await
+                        })
+                        .await,
+                        Ok(Ok(()))
+                    )
+                })
+            });
+        let _ = tell.send(proved);
+    });
+    told.recv_timeout(HANDSHAKE_LIMIT * 2).unwrap_or(false)
+}
+
 /// Chooses the session's pipe, named by the file at `file`. The pipe itself
 /// is made when the session is served. A file left by a session that is gone
-/// is replaced; one that names a pipe that still answers is another running
+/// is replaced, and so is one that names a pipe somebody else made; only one
+/// that names a pipe that proves it is this app's is another running
 /// session.
 pub fn bind(file: &Path) -> io::Result<Bound> {
     if let Some(folder) = file.parent() {
         std::fs::create_dir_all(folder)?;
     }
-    if let Ok(name) = endpoint::read_pipe_name(file) {
-        match OpenOptions::new().read(true).write(true).open(&name) {
-            Ok(_) => return Err(in_use()),
-            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => return Err(in_use()),
-            Err(_) => {}
-        }
+    if endpoint::read_link(file).is_ok_and(answers) {
+        return Err(in_use());
     }
     Ok(Bound {
-        name: endpoint::new_pipe_name()?,
+        link: Link::new()?,
         file: file.to_owned(),
     })
 }
@@ -87,18 +124,25 @@ fn instance(name: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipe
 /// request to the desk and is told how it ended. Dropping it closes every
 /// connection and removes the file that names the pipe.
 pub async fn serve(bound: Bound, desk: Arc<Desk>) -> io::Result<()> {
-    let Bound { name, file } = bound;
-    // The first instance is made by this session or not at all: nobody can
-    // have made the pipe first under a name only this session knows, and if
-    // they did, this fails.
+    let Bound { link, file } = bound;
+    let Link { name, secret } = link;
+    // The first instance is made by this session or not at all: if somebody
+    // made the pipe first under this name, this fails.
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .reject_remote_clients(true)
         .create(&name)?;
     // Only now can the host find it.
-    std::fs::write(&file, &name)?;
-    let _unlink = Unlink { file, name };
-    let name = &_unlink.name;
+    Link {
+        name: name.clone(),
+        secret: secret.clone(),
+    }
+    .write(&file)?;
+    let _unlink = Unlink {
+        file,
+        name: name.clone(),
+    };
+    let (name, secret) = (Arc::<str>::from(name), Arc::new(secret));
     let mut conversations = JoinSet::new();
     loop {
         tokio::select! {
@@ -106,17 +150,31 @@ pub async fn serve(bound: Bound, desk: Arc<Desk>) -> io::Result<()> {
                 // A pipe with no instance waiting refuses the next host, so
                 // the next one is made before this one is served.
                 let next = loop {
-                    match instance(name) {
+                    match instance(&name) {
                         Ok(next) => break next,
                         // Out of handles, most likely: let some close.
                         Err(_) => sleep(Duration::from_millis(100)).await,
                     }
                 };
-                let stream = std::mem::replace(&mut server, next);
+                let mut stream = std::mem::replace(&mut server, next);
                 // Past the limit a connection is closed unanswered.
                 if connected.is_ok() && conversations.len() < MAX_CONNECTIONS {
-                    let desk = desk.clone();
-                    conversations.spawn(async move { converse(stream, &desk).await });
+                    let (desk, name, secret) = (desk.clone(), name.clone(), secret.clone());
+                    conversations.spawn(async move {
+                        // Any account can open the pipe; only a host that
+                        // holds the secret gets to send a request.
+                        let proved = matches!(
+                            timeout(
+                                HANDSHAKE_LIMIT,
+                                handshake::as_session(&mut stream, &name, &secret),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        );
+                        if proved {
+                            converse(stream, &desk).await;
+                        }
+                    });
                 }
             }
             Some(_) = conversations.join_next() => {}

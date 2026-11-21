@@ -353,11 +353,14 @@ impl Browser {
     }
 
     fn browser(&self, known: &Known, home: &Path) -> BrowserInfo {
-        let path = known
-            .found(home)
+        // Where the browser looks, if it knows. On Windows a manifest that
+        // no registry value points to is one the browser cannot find.
+        let registered = known.found(home);
+        let path = registered
+            .clone()
             .unwrap_or_else(|| known.manifest_path(home));
-        let found = std::fs::read(&path)
-            .ok()
+        let found = registered
+            .and_then(|path| std::fs::read(path).ok())
             .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default());
         let wanted = self.host.as_ref().map(|host| known.manifest(host));
         let (state, points_to) = match found {

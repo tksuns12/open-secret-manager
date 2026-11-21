@@ -769,19 +769,23 @@ async fn a_membership_change_survives_a_crash_at_every_persistence_step() {
             }
             assert!(crash.fired(), "{point:?} was never reached");
             // The crash reaches the node's state a moment after it fires.
-            let mut crashed: Vec<DeviceId> = Vec::new();
-            for _ in 0..200 {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                crashed = cluster
+            let crashed_nodes = || -> Vec<DeviceId> {
+                cluster
                     .running
                     .iter()
                     .filter(|(_, node)| node.raft().metrics().borrow().running_state.is_err())
                     .map(|(device, _)| *device)
-                    .collect();
-                if !crashed.is_empty() {
+                    .collect()
+            };
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                if !crashed_nodes().is_empty() {
                     break;
                 }
             }
+            // A second node that fails a moment later is still one too many.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let crashed = crashed_nodes();
             assert_eq!(crashed.len(), 1, "{point:?}");
             // Until the change completes, a rotation is not in effect.
             for node in cluster.running.values() {

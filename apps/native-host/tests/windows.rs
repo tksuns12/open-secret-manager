@@ -2,8 +2,8 @@
 //! would, against the real desk serving a real named pipe.
 //!
 //! The host finds the pipe through the account's real data folder, which no
-//! environment variable moves, so this is one test, and it leaves the folder
-//! as it found it.
+//! environment variable moves, so this is one test, and it puts back what an app
+//! running there has left in the folder.
 
 #![cfg(windows)]
 
@@ -120,6 +120,33 @@ fn waiting(id: &str) -> Value {
     json!({ "type": "waiting", "requestId": id })
 }
 
+/// A file in the account's real data folder, taken away for the test and
+/// put back when it ends, however it ends.
+struct PutBack {
+    file: std::path::PathBuf,
+    held: Option<Vec<u8>>,
+}
+
+impl PutBack {
+    fn take(file: &std::path::Path) -> Self {
+        let held = std::fs::read(file).ok();
+        let _ = std::fs::remove_file(file);
+        Self {
+            file: file.to_owned(),
+            held,
+        }
+    }
+}
+
+impl Drop for PutBack {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.file);
+        if let Some(held) = &self.held {
+            let _ = std::fs::write(&self.file, held);
+        }
+    }
+}
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let started = Instant::now();
     while !done() {
@@ -131,7 +158,9 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 #[test]
 fn a_fill_goes_over_the_pipe_only_on_the_owners_choice() {
     let file = endpoint::pipe_file_path().unwrap();
-    let _ = std::fs::remove_file(&file);
+    // The host looks in the account's real data folder: what an app that
+    // runs there has left is put back at the end.
+    let _put_back = PutBack::take(&file);
 
     // No session: nothing names a pipe, and a file naming one nobody
     // listens on, or not a pipe of this app at all, is no better.
@@ -139,12 +168,51 @@ fn a_fill_goes_over_the_pipe_only_on_the_owners_choice() {
     host.send(&fill("a", "https://example.com"));
     assert_eq!(host.next(), error("a", "desktop_session_unavailable"));
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, endpoint::new_pipe_name().unwrap()).unwrap();
+    endpoint::Link::new().unwrap().write(&file).unwrap();
     host.send(&fill("b", "https://example.com"));
     assert_eq!(host.next(), error("b", "desktop_session_unavailable"));
+    // A file from before the secret was added names no link.
+    std::fs::write(&file, endpoint::new_pipe_name().unwrap()).unwrap();
+    host.send(&fill("b2", "https://example.com"));
+    assert_eq!(host.next(), error("b2", "desktop_session_unavailable"));
     std::fs::write(&file, r"\\.\pipe\somebody-else").unwrap();
     host.send(&fill("c", "https://example.com"));
     assert_eq!(host.next(), error("c", "desktop_session_unavailable"));
+
+    // What a killed app leaves, with somebody else's pipe under its name:
+    // the host sends that pipe nothing but a random number.
+    let left = endpoint::Link::new().unwrap();
+    left.write(&file).unwrap();
+    let impostor_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let impostor = {
+        let _enter = impostor_runtime.enter();
+        tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&left.name)
+            .unwrap()
+    };
+    let heard = thread::spawn(move || {
+        impostor_runtime.block_on(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut impostor = impostor;
+            impostor.connect().await.unwrap();
+            let mut number = [0_u8; 32];
+            impostor.read_exact(&mut number).await.unwrap();
+            impostor.write_all(&[9_u8; 64]).await.unwrap();
+            let mut rest = Vec::new();
+            impostor.read_to_end(&mut rest).await.unwrap();
+            rest
+        })
+    });
+    host.send(&fill("c2", "https://example.com"));
+    assert_eq!(host.next(), error("c2", "desktop_session_unavailable"));
+    assert!(
+        heard.join().unwrap().is_empty(),
+        "the host sent the impostor a request"
+    );
     let _ = std::fs::remove_file(&file);
 
     // The app starts.

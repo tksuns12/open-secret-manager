@@ -1593,6 +1593,7 @@ dependencies = [
  "base64ct",
  "dirs",
  "getrandom 0.3.4",
+ "hmac 0.12.1",
  "osm-origin",
  "proptest",
  "rustix",
@@ -1600,6 +1601,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tokio",
  "zeroize",
 ]
 

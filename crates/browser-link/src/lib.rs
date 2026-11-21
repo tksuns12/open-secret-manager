@@ -11,6 +11,8 @@
 //! links.
 
 pub mod frame;
+#[cfg(any(windows, test))]
+pub mod handshake;
 mod message;
 
 #[cfg(unix)]

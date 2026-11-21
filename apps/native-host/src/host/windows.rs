@@ -1,7 +1,8 @@
 //! The host's side of the session's named pipe.
 //!
-//! The pipe's name is in a file in the account's data folder (see
-//! `osm_browser_link::endpoint`). A pipe cannot be cancelled from another
+//! The pipe's name and a secret are in a file in the account's data folder
+//! (see `osm_browser_link::endpoint`). The host sends a pipe nothing but a
+//! random number until the session on it has proved it holds the secret. A pipe cannot be cancelled from another
 //! thread the way a socket is shut down, so the host runs its connections on
 //! a small runtime: each request's connection is a task, which a withdrawal
 //! tells to stop.
@@ -12,7 +13,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use osm_browser_link::{endpoint, frame::Prefix, Failure, Refusal, Response};
+use osm_browser_link::{endpoint, frame::Prefix, handshake, Failure, Refusal, Response};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::windows::named_pipe::{ClientOptions, NamedPipeClient},
@@ -69,26 +70,32 @@ impl<W: Write + Send + 'static> Host<W> {
         body: &[u8],
         answers: impl Fn(&Response) -> bool + Send + 'static,
     ) -> Result<(), Refusal> {
-        let mut open = lock(&self.open);
-        if open.contains_key(request_id) {
-            return Err(Refusal::Replayed);
-        }
-        if open.len() >= MAX_OPEN {
-            return Err(Refusal::Busy);
-        }
+        let at_capacity = |open: &HashMap<String, oneshot::Sender<()>>| {
+            if open.contains_key(request_id) {
+                Err(Refusal::Replayed)
+            } else if open.len() >= MAX_OPEN {
+                Err(Refusal::Busy)
+            } else {
+                Ok(())
+            }
+        };
+        at_capacity(&lock(&self.open))?;
         let unavailable = |_| Refusal::DesktopSessionUnavailable;
         let file = self
             .socket
             .as_ref()
             .ok_or(Refusal::DesktopSessionUnavailable)?;
-        let name = endpoint::read_pipe_name(file).map_err(unavailable)?;
+        let link = endpoint::read_link(file).map_err(unavailable)?;
         let framed = Prefix::Socket.frame(body).map_err(unavailable)?;
         let runtime = &self.link.0;
+        // The connection is made without holding what the relays take: a
+        // blocked worker cannot drive the clock this waits on.
         let session = runtime
             .block_on(async {
                 // Made inside the runtime: a timeout needs its clock.
                 timeout(SEND_LIMIT, async {
-                    let mut session = connect(&name).await?;
+                    let mut session = connect(&link.name).await?;
+                    handshake::as_host(&mut session, &link.name, &link.secret).await?;
                     session.write_all(&framed).await?;
                     io::Result::Ok(session)
                 })
@@ -96,6 +103,9 @@ impl<W: Write + Send + 'static> Host<W> {
             })
             .map_err(|_| Refusal::DesktopSessionUnavailable)?
             .map_err(unavailable)?;
+        let mut open = lock(&self.open);
+        // Another request may have taken the place meanwhile.
+        at_capacity(&open)?;
         let (withdraw, withdrawn) = oneshot::channel();
         open.insert(request_id.to_owned(), withdraw);
         drop(open);

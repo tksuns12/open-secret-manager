@@ -477,17 +477,30 @@ fn with_stores_closed<T>(
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = AddressBook::default();
     let result = step();
     let peers_path = net.directory.join("peers.sqlite3");
-    *peers = PeerStore::open(&peers_path, net.keystore.clone())
-        .map_err(|error| store_error("peers.sqlite3", error))?;
-    *net.addresses
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
+    // The address book first, and whatever else fails, so that it is not
+    // left empty by a store that did not open.
+    let addresses =
+        AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error));
+    let opened_peers = PeerStore::open(&peers_path, net.keystore.clone())
+        .map_err(|error| store_error("peers.sqlite3", error));
+    let mut address_error = None;
+    match addresses {
+        Ok(book) => {
+            *net.addresses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = book;
+        }
+        Err(error) => address_error = Some(error),
+    }
+    *peers = opened_peers?;
     *invitations = InvitationStore::open(
         net.directory.join("invitations.sqlite3"),
         InvitationPolicy::default(),
     )
     .map_err(|error| store_error("invitations.sqlite3", error.into()))?;
+    if let Some(error) = address_error {
+        return Err(error);
+    }
     result
 }
 
