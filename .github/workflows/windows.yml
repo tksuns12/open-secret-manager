@@ -1,0 +1,30 @@
+# The only place this project's code is built and run on Windows. The rest
+# is checked by scripts/check.sh on the maintainer's machines.
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # The desktop crate embeds the built window.
+      - run: npm ci && npm run build
+        working-directory: apps/desktop
+      - run: rustc --version && cargo --version
+      - name: Shared crates
+        run: cargo test --workspace --exclude osm-native-host --locked --no-fail-fast
+      - name: Desktop app
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --workspace --locked --no-fail-fast
