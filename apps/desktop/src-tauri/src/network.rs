@@ -382,7 +382,10 @@ fn move_vault_files(vault_path: &Path, archive: &Path, vault_first: bool) -> std
                     // still be doing as they are moved.
                     Err(error)
                         if error.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
-                    result => result?,
+                    // Say which file, as the system's message does not.
+                    result => result.map_err(|error| {
+                        std::io::Error::new(error.kind(), format!("{file}: {error}"))
+                    })?,
                 }
             }
         }

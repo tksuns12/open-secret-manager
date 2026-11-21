@@ -170,6 +170,10 @@ fn the_putting_away_note_is_written_and_read_as_frozen() {
     let archive = folder.data().join(format!("archive-{MADE_AT}"));
     let made = putting_away_note(PutAway::Left, &archive)
         .replace(&*folder.data().to_string_lossy(), FOLDER);
+    // The note names the archive by the system's own path, whose separator
+    // the frozen copy, made on Unix, writes as `/`.
+    #[cfg(windows)]
+    let made = made.replace('\\', "/");
     let frozen = String::from_utf8(frozen("putting-away", made.as_bytes())).unwrap();
     assert_eq!(made, frozen);
 

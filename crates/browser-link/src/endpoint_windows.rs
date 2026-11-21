@@ -54,7 +54,7 @@ pub fn pipe_file_path() -> Option<PathBuf> {
 /// digits from the system's random generator.
 pub fn new_pipe_name() -> io::Result<String> {
     let mut random = [0_u8; NAME_BYTES];
-    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
     let mut name = String::from(PIPE_PREFIX);
     for byte in random {
         write!(name, "{byte:02x}").expect("writing to a string");
