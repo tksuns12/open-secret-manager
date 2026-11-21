@@ -1460,6 +1460,14 @@ fn a_device_without_a_vote_syncs_and_when_lost_is_removed_by_the_other_alone() {
             info.members.len() == 1 && info.pending.is_none() && info.epoch == 2
         })
         .await;
+        // The vault takes the new epoch's key in after the control state has
+        // it, which a slow machine shows.
+        for _ in 0..600 {
+            if current_epoch(&a).await == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert_eq!(current_epoch(&a).await, 2);
     });
 }
@@ -1837,30 +1845,15 @@ fn a_removed_devices_writes_passed_on_by_a_member_that_had_not_heard_are_held_on
         }
         tell_where(&d, &[&c]).await;
         // A and B cannot be reached, which the sync reports.
-        eprintln!("DEBUG d->c port {:?}", network::listen_port(&c).await);
-        eprintln!(
-            "DEBUG d info {}",
-            serde_json::to_string(&devices(&d).await).unwrap()
-        );
-        eprintln!(
-            "DEBUG c info {}",
-            serde_json::to_string(&devices(&c).await).unwrap()
-        );
-        let synced = network::sync_now(d.clone()).await;
-        eprintln!(
-            "DEBUG sync_now(d) = {:?}",
-            synced
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| (e.code, e.message.clone()))
-        );
-        for _ in 0..3 {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            eprintln!(
-                "DEBUG c titles {:?}; d info {}",
-                titles(&c).await,
-                serde_json::to_string(&devices(&d).await).unwrap()
-            );
+        // D's own sync after it started can still be under way, trying A and
+        // B (which a slow machine takes seconds over); a sync asked for
+        // meanwhile does nothing, so it is asked for again until C has it.
+        for _ in 0..600 {
+            let _ = network::sync_now(d.clone()).await;
+            if titles(&c).await == ["Made after removal", "Shared"] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         eventually(&c, &["Made after removal", "Shared"]).await;
         assert_eq!(
