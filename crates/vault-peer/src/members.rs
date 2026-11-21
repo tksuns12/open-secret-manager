@@ -635,17 +635,26 @@ impl MemberEndpoint {
         };
         tokio::pin!(direct, relayed);
         // The first that answers; when one fails, the other.
+        let started = std::time::Instant::now();
         tokio::select! {
             outcome = &mut direct => match outcome {
                 Ok((tcp, address)) => Ok((tcp, Some(address))),
-                Err(_) => relayed.await.map(|tcp| (tcp, None)),
+                Err(error) => {
+                    eprintln!("TRACE direct failed after {:?}: {error}", started.elapsed());
+                    let outcome = relayed.await.map(|tcp| (tcp, None));
+                    eprintln!("TRACE then relay after {:?}: {:?}", started.elapsed(), outcome.as_ref().err());
+                    outcome
+                }
             },
             outcome = &mut relayed => match outcome {
                 Ok(tcp) => Ok((tcp, None)),
-                Err(error) => direct
-                    .await
-                    .map(|(tcp, address)| (tcp, Some(address)))
-                    .map_err(|_| error),
+                Err(error) => {
+                    eprintln!("TRACE relay failed after {:?}: {error}", started.elapsed());
+                    direct
+                        .await
+                        .map(|(tcp, address)| (tcp, Some(address)))
+                        .map_err(|_| error)
+                }
             },
         }
     }

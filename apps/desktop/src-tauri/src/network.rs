@@ -445,6 +445,11 @@ fn with_stores_closed<T>(
     *peers = PeerStore::open_in_memory().map_err(network_error)?;
     *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
         .map_err(|error| network_error(error.into()))?;
+    // The address book keeps the peer store's file open too, and Windows
+    // does not move a file that is open.
+    *net.addresses
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = AddressBook::default();
     let result = step();
     let peers_path = net.directory.join("peers.sqlite3");
     *peers = PeerStore::open(&peers_path, net.keystore.clone())
