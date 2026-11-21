@@ -1,33 +1,49 @@
-# Reaching devices on other networks (design, before Phase 16)
+# Reaching devices on other networks
 
-How a vault's devices could reach each other when they are not on one
-network: a phone on mobile data and the computer at home, or two computers
-in two homes. Written on 2026-10-12 for the owner to decide on before any
-of it is planned; the owner's decisions are at the end. Nothing here is
-implemented yet.
+How a vault's devices reach each other when they are not on one network: a
+phone on mobile data and the computer at home, or two computers in two
+homes. This began as a design, written on 2026-10-12 for the owner to decide
+on before Phase 16; the owner chose options A and B below, and both are
+built. What is and is not verified is in
+[implementation-status.md](implementation-status.md) ("Devices on other
+networks"); the relay has been tried in process and in a Linux container,
+and **not yet on a machine of its own on the internet**.
 
-## What happens today
+## What happens now
 
-- Each device listens on TCP port 47820 (or any free port) on IPv4 only
-  (`0.0.0.0`); nothing listens on IPv6.
-- An invitation names one address: the IPv4 address of the route to the
-  internet, which at home is the computer's address on the home network.
-- Each device keeps one address for each other device, learned from a
-  connection it accepted or made, or from a member's roster.
+- Each device listens on TCP port 47820 (or any free port) over IPv6 and
+  IPv4 alike, on one socket.
+- An invitation names up to four addresses of the inviter: the IPv4 and
+  IPv6 ones its route to the internet leaves from, then its other
+  interfaces', such as a VPN's. Loopback, link-local and similar addresses
+  are left out.
+- Each device keeps up to eight addresses for each other device, best
+  first, adding what members report and what an invitation named. A dial
+  tries them in turn, each 300 ms after the one before unless that one has
+  failed, and keeps the first that answers.
+- With a relay set up (below), a device that cannot reach another directly
+  reaches it through the relay.
 - Nothing finds devices: there is no discovery, no port mapping on the
-  router, no relay.
+  router.
 
-So two devices sync only when one can open a TCP connection to the other:
-on one home network, or with a port forwarded on the router by hand. A
-phone that leaves the house keeps its home computer's home-network address,
-and its syncs fail until it is back. A phone is never reachable from
-outside; it always dials. Two computers in two homes need a forwarded port.
+So with no VPN and no relay, two devices still sync only when one can open
+a TCP connection to the other: on one home network, on a network that
+gives devices global IPv6 addresses and lets the connection in, or with a
+port forwarded on the router by hand. A phone that leaves the house syncs
+again when it is back. A phone is never reachable from outside; it always
+dials.
 
 What stays, whatever is chosen: devices authenticate each other by the
 pinned TLS certificates of their members, and an address only says where to
 try (formats: "Addresses are advisory; the pin authenticates whatever
 answers"). No server ever holds a key or plaintext. A vault used on one
-network needs no server and no account, as now.
+network needs no server and no account.
+
+## What it was before Phase 16
+
+A device listened on IPv4 only (`0.0.0.0`), an invitation named one
+address, and each device kept one address for each other. The options
+below were weighed against that.
 
 ## The options
 
@@ -81,7 +97,7 @@ looking at only if live syncing through B proves too little for the phones.
 router to forward its port. Often turned off, no use behind carrier-grade
 NAT, and it opens the listener to the whole internet. Not recommended.
 
-## Recommendation
+## Recommendation (at the time)
 
 Phase 16: A, then B.
 
@@ -113,7 +129,7 @@ container), and set up for real later.
 
 ## Setting up a relay (once there is a machine for it)
 
-Not yet done on a real server: these steps are what the tests did on this
+Not yet done on a real server: these steps are what the tests did on a
 Mac and in a Linux container, written for one.
 
 1. A machine every device can reach at one address or name: a rented

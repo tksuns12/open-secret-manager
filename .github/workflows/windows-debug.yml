@@ -6,18 +6,18 @@ on:
 permissions:
   contents: read
 jobs:
-  quick:
+  desktop:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Host over the pipe
-        run: cargo test -p osm-native-host --locked --test windows -- --nocapture
-      - name: Phone through the relay
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: npm ci && npm run build
+        working-directory: apps/desktop
+      - name: Desktop library tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked
+      - name: Desktop program builds
         if: always()
-        run: cargo test -p osm-mobile --locked --test join a_phone_takes -- --nocapture
-        env:
-          RUST_BACKTRACE: "1"
-      - name: Pipe tests
-        if: always()
-        run: cargo test -p osm-vault-browser -p osm-browser-link --locked
+        run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
