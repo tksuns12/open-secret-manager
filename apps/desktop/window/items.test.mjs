@@ -160,6 +160,24 @@ async function shownMatches(page, selector, pattern) {
   }, [selector, pattern.source]);
 }
 
+test("a kind unchecked while the length is still settling stays unchecked", async () => {
+  const { page, errors } = await window.open();
+  await page.getByRole("button", { name: /Generator/ }).click();
+  const generator = page.locator(".generator-modal .generator");
+  await generator.getByLabel("Length").focus();
+  await page.keyboard.press("End");
+  await generator.getByLabel("A–Z", { exact: true }).uncheck();
+  // Longer than the length's own delay before it is kept.
+  await page.waitForTimeout(800);
+  assert.equal(await generator.getByLabel("A–Z", { exact: true }).isChecked(), false);
+  await generator.locator(".range-label", { hasText: "64" }).waitFor();
+  await page.locator(".generator-modal").getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: /Generator/ }).click();
+  assert.equal(await generator.getByLabel("A–Z", { exact: true }).isChecked(), false);
+  await generator.locator(".range-label", { hasText: "64" }).waitFor();
+  assert.deepEqual(errors, []);
+});
+
 test("the generator makes a password of the length and kinds chosen, and keeps the choice", async () => {
   const { page, errors } = await window.open();
   await page.getByRole("button", { name: /Generator/ }).click();

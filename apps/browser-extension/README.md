@@ -69,6 +69,13 @@ which the desktop app accepts from version 0.1.1 on; a Chromium browser
 connected with an earlier version is shown as connected to something else
 until it is connected again.
 
+On Windows the desktop app tells Chrome, Edge, Brave, Chromium and Firefox
+where the host is through a value under the current user's registry key
+rather than a file in a folder. That path is built and tested on GitHub's
+Windows machine, with a stand-in for the browser; the desktop app itself is
+not released for Windows, and the extension has not been tried with a real
+browser there.
+
 ## Building and loading
 
 With Node 24 (the version the project builds with) and npm:

@@ -351,6 +351,31 @@ fn archive_vault_files(vault_path: &Path, vault_first: bool) -> std::io::Result<
     Ok(archive)
 }
 
+/// Renames a file of the vault. On Windows a file that is open cannot be
+/// moved, and a store that was just shut down can still be closing as it is
+/// moved (a task that held it ends a moment after it was told to), so a
+/// refusal for that reason is tried again for a few seconds.
+fn rename_when_closed(from: &Path, to: &Path) -> std::io::Result<()> {
+    // The system's "in use by another process" and "access denied".
+    const IN_USE: [i32; 2] = [32, 5];
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error)
+                if cfg!(windows)
+                    && tries < 50
+                    && error
+                        .raw_os_error()
+                        .is_some_and(|code| IN_USE.contains(&code)) =>
+            {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Moves the vault and everything that belongs to it into `archive`. Each
 /// step is a rename, and the steps can be repeated.
 ///
@@ -376,13 +401,16 @@ fn move_vault_files(vault_path: &Path, archive: &Path, vault_first: bool) -> std
             let file = format!("{name}{suffix}");
             let from = directory.join(&file);
             if from.exists() {
-                match std::fs::rename(&from, archive.join(&file)) {
+                match rename_when_closed(&from, &archive.join(&file)) {
                     // SQLite deletes a database's side files when its last
                     // connection closes, which a store just shut down can
                     // still be doing as they are moved.
                     Err(error)
                         if error.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
-                    result => result?,
+                    // Say which file, as the system's message does not.
+                    result => result.map_err(|error| {
+                        std::io::Error::new(error.kind(), format!("{file}: {error}"))
+                    })?,
                 }
             }
         }
@@ -442,19 +470,37 @@ fn with_stores_closed<T>(
     *peers = PeerStore::open_in_memory().map_err(network_error)?;
     *invitations = InvitationStore::open_in_memory(InvitationPolicy::default())
         .map_err(|error| network_error(error.into()))?;
-    let result = step();
-    let peers_path = net.directory.join("peers.sqlite3");
-    *peers = PeerStore::open(&peers_path, net.keystore.clone())
-        .map_err(|error| store_error("peers.sqlite3", error))?;
+    // The address book keeps the peer store's file open too, and Windows
+    // does not move a file that is open.
     *net.addresses
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = AddressBook::default();
+    let result = step();
+    let peers_path = net.directory.join("peers.sqlite3");
+    // The address book first, and whatever else fails, so that it is not
+    // left empty by a store that did not open.
+    let addresses =
+        AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error));
+    let opened_peers = PeerStore::open(&peers_path, net.keystore.clone())
+        .map_err(|error| store_error("peers.sqlite3", error));
+    let mut address_error = None;
+    match addresses {
+        Ok(book) => {
+            *net.addresses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = book;
+        }
+        Err(error) => address_error = Some(error),
+    }
+    *peers = opened_peers?;
     *invitations = InvitationStore::open(
         net.directory.join("invitations.sqlite3"),
         InvitationPolicy::default(),
     )
     .map_err(|error| store_error("invitations.sqlite3", error.into()))?;
+    if let Some(error) = address_error {
+        return Err(error);
+    }
     result
 }
 

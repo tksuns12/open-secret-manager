@@ -682,6 +682,10 @@ pub fn listen(port: u16) -> std::io::Result<TcpListener> {
     };
     let listener = match both() {
         Ok(listener) => listener,
+        // A port that is taken is taken: a second socket for IPv4 alone must
+        // not share it (Windows lets one bind beside a dual-stack socket),
+        // or two devices would answer on one port.
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Err(error),
         Err(_) => std::net::TcpListener::bind(("0.0.0.0", port))?,
     };
     listener.set_nonblocking(true)?;

@@ -1,20 +1,26 @@
 use std::{
-    collections::HashMap,
     io::Write,
-    net::Shutdown,
-    os::unix::net::UnixStream,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
-    thread,
     time::Duration,
 };
 
 use osm_browser_link::{
     endpoint,
     frame::{self, Prefix},
-    Caller, Ceremony, Failure, Forwarded, ForwardedCard, ForwardedPasskey, PasskeyRequest, Refusal,
-    Request, Response,
+    Caller, Ceremony, Forwarded, ForwardedCard, ForwardedPasskey, PasskeyRequest, Refusal, Request,
+    Response,
 };
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+use unix::{Link, Open};
+#[cfg(windows)]
+use windows::{Link, Open};
 
 /// How many requests may wait for the desktop session at once. The session
 /// takes one at a time and refuses the rest itself; this only bounds what
@@ -28,17 +34,18 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(60);
 /// How long the desktop session may take to accept the request.
 const SEND_LIMIT: Duration = Duration::from_secs(5);
 
-/// The requests waiting for the desktop session, each with the connection
-/// that carries it.
-type Open = Arc<Mutex<HashMap<String, UnixStream>>>;
-
 pub struct Host<W> {
     /// The extension that started this process, if it is the allowed one.
     caller: Option<Caller>,
-    /// Where the desktop session listens, if this account has such a place.
+    /// Where the desktop session listens, if this account has such a place:
+    /// its socket, or on Windows the file that names its pipe.
     socket: Option<PathBuf>,
     out: Arc<Mutex<W>>,
+    /// The requests waiting for the desktop session.
     open: Open,
+    /// What the platform needs to reach the session. Nothing, on Unix.
+    #[cfg_attr(unix, allow(dead_code))]
+    link: Link,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -66,6 +73,7 @@ impl<W: Write + Send + 'static> Host<W> {
             socket,
             out: Arc::new(Mutex::new(out)),
             open: Open::default(),
+            link: Link::new(),
         }
     }
 
@@ -136,99 +144,13 @@ impl<W: Write + Send + 'static> Host<W> {
             send(&self.out, &Response::refusal(request_id, code));
         }
     }
-
-    /// Passes a checked request, `body`, to the desktop session and leaves a
-    /// thread handing back what the session answers to it, as `answers`
-    /// tells.
-    fn forward(
-        &self,
-        request_id: &str,
-        body: &[u8],
-        answers: impl Fn(&Response) -> bool + Send + 'static,
-    ) -> Result<(), Refusal> {
-        let mut open = lock(&self.open);
-        if open.contains_key(request_id) {
-            return Err(Refusal::Replayed);
-        }
-        if open.len() >= MAX_OPEN {
-            return Err(Refusal::Busy);
-        }
-        let unavailable = |_| Refusal::DesktopSessionUnavailable;
-        let path = self
-            .socket
-            .as_ref()
-            .ok_or(Refusal::DesktopSessionUnavailable)?;
-        let mut session = endpoint::connect(path).map_err(unavailable)?;
-        session
-            .set_read_timeout(Some(SILENCE_LIMIT))
-            .map_err(unavailable)?;
-        session
-            .set_write_timeout(Some(SEND_LIMIT))
-            .map_err(unavailable)?;
-        let framed = Prefix::Socket.frame(body).map_err(unavailable)?;
-        session.write_all(&framed).map_err(unavailable)?;
-        open.insert(
-            request_id.to_owned(),
-            session.try_clone().map_err(unavailable)?,
-        );
-        drop(open);
-
-        let (request_id, out, open) = (request_id.to_owned(), self.out.clone(), self.open.clone());
-        thread::spawn(move || relay(&request_id, &answers, session, &out, &open));
-        Ok(())
-    }
-
-    /// Withdraws a request. Closing its connection is what tells the
-    /// desktop session.
-    fn cancel(&self, request_id: &str) {
-        if let Some(session) = lock(&self.open).remove(request_id) {
-            let _ = session.shutdown(Shutdown::Both);
-        }
-    }
-}
-
-/// Hands the desktop session's answers to one request back to the
-/// extension, until the answer that ends it.
-fn relay(
-    request_id: &str,
-    answers: &impl Fn(&Response) -> bool,
-    mut session: UnixStream,
-    out: &Mutex<impl Write>,
-    open: &Open,
-) {
-    loop {
-        // Only what answers exactly this request is handed on. Anything
-        // else, a closed connection, and a long silence all mean there is
-        // no session to trust with it.
-        let answer = match Prefix::Socket.read(&mut session) {
-            Ok(Some(body)) => serde_json::from_slice::<Response>(&body)
-                .ok()
-                .filter(|response| answers(response)),
-            _ => None,
-        };
-        // Held while answering, so that nothing but `cancelled` follows a
-        // withdrawal.
-        let mut open = lock(open);
-        if !open.contains_key(request_id) {
-            send(out, &Response::refusal(request_id, Refusal::Cancelled));
-            return;
-        }
-        let answer = answer.unwrap_or_else(|| {
-            Response::Error(Failure::new(request_id, Refusal::DesktopSessionUnavailable))
-        });
-        send(out, &answer);
-        if answer.is_final() {
-            open.remove(request_id);
-            return;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io;
 
-    use osm_browser_link::CHROMIUM_EXTENSION_ID;
+    use osm_browser_link::{Failure, CHROMIUM_EXTENSION_ID};
     use proptest::prelude::*;
 
     use super::*;

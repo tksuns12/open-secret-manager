@@ -1878,7 +1878,12 @@ function Generator({ choice, onChoice, onCopy, onUse }: { choice: GeneratorChoic
   latest.current = { choice, length, onChoice };
   useEffect(() => {
     if (length === choice.length) return;
-    const timer = setTimeout(() => onChoice({ ...choice, length }), 300);
+    // The kinds as they are when it fires, not as they were when the slider
+    // moved: a box unchecked meanwhile would be put back.
+    const timer = setTimeout(() => {
+      const { choice, length, onChoice } = latest.current;
+      onChoice({ ...choice, length });
+    }, 300);
     return () => clearTimeout(timer);
   }, [length]);
   useEffect(() => () => {

@@ -11,9 +11,14 @@
 //! links.
 
 pub mod frame;
+#[cfg(any(windows, test))]
+pub mod handshake;
 mod message;
 
 #[cfg(unix)]
+pub mod endpoint;
+#[cfg(windows)]
+#[path = "endpoint_windows.rs"]
 pub mod endpoint;
 
 pub use message::{

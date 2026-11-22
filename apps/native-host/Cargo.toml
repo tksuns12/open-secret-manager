@@ -9,6 +9,10 @@ rust-version.workspace = true
 osm-browser-link = { path = "../../crates/browser-link" }
 serde_json = "1.0"
 
+[target.'cfg(windows)'.dependencies]
+zeroize = "1.8.2"
+tokio = { version = "1.53.1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
+
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 osm-vault-browser = { path = "../../crates/vault-browser" }
