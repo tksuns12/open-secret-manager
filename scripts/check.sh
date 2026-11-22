@@ -18,10 +18,8 @@
 #                                 container (scripts/test-linux.sh) and the
 #                                 real app driven end to end there
 #                                 (scripts/test-linux-app.sh), on the
-#                                 working tree; OSM_COLIMA_PROFILE names a
-#                                 colima machine to start for it and stop
-#                                 again, which leaves the Docker context as
-#                                 it was
+#                                 working tree, on the current Docker
+#                                 context (OSM_DOCKER_CONTEXT names another)
 #   scripts/check.sh --fuzz       also coverage fuzzing of the parsers
 #                                 (scripts/fuzz.sh, on a nightly
 #                                 toolchain), OSM_FUZZ_SECONDS per target
@@ -99,28 +97,11 @@ if [ "$fuzz_run" = yes ]; then
     scripts/fuzz.sh "${OSM_FUZZ_SECONDS:-300}"
 fi
 
-# Before the phones: a colima machine started here is stopped again first,
-# and an emulator can be killed for memory while one runs.
+# Before the phones: an emulator can be killed for memory while one runs.
 if [ "$linux" = yes ]; then
     step "Desktop's Linux code in a container"
-    profile=${OSM_COLIMA_PROFILE:-}
-    if [ -n "$profile" ] && ! colima status "$profile" >/dev/null 2>&1; then
-        context=$(docker context show)
-        trap 'colima stop "$profile"' EXIT
-        colima start "$profile"
-        # Starting makes the machine's context the current one.
-        docker context use "$context" >/dev/null
-    fi
-    if [ -n "$profile" ]; then
-        OSM_DOCKER_CONTEXT=$([ "$profile" = default ] && echo colima || echo "colima-$profile")
-        export OSM_DOCKER_CONTEXT
-    fi
     OSM_ALLOW_CHANGES=1 scripts/test-linux.sh
     OSM_ALLOW_CHANGES=1 scripts/test-linux-app.sh
-    if [ -n "${context:-}" ]; then
-        trap - EXIT
-        colima stop "$profile"
-    fi
 fi
 
 if [ "$mobile" = yes ]; then

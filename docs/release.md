@@ -168,7 +168,9 @@ build.
   with the same key, so the keystore is kept as carefully as a Developer
   ID. `scripts/reproduce-android.sh` builds twice and compares the file
   lists. The Docker context (`OSM_DOCKER_CONTEXT`) must run linux/amd64
-  containers; on an Apple Silicon Mac, a colima machine with Rosetta does.
+  containers; on an Apple Silicon Mac, one with Rosetta or emulation does
+  (the project's containers run on the `kiri` context; the Android build
+  has not been tried on it yet).
   A release is never built on the Mac itself: the APK's other files come
   out the same there, but not the shared code's library, as Cargo puts the
   kind of machine that builds into every crate's hash and rustc orders the
@@ -234,7 +236,7 @@ the NDK there is also a change to the recipe's `ndk`.
 From a commit with nothing uncommitted:
 
 1. `scripts/check.sh --network --browsers --linux` passes (`--linux` needs a
-   Docker engine; `OSM_COLIMA_PROFILE` names a colima machine to start for it).
+   Docker engine; `OSM_DOCKER_CONTEXT` names the context to use).
 2. `scripts/release-macos.sh`, with `OSM_SIGNING_IDENTITY` (a Developer ID
    Application identity) and `OSM_NOTARY_PROFILE` (a notarytool keychain
    profile) set for a signed and notarized release. Without them the app is

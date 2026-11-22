@@ -16,7 +16,7 @@
 #                       it until it is signed.
 # OSM_DOCKER_CONTEXT    the Docker context to build in (default: the current
 #                       one). It must run linux/amd64 containers: on an
-#                       Apple Silicon Mac, a colima machine with Rosetta.
+#                       Apple Silicon Mac, one with Rosetta or emulation.
 # OSM_ALLOW_CHANGES=1   build although the working tree has changes, which
 #                       are then built too; the result is not a release.
 set -eu
