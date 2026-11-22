@@ -1630,6 +1630,28 @@ impl Vault {
         ids.iter().map(|id| self.get(id).map(Into::into)).collect()
     }
 
+    /// Which logins hold a weak password or share one (see
+    /// [`crate::health`]), judged on what each shows now. Made when asked
+    /// for from what the unlocked vault holds; nothing keeps it.
+    pub fn password_health(&self) -> Result<crate::health::PasswordHealth> {
+        self.key()?;
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT item_id FROM heads WHERE tombstone=0 AND item_id NOT IN (?1, ?2) \
+             ORDER BY item_id",
+        )?;
+        let ids = statement
+            .query_map(RESERVED_IDS, |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        // One item at a time, so that of each only what the check needs
+        // stays in memory.
+        let mut check = crate::health::Check::default();
+        for id in &ids {
+            check.add(&self.get(id)?.item);
+        }
+        Ok(check.finish())
+    }
+
     /// Notes in the vault that this device saved a backup now, for its other
     /// devices to learn when they sync (see [`BACKUPS_ID`]).
     pub fn note_backup(&mut self) -> Result<RevisionInfo> {

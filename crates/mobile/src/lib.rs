@@ -322,6 +322,62 @@ pub struct ItemSummary {
     pub passkeys: u32,
 }
 
+/// Why a password is called weak (see `osm_vault_core::health`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum Weakness {
+    TooShort,
+    OneKind,
+    Common,
+    HoldsOwnName,
+}
+
+/// A login whose password is weak, and why. Never the password.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WeakPassword {
+    pub id: String,
+    pub reasons: Vec<Weakness>,
+}
+
+impl std::fmt::Debug for WeakPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakPassword")
+            .field("reasons", &self.reasons)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A set of logins that share one password.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReusedPassword {
+    pub ids: Vec<String>,
+}
+
+// Which logins share a password is not printed, however a log is made.
+impl std::fmt::Debug for ReusedPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReusedPassword")
+            .field("logins", &self.ids.len())
+            .finish()
+    }
+}
+
+/// Which logins hold a weak password or share one: ids and reasons, made
+/// when asked for and kept by no one.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PasswordHealth {
+    pub weak: Vec<WeakPassword>,
+    pub reused: Vec<ReusedPassword>,
+}
+
+impl std::fmt::Debug for PasswordHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordHealth")
+            .field("weak", &self.weak.len())
+            .field("reused", &self.reused.len())
+            .finish()
+    }
+}
+
 /// A login's passkey as its page shows it: the site and the account it is
 /// for. Never its key.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -925,6 +981,11 @@ impl Device {
 
     pub fn items(&self) -> Result<Vec<ItemSummary>, MobileError> {
         self.tokio.block_on(self.inner.items())
+    }
+
+    /// Which logins hold a weak password or share one, judged now.
+    pub fn password_health(&self) -> Result<PasswordHealth, MobileError> {
+        self.tokio.block_on(self.inner.password_health())
     }
 
     pub fn item(&self, id: String) -> Result<ItemDetail, MobileError> {

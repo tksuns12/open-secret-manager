@@ -3321,3 +3321,31 @@ fn everyday_use_never_breaks_the_seal() {
     a.unlock_with_recovery(&recovery).unwrap();
     assert!(!a.rows_changed());
 }
+
+#[test]
+fn password_health_judges_the_live_logins_and_not_the_deleted_ones() {
+    let dir = tempdir().unwrap();
+    let (mut vault, _) = Vault::create(dir.path().join("vault.db"), "initial password").unwrap();
+    let mut login = |title: &str, url: &str, password: &str| {
+        let mut item = Item::new(title);
+        item.username = "me".into();
+        item.url = url.into();
+        item.password = password.into();
+        let written = vault.put(item).unwrap();
+        (written.item_id, written.revision)
+    };
+    let (first, _) = login("One", "https://one.test", "rT9#vLm2qXa");
+    let (second, second_revision) = login("Two", "https://two.test", "rT9#vLm2qXa");
+    let (short, _) = login("Three", "https://three.test", "abc");
+    let health = vault.password_health().unwrap();
+    assert_eq!(health.reused.len(), 1);
+    assert!(health.reused[0].contains(&first) && health.reused[0].contains(&second));
+    assert_eq!(health.weak.len(), 1);
+    assert_eq!(health.weak[0].id, short);
+
+    // An item put away is no longer judged, and a locked vault says nothing.
+    vault.delete(&second, &second_revision).unwrap();
+    assert!(vault.password_health().unwrap().reused.is_empty());
+    vault.lock();
+    assert!(vault.password_health().is_err());
+}

@@ -36,7 +36,8 @@ use crate::{
     fill::{self, AppChoices, Asks, Filled, Offer, Requester},
     CardDetail, CardFill, DeletedEntry, DeviceState, HistoryEntry, ItemDetail, ItemDraft,
     ItemSummary, MobileError, PasskeyCaller, PasskeyChoice, PasskeyCreation, PasskeyRefusal,
-    PasskeySignIn, RebasedEdit, SaveCandidate, SyncState, SyncStatus,
+    PasskeySignIn, PasswordHealth, RebasedEdit, ReusedPassword, SaveCandidate, SyncState,
+    SyncStatus, WeakPassword, Weakness,
 };
 
 /// The first eight hex digits of a device's ID, as the screens name it.
@@ -334,6 +335,37 @@ impl Runtime {
         let vault = self.vault.lock().await;
         let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
         Ok(vault.list()?.into_iter().map(ItemSummary::from).collect())
+    }
+
+    pub(crate) async fn password_health(&self) -> Result<PasswordHealth, MobileError> {
+        use osm_vault_core::health::Weakness as Core;
+        let vault = self.vault.lock().await;
+        let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
+        let health = vault.password_health()?;
+        Ok(PasswordHealth {
+            weak: health
+                .weak
+                .into_iter()
+                .map(|weak| WeakPassword {
+                    id: weak.id,
+                    reasons: weak
+                        .reasons
+                        .into_iter()
+                        .map(|reason| match reason {
+                            Core::TooShort => Weakness::TooShort,
+                            Core::OneKind => Weakness::OneKind,
+                            Core::Common => Weakness::Common,
+                            Core::HoldsOwnName => Weakness::HoldsOwnName,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            reused: health
+                .reused
+                .into_iter()
+                .map(|ids| ReusedPassword { ids })
+                .collect(),
+        })
     }
 
     pub(crate) async fn item(&self, id: &str) -> Result<ItemDetail, MobileError> {

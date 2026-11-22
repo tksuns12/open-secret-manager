@@ -3,6 +3,7 @@
 pub mod card;
 mod crypto;
 mod error;
+pub mod health;
 mod import;
 mod model;
 pub mod passkey;

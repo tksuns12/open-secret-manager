@@ -1,5 +1,5 @@
 import { cardBrand, cardDigits } from "./card";
-import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, GeneratorChoice, HeldChange, HistoryEntry, ImportSummary, PasskeySummary, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
+import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, GeneratorChoice, HeldChange, HistoryEntry, ImportSummary, PasskeySummary, PasswordHealth, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
 type Invoke = (cmd: string, args?: unknown) => Promise<unknown>;
 type Listen = (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
@@ -244,6 +244,13 @@ export const bridge: DesktopBridge = {
     // A new list each time, as the shell's is: the window reloads what goes
     // with the items when the list changes.
     return [...previewEntries];
+  },
+  async passwordHealth() {
+    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    if (invoke) return (await invoke("password_health")) as PasswordHealth;
+    // The preview keeps no password, so it answers with a sample: a short
+    // password on the Wi-Fi login, and one shared by the two first logins.
+    return { weak: [{ id: "5", reasons: ["too_short", "one_kind"] }], reused: [["1", "2"]] };
   },
   async lock() {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;

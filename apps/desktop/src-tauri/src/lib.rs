@@ -182,6 +182,55 @@ async fn list_entries(state: tauri::State<'_, AppState>) -> Result<Vec<ItemSumma
         .map_err(Into::into)
 }
 
+/// What the vault's logins say of their passwords: ids and reasons only,
+/// made when asked for and kept by no one (see `osm_vault_core::health`).
+#[derive(Serialize)]
+struct PasswordHealth {
+    weak: Vec<WeakPassword>,
+    reused: Vec<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct WeakPassword {
+    id: String,
+    reasons: Vec<&'static str>,
+}
+
+#[tauri::command]
+async fn password_health(
+    state: tauri::State<'_, AppState>,
+) -> Result<PasswordHealth, CommandError> {
+    use osm_vault_core::health::Weakness;
+    let vault = state.vault.lock().await;
+    let health = vault
+        .as_ref()
+        .ok_or_else(|| CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        })?
+        .password_health()?;
+    Ok(PasswordHealth {
+        weak: health
+            .weak
+            .into_iter()
+            .map(|weak| WeakPassword {
+                id: weak.id,
+                reasons: weak
+                    .reasons
+                    .into_iter()
+                    .map(|reason| match reason {
+                        Weakness::TooShort => "too_short",
+                        Weakness::OneKind => "one_kind",
+                        Weakness::Common => "common",
+                        Weakness::HoldsOwnName => "holds_own_name",
+                    })
+                    .collect(),
+            })
+            .collect(),
+        reused: health.reused,
+    })
+}
+
 /// A new password as `choice` asks, which is the owner's choice in the
 /// window, kept or not.
 #[tauri::command]
@@ -994,6 +1043,7 @@ pub fn run() {
             lock_vault,
             idle::lock_when_idle,
             list_entries,
+            password_health,
             generate_password,
             copy_generated,
             copy_totp,

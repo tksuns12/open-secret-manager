@@ -31,3 +31,17 @@ _Avoid_: linked login, match
 **Save candidate**:
 A login that what a form sent could be saved into: one the same form could be filled with, under the username it sent.
 _Avoid_: update target
+
+## Password health
+
+**Weak password**:
+A login's password that is short, of one kind of character and short, a common one (or a run such as `12345678`), or that holds the item's own username, title or site name. Each is a reason the code can show; a password that is none of these is not thereby strong.
+_Avoid_: low score, strength meter
+
+**Reused password**:
+One password held by logins at two or more places, a place being a username at a site (its registrable domain). Two logins for one username at one site are a duplicate, not a reuse.
+_Avoid_: duplicate password
+
+**Needs attention**:
+A login with a weak password or a reused one. Judged on this device from the unlocked vault when asked for, from the version the vault shows; named by id and reason, never by the password, and kept by nothing.
+_Avoid_: unsafe, compromised, breached (nothing is looked up, so nothing is known to be leaked)

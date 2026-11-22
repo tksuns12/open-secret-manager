@@ -36,6 +36,29 @@ test("the list shows the vault's items, and the search and the filters narrow it
   assert.deepEqual(errors, []);
 });
 
+test("logins with a weak or shared password are marked, filtered, and told why", async () => {
+  const { page, errors } = await window.open();
+  const nav = page.getByRole("navigation", { name: "Vault filters" });
+  const attention = nav.getByRole("button", { name: /Needs attention/ });
+  await attention.locator(".nav-count").waitFor();
+  assert.equal(await attention.locator(".nav-count").textContent(), "3");
+  await attention.click();
+  assert.deepEqual(await titles(page), ["Proton Mail", "GitHub", "Studio Wi-Fi"]);
+  await page.locator(".entry-row", { hasText: "Studio Wi-Fi" }).click();
+  const note = page.locator(".attention-note");
+  await note.getByText("Worth changing this password").waitFor();
+  assert.match(await note.textContent(), /is short and uses one kind of character/);
+  await page.locator(".entry-row", { hasText: "GitHub" }).click();
+  assert.match(await page.locator(".attention-note").textContent(), /also used by another login/);
+  // An item that is fine has neither the mark nor the note.
+  await nav.getByRole("button", { name: /All items/ }).click();
+  await page.locator(".entry-row", { hasText: "Banking" }).click();
+  assert.equal(await page.locator(".attention-note").count(), 0);
+  assert.equal(await page.locator(".entry-row", { hasText: "Banking" }).locator(".attention").count(), 0);
+  assert.equal(await page.locator(".entry-row", { hasText: "Studio Wi-Fi" }).locator(".attention").count(), 1);
+  assert.deepEqual(errors, []);
+});
+
 test("a card is made with a card's fields, shown without its number, and edited keeping what was left blank", async () => {
   const { page, errors } = await window.open();
   const editor = page.locator(".entry-editor");

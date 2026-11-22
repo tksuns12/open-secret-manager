@@ -1,3 +1,8 @@
+/** Why a password is called weak (`osm_vault_core::health::Weakness`). */
+export type WeakReason = "too_short" | "one_kind" | "common" | "holds_own_name";
+/** Which logins hold a weak password or share one: ids and reasons, never a password. */
+export type PasswordHealth = { weak: { id: string; reasons: WeakReason[] }[]; reused: string[][] };
+
 export type EntryKind = "login" | "secure_note" | "identity" | "card";
 
 export type VaultEntry = {
@@ -426,6 +431,8 @@ export type BrowserStatus = {
 export type DesktopBridge = {
   status: () => Promise<"missing" | "locked" | "unlocked">;
   listEntries: () => Promise<VaultEntry[]>;
+  /** Which logins hold a weak password or share one, judged now in the shell. */
+  passwordHealth: () => Promise<PasswordHealth>;
   unlock: (password: string) => Promise<void>;
   createVault: (password: string) => Promise<string>;
   lock: () => Promise<void>;

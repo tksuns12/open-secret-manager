@@ -385,6 +385,16 @@ Its stops:
 4. A strong password made at a sign-up on Android, saved and filled. **Done** (see Android autofill in the delivery matrix).
 5. On the owner's phone, and loose ends. **Done** (2026-10-26): the signed release of `f1766e65` on the owner's phone, which the owner found working (see Android app and Android autofill in the delivery matrix); the desktop's bundle rebuilt with the generator's choices for the owner's Mac; and the review packet (its parts, line counts, what to look at, the phones' trust boundary, the evidence, and a question on a password made at a sign-up) brought up to date.
 
+### Phase 20 — Passwords worth changing
+
+Started 2026-11-22, the owner's fourth priority after Windows: say which logins hold a weak password or share one, on the device, without a lookup.
+
+1. The check in the shared code (`osm_vault_core::health`, `Vault::password_health`): weak for a reason it can show, reused across places, a login with a password only, the version the vault shows. **Done**, with tests of the reasons, of reuse and duplicates (https, http, other schemes, apps, IP addresses), of what is printed, of the generator's lengths 8 to 64 with every kind chosen and of its one-kind choices at 8, and of deleted items. Not tested: a conflicted item, the window clearing it at a lock, a refresh after an edit, the phone export.
+2. The desktop: the `password_health` command, a "Needs attention" filter with its count, a mark on each such item and a note in its detail saying why. **Done**, with a test of the window; the window's lower-height sidebar was tightened by a pixel a row to fit the sixth filter.
+3. The phones' export (`osm-mobile`'s `password_health`, with the Kotlin and Swift bindings made from it). **Done** in the shared code; the phones' screens for it are **not started**.
+
+Known: a password the generator makes of one kind of character below 12 characters (digits only for a PIN, or lowercase only) is called weak; on 2000 items the check takes about 120 ms in a release build, and runs at each change of the list; the list of common passwords is short and written by hand, not taken from a published list; no breach lookup, by design.
+
 ## Work that can proceed in parallel
 
 Core persistence/cryptography, sync transport primitives, and frontend shell work can run independently after types and errors are agreed. The UI uses an explicit development adapter until the core bridge exists and labels any demonstration data. The sync layer accepts only encrypted envelopes and signed public control data. Browser filling depends on the desktop session and core origin policy; it cannot be made real by a standalone extension patch.
