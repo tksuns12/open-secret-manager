@@ -29,3 +29,8 @@ jobs:
       - name: Desktop app
         if: always()
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --workspace --locked --no-fail-fast
+      # The host as the installer ships it: built alone, so that no other
+      # crate's features are added to its own, as the workspace's test build adds them.
+      - name: Native host, built alone
+        if: always()
+        run: cargo build --release --locked -p osm-native-host
