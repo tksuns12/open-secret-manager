@@ -235,7 +235,7 @@ fun VaultScreen(
                         ?: state.history?.let { HistoryList(it, session) }
                         ?: state.deleted?.let { DeletedList(it, session) }
                         ?: state.passwordChange.takeIf { it }?.let { PasswordChange(state, session) }
-                        ?: state.detail?.let { Detail(it, session) }
+                        ?: state.detail?.let { Detail(it, state.attention[it.id].orEmpty(), session) }
                         ?: if (place.settings) SettingsScreen(state, session, place) else Items(state, session, place)
                     Screen.REMOVED -> Message(
                         "This phone was removed from the vault",
@@ -558,6 +558,7 @@ private enum class ItemFilter(val label: String, val tag: String) {
     LOGINS("Logins", "filter-logins"),
     CARDS("Cards", "filter-cards"),
     NOTES("Notes", "filter-notes"),
+    ATTENTION("Needs attention", "filter-attention"),
 }
 
 @Composable
@@ -573,6 +574,7 @@ private fun Items(state: UiState, session: VaultSession, place: ListPlace) {
                 ItemFilter.LOGINS -> it.kind == ItemKind.LOGIN
                 ItemFilter.CARDS -> it.kind == ItemKind.CARD
                 ItemFilter.NOTES -> it.kind == ItemKind.SECURE_NOTE
+                ItemFilter.ATTENTION -> state.attention.containsKey(it.id)
             }
     }
     Column(Modifier.fillMaxSize()) {
@@ -609,16 +611,16 @@ private fun Items(state: UiState, session: VaultSession, place: ListPlace) {
             contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            items(shown, key = { it.id }) { item -> ItemRow(item) { session.open(item.id) } }
+            items(shown, key = { it.id }) { item -> ItemRow(item, state.attention.containsKey(item.id)) { session.open(item.id) } }
             if (shown.isEmpty()) {
                 item {
                     Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            if (state.items.isEmpty()) "Nothing here yet" else "No match",
+                            if (state.items.isEmpty()) "Nothing here yet" else if (filter == ItemFilter.ATTENTION && query.isBlank()) "Nothing needs attention" else "No match",
                             style = MaterialTheme.typography.titleMedium,
                         )
                         Text(
-                            if (state.items.isEmpty()) "Add an item, or sync with your computer." else "Try another word or filter.",
+                            if (state.items.isEmpty()) "Add an item, or sync with your computer." else if (filter == ItemFilter.ATTENTION && query.isBlank()) "By what this checks: short, one kind of character, common, its own name, or shared." else "Try another word or filter.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -804,7 +806,7 @@ private fun RowsChanged(session: VaultSession) {
 }
 
 @Composable
-private fun ItemRow(item: ItemSummary, onClick: () -> Unit) {
+private fun ItemRow(item: ItemSummary, needsAttention: Boolean, onClick: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).clickable(onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 10.dp).testTag("item:${item.title}"),
@@ -827,6 +829,7 @@ private fun ItemRow(item: ItemSummary, onClick: () -> Unit) {
                 )
             }
         }
+        if (needsAttention) Text("!", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.titleMedium, modifier = Modifier.semantics { contentDescription = "Needs attention" }.testTag("attention:${item.title}"))
         if (item.favorite) Text("★", color = MaterialTheme.colorScheme.primary, modifier = Modifier.semantics { contentDescription = "Favorite" })
     }
 }
@@ -853,7 +856,7 @@ internal fun cardLine(brand: String?, ending: String?): String =
     listOfNotNull(brand?.takeIf { it.isNotBlank() } ?: "Card", ending?.let { "•••• $it" }).joinToString(" ")
 
 @Composable
-private fun Detail(detail: ItemDetail, session: VaultSession) {
+private fun Detail(detail: ItemDetail, attention: List<String>, session: VaultSession) {
     var confirmingDelete by remember(detail.id) { mutableStateOf(false) }
     var removing by remember(detail.id) { mutableStateOf<PasskeyDetail?>(null) }
     val editable = detail.kind != ItemKind.IDENTITY && !detail.conflict
@@ -875,6 +878,14 @@ private fun Detail(detail: ItemDetail, session: VaultSession) {
                     color = MaterialTheme.colorScheme.onErrorContainer,
                     modifier = Modifier.padding(16.dp),
                 )
+            }
+        }
+        if (attention.isNotEmpty()) {
+            Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.semantics(mergeDescendants = true) {}.testTag("attention-note")) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Worth changing this password", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                    Text(attention.joinToString(" "), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                }
             }
         }
         if (editable) {

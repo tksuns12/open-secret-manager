@@ -121,6 +121,58 @@ class EditTest {
         compose.onAllNodesWithTag("item:Forum").assertCountEquals(0)
     }
 
+    /** Makes a login with the password typed over the one made for it, and leaves it open. */
+    private fun makeLogin(title: String, username: String, password: String) {
+        compose.onNodeWithTag("new-item").performClick()
+        waitFor("edit-title")
+        compose.onNodeWithTag("edit-title").performTextInput(title)
+        compose.onNodeWithTag("edit-username").performTextInput(username)
+        compose.onNodeWithTag("edit-password").performTextReplacement(password)
+        save()
+        waitFor("detail-username")
+    }
+
+    @Test
+    fun loginsWithAWeakOrSharedPasswordAreMarkedFilteredAndToldWhy() {
+        unlocked()
+        makeLogin("Shared one", "anna", "Zq7!rT9#vLm2qXa")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Bank")
+        makeLogin("Shared two", "bert", "Zq7!rT9#vLm2qXa")
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Bank")
+        makeLogin("Weak one", "carl", "kjhdsfpq")
+        // Its own note, told in the detail it opens in.
+        waitFor("attention-note")
+        assertTrue(text("attention-note").contains("uses one kind of character"))
+        compose.onNodeWithTag("back").performClick()
+        waitFor("item:Bank")
+
+        compose.onNodeWithTag("filter-attention").performScrollTo().performClick()
+        compose.waitUntil(15_000) { compose.onAllNodesWithTag("item:Shared one").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("item:Shared one").assertExists()
+        compose.onNodeWithTag("item:Shared two").assertExists()
+        compose.onNodeWithTag("item:Weak one").assertExists()
+        compose.onAllNodesWithTag("item:Bank").assertCountEquals(0)
+        compose.onNodeWithTag("attention:Shared two", useUnmergedTree = true).assertExists()
+
+        compose.onNodeWithTag("item:Shared two").performClick()
+        waitFor("attention-note")
+        assertTrue(text("attention-note").contains("also used by another login"))
+        // A password edited alone, with the list as it was, clears the mark.
+        compose.onNodeWithTag("edit").performClick()
+        waitFor("edit-password")
+        compose.onNodeWithTag("edit-password").performTextReplacement("a-different-Strong#4-x")
+        save()
+        // Saved, and opened again; back on the list, with the filter still on, only the weak one is left.
+        waitFor("detail-username")
+        compose.onNodeWithTag("back").performClick()
+        compose.waitUntil(15_000) { compose.onAllNodesWithTag("item:Shared two").fetchSemanticsNodes().isEmpty() }
+        compose.onAllNodesWithTag("item:Shared one").assertCountEquals(0)
+        compose.onNodeWithTag("item:Weak one").assertExists()
+        compose.onNodeWithTag("attention:Weak one", useUnmergedTree = true).assertExists()
+    }
+
     @Test
     fun aCardIsMadeAndEditedByItsOwnFieldsKeepingWhatWasLeftBlank() {
         unlocked()

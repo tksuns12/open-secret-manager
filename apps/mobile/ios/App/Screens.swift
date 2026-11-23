@@ -260,7 +260,7 @@ private struct JoinConfirm: View {
 
 /// Which items the list shows.
 private enum ItemFilter: CaseIterable {
-    case all, favorites, logins, cards, notes
+    case all, favorites, logins, cards, notes, attention
 
     var label: String {
         switch self {
@@ -269,6 +269,7 @@ private enum ItemFilter: CaseIterable {
         case .logins: "Logins"
         case .cards: "Cards"
         case .notes: "Notes"
+        case .attention: "Needs attention"
         }
     }
 
@@ -279,16 +280,18 @@ private enum ItemFilter: CaseIterable {
         case .logins: "filter-logins"
         case .cards: "filter-cards"
         case .notes: "filter-notes"
+        case .attention: "filter-attention"
         }
     }
 
-    func admits(_ item: ItemSummary) -> Bool {
+    func admits(_ item: ItemSummary, attention: [String: [String]]) -> Bool {
         switch self {
         case .all: true
         case .favorites: item.favorite
         case .logins: item.kind == .login
         case .cards: item.kind == .card
         case .notes: item.kind == .secureNote
+        case .attention: attention[item.id] != nil
         }
     }
 }
@@ -300,7 +303,7 @@ private struct Items: View {
 
     private var shown: [ItemSummary] {
         model.items.filter { item in
-            filter.admits(item) && (query.isEmpty
+            filter.admits(item, attention: model.attention) && (query.isEmpty
                 || item.title.localizedCaseInsensitiveContains(query) || item.username.localizedCaseInsensitiveContains(query)
                 || item.url.localizedCaseInsensitiveContains(query))
         }
@@ -349,6 +352,11 @@ private struct Items: View {
                             }
                         }
                         Spacer(minLength: 0)
+                        if model.attention[item.id] != nil {
+                            Text("!").font(.body.weight(.bold)).foregroundStyle(.red)
+                                .accessibilityLabel("Needs attention")
+                                .accessibilityIdentifier("attention:\(item.title)")
+                        }
                         if item.favorite {
                             Image(systemName: "star.fill").foregroundStyle(OSM.accent).accessibilityLabel("Favorite")
                         }
@@ -362,7 +370,7 @@ private struct Items: View {
                 .listRowSeparatorTint(OSM.hairline)
             }
             if shown.isEmpty {
-                Text(model.items.isEmpty ? "No items yet" : "Nothing matches")
+                Text(model.items.isEmpty ? "No items yet" : filter == .attention && query.isEmpty ? "Nothing needs attention, by what this checks" : "Nothing matches")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 32)
@@ -489,6 +497,14 @@ private struct Detail: View {
                 if detail.conflict {
                     Text("Two devices changed this at once. Choose which version to keep on your computer.")
                         .foregroundStyle(.red)
+                }
+                if let told = model.attention[detail.id] {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Worth changing this password").font(.subheadline.weight(.semibold))
+                        Text(told.joined(separator: " ")).font(.subheadline)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("attention-note")
                 }
                 if editable {
                     HStack(spacing: 12) {

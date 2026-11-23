@@ -54,6 +54,8 @@ enum class Screen { OPENING, NO_VAULT, JOINING, LOCKED, UNLOCKED, REMOVED, UNREA
 data class UiState(
     val screen: Screen = Screen.OPENING,
     val items: List<ItemSummary> = emptyList(),
+    /** What each login that needs attention is told, by id; cleared where the list is, and kept nowhere else. */
+    val attention: Map<String, List<String>> = emptyMap(),
     val detail: ItemDetail? = null,
     val sync: SyncStatus? = null,
     /** The code to compare with the inviting device's, while joining. */
@@ -119,6 +121,14 @@ class VaultSession(private val context: Context, private val folder: File) {
      * locks, by [SystemClock.elapsedRealtime]. Written under [calls].
      */
     @Volatile private var lockAt: Long? = null
+    /**
+     * Whether the check of the passwords is owed: at an unlock, after what the
+     * owner did (a save, a delete, a restore), when the list changed, and
+     * otherwise once a [HEALTH_EVERY_MS] at most, since each check decrypts every
+     * item and holds the vault's lock that autofill waits for. Under [calls].
+     */
+    private var healthStale = true
+    private var healthAt = 0L
     /** Locks the vault once the time it stays unlocked for has run out. */
     private var lockLater: Job? = null
     /**
@@ -227,6 +237,8 @@ class VaultSession(private val context: Context, private val folder: File) {
         scope.launch {
             calls.withLock {
                 if (busy != null) _state.update { it.copy(busy = busy, notice = null) }
+                // What the owner asked for may change a password: the next read checks them again.
+                healthStale = true
                 try {
                     work()
                 } catch (error: Exception) {
@@ -256,7 +268,11 @@ class VaultSession(private val context: Context, private val folder: File) {
                     } finally {
                         if (busy != null) _state.update { it.copy(busy = null) }
                     }
-                    calls.withLock { runCatching { refresh() } }
+                    // What was fetched may have changed a password: checked again at this read.
+                    calls.withLock {
+                        healthStale = true
+                        runCatching { refresh() }
+                    }
                 }
             } finally {
                 finished.complete(Unit)
@@ -287,10 +303,26 @@ class VaultSession(private val context: Context, private val folder: File) {
         }
         unlockedNow = screen == Screen.UNLOCKED
         val items = if (screen == Screen.UNLOCKED) device.items().sortedBy { it.title.lowercase() } else emptyList()
+        // Checked again when owed (healthStale), as a password edited alone leaves the list as it was.
+        val before = _state.value
+        val now = SystemClock.elapsedRealtime()
+        val attention = when {
+            screen != Screen.UNLOCKED -> emptyMap<String, List<String>>().also { healthStale = true }
+            healthStale || now - healthAt >= HEALTH_EVERY_MS || items != before.items ->
+                // A failed check keeps the marks as they were and is tried again at the next read.
+                runCatching { attentionOf(device.passwordHealth()) }
+                    .onSuccess {
+                        healthStale = false
+                        healthAt = now
+                    }
+                    .getOrDefault(before.attention)
+            else -> before.attention
+        }
         _state.update { current ->
             current.copy(
                 screen = screen,
                 items = items,
+                attention = attention,
                 // A detail stays open only while its item does.
                 detail = current.detail?.takeIf { detail -> screen == Screen.UNLOCKED && items.any { it.id == detail.id } },
                 sync = device.syncStatus(),
@@ -383,7 +415,7 @@ class VaultSession(private val context: Context, private val folder: File) {
         if (!lockDue()) return
         _state.update {
             it.copy(
-                screen = Screen.LOCKED, items = emptyList(), detail = null, editor = null, history = null,
+                screen = Screen.LOCKED, items = emptyList(), attention = emptyMap(), detail = null, editor = null, history = null,
                 deleted = null, passwordChange = false, rowsChanged = false,
             )
         }
@@ -923,6 +955,9 @@ class VaultSession(private val context: Context, private val folder: File) {
     private companion object {
         /** How long the system's list waits for [offer]: the system gives an answer some 5 seconds. */
         const val OFFER_MILLIS = 3_000L
+
+        /** The most often the passwords are checked again with nothing the owner did and no change of the list. */
+        const val HEALTH_EVERY_MS = 60_000L
     }
 
     private fun describe(error: MobileException): String = when (error) {

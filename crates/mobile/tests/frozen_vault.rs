@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use osm_mobile::{
     Asks, CardDraft, Device, DeviceState, ItemDraft, ItemKind, MobileError, Requester, SyncState,
+    Weakness,
 };
 
 const PASSWORD: &str = "fixture password, not a secret";
@@ -1214,4 +1215,51 @@ fn the_password_changes_given_the_current_one_and_a_long_enough_new_one() {
     drop(device);
     let again = Device::open_listening_on(folder, 0).unwrap();
     again.unlock(new.into()).unwrap();
+}
+
+#[test]
+fn password_health_names_the_weak_and_the_shared_without_a_password() {
+    let (_dir, folder) = copy_of_the_frozen_vault();
+    let device = Device::open_listening_on(folder, 0).unwrap();
+    assert!(matches!(device.password_health(), Err(MobileError::Locked)));
+    device.unlock(PASSWORD.into()).unwrap();
+
+    let make = |title: &str, url: &str, password: &str| {
+        let mut one = draft(title, ItemKind::Login);
+        one.url = url.into();
+        one.password = Some(password.into());
+        device.create_item(one).unwrap()
+    };
+    let first = make("Shared one", "https://one.test", "Zq7!rT9#vLm2qXa");
+    let second = make("Shared two", "https://two.test", "Zq7!rT9#vLm2qXa");
+    let weak = make("Weak", "https://weak.test", "kjhdsfpq");
+
+    let health = device.password_health().unwrap();
+    assert!(health
+        .weak
+        .iter()
+        .any(|found| found.id == weak && found.reasons == [Weakness::OneKind]));
+    let mut together = vec![first.clone(), second.clone()];
+    together.sort();
+    assert!(health.reused.iter().any(|set| set.ids == together));
+
+    // It names ids and reasons: the passwords are in nothing it prints.
+    let printed = format!("{health:?}");
+    assert!(!printed.contains("kjhdsfpq") && !printed.contains(&first));
+
+    // A password edited alone changes the answer, though the list of items
+    // reads the same.
+    let before = device.items().unwrap();
+    let mut changed = draft("Shared two", ItemKind::Login);
+    changed.url = "https://two.test".into();
+    changed.password = Some("another-Strong#4-x".into());
+    let revision = device.item(second.clone()).unwrap().revision;
+    device.update_item(second, revision, changed).unwrap();
+    assert_eq!(
+        device.items().unwrap().len(),
+        before.len(),
+        "no item came or went"
+    );
+    let after = device.password_health().unwrap();
+    assert!(!after.reused.iter().any(|set| set.ids == together));
 }

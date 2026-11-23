@@ -94,6 +94,61 @@ final class EditTests: UITestCase {
         XCTAssert(app.buttons["item:Forum"].waitForNonExistence(timeout: 10))
     }
 
+    /// Makes a login with the password typed over the one made for it; it is left open.
+    private func makeLogin(_ title: String, _ username: String, _ password: String, in app: XCUIApplication) {
+        app.buttons["new-item"].tap()
+        XCTAssert(field("edit-title", in: app).waitForExistence(timeout: 10))
+        type(title, into: "edit-title", in: app)
+        type(username, into: "edit-username", in: app)
+        replace("edit-password", with: password, in: app)
+        app.buttons["save"].tap()
+        XCTAssert(app.staticTexts["detail-username"].waitForLabel(username))
+    }
+
+    func testLoginsWithAWeakOrSharedPasswordAreMarkedFilteredAndToldWhy() {
+        let app = unlocked()
+        makeLogin("Shared one", "anna", "Zq7!rT9#vLm2qXa", in: app)
+        app.buttons["back"].tap()
+        makeLogin("Shared two", "bert", "Zq7!rT9#vLm2qXa", in: app)
+        app.buttons["back"].tap()
+        makeLogin("Weak one", "carl", "kjhdsfpq", in: app)
+        // Its own note, told in the detail it opens in.
+        let note = app.descendants(matching: .any)["attention-note"].firstMatch
+        XCTAssert(note.waitForExistence(timeout: 15))
+        XCTAssert(note.label.contains("uses one kind of character"), note.label)
+        app.buttons["back"].tap()
+
+        // The last of the chips is past the screen's edge until the row is moved.
+        let attention = app.buttons["filter-attention"]
+        XCTAssert(attention.waitForExistence(timeout: 15))
+        let edge = app.windows.firstMatch.frame.width
+        for _ in 0..<3 where attention.frame.maxX > edge - 8 { app.buttons["filter-all"].swipeLeft() }
+        attention.tap()
+        XCTAssert(app.buttons["filter-attention"].isSelected)
+        XCTAssert(app.buttons["item:Shared one"].waitForExistence(timeout: 15))
+        XCTAssert(app.buttons["item:Shared two"].exists)
+        XCTAssert(app.buttons["item:Weak one"].exists)
+        XCTAssertFalse(app.buttons["item:Bank"].exists)
+        XCTAssert(app.staticTexts["attention:Shared two"].exists)
+
+        app.buttons["item:Shared two"].tap()
+        let shared = app.descendants(matching: .any)["attention-note"].firstMatch
+        XCTAssert(shared.waitForExistence(timeout: 10))
+        XCTAssert(shared.label.contains("also used by another login"), shared.label)
+        // A password edited alone, with the list as it was, clears the mark.
+        app.buttons["edit"].tap()
+        XCTAssert(field("edit-password", in: app).waitForExistence(timeout: 10))
+        replace("edit-password", with: "a-different-Strong#4-x", in: app)
+        app.buttons["save"].tap()
+        // Saved, and opened again; back on the list, with the filter still on, only the weak one is left.
+        XCTAssert(app.staticTexts["detail-username"].waitForExistence(timeout: 15))
+        app.buttons["back"].tap()
+        XCTAssert(app.buttons["item:Shared two"].waitForNonExistence(timeout: 15))
+        XCTAssertFalse(app.buttons["item:Shared one"].exists)
+        XCTAssert(app.buttons["item:Weak one"].exists)
+        XCTAssert(app.staticTexts["attention:Weak one"].exists)
+    }
+
     func testACardIsMadeAndEditedByItsOwnFieldsKeepingWhatWasLeftBlank() {
         let app = unlocked()
         app.buttons["new-item"].tap()

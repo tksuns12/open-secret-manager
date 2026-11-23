@@ -28,6 +28,16 @@ struct History: Equatable {
 final class VaultModel: ObservableObject {
     @Published private(set) var screen: Screen = .opening
     @Published private(set) var items: [ItemSummary] = []
+    /// What each login that needs attention is told, by id; cleared when the vault locks, and kept nowhere else.
+    @Published private(set) var attention: [String: [String]] = [:]
+    /// Whether the check of the passwords is owed: at an unlock, after what the
+    /// owner did (a save, a delete, a restore), when the list changed, and
+    /// otherwise once a minute at most, since each check decrypts every item
+    /// and holds the queue the device is used on.
+    private var healthStale = true
+    /// Counts what the owner has asked for: a check that began before the latest ask has not seen its effect and does not settle the debt.
+    private var healthAsked = 0
+    private var healthAt: TimeInterval?  // the device's uptime, which a changed clock does not move
     @Published private(set) var detail: ItemDetail?
     @Published private(set) var sync: SyncStatus?
     /// The code to compare with the inviting device's, while joining.
@@ -72,6 +82,9 @@ final class VaultModel: ObservableObject {
     @discardableResult
     private func call<T>(_ busy: String? = nil, _ work: @escaping (Device) throws -> T) async -> T? {
         guard let device else { return nil }
+        // What the owner asked for may change a password: the next read checks them again.
+        healthStale = true
+        healthAsked += 1
         if let busy {
             self.busy = busy
             notice = nil
@@ -79,6 +92,9 @@ final class VaultModel: ObservableObject {
         defer { if busy != nil { self.busy = nil } }
         do {
             let result = try await onQueue { try work(device) }
+            // A refresh that ran meanwhile saw the vault as it was.
+            healthStale = true
+            healthAsked += 1
             await refresh()
             return result
         } catch MobileError.UnreadableVault(let reason) {
@@ -86,6 +102,8 @@ final class VaultModel: ObservableObject {
             unreadable = reason
         } catch {
             notice = describe(error)
+            healthStale = true
+            healthAsked += 1
             await refresh()
         }
         return nil
@@ -94,10 +112,20 @@ final class VaultModel: ObservableObject {
     /// Reads where the device stands, and what an unlocked vault holds.
     private func refresh() async {
         guard let device else { return }
-        guard let (state, items, sync, rowsChanged) = try? await onQueue({ () -> (DeviceState, [ItemSummary], SyncStatus, Bool) in
+        let asked = healthAsked
+        let (stale, checkedAt, shown) = (healthStale, healthAt, self.items.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending })
+        guard let (state, items, attention, sync, rowsChanged) = try? await onQueue({ () -> (DeviceState, [ItemSummary], [String: [String]]?, SyncStatus, Bool) in
             let state = device.state()
             let items = state == .unlocked ? ((try? device.items()) ?? []) : []
-            return (state, items, device.syncStatus(), state == .unlocked && device.rowsChanged())
+            // Asked for again when owed (see healthStale), as a password edited alone leaves the list as it was; a failed check leaves the marks as they were and is tried again at the next read.
+            var attention: [String: [String]]? = nil
+            if state != .unlocked {
+                attention = [:]
+            } else if stale || checkedAt.map({ ProcessInfo.processInfo.systemUptime - $0 >= 60 }) != false
+                        || items.sorted(by: { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }) != shown {
+                attention = (try? device.passwordHealth()).map(attentionOf)
+            }
+            return (state, items, attention, device.syncStatus(), state == .unlocked && device.rowsChanged())
         }) else { return }
         guard screen != .unreadable else { return }
         screen = switch state {
@@ -108,6 +136,12 @@ final class VaultModel: ObservableObject {
         case .removed: .removed
         }
         self.items = items.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        if let attention {
+            self.attention = attention
+            // Owed again at the next unlock; checked now otherwise.
+            if asked == healthAsked { healthStale = state != .unlocked }
+            healthAt = state == .unlocked ? ProcessInfo.processInfo.systemUptime : nil
+        }
         self.sync = sync
         self.rowsChanged = rowsChanged
         // A detail stays open only while its item does.
@@ -285,6 +319,9 @@ final class VaultModel: ObservableObject {
             } catch {
                 notice = describe(error)
             }
+            // A write that does not go through `call` may have changed a password too.
+            healthStale = true
+            healthAsked += 1
             await refresh()
         }
     }
@@ -350,6 +387,9 @@ final class VaultModel: ObservableObject {
             } catch {
                 notice = describe(error)
             }
+            // A write that does not go through `call` may have changed a password too.
+            healthStale = true
+            healthAsked += 1
             await refresh()
         }
     }
@@ -492,6 +532,9 @@ final class VaultModel: ObservableObject {
         refresher = nil
         guard let device else { return }
         self.device = nil
+        attention = [:]
+        healthStale = true
+        healthAsked += 1  // a refresh still running must not settle the debt
         detail = nil
         editor = nil
         history = nil

@@ -35,7 +35,7 @@ _Avoid_: update target
 ## Password health
 
 **Weak password**:
-A login's password that is short, of one kind of character and short, a common one (or a run such as `12345678`), or that holds the item's own username, title or site name. Each is a reason the code can show; a password that is none of these is not thereby strong.
+A login's password that is short, of one kind of character and short, a common one (or a run such as `12345678` or one piece repeated, as `Xk9!Xk9!`), or that holds the item's own username, title or site name. Each is a reason the code can show; a password that is none of these is not thereby strong.
 _Avoid_: low score, strength meter
 
 **Reused password**:

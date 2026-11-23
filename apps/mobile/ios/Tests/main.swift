@@ -139,6 +139,23 @@ do {
     check(try generatePassword(options: options).count == 24, "the generator makes the length asked for")
     check(fails({ try device.goOnline() }) { if case .Network = $0 { true } else { false } }, "a copy of a vault does not go online")
     check(device.syncStatus().state == .offline, "it reports being offline")
+    // Which logins need attention: ids and reasons, from the passwords as kept.
+    var shared = draft
+    shared.url = "https://one.test"
+    shared.password = "Zq7!rT9#vLm2qXa"
+    let sharedOne = try device.createItem(draft: shared)
+    shared.title = "Forum two"
+    shared.url = "https://two.test"
+    let sharedTwo = try device.createItem(draft: shared)
+    var weakDraft = draft
+    weakDraft.title = "Weak one"
+    weakDraft.url = "https://weak.test"
+    weakDraft.password = "kjhdsfpq"
+    let weakOne = try device.createItem(draft: weakDraft)
+    let health = try device.passwordHealth()
+    check(health.weak.contains { $0.id == weakOne && $0.reasons == [.oneKind] }, "a weak password is named with its reason")
+    check(health.reused.contains { Set($0.ids) == Set([sharedOne, sharedTwo]) }, "two logins sharing a password are named together")
+    check(!"\(health)".contains("kjhdsfpq"), "no password is in what it says")
     // The password changes, given the current one.
     let newPassword = "a new password for this phone"
     check(fails({ try device.changePassword(currentPassword: "not the password", newPassword: newPassword) }) { if case .InvalidCredentials = $0 { true } else { false } }, "a wrong current password changes nothing")

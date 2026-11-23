@@ -115,7 +115,7 @@ impl Check {
             id: item.id.clone(),
             password: Zeroizing::new(item.password.clone()),
             place: (
-                item.username.to_lowercase(),
+                item.username.trim().to_lowercase(),
                 site(&item.url).unwrap_or_default(),
             ),
         });
@@ -162,37 +162,71 @@ pub fn password_health<'a>(items: impl IntoIterator<Item = &'a Item>) -> Passwor
     check.finish()
 }
 
+/// Schemes whose host is a name in the domain system, so that its
+/// registrable domain is the site. Of another scheme (`android://`,
+/// `androidapp://`) the host is something else, a reversed package name,
+/// and is the site as it is.
+const NAMED_HOSTS: [&str; 14] = [
+    "http", "https", "ftp", "ftps", "sftp", "ssh", "smb", "ws", "wss", "imap", "imaps", "pop3",
+    "pop3s", "smtp",
+];
+
+/// Whether `address` starts with a scheme: letters, digits, `+`, `-` or `.`
+/// from a letter, then `:/`. (`localhost:3000` has none.)
+fn scheme_of(address: &str) -> Option<&str> {
+    let (scheme, rest) = address.split_once(':')?;
+    let mut characters = scheme.chars();
+    let first = characters.next()?;
+    (first.is_ascii_alphabetic()
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && rest.starts_with('/'))
+    .then_some(scheme)
+}
+
 /// The site an address is for: the registrable domain of its host, such as
 /// `example.co.uk` for `https://login.example.co.uk/in`; an IP address as it
-/// is; and for an address that is not one, what it says, lowercased. An
-/// address with no scheme is read as an https one. Whatever the scheme,
-/// `http://example.com` and `https://example.com` are one site.
-fn site(address: &str) -> Option<String> {
+/// is; of a scheme whose host is no domain name, the host as it is; and for
+/// an address that is not one, what it says, lowercased. An address with no
+/// scheme is read as an https one. Whatever the scheme, `http://example.com`
+/// and `https://example.com` are one site. The second is whether it is a
+/// domain, which may hold a name.
+fn site_of(address: &str) -> Option<(String, bool)> {
     let address = address.trim();
     if address.is_empty() {
         return None;
     }
-    let parsed = if address.contains("://") {
+    let scheme = scheme_of(address).map(str::to_ascii_lowercase);
+    let parsed = if scheme.is_some() {
         Url::parse(address)
     } else {
         Url::parse(&format!("https://{address}"))
     };
     let Ok(parsed) = parsed else {
-        return Some(address.to_lowercase());
+        return Some((address.to_lowercase(), false));
     };
+    let named = scheme
+        .as_deref()
+        .is_none_or(|scheme| NAMED_HOSTS.contains(&scheme));
     Some(match parsed.host() {
         Some(Host::Domain(host)) => {
             let host = host.to_ascii_lowercase();
             // Other schemes hand an address back as text, as a domain, and
             // the list would take its last two numbers for one.
-            if host.parse::<std::net::IpAddr>().is_ok() {
-                return Some(host);
+            if host.parse::<std::net::IpAddr>().is_ok() || !named {
+                return Some((host, false));
             }
-            psl::domain_str(&host).map(str::to_owned).unwrap_or(host)
+            (
+                psl::domain_str(&host).map(str::to_owned).unwrap_or(host),
+                true,
+            )
         }
-        Some(host) => host.to_string(),
-        None => address.to_lowercase(),
+        Some(host) => (host.to_string(), false),
+        None => (address.to_lowercase(), false),
     })
+}
+
+fn site(address: &str) -> Option<String> {
+    site_of(address).map(|(site, _)| site)
 }
 
 fn weaknesses(item: &Item) -> Vec<Weakness> {
@@ -236,16 +270,23 @@ fn kinds(password: &str) -> usize {
 }
 
 /// Whether the password holds a word that names its item: the username (and
-/// what is before an `@` in it), the title, or the first label of the
+/// what is before an `@` in it), the title, each word of the title and the
+/// title run together (`Acme Shop` as `acmeshop`), or the first label of the
 /// site's registrable domain (`example` for `https://www.example.com`).
 fn holds_own_name(item: &Item) -> bool {
     let password = Zeroizing::new(item.password.to_lowercase());
-    let mut words = vec![item.username.to_lowercase(), item.title.to_lowercase()];
+    let title = item.title.to_lowercase();
+    let mut words = vec![item.username.trim().to_lowercase(), title.clone()];
+    words.extend(
+        title
+            .split(|c: char| !c.is_alphanumeric())
+            .map(str::to_owned),
+    );
+    words.push(title.chars().filter(|c| c.is_alphanumeric()).collect());
     if let Some((name, _)) = item.username.split_once('@') {
-        words.push(name.to_lowercase());
+        words.push(name.trim().to_lowercase());
     }
-    if let Some(site) = site(&item.url) {
-        // An address that is not a domain has no label to take.
+    if let Some((site, true)) = site_of(&item.url) {
         if let Some(label) = site.split('.').next() {
             words.push(label.to_owned());
         }
@@ -271,24 +312,38 @@ fn is_common(password: &str) -> bool {
 }
 
 /// All one character, or a stretch of one row of a keyboard, or of the
-/// digits or the alphabet, going up or down, of at least four characters.
+/// digits (round from 9 to 0) or the alphabet, going up or down, of at least
+/// four characters; or a shorter piece repeated (`123123123123`,
+/// `passwordpassword`).
 fn is_run(password: &str) -> bool {
-    let characters: Zeroizing<Vec<char>> = Zeroizing::new(password.chars().collect());
+    // Room for every character at once, so that no copy is left behind by a
+    // buffer that grew.
+    let mut characters: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(password.len()));
+    characters.extend(password.chars());
     if characters.len() < 4 {
         return false;
     }
-    if characters.iter().all(|c| *c == characters[0]) {
+    if (1..=characters.len() / 2)
+        .filter(|unit| characters.len().is_multiple_of(*unit))
+        .any(|unit| {
+            characters
+                .chunks(unit)
+                .all(|chunk| chunk == &characters[..unit])
+        })
+    {
         return true;
     }
-    let forward: Zeroizing<String> = Zeroizing::new(characters.iter().collect());
-    let backward: Zeroizing<String> = Zeroizing::new(characters.iter().rev().collect());
+    let mut forward: Zeroizing<String> = Zeroizing::new(String::with_capacity(password.len()));
+    forward.extend(characters.iter());
+    let mut backward: Zeroizing<String> = Zeroizing::new(String::with_capacity(password.len()));
+    backward.extend(characters.iter().rev());
     ROWS.iter()
         .any(|row| row.contains(forward.as_str()) || row.contains(backward.as_str()))
 }
 
 /// Strings whose stretches are runs.
 const ROWS: [&str; 6] = [
-    "01234567890",
+    "0123456789012345678901234567890123456789",
     "abcdefghijklmnopqrstuvwxyz",
     "qwertyuiop",
     "asdfghjkl",
@@ -508,6 +563,99 @@ mod tests {
         // Whatever is not an address stays what it says.
         assert!(shared("my router", "my nas"));
         assert!(!shared("My Router", "my router"));
+    }
+
+    #[test]
+    fn an_address_is_read_by_its_own_scheme_and_not_by_what_it_mentions() {
+        // A `://` inside the address is not its scheme.
+        assert!(!shared("example.com/r?to=http://x", "example.com"));
+        assert!(!shared(
+            "example.com/in?next=http://x",
+            "https://example.com/other"
+        ));
+        // The secure and mail forms of a host are the same account as the plain one.
+        assert!(!shared("wss://www.example.com", "https://www.example.com"));
+        assert!(!shared(
+            "imap://mail.example.com",
+            "https://mail.example.com"
+        ));
+        assert!(!shared("ftps://ftp.example.com", "ftp://ftp.example.com"));
+        // One slash, a typo, is still http.
+        assert!(!shared("http:/example.com", "https://example.com"));
+        // Apps are told apart by their whole package name, and are not
+        // taken for a domain of the public suffix list.
+        assert!(shared(
+            "android://H@com.alpha.mail.android/",
+            "android://H@org.beta.mail.android/"
+        ));
+        assert!(shared(
+            "androidapp://com.facebook.katana",
+            "androidapp://com.facebook.orca"
+        ));
+        assert!(!shared(
+            "androidapp://com.facebook.katana",
+            "androidapp://com.facebook.katana"
+        ));
+        // A package's word `android` is not the item's own name.
+        let app = login(
+            "a",
+            "Mail",
+            "me",
+            "androidapp://com.google.android.gm",
+            "Zq7!android9Lm#2",
+        );
+        assert!(password_health([&app]).weak.is_empty());
+    }
+
+    #[test]
+    fn a_long_run_and_a_repeated_piece_are_common() {
+        for common in [
+            "123456789012",
+            "1234567890123",
+            "0987654321098",
+            "123123123123",
+            "passwordpassword",
+        ] {
+            assert!(
+                reasons_of_the_password_alone(common).contains(&Weakness::Common),
+                "{common}"
+            );
+        }
+        assert!(
+            !reasons_of_the_password_alone("rT9#vLm2qXarT9#vLm2qXb").contains(&Weakness::Common)
+        );
+    }
+
+    #[test]
+    fn each_word_of_a_title_is_a_name_of_the_item() {
+        let item = |title: &str, password: &str| {
+            let item = login("a", title, "someone", "", password);
+            password_health([&item])
+                .weak
+                .into_iter()
+                .next()
+                .map(|weak| weak.reasons)
+        };
+        assert_eq!(
+            item("Acme Shop", "AcmeShop2024!xQ"),
+            Some(vec![Weakness::HoldsOwnName])
+        );
+        assert_eq!(
+            item("My Bank", "MyBank#2024xQz"),
+            Some(vec![Weakness::HoldsOwnName])
+        );
+        assert_eq!(
+            item("Acme Shop", "Zq7!Shop-x9Lm#"),
+            Some(vec![Weakness::HoldsOwnName])
+        );
+        assert_eq!(item("Acme Shop", "rT9#vLm2qXa!"), None);
+    }
+
+    #[test]
+    fn a_username_is_taken_as_it_is_without_the_spaces_around_it() {
+        let a = login("a", "A", " me ", "https://one.test", "rT9#vLm2qXa");
+        let b = login("b", "B", "me", "https://one.test", "rT9#vLm2qXa");
+        assert!(password_health([&a, &b]).reused.is_empty());
     }
 
     #[test]

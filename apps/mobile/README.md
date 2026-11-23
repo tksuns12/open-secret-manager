@@ -13,7 +13,9 @@ whose Kotlin and Swift bindings UniFFI generates at build time.
 - `app`: the app. It joins a vault from a computer by invitation and
   comparison of codes, unlocks with its own password or, once turned on,
   a fingerprint, which it asks for as soon as it shows the vault locked,
-  lists and searches the items, copies a username,
+  lists and searches the items (and, on a filter of its own, the logins
+  whose password is weak or shared, marked and told why, judged on the
+  phone from the unlocked vault and kept nowhere), copies a username,
   password, or one-time code, creates, edits, and deletes logins and
   secure notes, shows an item's history and the items deleted,
   restoring a login or note from either, and changes its own password. It
@@ -78,7 +80,8 @@ synchronized with these):
 - `App`: the app, in SwiftUI. It joins a vault from a computer by
   invitation and comparison of codes, unlocks with its own password or,
   once turned on, Face ID or Touch ID, which it asks for as soon as it
-  shows the vault locked, lists and searches the items,
+  shows the vault locked, lists and searches the items (the logins with a
+  weak or shared password on a filter of their own, as on Android),
   copies a username, password, or one-time code, creates, edits, and
   deletes logins and secure notes, shows an item's history and the
   items deleted, restoring a login or note from either, and changes its
