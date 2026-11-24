@@ -1,0 +1,1 @@
+Marks the logins with a weak password or one used in two places, and says why (a "Needs attention" filter). Joins a vault from a computer that is away from your networks, through the relay you run. The notice no longer sits over the keyboard.

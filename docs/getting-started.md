@@ -27,8 +27,8 @@ Take the app for your computer from
 [Releases](https://github.com/tksuns12/open-secret-manager/releases); the
 [README](../README.md#getting-it) lists what is supported (macOS 14 or later
 on Apple Silicon, and a Linux `.deb` that has not yet been tried on a Linux
-desktop; Windows is not released: its code is built and tested, but there is
-no installer and nobody has used it there).
+desktop; Windows 10 or later has an installer, which is not signed, so
+Windows SmartScreen warns the first time you run it).
 
 The app is not notarized by Apple, as the project joins no vendor's paid
 program. On a Mac, the first time you open it
