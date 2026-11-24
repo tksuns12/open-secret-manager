@@ -47,6 +47,7 @@ fn pairing_messages_are_the_frozen_ones() {
             token,
             expires_at: 1_800_000_000,
         },
+        relay: None,
     };
     let text = invitation.encode().unwrap();
 
@@ -170,7 +171,8 @@ fn pairing_messages_are_the_frozen_ones() {
     // An invitation of a later version, with a byte too many, or of the
     // wrong kind is refused.
     let mut later = invitation.body_bytes();
-    later[0] = PAIRING_VERSION + 1;
+    // Version 2 is the invitation that carries a relay; the next is unknown.
+    later[0] = PAIRING_VERSION_WITH_RELAY + 1;
     assert!(matches!(
         Invitation::decode(&format!(
             "{INVITATION_PREFIX}{}",
@@ -212,6 +214,7 @@ fn an_invitation_and_a_join_request_print_no_token() {
             token,
             expires_at: 1_800_000_000,
         },
+        relay: None,
     };
     let request = JoinRequest {
         version: PAIRING_VERSION,
@@ -234,4 +237,135 @@ fn an_invitation_and_a_join_request_print_no_token() {
             assert!(!printed.contains(&secret), "{printed}");
         }
     }
+}
+
+#[test]
+fn an_invitation_carries_a_relay_only_when_asked_and_without_one_stays_version_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, _) = Vault::create(dir.path().join("v.db"), "a long enough password").unwrap();
+    let mut invitations =
+        InvitationStore::open_in_memory(osm_vault_sync::InvitationPolicy::default()).unwrap();
+    let mut peers = PeerStore::open_in_memory().unwrap();
+    let relay = RelayCode::new("relay.example.test:47830", [7; 32], [9; 32]).unwrap();
+    let addresses = vec!["192.0.2.10:47820".to_owned()];
+
+    let plain = invite(
+        &vault,
+        &mut invitations,
+        &mut peers,
+        addresses.clone(),
+        1_800_000_000,
+        300,
+    )
+    .unwrap();
+    let text = plain.encode().unwrap();
+    assert!(Invitation::decode(&text).unwrap().relay().is_none());
+    // Version 1 as before: the first byte of its body.
+    let bytes =
+        Base64UrlUnpadded::decode_vec(text.strip_prefix(INVITATION_PREFIX).unwrap()).unwrap();
+    assert_eq!(bytes[0], PAIRING_VERSION);
+
+    let with = invite_through_relay(
+        &vault,
+        &mut invitations,
+        &mut peers,
+        addresses,
+        &relay,
+        1_800_000_000,
+        300,
+    )
+    .unwrap();
+    let text = with.encode().unwrap();
+    let read = Invitation::decode(&text).unwrap();
+    let kept = read.relay().unwrap();
+    assert_eq!(kept.address(), relay.address());
+    assert_eq!(kept.pin(), relay.pin());
+    assert_eq!(*kept.token(), *relay.token());
+    let bytes =
+        Base64UrlUnpadded::decode_vec(text.strip_prefix(INVITATION_PREFIX).unwrap()).unwrap();
+    assert_eq!(bytes[0], PAIRING_VERSION_WITH_RELAY);
+    // Neither form prints the relay or a token.
+    assert!(!format!("{read:?}").contains("relay"));
+
+    // A byte too many, or too few, is refused.
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(Invitation::decode(&format!(
+        "{INVITATION_PREFIX}{}",
+        Base64UrlUnpadded::encode_string(&longer)
+    ))
+    .is_err());
+    assert!(Invitation::decode(&format!(
+        "{INVITATION_PREFIX}{}",
+        Base64UrlUnpadded::encode_string(&bytes[..bytes.len() - 1])
+    ))
+    .is_err());
+
+    // The relay takes room from the addresses: the later ones are left out
+    // until the code fits, and the code is the same one that was refused
+    // for its length. With nothing that could be left out, it is refused.
+    let wide: Vec<String> = (0..4).map(|n| format!("{}:{n}", "a".repeat(70))).collect();
+    let plain = invite(
+        &vault,
+        &mut invitations,
+        &mut peers,
+        wide.clone(),
+        1_800_000_000,
+        300,
+    )
+    .unwrap();
+    assert!(plain.encode().is_ok());
+    assert_eq!(plain.addresses().len(), 4);
+    let far = RelayCode::new(&"h".repeat(40), [7; 32], [9; 32]).unwrap();
+    let trimmed = invite_through_relay(
+        &vault,
+        &mut invitations,
+        &mut peers,
+        wide,
+        &far,
+        1_800_000_000,
+        300,
+    )
+    .unwrap();
+    assert!(trimmed.addresses().len() < 4 && !trimmed.addresses().is_empty());
+    assert!(trimmed.encode().unwrap().len() <= MAX_INVITATION_CODE_LEN);
+    assert_eq!(
+        Invitation::decode(&trimmed.encode().unwrap())
+            .unwrap()
+            .addresses(),
+        trimmed.addresses()
+    );
+}
+
+/// An invitation that carries a relay, as this code made it when the form
+/// was frozen: the same keys and token as the first, and the relay's.
+#[test]
+fn an_invitation_with_a_relay_is_the_frozen_one() {
+    let invitation = Invitation {
+        body: InvitationBody {
+            version: PAIRING_VERSION,
+            vault_id: counting(0x10),
+            inviter_device_id: counting(0x40),
+            inviter_public_key: counting(0x60),
+            inviter_transport_pin: counting(0x20),
+            addresses: vec!["192.0.2.10:47820".to_owned()],
+            token: counting(0x70),
+            expires_at: 1_800_000_000,
+        },
+        relay: Some(
+            RelayCode::new("relay.example.test:47830", counting(0xe0), counting(0xf0)).unwrap(),
+        ),
+    };
+    let text = invitation.encode().unwrap();
+    let made = serde_json::json!({
+        "about": "An invitation that carries the vault's relay (version 2 of the invitation, same text prefix), as this code made it when the form was frozen. The first body byte is the version; the fields are those of version 1, then the relay's address, the SHA-256 pin of its certificate, and its token. The keys and tokens are counting patterns and protect nothing.",
+        "invitation_text": text.as_str(),
+    });
+    let frozen = frozen("pairing-relay.json", &made);
+    let read = Invitation::decode(frozen["invitation_text"].as_str().unwrap()).unwrap();
+    assert_eq!(read.encode().unwrap().as_str(), frozen["invitation_text"]);
+    let relay = read.relay().unwrap();
+    assert_eq!(relay.address(), "relay.example.test:47830");
+    assert_eq!(relay.pin(), counting::<32>(0xe0));
+    assert_eq!(read.addresses(), ["192.0.2.10:47820"]);
 }

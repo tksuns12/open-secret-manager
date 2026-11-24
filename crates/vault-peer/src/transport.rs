@@ -42,11 +42,12 @@ use crate::{
     approve_enrollment,
     control::Voting,
     members::MemberContact,
+    members::PAIRING_OPENING,
     pairing::JoinReview,
     peers::{pin_of, TransportIdentity},
     review_join,
     wire::{decode_body, encode_frame, MAX_FRAME_BYTES},
-    EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, PeerStore, Result, SyncMessage,
+    EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, PeerStore, Relay, Result, SyncMessage,
     SyncReport, SyncSession, MAX_INVITATION_TTL_SECS,
 };
 
@@ -85,6 +86,26 @@ enum PairingReply {
 pub struct PairingListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    /// Joiners that came through the relay, while the listener takes them.
+    relayed: Mutex<mpsc::Receiver<TcpStream>>,
+    sink: mpsc::Sender<TcpStream>,
+    /// The device whose relay they come through, once [`through`](Self::through).
+    through: std::sync::Mutex<Option<crate::MemberEndpoint>>,
+}
+
+impl Drop for PairingListener {
+    fn drop(&mut self) {
+        // The invitation is no longer open: nothing more is taken through
+        // the relay on its account.
+        let through = self
+            .through
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(endpoint) = through {
+            endpoint.clear_pairing_sink(&self.sink);
+        }
+    }
 }
 
 impl PairingListener {
@@ -101,10 +122,27 @@ impl PairingListener {
 
     fn on(listener: TcpListener, peers: &mut PeerStore) -> Result<Self> {
         let identity = peers.transport_identity()?;
+        let (sink, relayed) = mpsc::channel(4);
         Ok(Self {
             listener,
             acceptor: TlsAcceptor::from(server_config(&identity, ClientPolicy::AnyForPairing)?),
+            relayed: Mutex::new(relayed),
+            sink,
+            through: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Also takes the joiners that reach `endpoint`'s device through its
+    /// relay, for as long as this listener lives: that is, while the
+    /// invitation it was made for is open. Nothing else that comes through
+    /// the relay reaches a pairing, and without a listener nothing does. One
+    /// invitation is open through the relay at a time: the latest.
+    pub fn through(&self, endpoint: &crate::MemberEndpoint) {
+        endpoint.set_pairing_sink(Some(self.sink.clone()));
+        *self
+            .through
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(endpoint.clone());
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -117,7 +155,13 @@ impl PairingListener {
     /// continues.
     pub async fn next_request(&self) -> Result<IncomingJoin> {
         loop {
-            let (tcp, _) = self.listener.accept().await?;
+            let tcp = {
+                let mut relayed = self.relayed.lock().await;
+                tokio::select! {
+                    accepted = self.listener.accept() => accepted?.0,
+                    Some(tcp) = relayed.recv() => tcp,
+                }
+            };
             if let Ok(incoming) = self.receive(tcp).await {
                 return Ok(incoming);
             }
@@ -264,12 +308,25 @@ impl ApprovedEnrollment {
 pub struct PairingConnection {
     joiner: Joiner,
     stream: tokio_rustls::client::TlsStream<TcpStream>,
+    /// The relay the invitation named, with the connections that reach this
+    /// device through it, when the invitation named one.
+    relay: Option<(Relay, mpsc::Receiver<TcpStream>)>,
 }
 
 impl PairingConnection {
     /// The short code to show while the owner confirms on the inviter.
     pub fn sas(&self) -> String {
         self.joiner.sas()
+    }
+
+    /// The relay the invitation named, which this device has been
+    /// registered at since it connected, and the connections that reach it
+    /// there. Until the grant names the members, the vault's devices
+    /// reach this device only through it when it is away from every
+    /// network they are on: use it (`MemberEndpoint::set_relay` and
+    /// `serve_relayed`) before waiting for the enrollment.
+    pub fn take_relay(&mut self) -> Option<(Relay, mpsc::Receiver<TcpStream>)> {
+        self.relay.take()
     }
 
     /// This device's pending identity. Start its control-plane node under
@@ -342,14 +399,69 @@ impl PreparedJoin {
             &self.identity,
             joiner.inviter_transport_pin(),
         )?);
-        let (tcp, _) = connect_any(joiner.inviter_addresses()).await?;
-        let mut stream = with_timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name(), tcp))
-            .await?
-            .map_err(handshake_error)?;
+        let (mut stream, relay) = reach_inviter(&joiner, &self.identity, &connector).await?;
         write_frame(&mut stream, &self.request).await?;
-        Ok(PairingConnection { joiner, stream })
+        Ok(PairingConnection {
+            joiner,
+            stream,
+            relay,
+        })
     }
 }
+
+/// A connection to the inviter: at the addresses its invitation names, and
+/// through the relay it names, if it names one, when they have not answered
+/// within a second. The relay is kept, with this device registered at it,
+/// for the members that then reach it there.
+async fn reach_inviter(
+    joiner: &Joiner,
+    identity: &TransportIdentity,
+    connector: &TlsConnector,
+) -> Result<(
+    tokio_rustls::client::TlsStream<TcpStream>,
+    Option<(Relay, mpsc::Receiver<TcpStream>)>,
+)> {
+    // A way counts as reached when the inviter has taken the handshake, not
+    // when the connection opened: one the inviter drops is not the one kept.
+    let shake = |tcp: TcpStream| async move {
+        with_timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name(), tcp))
+            .await?
+            .map_err(handshake_error)
+    };
+    let direct = async {
+        let (tcp, _) = connect_any(joiner.inviter_addresses()).await?;
+        shake(tcp).await
+    };
+    let Some(code) = joiner.invitation_relay() else {
+        return Ok((direct.await?, None));
+    };
+    let (relay, relayed) = Relay::start(code.clone(), identity.clone());
+    let dialer = relay.clone();
+    let through = async {
+        tokio::time::sleep(PAIRING_RELAY_AFTER).await;
+        let mut tcp = dialer.dial(joiner.inviter_transport_pin()).await?;
+        // The inviter tells this from a member by this byte (see
+        // `serve_relayed`).
+        tcp.write_all(&[PAIRING_OPENING]).await?;
+        shake(tcp).await
+    };
+    tokio::pin!(direct, through);
+    let stream = tokio::select! {
+        outcome = &mut direct => match outcome {
+            Ok(stream) => stream,
+            Err(_) => through.await?,
+        },
+        outcome = &mut through => match outcome {
+            Ok(stream) => stream,
+            Err(_) => direct.await?,
+        },
+    };
+    Ok((stream, Some((relay, relayed))))
+}
+
+/// How long the addresses an invitation names have to answer before the
+/// relay is tried as well.
+const PAIRING_RELAY_AFTER: Duration = Duration::from_secs(1);
 
 /// Connects to the inviter named in `invitation`, pinning its certificate,
 /// and sends the join request of a new device, which has no vault yet.

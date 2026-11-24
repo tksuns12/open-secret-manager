@@ -1,0 +1,4 @@
+{
+  "about": "An invitation that carries the vault's relay (version 2 of the invitation, same text prefix), as this code made it when the form was frozen. The first body byte is the version; the fields are those of version 1, then the relay's address, the SHA-256 pin of its certificate, and its token. The keys and tokens are counting patterns and protect nothing.",
+  "invitation_text": "OSM-PAIR1-AhAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vQEFCQ0RFRkdISUpLTE1OT2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8BEDE5Mi4wLjIuMTA6NDc4MjBwcXJzdHV2d3h5ent8fX5_gIGCg4SFhoeIiYqLjI2Oj4Ckp9oGGHJlbGF5LmV4YW1wbGUudGVzdDo0NzgzMODh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-vv8_f7_8PHy8_T19vf4-fr7_P3-_wABAgMEBQYHCAkKCwwNDg8"
+}

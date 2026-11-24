@@ -50,6 +50,16 @@ fn join(inviter: &mut Running, files: &Files) -> (Running, String) {
 /// As [`join`], with the inviter's command: `invite`, or `invite
 /// without-vote`.
 fn join_with(inviter: &mut Running, files: &Files, invite: &str) -> (Running, String) {
+    join_listening_at(inviter, files, invite, "127.0.0.1:0")
+}
+
+/// As [`join_with`], with the address the new device listens at, or `-`.
+fn join_listening_at(
+    inviter: &mut Running,
+    files: &Files,
+    invite: &str,
+    listen: &str,
+) -> (Running, String) {
     let code = command(inviter, invite, "INVITE");
     let mut joiner = Running::start(&[
         "join-device",
@@ -57,7 +67,7 @@ fn join_with(inviter: &mut Running, files: &Files, invite: &str) -> (Running, St
         &files.vault,
         &files.peers,
         &files.control,
-        "127.0.0.1:0",
+        listen,
     ]);
     let code_on_joiner = joiner.expect("SAS");
     let code_on_inviter = inviter.expect("SAS");
@@ -332,4 +342,105 @@ fn a_phone_joins_without_a_vote_and_the_one_voter_removes_it_while_it_is_off() {
         &["epoch=2", "vault_epoch=2", "members=1", "voters=1"],
     );
     quit(a);
+}
+
+/// Two computers that never sync with each other, and a phone that dials
+/// each in turn: what one wrote reaches the other by way of the phone, in
+/// both directions. The phone only dials (it listens nowhere), as on a real
+/// one, so it does not relay for anyone; it carries.
+#[test]
+fn a_phone_that_visits_two_computers_carries_each_ones_items_to_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = |name| Files::new(dir.path(), name);
+    let (a_files, b_files, phone_files) = (files("a"), files("b"), files("phone"));
+    run(&["create", &a_files.vault]);
+    let (mut a, a_id) = a_files.start("127.0.0.1:0");
+    command(&mut a, "found", "FOUNDED");
+
+    // B, a second computer with a vote, and the phone, without one, both
+    // join through A while the three can reach each other.
+    let (mut b, b_id) = join(&mut a, &b_files);
+    let (phone, _) = join_with(&mut a, &phone_files, "invite without-vote");
+    for device in [&mut a, &mut b] {
+        wait_status(device, &["epoch=1", "members=3", "voters=2"]);
+    }
+    // The phone goes on dialling out only.
+    quit(phone);
+    let (mut phone, _) = phone_files.start("-");
+    wait_status(&mut phone, &["epoch=1", "members=3"]);
+
+    // From here A and B never sync with each other. Each writes alone.
+    command(&mut a, "add From-A", "ADDED");
+    command(&mut b, "add From-B", "ADDED");
+    assert_eq!(items(&mut a), ["From-A"]);
+    assert_eq!(items(&mut b), ["From-B"]);
+
+    // The phone visits A: it takes A's item. It visits B: it brings it, and
+    // takes B's.
+    let outcomes = sync(&mut phone, Some(&a_id));
+    assert!(outcomes[0].starts_with("ED "), "{outcomes:?}");
+    assert_eq!(items(&mut phone), ["From-A"]);
+    let outcomes = sync(&mut phone, Some(&b_id));
+    assert!(outcomes[0].starts_with("ED "), "{outcomes:?}");
+    assert_eq!(items(&mut phone), ["From-A", "From-B"]);
+    assert_eq!(items(&mut b), ["From-A", "From-B"]);
+
+    // A has still heard nothing of B's item, from B or from anyone.
+    assert_eq!(items(&mut a), ["From-A"]);
+    // Back at A, it brings B's.
+    sync(&mut phone, Some(&a_id));
+    assert_eq!(items(&mut a), ["From-A", "From-B"]);
+    for device in [phone, a, b] {
+        quit(device);
+    }
+}
+
+/// A free port on this machine, for a relay to listen on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A device that is on none of the inviter's networks (it listens nowhere,
+/// and the invitation names no address) joins through the vault's relay and
+/// then syncs both ways (the sync itself may go direct, as the device has
+/// by then learned the inviter's address; the join and the catching up
+/// cannot).
+#[test]
+fn a_device_away_from_every_network_joins_and_syncs_through_the_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = |name| Files::new(dir.path(), name);
+    let (a_files, away_files) = (files("a"), files("away"));
+    let relay_address = format!("127.0.0.1:{}", free_port());
+    let relay_folder = path(dir.path(), "relay");
+    let relay = Running::start_relay(&relay_folder, &relay_address);
+    let relay_code = relay.expect("RELAY-CODE");
+
+    run(&["create", &a_files.vault]);
+    let (mut a, _) = a_files.start("127.0.0.1:0");
+    command(&mut a, "found", "FOUNDED");
+    command(&mut a, "add From-A", "ADDED");
+    a.answer(&format!("relay {relay_code}"));
+    a.expect("RELAY-CONNECTED");
+
+    // The invitation names the relay and no address; the new device listens
+    // nowhere.
+    let (mut away, _) = join_listening_at(&mut a, &away_files, "invite away", "-");
+    wait_status(&mut away, &["epoch=1", "members=2"]);
+    let outcomes = sync(&mut away, None);
+    assert!(
+        outcomes.iter().all(|line| line.starts_with("ED ")),
+        "{outcomes:?}"
+    );
+    assert_eq!(items(&mut away), ["From-A"]);
+    command(&mut away, "add From-away", "ADDED");
+    sync(&mut away, None);
+    assert_eq!(items(&mut a), ["From-A", "From-away"]);
+    for device in [away, a] {
+        quit(device);
+    }
+    drop(relay);
 }

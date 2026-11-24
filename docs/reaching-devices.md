@@ -39,6 +39,20 @@ try (formats: "Addresses are advisory; the pin authenticates whatever
 answers"). No server ever holds a key or plaintext. A vault used on one
 network needs no server and no account.
 
+## Joining from another network (Phase 21)
+
+A new device can join a vault while away from every network the inviter is
+on. The owner asks for an invitation "for a device away"; it carries the
+vault's relay (address, pin, token) as well as the inviter's addresses, and
+the joiner reaches the inviter through the relay when its addresses do not
+answer. The new device then stays registered at the relay, so that the
+vault's devices, which must also use the relay, reach it there while it is
+enrolled and given its keys. The invitation then holds the relay's token (see
+the threat model); the ordinary invitation, without the relay, is the
+default and is what the released apps read. Not yet in the desktop's or the
+phones' screens: `osm-peer` does it (`invite away`, `join-device … -`), and
+the shared code is tested in process and between processes.
+
 ## What it was before Phase 16
 
 A device listened on IPv4 only (`0.0.0.0`), an invitation named one
@@ -171,5 +185,8 @@ Mac and in a Linux container, written for one.
    got out: stop the relay, delete `token` in its folder, start it again,
    and paste the new code in the desktop app. Devices that have not synced
    since cannot use the relay until they have, at home.
+   An invitation made for a device away (Phase 21) holds the relay's code, so
+   one that got out, or was shown to someone who is then refused, is a reason to
+   do this too.
 6. To stop: Stop using it, in the same panel; the other devices stop with
    their next sync.

@@ -157,6 +157,11 @@ impl RelayCode {
     pub fn pin(&self) -> [u8; 32] {
         self.pin
     }
+
+    /// The relay's token, for an invitation that carries the relay.
+    pub(crate) fn token(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.token)
+    }
 }
 
 #[derive(Serialize, Deserialize)]

@@ -61,6 +61,17 @@ impl Running {
         Self::spawn(osm_peer(), args)
     }
 
+    /// Starts `osm-relay` on `address`, which devices reach it at too, with
+    /// its files in `folder`. Its output line `RELAY-CODE` is the next to
+    /// [`expect`](Self::expect).
+    pub fn start_relay(folder: &str, address: &str) -> Self {
+        let program = std::env::var_os("OSM_TEST_CRATE_DIR").map_or_else(
+            || std::path::PathBuf::from(env!("CARGO_BIN_EXE_osm-relay")),
+            |folder| std::path::Path::new(&folder).join("osm-relay"),
+        );
+        Self::spawn(Command::new(program), &[folder, address, address])
+    }
+
     /// Starts a process that has no way to learn the vault password.
     pub fn start_without_password(args: &[&str]) -> Self {
         let mut command = osm_peer();

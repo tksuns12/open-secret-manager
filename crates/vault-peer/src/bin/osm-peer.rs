@@ -11,7 +11,7 @@
 //! osm-peer list <vault>                                ITEM <title>
 //! osm-peer device <vault> <peers.db> <control.db> <listen-addr|->
 //! osm-peer device-locked <vault> <peers.db> <control.db> <listen-addr|->
-//! osm-peer join-device <code> <vault> <peers.db> <control.db> <listen-addr>
+//! osm-peer join-device <code> <vault> <peers.db> <control.db> <listen-addr|->
 //! ```
 //!
 //! `add` and `list` unlock the vault for one operation and leave received
@@ -29,6 +29,9 @@
 //! found                 FOUNDED
 //! invite                INVITE, SAS (answer y), ENROLLING, ENROLLED <device>
 //! invite without-vote   the same, for a device that will not vote
+//! invite away           the same, for a device away from every network this
+//!                       one is on: the invitation names the vault's relay and
+//!                       no address (`invite without-vote away` as well)
 //! add <title>           ADDED
 //! list                  ITEM <title>..., LISTED
 //! sync [<device>]       SYNCED or SYNC-FAILED per member, SYNC-DONE
@@ -64,9 +67,9 @@ use osm_vault_membership::{
     device_id_from_bytes, device_id_to_bytes, ControlNode, DeviceId, NodeOptions,
 };
 use osm_vault_peer::{
-    control, invite, serve_members, serve_relayed, start_node, start_pairing, AddressBook,
-    Invitation, MemberEndpoint, MemberSync, PairingListener, PeerStore, Relay, RelayCode,
-    SyncReport, Voting, MAX_INVITATION_TTL_SECS,
+    control, invite, invite_through_relay, serve_members, serve_relayed, start_node, start_pairing,
+    AddressBook, Invitation, MemberEndpoint, MemberSync, PairingListener, PeerStore, Relay,
+    RelayCode, SyncReport, Voting, MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::{
@@ -133,8 +136,10 @@ async fn run(args: &[String]) -> CliResult {
             let mut lines = stdin_lines();
             let mut peers =
                 PeerStore::open(peers, std::sync::Arc::new(osm_vault_peer::NoKeystore))?;
-            let connection = start_pairing(Invitation::decode(code)?, &mut peers, now()).await?;
+            let mut connection =
+                start_pairing(Invitation::decode(code)?, &mut peers, now()).await?;
             println!("SAS {}", connection.sas());
+            let relay = connection.take_relay();
             // The node runs from the start so that the leader can bring it
             // up to date; it accepts no one until the grant names members.
             let id = connection.joiner().control_device();
@@ -142,7 +147,23 @@ async fn run(args: &[String]) -> CliResult {
             let (endpoint, node) =
                 start_control(vault_id, id, &mut peers, peers_path(&args), control).await?;
             let (sync, incoming) = mpsc::channel(4);
-            let server = serve(listen, &endpoint, &node, &sync).await?;
+            // `-`: no listener, as behind a router that lets nothing in.
+            let server = if *listen == "-" {
+                None
+            } else {
+                Some(serve(listen, &endpoint, &node, &sync).await?)
+            };
+            // The relay the invitation named: the vault's devices reach this
+            // device through it until it has told them where it listens.
+            if let Some((relay, relayed)) = relay {
+                endpoint.set_relay(Some(relay));
+                tokio::spawn(serve_relayed(
+                    relayed,
+                    endpoint.clone(),
+                    node.clone(),
+                    Some(sync.clone()),
+                ));
+            }
             let owner_confirmed = lines.recv().await.as_deref() == Some("y");
             let (joiner, grant) = connection.receive_enrollment().await?;
             endpoint.introduce_grant(&joiner, &grant)?;
@@ -167,7 +188,7 @@ async fn run(args: &[String]) -> CliResult {
             let device = Device {
                 sync,
                 incoming: Mutex::new(Some(incoming)),
-                server: Mutex::new(Some(server)),
+                server: Mutex::new(server),
                 ..Device::new(vault, peers, endpoint, node)
             };
             device.run(lines).await
@@ -417,8 +438,12 @@ impl Device {
                 control::found(&vault, &mut peers, &self.node).await?;
                 println!("FOUNDED");
             }
-            ["invite"] => self.invite(lines, Voting::Votes).await?,
-            ["invite", "without-vote"] => self.invite(lines, Voting::WithoutVote).await?,
+            ["invite"] => self.invite(lines, Voting::Votes, false).await?,
+            ["invite", "without-vote"] => self.invite(lines, Voting::WithoutVote, false).await?,
+            ["invite", "away"] => self.invite(lines, Voting::Votes, true).await?,
+            ["invite", "without-vote", "away"] => {
+                self.invite(lines, Voting::WithoutVote, true).await?
+            }
             ["add", title @ ..] if !title.is_empty() => {
                 self.vault.lock().await.put(Item::new(title.join(" ")))?;
                 println!("ADDED");
@@ -503,7 +528,10 @@ impl Device {
     /// `y`, the enrollment is proposed to the vault's devices, and the
     /// joiner is told once they accept it. `voting` says whether it will
     /// vote.
-    async fn invite(&self, lines: &mut Lines, voting: Voting) -> CliResult {
+    async fn invite(&self, lines: &mut Lines, voting: Voting, away: bool) -> CliResult {
+        if away && self.endpoint.relay().is_none() {
+            return Err("this device is not using the relay: run `relay <code>` first".into());
+        }
         let listener = {
             let mut peers = self.peers.lock().await;
             PairingListener::bind("127.0.0.1:0", &mut peers).await?
@@ -512,15 +540,33 @@ impl Device {
             let vault = self.vault.lock().await;
             let mut invitations = self.invitations.lock().await;
             let mut peers = self.peers.lock().await;
-            invite(
-                &vault,
-                &mut invitations,
-                &mut peers,
-                vec![listener.local_addr()?.to_string()],
-                now(),
-                MAX_INVITATION_TTL_SECS,
-            )?
+            if away {
+                // For a joiner away from every network this device is on: the
+                // vault's relay, and no address at all.
+                let code = vault.relay()?.ok_or("the vault has no relay")?;
+                invite_through_relay(
+                    &vault,
+                    &mut invitations,
+                    &mut peers,
+                    Vec::new(),
+                    &RelayCode::decode(&code)?,
+                    now(),
+                    MAX_INVITATION_TTL_SECS,
+                )?
+            } else {
+                invite(
+                    &vault,
+                    &mut invitations,
+                    &mut peers,
+                    vec![listener.local_addr()?.to_string()],
+                    now(),
+                    MAX_INVITATION_TTL_SECS,
+                )?
+            }
         };
+        if away {
+            listener.through(&self.endpoint);
+        }
         println!("INVITE {}", invitation.encode()?.as_str());
         let pending = loop {
             let incoming = tokio::time::timeout(

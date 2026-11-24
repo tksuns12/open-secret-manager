@@ -24,12 +24,12 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, sync::mpsc, task::JoinHandle};
 use crate::{
     control,
     control_tests::{titles, until},
-    invite, serve_members, serve_relay, serve_relayed, start_node, start_pairing,
-    start_pairing_with_vault,
+    invite, invite_through_relay, serve_members, serve_relay, serve_relayed, start_node,
+    start_pairing, start_pairing_with_vault,
     tests::login,
     transport::{client_config_for_tests, server_name_for_tests},
-    AddressBook, Error, MemberContact, MemberEndpoint, MemberSync, PairingListener, PeerStore,
-    Relay, RelayCode, SyncReport, Voting,
+    AddressBook, Error, Invitation, MemberContact, MemberEndpoint, MemberSync, PairingListener,
+    PeerStore, Relay, RelayCode, SyncReport, Voting,
 };
 use tokio_rustls::TlsConnector;
 
@@ -1354,6 +1354,185 @@ impl Member {
             invitations: InvitationStore::open_in_memory(InvitationPolicy::default()).unwrap(),
         }
     }
+}
+
+impl Member {
+    /// As [`Self::invite`], for a device away from every network the inviter
+    /// listens on: the invitation names one address that leads nowhere and
+    /// the vault's relay, and the joiner listens nowhere. Its pairing, and
+    /// then the leader's way to it, are through the relay. The inviter has
+    /// the relay in use already.
+    async fn invite_through_the_relay(
+        &mut self,
+        dir: &TempDir,
+        name: &str,
+        relay: &RelayCode,
+    ) -> Member {
+        let pairing = PairingListener::bind("127.0.0.1:0", &mut self.host.peers)
+            .await
+            .unwrap();
+        pairing.through(&self.host.endpoint);
+        let invitation = invite_through_relay(
+            &self.vault,
+            &mut self.invitations,
+            &mut self.host.peers,
+            vec![NOWHERE.to_owned()],
+            relay,
+            NOW,
+            300,
+        )
+        .unwrap();
+        // What the joiner scans: the text, not the value.
+        let invitation = Invitation::decode(&invitation.encode().unwrap()).unwrap();
+        assert_eq!(
+            invitation.relay().map(RelayCode::address),
+            Some(relay.address())
+        );
+
+        let mut peers = PeerStore::open_in_memory().unwrap();
+        let (incoming, connection) = tokio::join!(pairing.next_request(), async {
+            start_pairing(invitation, &mut peers, NOW).await
+        });
+        let mut connection = connection.unwrap();
+        let (joiner_relay, relayed) = connection.take_relay().unwrap();
+        let device = connection.joiner().control_device();
+        let vault_id = connection.joiner().vault_id();
+        let mut host = Host::start(dir, device, vault_id).await;
+        host.stop().await;
+        host.peers = peers;
+        host.restart(vault_id).await;
+        // No listener: the joiner is reached through the relay or not at all.
+        host.endpoint.set_relay(Some(joiner_relay.clone()));
+        host.relayed = Some(tokio::spawn(serve_relayed(
+            relayed,
+            host.endpoint.clone(),
+            host.node.clone(),
+            host.sync.clone(),
+        )));
+
+        let pending = incoming
+            .unwrap()
+            .review(&self.vault, &self.invitations, &mut self.host.peers, NOW)
+            .unwrap();
+        assert_eq!(pending.sas(), connection.sas());
+        let (proposal, approved) = pending
+            .approve_enrollment(
+                &self.vault,
+                &mut self.invitations,
+                self.host.endpoint.roster(),
+                Voting::Votes,
+                self.host.endpoint.listen_port(),
+                NOW,
+            )
+            .unwrap();
+        control::submit(&self.host.node, proposal).await.unwrap();
+        let (sent, received) = tokio::join!(approved.send(), connection.receive_enrollment());
+        sent.unwrap();
+        let (joiner, grant) = received.unwrap();
+        let members = joiner.members(&grant).unwrap();
+        host.endpoint.introduce_grant(&joiner, &grant).unwrap();
+        for _ in 0..100 {
+            if host.endpoint.announce_all().await == members.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        until("the joiner is a member", || {
+            self.host.state().is_settled_member(device)
+        })
+        .await;
+        for request in control::grant_requests(&self.vault, &self.host.state()).unwrap() {
+            control::submit(&self.host.node, request).await.unwrap();
+        }
+        until("the joiner holds every key", || {
+            joiner.enrolled(&host.state())
+        })
+        .await;
+        let vault = joiner
+            .finish_enrollment(
+                &grant,
+                true,
+                &host.state(),
+                dir.path().join(format!("{name}.db")),
+                PASSWORD,
+            )
+            .unwrap();
+        Member {
+            host,
+            vault,
+            invitations: InvitationStore::open_in_memory(InvitationPolicy::default()).unwrap(),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_away_from_every_network_joins_through_the_relay_and_syncs_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    a.vault.put(login("From A", "a-secret")).unwrap();
+    let (code, _relay) = relay().await;
+    a.host.use_relay(&code).await;
+
+    // The only address the invitation names leads nowhere, and the joiner
+    // listens nowhere: all of it, the pairing and the catching up, goes
+    // through the relay.
+    let mut b = a.invite_through_the_relay(&dir, "b", &code).await;
+    assert!(b.host.endpoint.listen_port().is_none());
+
+    // And the two sync (the joiner learned A's own address in the roster,
+    // so this may go direct; the join and the catching up did not).
+    b.vault.put(login("From B", "b-secret")).unwrap();
+    let (sent, received) = sync(&mut b, &mut a).await;
+    assert!(
+        sent.sent >= 1 || received.sent >= 1,
+        "{sent:?} {received:?}"
+    );
+    assert_eq!(titles(&a.vault), ["From A", "From B"]);
+    assert_eq!(titles(&b.vault), ["From A", "From B"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_through_the_relay_is_refused_once_its_invitations_listener_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    let (code, _relay) = relay().await;
+    a.host.use_relay(&code).await;
+
+    // An invitation made, and its listener gone, as when it was used up or
+    // closed: the joiner's connection is dropped, not taken as a member's.
+    let pairing = PairingListener::bind("127.0.0.1:0", &mut a.host.peers)
+        .await
+        .unwrap();
+    pairing.through(&a.host.endpoint);
+    // An address that refuses at once, so that the refusal is what ends it.
+    let closed = {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().to_string()
+    };
+    let invitation = invite_through_relay(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.host.peers,
+        vec![closed],
+        &code,
+        NOW,
+        300,
+    )
+    .unwrap();
+    drop(pairing);
+    let mut peers = PeerStore::open_in_memory().unwrap();
+    // Refused, and not merely left waiting: the connection is dropped at
+    // once, as no one holds the sink any longer.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        start_pairing(invitation, &mut peers, NOW),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Ok(Err(_))),
+        "expected a refusal, got {:?}",
+        outcome.map(|result| result.map(|_| ()))
+    );
 }
 
 /// Syncs two members over the member endpoint: `dialer` opens the

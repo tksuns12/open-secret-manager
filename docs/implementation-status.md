@@ -416,3 +416,11 @@ Integration order is core → desktop local workflow → authenticated revision 
 | Compromised enrolled device | Raft and signatures do not stop malicious authorized behavior | Disclose trust limit and support explicit removal/recovery |
 
 No checklist entry should be marked verified from design prose, dependency presence, or a skipped check. Record the actual command or manual scenario, outcome, and material limits with the release evidence.
+
+### Phase 21 — Joining through the relay
+
+Started 2026-11-24: a new device can join while away from every network the inviter is on.
+
+1. The shared code (`osm-vault-peer`): invitation version 2 carries the vault's relay; the joiner tries the invitation's addresses and the relay, and stays registered at the relay for the catching up; the inviter hands a joiner that came through the relay (first byte `P`) to the open invitation's listener and nothing else. **Done**, with tests in process (a device that listens nowhere, with an invitation whose one address leads nowhere, joins, is given its keys, and syncs; the same with its connection refused once its invitation's listener is gone; version 1 and 2 round trips, tampering, the frozen version 2 text, the limit on the text's length) and between processes (`osm-peer invite away`, `join-device … -`, a relay of its own). Without the relay branch of the joiner the in-process join does not complete. The reviewer's findings were fixed: tokens wiped on every decode path, a pairing sink that cannot be set silently or left stuck, a way counted when the inviter has taken its handshake, not when its connection opened, the addresses trimmed to make room for the relay.
+2. **Not done:** the desktop's and the phones' screens (an "invite a device that is away" choice; the phones' join taking the relay from the connection before waiting for the enrollment, `PairingConnection::take_relay`, which they do not call yet, so a version 2 invitation must not be issued to them), documents of the apps, fuzz seeds of version 2, and a release of the phones. Not tried across real networks or with the relay on a real server.
+

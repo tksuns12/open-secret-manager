@@ -41,10 +41,13 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     control::{self, Reconciled, Voting},
     members::{valid_contacts, MemberContact},
+    relay::RelayCode,
     Error, PeerStore, Result,
 };
 
 const PAIRING_VERSION: u8 = 1;
+/// An invitation that also carries the relay the inviter is reached by.
+const PAIRING_VERSION_WITH_RELAY: u8 = 2;
 const INVITATION_PREFIX: &str = "OSM-PAIR1-";
 const MAX_INVITATION_CODE_LEN: usize = 512;
 const MAX_ADDRESSES: usize = 4;
@@ -68,10 +71,37 @@ struct InvitationBody {
     expires_at: u64,
 }
 
+/// Version 2 of the invitation: version 1's fields, then the relay the
+/// inviter is reached by, so that a device away from the inviter's networks
+/// can still join. Only issued on request; version 1 stays the default.
+#[derive(Serialize, Deserialize)]
+struct InvitationBodyWithRelay {
+    version: u8,
+    vault_id: [u8; 32],
+    inviter_device_id: [u8; 16],
+    inviter_public_key: [u8; 32],
+    inviter_transport_pin: [u8; 32],
+    addresses: Vec<String>,
+    token: [u8; 32],
+    expires_at: u64,
+    relay_address: String,
+    relay_pin: [u8; 32],
+    relay_token: [u8; 32],
+}
+
+impl Drop for InvitationBodyWithRelay {
+    fn drop(&mut self) {
+        self.token.zeroize();
+        self.relay_token.zeroize();
+    }
+}
+
 /// An out-of-band invitation. It contains a bearer token, so it is never
 /// logged and is zeroized on drop.
 pub struct Invitation {
     body: InvitationBody,
+    /// The relay of the vault, when the invitation names one.
+    relay: Option<RelayCode>,
 }
 
 impl Drop for Invitation {
@@ -92,12 +122,34 @@ impl Invitation {
     /// The text form shown to the owner, `OSM-PAIR1-` plus base64url.
     pub fn encode(&self) -> Result<Zeroizing<String>> {
         let bytes = Zeroizing::new(
-            postcard::to_allocvec(&self.body).map_err(|_| Error::InvalidInvitation)?,
+            match &self.relay {
+                None => postcard::to_allocvec(&self.body),
+                Some(relay) => postcard::to_allocvec(&InvitationBodyWithRelay {
+                    version: PAIRING_VERSION_WITH_RELAY,
+                    vault_id: self.body.vault_id,
+                    inviter_device_id: self.body.inviter_device_id,
+                    inviter_public_key: self.body.inviter_public_key,
+                    inviter_transport_pin: self.body.inviter_transport_pin,
+                    addresses: self.body.addresses.clone(),
+                    token: self.body.token,
+                    expires_at: self.body.expires_at,
+                    relay_address: relay.address().to_owned(),
+                    relay_pin: relay.pin(),
+                    relay_token: *relay.token(),
+                }),
+            }
+            .map_err(|_| Error::InvalidInvitation)?,
         );
-        Ok(Zeroizing::new(format!(
+        let code = Zeroizing::new(format!(
             "{INVITATION_PREFIX}{}",
             Base64UrlUnpadded::encode_string(&bytes)
-        )))
+        ));
+        // A code with a relay that the joiner could not read back is not
+        // issued; a plain one is as it always was.
+        if self.relay.is_some() && code.len() > MAX_INVITATION_CODE_LEN {
+            return Err(Error::InvalidInvitation);
+        }
+        Ok(code)
     }
 
     pub fn decode(code: &str) -> Result<Self> {
@@ -111,23 +163,62 @@ impl Invitation {
         let bytes = Zeroizing::new(
             Base64UrlUnpadded::decode_vec(encoded).map_err(|_| Error::InvalidInvitation)?,
         );
-        let (body, rest): (InvitationBody, _) =
-            postcard::take_from_bytes(&bytes).map_err(|_| Error::InvalidInvitation)?;
-        // One form only: not a number written in more bytes than it needs.
-        let one_form = postcard::to_allocvec(&body)
-            .map(Zeroizing::new)
-            .is_ok_and(|again| again.as_slice() == bytes.as_slice());
-        let invitation = Self { body };
-        if !rest.is_empty() || !one_form {
-            return Err(Error::InvalidInvitation);
-        }
-        if invitation.body.version != PAIRING_VERSION {
-            return Err(Error::UnsupportedVersion);
-        }
+        // The first byte is the version, in either form.
+        let invitation = match bytes.first().copied() {
+            Some(PAIRING_VERSION) => {
+                let (body, rest): (InvitationBody, _) =
+                    postcard::take_from_bytes(&bytes).map_err(|_| Error::InvalidInvitation)?;
+                // Held from here, so that the token is wiped on every path.
+                let invitation = Self { body, relay: None };
+                // One form only: not a number written in more bytes than it needs.
+                let one_form = postcard::to_allocvec(&invitation.body)
+                    .map(Zeroizing::new)
+                    .is_ok_and(|again| again.as_slice() == bytes.as_slice());
+                if !rest.is_empty() || !one_form {
+                    return Err(Error::InvalidInvitation);
+                }
+                invitation
+            }
+            Some(PAIRING_VERSION_WITH_RELAY) => {
+                // Its tokens are wiped when it drops, on every path.
+                let (mut wide, rest): (InvitationBodyWithRelay, _) =
+                    postcard::take_from_bytes(&bytes).map_err(|_| Error::InvalidInvitation)?;
+                let one_form = postcard::to_allocvec(&wide)
+                    .map(Zeroizing::new)
+                    .is_ok_and(|again| again.as_slice() == bytes.as_slice());
+                if !rest.is_empty() || !one_form {
+                    return Err(Error::InvalidInvitation);
+                }
+                let relay = RelayCode::new(&wide.relay_address, wide.relay_pin, wide.relay_token)
+                    .map_err(|_| Error::InvalidInvitation)?;
+                let body = InvitationBody {
+                    version: PAIRING_VERSION,
+                    vault_id: wide.vault_id,
+                    inviter_device_id: wide.inviter_device_id,
+                    inviter_public_key: wide.inviter_public_key,
+                    inviter_transport_pin: wide.inviter_transport_pin,
+                    addresses: std::mem::take(&mut wide.addresses),
+                    token: wide.token,
+                    expires_at: wide.expires_at,
+                };
+                Self {
+                    body,
+                    relay: Some(relay),
+                }
+            }
+            Some(_) => return Err(Error::UnsupportedVersion),
+            None => return Err(Error::InvalidInvitation),
+        };
         if !valid_addresses(&invitation.body.addresses) {
             return Err(Error::InvalidInvitation);
         }
         Ok(invitation)
+    }
+
+    /// The relay of the vault, when the inviter named it for a joiner away
+    /// from its networks.
+    pub fn relay(&self) -> Option<&RelayCode> {
+        self.relay.as_ref()
     }
 
     pub fn vault_id(&self) -> [u8; 32] {
@@ -315,7 +406,35 @@ pub fn invite(
             token: *token.expose_secret(),
             expires_at,
         },
+        relay: None,
     })
+}
+
+/// As [`invite`], for a joiner that may be away from the inviter's
+/// networks: the invitation also carries `relay`, the vault's, by which the
+/// joiner reaches the inviter. It holds the relay's token, so it is shown
+/// only when the owner asks for it.
+pub fn invite_through_relay(
+    vault: &Vault,
+    invitations: &mut InvitationStore,
+    peers: &mut PeerStore,
+    mut addresses: Vec<String>,
+    relay: &RelayCode,
+    now: u64,
+    ttl_secs: u64,
+) -> Result<Invitation> {
+    let mut invitation = invite(vault, invitations, peers, addresses.clone(), now, ttl_secs)?;
+    invitation.relay = Some(relay.clone());
+    // The relay takes room the addresses had: the later addresses, which
+    // are the less likely to be the joiner's way, are left out until the code
+    // fits what can be scanned and pasted.
+    while invitation.encode().is_err() {
+        if addresses.pop().is_none() {
+            return Err(Error::InvalidInvitation);
+        }
+        invitation.body.addresses = addresses.clone();
+    }
+    Ok(invitation)
 }
 
 /// Validates a join request without consuming the invitation. Only a request
@@ -551,6 +670,10 @@ impl Joiner {
 
     pub(crate) fn inviter_device_id(&self) -> [u8; 16] {
         self.invitation.body.inviter_device_id
+    }
+
+    pub(crate) fn invitation_relay(&self) -> Option<&RelayCode> {
+        self.invitation.relay.as_ref()
     }
 
     pub(crate) fn inviter_addresses(&self) -> &[String] {

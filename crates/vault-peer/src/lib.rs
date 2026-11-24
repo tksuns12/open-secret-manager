@@ -35,8 +35,8 @@ pub use members::{
     MEMBER_PROTOCOL_VERSION,
 };
 pub use pairing::{
-    approve_enrollment, invite, review_join, EnrollmentGrant, Invitation, JoinRequest, JoinReview,
-    Joiner, MAX_INVITATION_TTL_SECS,
+    approve_enrollment, invite, invite_through_relay, review_join, EnrollmentGrant, Invitation,
+    JoinRequest, JoinReview, Joiner, MAX_INVITATION_TTL_SECS,
 };
 pub use peers::{KeyKept, Peer, PeerStore, TransportIdentity};
 pub use relay::{serve_relay, Relay, RelayCode, RELAY_PROTOCOL_VERSION};

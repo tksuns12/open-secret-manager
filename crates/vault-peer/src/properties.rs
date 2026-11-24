@@ -129,6 +129,28 @@ proptest! {
     }
 }
 
+proptest! {
+    /// Any one character of an invitation that carries a relay changed, or
+    /// the end cut off, reads as nothing or back as exactly its own text.
+    #[test]
+    fn a_damaged_invitation_with_a_relay_is_refused_or_read_as_itself(
+        at in 10usize..340,
+        letter in "[A-Za-z0-9_-]",
+        cut in 0usize..3,
+    ) {
+        let frozen: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/pairing-relay.json")).unwrap();
+        let mut text = frozen["invitation_text"].as_str().unwrap().to_owned();
+        let at = at.min(text.len() - 1);
+        text.replace_range(at..=at, &letter);
+        text.truncate(text.len() - cut);
+        if let Ok(invitation) = Invitation::decode(&text) {
+            let written = invitation.encode().unwrap();
+            prop_assert_eq!(written.as_str(), text.trim());
+        }
+    }
+}
+
 /// A vault with a few items for a sync session to send.
 fn vault_with_items(dir: &std::path::Path) -> Vault {
     let (mut vault, _) =

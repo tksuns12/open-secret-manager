@@ -55,7 +55,7 @@ use osm_vault_membership::{
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     task::{JoinHandle, JoinSet},
@@ -73,6 +73,10 @@ use crate::{
     },
     EnrollmentGrant, Error, Joiner, PeerStore, Relay, Result, SyncReport,
 };
+
+/// What a joiner's connection through the relay opens with, before its TLS:
+/// the sign for the owner's open invitation, not a member.
+pub(crate) const PAIRING_OPENING: u8 = b'P';
 
 /// How long a dial waits on a device's addresses before trying the relay
 /// as well.
@@ -537,6 +541,9 @@ struct Inner {
     /// The relay this device reaches others through when their addresses do
     /// not answer, if the owner set one up.
     relay: Mutex<Option<Relay>>,
+    /// Where a pairing that came through the relay goes: the listener of an
+    /// open invitation. None while no invitation is open.
+    pairing: Mutex<Option<mpsc::Sender<TcpStream>>>,
     /// The addresses this device names for itself, if set rather than read
     /// from its network interfaces.
     own_addresses: Mutex<Option<Vec<String>>>,
@@ -570,6 +577,7 @@ impl MemberEndpoint {
                 listen_port: AtomicU16::new(0),
                 removed: AtomicBool::new(false),
                 relay: Mutex::new(None),
+                pairing: Mutex::new(None),
                 own_addresses: Mutex::new(None),
             }),
         })
@@ -593,6 +601,37 @@ impl MemberEndpoint {
             .relay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = relay;
+    }
+
+    /// Passes pairings that come through the relay to `sink`, the listener
+    /// of an open invitation (`PairingListener::through`).
+    pub(crate) fn set_pairing_sink(&self, sink: Option<mpsc::Sender<TcpStream>>) {
+        *self
+            .inner
+            .pairing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
+    }
+
+    /// Stops passing pairings to `sink`, if it is still the one.
+    pub(crate) fn clear_pairing_sink(&self, sink: &mpsc::Sender<TcpStream>) {
+        let mut slot = self
+            .inner
+            .pairing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.as_ref().is_some_and(|held| held.same_channel(sink)) {
+            *slot = None;
+        }
+    }
+
+    fn pairing_sink(&self) -> Option<mpsc::Sender<TcpStream>> {
+        self.inner
+            .pairing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .filter(|sink| !sink.is_closed())
     }
 
     /// The relay this device uses, if any.
@@ -1285,11 +1324,34 @@ pub async fn serve_relayed(
             continue;
         }
         let endpoint = endpoint.clone();
-        connections.spawn(serve_connection(
-            async move { endpoint.accept_relayed(tcp).await },
-            node.clone(),
-            sync.clone(),
-        ));
+        let (node, sync) = (node.clone(), sync.clone());
+        connections.spawn(async move {
+            // A joiner away from every network the invitation names opens
+            // with one byte no TLS record starts with; a member goes
+            // straight to TLS, whose first byte is 0x16.
+            let mut tcp = tcp;
+            let mut first = [0u8; 1];
+            let seen = with_timeout(HANDSHAKE_TIMEOUT, tcp.peek(&mut first)).await;
+            match seen {
+                Ok(Ok(1)) if first[0] == PAIRING_OPENING => {
+                    if tcp.read_exact(&mut first).await.is_ok() {
+                        // Taken only while an invitation is open.
+                        if let Some(sink) = endpoint.pairing_sink() {
+                            let _ = sink.try_send(tcp);
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {
+                    serve_connection(
+                        async move { endpoint.accept_relayed(tcp).await },
+                        node,
+                        sync,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        });
     }
 }
 
