@@ -915,7 +915,15 @@ impl Runtime {
         }
         let invitation = Invitation::decode(code).map_err(|_| MobileError::InvalidInvitation)?;
         let prepared = PreparedJoin::new(invitation, &mut *self.peers.lock().await, now())?;
-        let connection = prepared.connect().await?;
+        let mut connection = prepared.connect().await?;
+        // The relay an invitation for a device that is away names: this
+        // device is registered at it already, and the vault's devices reach
+        // it there while they enroll it.
+        let relay = connection.take_relay();
+        let relay_code = connection
+            .joiner()
+            .invitation_relay()
+            .and_then(|code| code.encode().ok());
         // The node runs from here on so that the leader can bring this
         // device up to date. It accepts no one until the inviting device
         // names the members.
@@ -923,6 +931,23 @@ impl Runtime {
         let control = self
             .start_control(joiner.vault_id(), joiner.control_device())
             .await?;
+        if let (Some((relay, relayed)), Some(code)) = (relay, relay_code) {
+            // Kept in memory while the join lasts, and in the peer store once
+            // it has succeeded (`join_finish`): a join that is given up, or
+            // quit, leaves nothing behind for the next vault to use.
+            control.stop_relay();
+            control.endpoint.set_relay(Some(relay));
+            let serving = tokio::spawn(serve_relayed(
+                relayed,
+                control.endpoint.clone(),
+                control.node.clone(),
+                Some(control.sync.clone()),
+            ));
+            *control
+                .relay
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((code, serving));
+        }
         let sas = connection.sas();
         *self.join.lock().await = Some(JoinState {
             connection,
@@ -948,6 +973,17 @@ impl Runtime {
             control.stop().await;
             self.forget_control().await;
             return Err(error);
+        }
+        // The relay the invitation named is this device's until the vault
+        // says otherwise; kept now, for a start before the first sync.
+        let from_invitation = control
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(code, _)| code.clone());
+        if let Some(code) = from_invitation {
+            let _ = self.peers.lock().await.set_relay_code(Some(&code));
         }
         self.maintain(&control).await;
         // Fetch the vault's contents right away.
@@ -1002,6 +1038,7 @@ impl Runtime {
         if let Some(control) = self.control.lock().await.take() {
             control.stop().await;
         }
+        let _ = self.peers.lock().await.set_relay_code(None);
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(self.directory.join(format!("{CONTROL_FILE}{suffix}")));
         }
@@ -1230,9 +1267,11 @@ impl Runtime {
         let wanted = {
             let vault = self.vault.lock().await;
             match vault.as_ref().filter(|vault| vault.is_unlocked()) {
-                Some(vault) => match vault.relay() {
-                    Ok(wanted) => wanted,
-                    Err(_) => return,
+                Some(vault) => match (vault.relay(), vault.has_relay_setting()) {
+                    (Ok(wanted), Ok(said)) if said || wanted.is_some() => wanted,
+                    // The vault has not said yet: a device that joined
+                    // through an invitation's relay keeps it until it does.
+                    _ => return,
                 },
                 None => return,
             }

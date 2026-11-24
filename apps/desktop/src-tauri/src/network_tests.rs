@@ -159,7 +159,7 @@ pub(crate) async fn pair_as(
     password: Option<&str>,
     votes: bool,
 ) {
-    let invitation = network::start_invite(votes, inviter.state(), inviter.clone())
+    let invitation = network::start_invite(votes, None, inviter.state(), inviter.clone())
         .await
         .unwrap();
     let joining = network::join_start(invitation.code.clone(), joiner.state(), joiner.clone())
@@ -300,7 +300,7 @@ fn desktop_shells_enroll_sync_remove_and_refuse_without_quorum() {
         kept.sort();
         assert_eq!(kept, ["Added on A", "Added on C", "Shared"]);
         drop(archived);
-        let refused = network::start_invite(true, c.state(), c.clone())
+        let refused = network::start_invite(true, None, c.state(), c.clone())
             .await
             .err()
             .unwrap();
@@ -308,7 +308,7 @@ fn desktop_shells_enroll_sync_remove_and_refuse_without_quorum() {
 
         // D starts joining but never finishes. Its enrollment stays
         // pending until a member cancels it; D never received a key.
-        let invitation = network::start_invite(true, a.state(), a.clone())
+        let invitation = network::start_invite(true, None, a.state(), a.clone())
             .await
             .unwrap();
         let joining = network::join_start(invitation.code.clone(), d.state(), d.clone())
@@ -2022,6 +2022,71 @@ fn a_relay_set_on_one_device_is_used_by_every_device_even_while_locked() {
         network::sync_now(b.clone()).await.unwrap();
         until_devices(&b, "B no longer uses the relay", |info| {
             info.relay.is_none()
+        })
+        .await;
+        for app in [&a, &b] {
+            network::shutdown(app).await;
+        }
+    });
+}
+
+#[test]
+fn an_invitation_for_a_device_that_is_away_carries_the_relay_and_is_refused_without_one() {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (app_a, app_b) = (shell(dir_a.path()), shell(dir_b.path()));
+    let codes = record(&app_a, "pairing-code");
+    let finished = record(&app_a, "pairing-finished");
+    let (a, b) = (app_a.handle().clone(), app_b.handle().clone());
+
+    tauri::async_runtime::block_on(async move {
+        crate::create_vault(PASSWORD.into(), a.state(), a.clone())
+            .await
+            .unwrap();
+        put(&a, "Shared").await;
+
+        // With no relay in use, such an invitation is not made.
+        let Err(refused) = network::start_invite(true, Some(true), a.state(), a.clone()).await
+        else {
+            panic!("an invitation with a relay was made with none in use");
+        };
+        assert_eq!(refused.code, "no_relay");
+        let plain = network::start_invite(true, None, a.state(), a.clone())
+            .await
+            .unwrap();
+        assert!(osm_vault_peer::Invitation::decode(&plain.code)
+            .unwrap()
+            .relay()
+            .is_none());
+        network::cancel_invite(a.state()).await.unwrap();
+
+        let code = relay().await;
+        network::set_relay(Some(code.clone()), a.clone())
+            .await
+            .unwrap();
+        until_devices(&a, "A is connected to the relay", |info| {
+            info.relay.as_ref().is_some_and(|relay| relay.connected)
+        })
+        .await;
+
+        // The invitation carries the relay; B, joining with it, uses the
+        // relay from the start, and keeps it once the vault names it.
+        let invitation = network::start_invite(true, Some(true), a.state(), a.clone())
+            .await
+            .unwrap();
+        let read = osm_vault_peer::Invitation::decode(&invitation.code).unwrap();
+        assert_eq!(read.relay().unwrap().encode().unwrap().as_str(), code);
+        let joining = network::join_start(invitation.code.clone(), b.state(), b.clone())
+            .await
+            .unwrap();
+        assert_eq!(nth(&codes, 0).await, format!("\"{}\"", joining.sas));
+        network::confirm_invite(true, a.state()).await.unwrap();
+        network::join_finish(Some("joiner password".into()), b.state(), b.clone())
+            .await
+            .unwrap();
+        assert!(nth(&finished, 0).await.contains("\"paired\":true"));
+        eventually(&b, &["Shared"]).await;
+        until_devices(&b, "B keeps the relay", |info| {
+            info.relay.as_ref().is_some_and(|relay| relay.connected)
         })
         .await;
         for app in [&a, &b] {

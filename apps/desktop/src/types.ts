@@ -512,7 +512,8 @@ export type DesktopBridge = {
   /** Deletes the folder and everything in it. */
   deleteArchive: (name: string) => Promise<void>;
   /** Invites a device; `votes` says whether it will count toward the majority a change needs. */
-  startInvite: (votes: boolean) => Promise<{ code: string; expiresAt: number; qr: InviteQr }>;
+  /** `away`: the new device is on none of this one's networks, so the invitation carries the relay's key. */
+  startInvite: (votes: boolean, away?: boolean) => Promise<{ code: string; expiresAt: number; qr: InviteQr }>;
   confirmInvite: (accept: boolean) => Promise<void>;
   cancelInvite: () => Promise<void>;
   joinStart: (code: string) => Promise<{ sas: string; keepsVault: boolean }>;

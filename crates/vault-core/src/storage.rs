@@ -1688,6 +1688,16 @@ impl Vault {
         self.note(RELAY_ID, &plaintext)
     }
 
+    /// Whether the vault says anything of its relay yet, even that it has
+    /// none. A vault that has not synced says nothing, which is not the same
+    /// as saying it has none.
+    pub fn has_relay_setting(&self) -> Result<bool> {
+        Ok(self
+            .notes(RELAY_ID)?
+            .iter()
+            .any(|(plaintext, _)| serde_json::from_slice::<RelaySetting>(plaintext).is_ok()))
+    }
+
     /// The code of the relay the vault's devices use, as last set on any of
     /// them by its clock; `None` if none was set, or it was taken away.
     pub fn relay(&self) -> Result<Option<Zeroizing<String>>> {

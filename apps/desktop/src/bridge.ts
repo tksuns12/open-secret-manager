@@ -496,8 +496,8 @@ export const bridge: DesktopBridge = {
   connectBrowser: (browser) => nativeOnly("connect_browser", { browser }),
   disconnectBrowser: (browser) => nativeOnly("disconnect_browser", { browser }),
   /** With `?devices`, a sample invitation that pairs nothing. */
-  async startInvite(votes) {
-    if (native() || !previewHasDevices()) return nativeOnly("start_invite", { votes });
+  async startInvite(votes, away) {
+    if (native() || !previewHasDevices()) return nativeOnly("start_invite", { votes, away: away ?? false });
     return { code: "OSM-PAIR1-PREVIEW-SAMPLE-NOT-AN-INVITATION", expiresAt: Date.now() + 15 * 60_000, qr: PREVIEW_INVITATION_QR };
   },
   confirmInvite: (accept) => nativeOnly("confirm_invite", { accept }),

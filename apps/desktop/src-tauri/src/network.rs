@@ -33,9 +33,9 @@ use osm_vault_membership::{
     Rejection,
 };
 use osm_vault_peer::{
-    control, invite, serve_members, serve_relayed, start_node, AddressBook, Invitation, KeyKept,
-    Keystore, MemberEndpoint, MemberSync, PairingConnection, PairingListener, PeerStore,
-    PendingJoin, PreparedJoin, Relay, RelayCode, Voting, MAX_INVITATION_TTL_SECS,
+    control, invite, invite_through_relay, serve_members, serve_relayed, start_node, AddressBook,
+    Invitation, KeyKept, Keystore, MemberEndpoint, MemberSync, PairingConnection, PairingListener,
+    PeerStore, PendingJoin, PreparedJoin, Relay, RelayCode, Voting, MAX_INVITATION_TTL_SECS,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use serde::Serialize;
@@ -635,6 +635,7 @@ async fn abandon_control<R: Runtime>(app: &AppHandle<R>) {
     if let Some(control) = net.control.lock().await.take() {
         control.stop().await;
     }
+    let _ = net.peers.lock().await.set_relay_code(None);
     net.delete_control_database();
 }
 
@@ -896,9 +897,11 @@ async fn refresh_relay<R: Runtime>(app: &AppHandle<R>, control: &Control) {
         let state = app.state::<AppState>();
         let vault = state.vault.lock().await;
         match vault.as_ref().filter(|vault| vault.is_unlocked()) {
-            Some(vault) => match vault.relay() {
-                Ok(wanted) => wanted,
-                Err(_) => return,
+            Some(vault) => match (vault.relay(), vault.has_relay_setting()) {
+                (Ok(wanted), Ok(said)) if said || wanted.is_some() => wanted,
+                // The vault has not said yet: a device that joined through an
+                // invitation's relay keeps it until it does.
+                _ => return,
             },
             None => return,
         }
@@ -1916,9 +1919,13 @@ pub struct InviteInfo {
 ///
 /// `votes` says whether the new device will count toward the majority a
 /// change needs: yes for a computer that is usually on, no for a phone.
+/// `away` is for a device that is on none of this one's networks: the
+/// invitation then carries the relay this device uses, which holds its token,
+/// so it is made only when asked for and only while the relay is in use.
 #[tauri::command]
 pub async fn start_invite<R: Runtime>(
     votes: bool,
+    away: Option<bool>,
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<InviteInfo, CommandError> {
@@ -1929,6 +1936,24 @@ pub async fn start_invite<R: Runtime>(
     };
     let net = &state.network;
     let control = member_control(&app).await?;
+    let relay_code = if away.unwrap_or(false) {
+        let code = control
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|running| running.code.clone())
+            .ok_or_else(|| CommandError {
+                code: "no_relay",
+                message:
+                    "this device is not using a relay: set one up first (Devices, On different \
+                          networks?)"
+                        .into(),
+            })?;
+        Some(RelayCode::decode(&code).map_err(network_error)?)
+    } else {
+        None
+    };
     let mut invite_slot = net.invite.lock().await;
     if let Some(previous) = invite_slot.take() {
         previous.task.abort();
@@ -1945,15 +1970,31 @@ pub async fn start_invite<R: Runtime>(
             .as_ref()
             .filter(|vault| vault.is_unlocked())
             .ok_or_else(locked)?;
-        let invitation = invite(
-            vault,
-            &mut invitations,
-            &mut peers,
-            invitation_addresses(port),
-            now(),
-            MAX_INVITATION_TTL_SECS,
-        )
+        let invitation = match &relay_code {
+            Some(relay) => invite_through_relay(
+                vault,
+                &mut invitations,
+                &mut peers,
+                invitation_addresses(port),
+                relay,
+                now(),
+                MAX_INVITATION_TTL_SECS,
+            ),
+            None => invite(
+                vault,
+                &mut invitations,
+                &mut peers,
+                invitation_addresses(port),
+                now(),
+                MAX_INVITATION_TTL_SECS,
+            ),
+        }
         .map_err(network_error)?;
+        if relay_code.is_some() {
+            // A joiner that comes through the relay reaches this
+            // invitation, as long as it is open.
+            listener.through(&control.endpoint);
+        }
         (listener, invitation)
     };
     let code = invitation.encode().map_err(network_error)?.to_string();
@@ -2142,16 +2183,45 @@ pub async fn join_start<R: Runtime>(
             Some(_) => return Err(locked()),
         }
     };
-    let connection = prepared
+    let mut connection = prepared
         .map_err(network_error)?
         .connect()
         .await
         .map_err(network_error)?;
+    // The relay an invitation for a device that is away names: this device
+    // is registered at it already, and the vault's devices reach it there
+    // while they enroll it.
+    let relay = connection.take_relay();
+    let relay_code = connection
+        .joiner()
+        .invitation_relay()
+        .and_then(|code| code.encode().ok());
     // The node runs from here on so that the leader can bring this device
     // up to date. It accepts no one until the inviting device names the
     // members.
     let joiner = connection.joiner();
     let control = start_control(&app, joiner.vault_id(), joiner.control_device()).await?;
+    if let (Some((relay, relayed)), Some(code)) = (relay, relay_code) {
+        // Kept in memory while the join lasts, and in the peer store once it
+        // has succeeded (`join_finish`): a join that is given up, or quit,
+        // leaves nothing behind for the next vault to use.
+        control.stop_relay();
+        control.endpoint.set_relay(Some(relay.clone()));
+        let serving = tauri::async_runtime::spawn(serve_relayed(
+            relayed,
+            control.endpoint.clone(),
+            control.node.clone(),
+            Some(control.sync.clone()),
+        ));
+        *control
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RunningRelay {
+            code,
+            relay,
+            serving,
+        });
+    }
     let sas = connection.sas();
     *net.join.lock().await = Some(JoinState {
         connection,
@@ -2203,6 +2273,17 @@ pub async fn join_finish<R: Runtime>(
         return Err(error);
     }
     net.clear_reset_note();
+    // The relay the invitation named is this device's until the vault says
+    // otherwise; kept now, for a start before the first sync.
+    let from_invitation = control
+        .relay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|running| running.code.clone());
+    if let Some(code) = from_invitation {
+        let _ = net.peers.lock().await.set_relay_code(Some(&code));
+    }
     maintain(&app, &control).await;
     // Fetch the vault's contents right away.
     let sync_app = app.clone();

@@ -16,9 +16,9 @@ use osm_mobile::{Device, DeviceState, ItemDraft, ItemKind, MobileError, SyncStat
 use osm_vault_core::{Item, ItemKind as CoreKind, Vault};
 use osm_vault_membership::{device_id_from_bytes, ControlNode, DeviceId, NodeOptions};
 use osm_vault_peer::{
-    control, invite, serve_members, serve_relay, serve_relayed, start_node, AddressBook, Keystore,
-    MemberEndpoint, MemberSync, MemoryKeystore, NoKeystore, PairingListener, PeerStore, Relay,
-    RelayCode, Voting,
+    control, invite, invite_through_relay, serve_members, serve_relay, serve_relayed, start_node,
+    AddressBook, Keystore, MemberEndpoint, MemberSync, MemoryKeystore, NoKeystore, PairingListener,
+    PeerStore, Relay, RelayCode, Voting,
 };
 use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -166,23 +166,53 @@ impl Desktop {
     async fn invite(
         self: &Arc<Self>,
     ) -> (String, std_mpsc::Receiver<String>, std_mpsc::Sender<bool>) {
+        self.invite_with(None).await
+    }
+
+    /// As [`Self::invite`], for a device away from every network this one
+    /// is on: the invitation names `relay` and no address, and the joiner
+    /// reaches this device only through it.
+    async fn invite_away(
+        self: &Arc<Self>,
+        relay: &RelayCode,
+    ) -> (String, std_mpsc::Receiver<String>, std_mpsc::Sender<bool>) {
+        self.invite_with(Some(relay)).await
+    }
+
+    async fn invite_with(
+        self: &Arc<Self>,
+        relay: Option<&RelayCode>,
+    ) -> (String, std_mpsc::Receiver<String>, std_mpsc::Sender<bool>) {
         let listener = PairingListener::bind("127.0.0.1:0", &mut *self.peers.lock().await)
             .await
             .unwrap();
         let code = {
             let vault = self.vault.lock().await;
-            invite(
-                &vault,
-                &mut *self.invitations.lock().await,
-                &mut *self.peers.lock().await,
-                vec![listener.local_addr().unwrap().to_string()],
-                now(),
-                300,
-            )
-            .unwrap()
-            .encode()
-            .unwrap()
-            .to_string()
+            let mut invitations = self.invitations.lock().await;
+            let mut peers = self.peers.lock().await;
+            let invitation = match relay {
+                Some(relay) => {
+                    listener.through(&self.endpoint);
+                    invite_through_relay(
+                        &vault,
+                        &mut invitations,
+                        &mut peers,
+                        Vec::new(),
+                        relay,
+                        now(),
+                        300,
+                    )
+                }
+                None => invite(
+                    &vault,
+                    &mut invitations,
+                    &mut peers,
+                    vec![listener.local_addr().unwrap().to_string()],
+                    now(),
+                    300,
+                ),
+            };
+            invitation.unwrap().encode().unwrap().to_string()
         };
         let (shown, codes) = std_mpsc::channel();
         let (answer, answers) = std_mpsc::channel::<bool>();
@@ -736,4 +766,104 @@ fn a_phone_takes_the_vaults_relay_and_syncs_through_it_while_locked() {
         .map(|item| item.title)
         .collect();
     assert!(titles.contains(&"Written at home".to_owned()), "{titles:?}");
+}
+
+/// A phone on none of the desktop's networks: the invitation names the
+/// vault's relay and no address, so the phone reaches the desktop, and is
+/// enrolled, through the relay alone.
+#[test]
+fn a_phone_away_from_every_network_joins_through_the_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop_runtime = tokio::runtime::Runtime::new().unwrap();
+    let desktop = desktop_runtime.block_on(Desktop::found(dir.path()));
+    let code = desktop_runtime.block_on(async {
+        let identity = PeerStore::open_in_memory()
+            .unwrap()
+            .transport_identity()
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let code = RelayCode::new(
+            &listener.local_addr().unwrap().to_string(),
+            identity.pin(),
+            [0x5a; 32],
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = serve_relay(listener, identity, [0x5a; 32]).await;
+        });
+        code
+    });
+    desktop_runtime.block_on(desktop.use_relay(&code));
+    desktop_runtime.block_on(desktop.put(login("Before the phone", "before")));
+
+    let phone =
+        Device::open_with_keystore(dir.path().join("phone"), 0, Arc::new(NoKeystore)).unwrap();
+    let (invitation, codes, answer) = desktop_runtime.block_on(desktop.invite_away(&code));
+    assert!(invitation.starts_with("OSM-PAIR1-"));
+    let shown = phone.join_start(invitation).unwrap();
+    assert_eq!(codes.recv_timeout(Duration::from_secs(60)).unwrap(), shown);
+    answer.send(true).unwrap();
+    phone.join_finish(PHONE_PASSWORD.into()).unwrap();
+
+    // Closed before its first sync and started afresh, locked: the relay the
+    // invitation named is kept, as the vault has not yet said which is its own.
+    drop(phone);
+    let folder = dir.path().join("phone");
+    let phone = Device::open_with_keystore(folder.clone(), 0, Arc::new(NoKeystore)).unwrap();
+    assert!(
+        PeerStore::open(folder.join("peers.sqlite3"), Arc::new(NoKeystore))
+            .unwrap()
+            .relay_code()
+            .unwrap()
+            .is_some()
+    );
+    phone.unlock(PHONE_PASSWORD.into()).unwrap();
+    phone.go_online().unwrap();
+    eventually("the phone has the vault's item", || {
+        let _ = phone.sync_now();
+        phone
+            .items()
+            .unwrap()
+            .iter()
+            .any(|item| item.title == "Before the phone")
+    });
+}
+
+/// A join that is quit before it finishes leaves no relay behind: the next
+/// vault on this phone must not use, or hand on, the relay of a join that
+/// never happened.
+#[test]
+fn a_join_through_the_relay_that_is_quit_midway_leaves_no_relay_in_the_phones_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop_runtime = tokio::runtime::Runtime::new().unwrap();
+    let desktop = desktop_runtime.block_on(Desktop::found(dir.path()));
+    let code = desktop_runtime.block_on(async {
+        let identity = PeerStore::open_in_memory()
+            .unwrap()
+            .transport_identity()
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let code = RelayCode::new(
+            &listener.local_addr().unwrap().to_string(),
+            identity.pin(),
+            [0x5a; 32],
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = serve_relay(listener, identity, [0x5a; 32]).await;
+        });
+        code
+    });
+    desktop_runtime.block_on(desktop.use_relay(&code));
+
+    let folder = dir.path().join("phone");
+    let phone = Device::open_with_keystore(folder.clone(), 0, Arc::new(NoKeystore)).unwrap();
+    let (invitation, codes, _answer) = desktop_runtime.block_on(desktop.invite_away(&code));
+    let shown = phone.join_start(invitation).unwrap();
+    assert_eq!(codes.recv_timeout(Duration::from_secs(60)).unwrap(), shown);
+
+    // Quit here: the owner never confirmed, and the phone is closed.
+    drop(phone);
+    let peers = PeerStore::open(folder.join("peers.sqlite3"), Arc::new(NoKeystore)).unwrap();
+    assert!(peers.relay_code().unwrap().is_none());
 }

@@ -444,3 +444,40 @@ fn a_device_away_from_every_network_joins_and_syncs_through_the_relay() {
     }
     drop(relay);
 }
+
+/// The device that invites is not the one that leads: the leader, which
+/// brings the new device up to date, reaches it through the relay too.
+#[test]
+fn a_device_away_is_brought_up_to_date_by_a_leader_that_did_not_invite_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = |name| Files::new(dir.path(), name);
+    let (a_files, b_files, away_files) = (files("a"), files("b"), files("away"));
+    let relay_address = format!("127.0.0.1:{}", free_port());
+    let relay = Running::start_relay(&path(dir.path(), "relay"), &relay_address);
+    let relay_code = relay.expect("RELAY-CODE");
+
+    run(&["create", &a_files.vault]);
+    let (mut a, _) = a_files.start("127.0.0.1:0");
+    command(&mut a, "found", "FOUNDED");
+    command(&mut a, "add From-A", "ADDED");
+    let (mut b, _) = join(&mut a, &b_files);
+    for device in [&mut a, &mut b] {
+        wait_status(device, &["epoch=1", "members=2", "voters=2"]);
+    }
+    // Both use the relay. A founded the vault, so A leads at first (not
+    // checked here); it never invites. B does.
+    for device in [&mut a, &mut b] {
+        device.answer(&format!("relay {relay_code}"));
+        device.expect("RELAY-CONNECTED");
+    }
+    let (mut away, _) = join_listening_at(&mut b, &away_files, "invite away", "-");
+    for device in [&mut a, &mut b, &mut away] {
+        wait_status(device, &["epoch=1", "members=3", "voters=3"]);
+    }
+    sync(&mut away, None);
+    assert_eq!(items(&mut away), ["From-A"]);
+    for device in [away, b, a] {
+        quit(device);
+    }
+    drop(relay);
+}

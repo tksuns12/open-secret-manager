@@ -52,3 +52,5 @@ button.history-note { width: 100%; text-align: left; cursor: pointer; }button.hi
 .startup-problem { width: 100%; min-height: 100vh; padding: 0 clamp(30px, 12vw, 160px); box-sizing: border-box; }.startup-problem span { max-width: 520px; }
 .passkey-list { margin-top: 12px; }.passkey-made { color: #857d71; }
 .passkey-verify { display: grid; gap: 6px; }.passkey-verify input { padding: 9px 10px; color: #e8e1d5; outline: none; border: 1px solid #3b352d; border-radius: 6px; background: #191714; font-size: 10px; }
+
+.device-panel .check-row { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; color: #b3a99b; font-size: 10px; line-height: 1.5; }

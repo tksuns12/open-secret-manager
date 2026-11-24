@@ -49,9 +49,17 @@ answer. The new device then stays registered at the relay, so that the
 vault's devices, which must also use the relay, reach it there while it is
 enrolled and given its keys. The invitation then holds the relay's token (see
 the threat model); the ordinary invitation, without the relay, is the
-default and is what the released apps read. Not yet in the desktop's or the
-phones' screens: `osm-peer` does it (`invite away`, `join-device … -`), and
-the shared code is tested in process and between processes.
+default and is what the released apps read. In the desktop's Devices panel, "Invite a
+device" offers it when this computer is connected to the relay ("The new
+device is away from your networks…"); a computer or a phone joins with such an
+invitation as with any other (pasted, or a phone scans it), and keeps the
+relay it names, in memory while it joins and in its peer store once it has
+joined, until the vault's own has reached it. It is
+also what `osm-peer` does (`invite away`, `join-device … -`). The phones'
+screens only take such an invitation; they do not make one. An invitation is
+only as good as the relay is reachable: the inviting computer must be
+connected to it while the invitation is open, and so must the vault's other
+voting devices for the enrollment to complete.
 
 ## What it was before Phase 16
 

@@ -127,3 +127,31 @@ test("a relay is set up from its code, said to be connected, and stopped", async
   await panel.getByRole("button", { name: /through a relay you run/ }).waitFor();
   assert.deepEqual(errors, []);
 });
+
+test("an invitation for a device that is away is offered only with a relay in use, and says it holds the relay's key", async () => {
+  const { page, errors } = await window.open("?devices");
+  const panel = await openDevices(page);
+  const away = panel.getByLabel(/The new device is away from your networks/);
+  await panel.getByRole("button", { name: "Invite a device" }).click();
+  assert.equal(await away.count(), 0);
+  await panel.getByRole("button", { name: "Cancel" }).click();
+
+  await panel.getByRole("button", { name: /through a relay you run/ }).click();
+  await panel.getByLabel("Relay code").fill("OSM-RELAY1-PREVIEW-SAMPLE");
+  await panel.getByRole("button", { name: "Use this relay" }).click();
+  await panel.locator(".relay-row").waitFor();
+
+  await panel.getByRole("button", { name: "Invite a device" }).click();
+  await away.check();
+  await panel.getByRole("button", { name: "A computer that is usually on · it votes" }).click();
+  await panel.getByText(/holds your relay's key, so show it only to the device you are adding/).waitFor();
+  await panel.getByRole("button", { name: "Cancel" }).click();
+
+  // The next invitation is the ordinary one again unless it is asked for.
+  await panel.getByRole("button", { name: "Invite a device" }).click();
+  assert.equal(await away.isChecked(), false);
+  await panel.getByRole("button", { name: "A computer that is usually on · it votes" }).click();
+  await panel.getByText("For a computer that is usually on: it will vote.", { exact: false }).waitFor();
+  assert.equal(await panel.getByText(/holds your relay's key/).count(), 0);
+  assert.deepEqual(errors, []);
+});

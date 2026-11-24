@@ -672,7 +672,8 @@ impl Joiner {
         self.invitation.body.inviter_device_id
     }
 
-    pub(crate) fn invitation_relay(&self) -> Option<&RelayCode> {
+    /// The relay the invitation named, if it named one.
+    pub fn invitation_relay(&self) -> Option<&RelayCode> {
         self.invitation.relay.as_ref()
     }
 
