@@ -8,3 +8,7 @@ apps/desktop/src-tauri/binaries/
 *.sqlite3-wal
 *.sqlite3-shm
 .DS_Store
+
+# A personal deployment of the relay (its app name, region and notes).
+/deploy/
+/.dockerignore
