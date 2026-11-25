@@ -34,6 +34,8 @@ pub(crate) fn secret_service_absent_message(message: &str) -> bool {
     let text = message.to_ascii_lowercase();
     text.contains("no dbus session or secret service provider found")
         || text.contains("unable to autolaunch a dbus-daemon")
+        || text.contains("dbus-launch terminated abnormally")
+        || text.contains("autolaunch error")
         || text.contains("cannot spawn a message bus")
         || text.contains("failed to execute dbus-launch")
         || text.contains("using x11 for dbus-daemon autolaunch was disabled")
@@ -180,6 +182,9 @@ mod tests {
     fn secret_service_absence_classifier_distinguishes_absent_from_locked_or_denied() {
         assert!(secret_service_absent_message(
             "DBus error: Unable to autolaunch a dbus-daemon without a $DISPLAY for X11"
+        ));
+        assert!(secret_service_absent_message(
+            "DBus error: /usr/bin/dbus-launch terminated abnormally without any error message"
         ));
         assert!(secret_service_absent_message(
             "DBus error: The name org.freedesktop.secrets was not provided by any .service files"
