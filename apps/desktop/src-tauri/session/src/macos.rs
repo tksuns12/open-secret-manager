@@ -4,10 +4,12 @@ use std::{
 };
 
 use block2::RcBlock;
-use objc2::rc::autoreleasepool;
-use objc2_app_kit::{NSPasteboard, NSPasteboardContentsOptions, NSWorkspace};
+use objc2::{rc::autoreleasepool, runtime::ProtocolObject};
+use objc2_app_kit::{
+    NSPasteboard, NSPasteboardContentsOptions, NSPasteboardItem, NSPasteboardWriting, NSWorkspace,
+};
 use objc2_foundation::{
-    NSDistributedNotificationCenter, NSNotification, NSNotificationCenter, NSString,
+    NSArray, NSDistributedNotificationCenter, NSNotification, NSNotificationCenter, NSString,
 };
 
 use crate::Away;
@@ -78,37 +80,52 @@ pub(crate) fn observe(center: &NSNotificationCenter, name: &str, away: Away, on_
 static LAST: Mutex<Option<isize>> = Mutex::new(None);
 
 pub(crate) fn copy_secret(pasteboard: &NSPasteboard, text: &str) -> Option<isize> {
-    // Callers run on threads that live as long as the process: nothing
-    // these calls leave for later may pile up on them.
+    // Serialize clipboard writes and clears against `LAST`, and publish the
+    // text together with Concealed/Transient markers in a single atomic
+    // `NSPasteboardItem` so clipboard watchers never see an unmarked copy.
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     autoreleasepool(|_| {
-        pasteboard.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
-        if !pasteboard.setString_forType(&NSString::from_str(text), &NSString::from_str(TEXT)) {
+        let item = NSPasteboardItem::new();
+        if !item.setString_forType(&NSString::from_str(text), &NSString::from_str(TEXT)) {
             return None;
         }
         for marker in MARKERS {
-            pasteboard.setString_forType(&NSString::from_str(""), &NSString::from_str(marker));
+            if !item.setString_forType(&NSString::from_str(""), &NSString::from_str(marker)) {
+                return None;
+            }
+        }
+        pasteboard.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
+        let writing: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*item);
+        let objects = NSArray::from_slice(&[writing]);
+        if !pasteboard.writeObjects(&objects) {
+            return None;
         }
         let change = pasteboard.changeCount();
-        *LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(change);
+        *last = Some(change);
         Some(change)
     })
 }
 
 pub(crate) fn clear_if_unchanged(pasteboard: &NSPasteboard, change: isize) {
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     autoreleasepool(|_| {
         if pasteboard.changeCount() == change {
             pasteboard.clearContents();
+            if *last == Some(change) {
+                *last = None;
+            }
         }
     });
 }
 
 pub(crate) fn clear_last(pasteboard: &NSPasteboard) {
-    if let Some(change) = LAST
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        clear_if_unchanged(pasteboard, change);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(change) = last.take() {
+        autoreleasepool(|_| {
+            if pasteboard.changeCount() == change {
+                pasteboard.clearContents();
+            }
+        });
     }
 }
 
@@ -120,22 +137,35 @@ pub(crate) fn can_check_owner() -> bool {
     unsafe { LAContext::new().canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_ok()
 }
 
+/// Wrapper allowing `LAContext` to be invalidated from another thread when a
+/// waiting passkey request ends before verification finishes.
+struct SendContext(objc2::rc::Retained<objc2_local_authentication::LAContext>);
+
+// SAFETY: Apple documents `LAContext::invalidate()` as thread-safe and valid to
+// call from any thread while an evaluation is in progress.
+unsafe impl Send for SendContext {}
+
 /// Asks the system to check the owner, saying `reason`; `done` is called
-/// once, on a thread of the system's, with whether the check passed.
-pub(crate) fn check_owner(reason: &str, done: Box<dyn FnOnce(bool) + Send>) {
+/// once, on a thread of the system's, with whether the check passed. Returns a
+/// cancellation closure that invalidates the `LAContext` if still pending.
+pub(crate) fn check_owner(
+    reason: &str,
+    done: Box<dyn FnOnce(bool) + Send>,
+) -> Box<dyn FnOnce() + Send> {
     use objc2::runtime::Bool;
     use objc2_foundation::NSError;
     use objc2_local_authentication::{LAContext, LAPolicy};
     // SAFETY: a new context, used for this one check.
     let context = unsafe { LAContext::new() };
-    let done = Mutex::new(Some(done));
-    // The context is kept until the check ends, which calls the block once.
-    let kept = Mutex::new(Some(context.clone()));
+    let done = Arc::new(Mutex::new(Some(done)));
+    let kept = Arc::new(Mutex::new(Some(SendContext(context.clone()))));
+    let reply_done = done.clone();
+    let reply_kept = kept.clone();
     let reply = RcBlock::new(move |passed: Bool, _: *mut NSError| {
-        if let Some(done) = done.lock().ok().and_then(|mut done| done.take()) {
+        if let Some(done) = reply_done.lock().ok().and_then(|mut done| done.take()) {
             done(passed.as_bool());
         }
-        drop(kept.lock().ok().and_then(|mut kept| kept.take()));
+        drop(reply_kept.lock().ok().and_then(|mut kept| kept.take()));
     });
     // SAFETY: the system runs the block on a queue of its own; the block
     // only calls `done`, which is `Send`, and lets go of the context.
@@ -146,6 +176,16 @@ pub(crate) fn check_owner(reason: &str, done: Box<dyn FnOnce(bool) + Send>) {
             &reply,
         )
     };
+    Box::new(move || {
+        if let Some(ctx) = kept.lock().ok().and_then(|mut kept| kept.take()) {
+            // SAFETY: `LAContext::invalidate` cancels any pending evaluation
+            // and is safe to invoke from any thread.
+            unsafe { ctx.0.invalidate() };
+        }
+        if let Some(done) = done.lock().ok().and_then(|mut done| done.take()) {
+            done(false);
+        }
+    })
 }
 
 #[cfg(test)]

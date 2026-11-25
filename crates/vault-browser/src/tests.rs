@@ -1226,3 +1226,107 @@ async fn a_pages_request_is_left_to_the_browser_when_the_app_does_not_answer_it(
     ));
     assert!(vault.list().unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passkey_sign_in_with_allow_credentials_does_not_probe_holds_and_bound_ticket_rejects_mismatch(
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let session = Session::start(Config::default());
+    let mut vault = vault_with(session.dir.path(), &[]);
+    let holds_calls = Arc::new(AtomicUsize::new(0));
+    let counter = holds_calls.clone();
+    session.desk.answer_sign_ins_with(Box::new(move |_, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Some(false)
+    }));
+
+    // 1. Unauthorized caller is rejected before `holds` is consulted.
+    let mut forged = passkey_request("forged-caller", Ceremony::Get, |_| {});
+    forged.caller = osm_browser_link::Caller::Firefox("evil@example.org".into());
+    let mut client = Client::bring_passkey(&session, &forged).await;
+    assert_eq!(
+        client.next().await,
+        refusal("forged-caller", Refusal::ExtensionNotAllowed)
+    );
+    assert_eq!(holds_calls.load(Ordering::SeqCst), 0);
+
+    // 2. Non-empty `allowCredentials` NEVER triggers silent `NoPasskey` probing.
+    let targeted = passkey_request("targeted-allow", Ceremony::Get, |options| {
+        options["allowCredentials"] = serde_json::json!([{ "type": "public-key", "id": "AQIDBA" }]);
+    });
+    let mut client = Client::bring_passkey(&session, &targeted).await;
+    assert_eq!(client.next().await, waiting("targeted-allow"));
+    assert_eq!(holds_calls.load(Ordering::SeqCst), 0);
+
+    // 3. Bound ticket rejects mismatched ticket / origin / rp_id.
+    let (ticket, ceremony, origin, rp_id) = session.desk.pending_passkey("targeted-allow").unwrap();
+    assert_eq!(ceremony, Ceremony::Get);
+    let unlock = session.asked(Some(&vault)).await.session.unwrap();
+    assert!(matches!(
+        session.desk.approve_passkey_get_bound(
+            ticket + 1,
+            "targeted-allow",
+            &origin,
+            &rp_id,
+            unlock,
+            &vault,
+            "item",
+            "cred",
+            true,
+        ),
+        Err(Refused::NotPending)
+    ));
+    assert!(matches!(
+        session.desk.approve_passkey_get_bound(
+            ticket,
+            "targeted-allow",
+            "https://other.example.com",
+            &rp_id,
+            unlock,
+            &vault,
+            "item",
+            "cred",
+            true,
+        ),
+        Err(Refused::NotPending)
+    ));
+    assert!(matches!(
+        session.desk.approve_passkey_get_bound(
+            ticket,
+            "targeted-allow",
+            &origin,
+            "other.example.com",
+            unlock,
+            &vault,
+            "item",
+            "cred",
+            true,
+        ),
+        Err(Refused::NotPending)
+    ));
+    assert!(session.desk.deny("targeted-allow"));
+    assert_eq!(
+        client.last().await,
+        refusal("targeted-allow", Refusal::Denied)
+    );
+
+    // 4. Discoverable `no_passkey` fast fallback is rate-limited per origin (3/60s)
+    //    and remembers request IDs against replay.
+    for index in 0..5 {
+        let id = format!("disc-{index}");
+        let mut c =
+            Client::bring_passkey(&session, &passkey_request(&id, Ceremony::Get, |_| {})).await;
+        assert_eq!(c.next().await, refusal(&id, Refusal::NoPasskey));
+    }
+    // Only the first 3 calls actually queried the vault; subsequent ones were rate-limited.
+    assert_eq!(holds_calls.load(Ordering::SeqCst), 3);
+    // Replaying a spent `no_passkey` ID is refused as Replayed without consulting `holds`.
+    let mut replay =
+        Client::bring_passkey(&session, &passkey_request("disc-0", Ceremony::Get, |_| {})).await;
+    assert_eq!(replay.next().await, refusal("disc-0", Refusal::Replayed));
+    assert_eq!(holds_calls.load(Ordering::SeqCst), 3);
+
+    // Avoid unused warning on `mut vault`.
+    let _ = &mut vault;
+}

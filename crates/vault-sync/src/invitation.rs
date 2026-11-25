@@ -72,10 +72,44 @@ pub struct InvitationStore {
     policy: InvitationPolicy,
 }
 
+#[cfg(unix)]
+fn precreate_owner_only(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
+}
+
+#[cfg(not(unix))]
+fn precreate_owner_only(_path: &Path) {}
+
+#[cfg(unix)]
+fn restrict_db_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::Permissions::from_mode(0o600);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = std::path::PathBuf::from(candidate);
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::set_permissions(&candidate, mode.clone());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_permissions(_path: &Path) {}
+
 impl InvitationStore {
     pub fn open(path: impl AsRef<Path>, policy: InvitationPolicy) -> Result<Self> {
+        let path = path.as_ref();
+        precreate_owner_only(path);
         let connection = Connection::open(path)?;
-        Self::from_connection(connection, policy)
+        let store = Self::from_connection(connection, policy)?;
+        restrict_db_permissions(path);
+        Ok(store)
     }
 
     pub fn open_in_memory(policy: InvitationPolicy) -> Result<Self> {

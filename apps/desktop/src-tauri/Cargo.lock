@@ -3612,10 +3612,12 @@ dependencies = [
  "arboard",
  "block2",
  "dbus",
+ "getrandom 0.3.4",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-local-authentication",
+ "sha2 0.10.9",
  "zeroize",
 ]
 
@@ -3633,6 +3635,7 @@ dependencies = [
  "base64ct",
  "osm-browser-link",
  "osm-vault-core",
+ "osm-win-pipe-acl",
  "serde_json",
  "tokio",
  "zeroize",
@@ -3713,6 +3716,14 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "zeroize",
+]
+
+[[package]]
+name = "osm-win-pipe-acl"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

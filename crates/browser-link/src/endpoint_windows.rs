@@ -15,7 +15,8 @@
 
 use std::{
     fmt::Write,
-    io,
+    fs::OpenOptions,
+    io::{self, Read, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -23,7 +24,7 @@ use zeroize::Zeroizing;
 
 use crate::handshake::{self, Secret};
 
-/// The app's folder inside the account's data folder.
+/// The app's folder inside the account's local data folder.
 pub const APP_FOLDER: &str = "OpenSecretManager";
 
 /// The file, inside the app's folder, that holds the current pipe's name
@@ -35,6 +36,10 @@ const PIPE_PREFIX: &str = r"\\.\pipe\OpenSecretManager-";
 
 /// How many random bytes a pipe name carries.
 const NAME_BYTES: usize = 16;
+
+/// Upper bound on the size of a `browser.pipe` link file (the real file is
+/// ~130 bytes).
+const MAX_LINK_BYTES: u64 = 512;
 
 /// The file naming the pipe of the desktop session in an app folder.
 pub fn pipe_file_in(app_folder: &Path) -> PathBuf {
@@ -53,9 +58,10 @@ pub fn socket_path() -> Option<PathBuf> {
     pipe_file_path()
 }
 
-/// As [`socket_path`].
+/// As [`socket_path`]. Kept in the account's local (non-roaming) data folder
+/// so the live machine-local pipe secret never syncs over Roaming Profiles.
 pub fn pipe_file_path() -> Option<PathBuf> {
-    Some(pipe_file_in(&dirs::data_dir()?.join(APP_FOLDER)))
+    Some(pipe_file_in(&dirs::data_local_dir()?.join(APP_FOLDER)))
 }
 
 /// A pipe name nobody else has: `\\.\pipe\OpenSecretManager-` and 32 hex
@@ -105,10 +111,29 @@ impl Link {
             self.name,
             &**handshake::secret_to_hex(&self.secret)
         ));
-        // A name of its own, so that two copies starting together do not
-        // write one file.
-        let temp = file.with_extension(format!("pipe.{}.tmp", std::process::id()));
-        std::fs::write(&temp, text.as_bytes())?;
+        // A random sibling file created with `create_new(true)`, so two copies
+        // starting together do not collide and a pre-planted symlink cannot be
+        // overwritten.
+        let mut suffix_bytes = [0_u8; 8];
+        getrandom::fill(&mut suffix_bytes).map_err(|error| io::Error::other(error.to_string()))?;
+        let mut suffix = String::with_capacity(16);
+        for byte in suffix_bytes {
+            write!(suffix, "{byte:02x}").expect("writing to a string");
+        }
+        let temp = file.with_extension(format!("pipe.{suffix}.tmp"));
+        let mut handle = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        if let Err(error) = handle
+            .write_all(text.as_bytes())
+            .and_then(|()| handle.sync_all())
+        {
+            drop(handle);
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        drop(handle);
         // Something that has the file open without letting it be replaced,
         // a virus scanner for one, lets go in a moment.
         let mut renamed = std::fs::rename(&temp, file);
@@ -128,13 +153,19 @@ impl Link {
 /// The link the file at `file` holds: a pipe's name of this app, then its
 /// secret, one to a line, and nothing else.
 pub fn read_link(file: &Path) -> io::Result<Link> {
-    let text = Zeroizing::new(std::fs::read_to_string(file)?);
     let invalid = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "the file does not hold a link of this app",
         )
     };
+    let handle = std::fs::File::open(file)?;
+    let mut raw = Zeroizing::new(Vec::new());
+    handle.take(MAX_LINK_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_LINK_BYTES {
+        return Err(invalid());
+    }
+    let text = Zeroizing::new(String::from_utf8(std::mem::take(&mut *raw)).map_err(|_| invalid())?);
     let mut lines = text.lines();
     let name = lines
         .next()
@@ -194,6 +225,7 @@ mod tests {
             format!("{}\n{secret}\n", name.to_uppercase()),
             format!("{name}\n{}\n", &secret[1..]),
             format!("{name}\n{secret}\nmore\n"),
+            format!("{name}\n{secret}\n{}", "x".repeat(1024)),
         ] {
             std::fs::write(&file, &wrong).unwrap();
             assert_eq!(

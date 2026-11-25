@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -9,7 +9,7 @@ use osm_browser_link::{
 use osm_vault_core::passkey::{Registering, Signing};
 
 /// How many request IDs are remembered, to refuse one that comes again.
-const REMEMBERED: usize = 1024;
+const REMEMBERED: usize = 65_536;
 
 /// What a request asks for: a login for a page, a card for the documents
 /// of a tab, or a passkey for a page.
@@ -45,7 +45,7 @@ impl Asked {
         Signing::from_options(&request.options, Some(&origin)).ok()
     }
 
-    fn check(&self) -> Result<Origin, Refusal> {
+    pub(crate) fn check(&self) -> Result<Origin, Refusal> {
         match self {
             Self::Login(request) => request.check(),
             Self::Card(request) => request.check(),
@@ -88,8 +88,9 @@ pub(crate) struct Broker {
     /// How long the owner has to decide.
     limit: Duration,
     pending: Option<Pending>,
-    /// IDs of requests taken in before, oldest first.
+    /// IDs of requests taken in before, oldest first, paired with an O(1) lookup set.
     seen: VecDeque<String>,
+    seen_set: HashSet<String>,
     tickets: u64,
 }
 
@@ -99,8 +100,27 @@ impl Broker {
             limit,
             pending: None,
             seen: VecDeque::new(),
+            seen_set: HashSet::new(),
             tickets: 0,
         }
+    }
+
+    pub fn has_seen(&self, request_id: &str) -> bool {
+        self.seen_set.contains(request_id)
+    }
+
+    pub fn remember(&mut self, request_id: &str) {
+        if self.seen_set.contains(request_id) {
+            return;
+        }
+        if self.seen.len() == REMEMBERED {
+            if let Some(oldest) = self.seen.pop_front() {
+                self.seen_set.remove(&oldest);
+            }
+        }
+        let owned = request_id.to_owned();
+        self.seen_set.insert(owned.clone());
+        self.seen.push_back(owned);
     }
 
     /// Takes a request in to wait for the owner, or says why not. The host
@@ -116,16 +136,13 @@ impl Broker {
             return Err(Refusal::ExtensionNotAllowed);
         }
         let origin = asked.check()?;
-        if self.seen.iter().any(|seen| seen == asked.request_id()) {
+        if self.has_seen(asked.request_id()) {
             return Err(Refusal::Replayed);
         }
         if self.pending(now).is_some() {
             return Err(Refusal::Busy);
         }
-        if self.seen.len() == REMEMBERED {
-            self.seen.pop_front();
-        }
-        self.seen.push_back(asked.request_id().to_owned());
+        self.remember(asked.request_id());
         self.tickets += 1;
         Ok(self.pending.insert(Pending {
             ticket: self.tickets,

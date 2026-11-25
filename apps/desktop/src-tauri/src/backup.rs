@@ -214,9 +214,7 @@ fn read_record(vault: &Path, id: &str) -> Option<BackupRecord> {
 
 fn write_record(vault: &Path, record: &BackupRecord) -> std::io::Result<()> {
     let path = record_file(vault);
-    let partial = path.with_extension("json.partial");
-    std::fs::write(&partial, serde_json::to_vec_pretty(record)?)?;
-    std::fs::rename(&partial, &path)
+    crate::atomic_write(&path, &serde_json::to_vec_pretty(record)?)
 }
 
 /// Notes that this device saved a backup of the vault `id` at `at`.

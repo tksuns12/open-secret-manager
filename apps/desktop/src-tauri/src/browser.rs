@@ -224,11 +224,10 @@ impl Known {
         let path = self.manifest_path(home);
         let folder = path.parent().unwrap_or(home);
         std::fs::create_dir_all(folder)?;
-        // Written beside and moved into place, so that a browser never reads
-        // half of it.
-        let partial = path.with_extension("json.partial");
-        std::fs::write(&partial, manifest)?;
-        std::fs::rename(&partial, &path)?;
+        // Written beside with a random `create_new` file and moved into place,
+        // so a browser never reads half of it and a pre-planted symlink is
+        // never followed.
+        crate::atomic_write(&path, manifest)?;
         #[cfg(windows)]
         {
             use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -297,7 +296,15 @@ pub struct Browser {
 
 impl Browser {
     pub fn open(vault_path: &Path) -> Self {
-        Self::with(vault_path, dirs::home_dir(), find_host())
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut browser = Self::with(vault_path, dirs::home_dir(), find_host());
+        // On Windows the pipe link lives in LocalAppData (`endpoint::socket_path`)
+        // so the machine-local secret never syncs via Roaming Profiles.
+        #[cfg(windows)]
+        if let Some(socket) = endpoint::socket_path() {
+            browser.socket = socket;
+        }
+        browser
     }
 
     /// A session whose browsers live under `home` and whose host program is
@@ -880,29 +887,52 @@ pub async fn approve_passkey<R: Runtime>(
         code: "locked",
         message: "the vault locked before the passkey was sent".into(),
     };
-    let asked = state
+    let parsed_session: osm_vault_core::UnlockSession = session.parse().map_err(|_| locked())?;
+    // Verify the vault is still unlocked under `session` before launching any
+    // OS biometric/owner prompt.
+    {
+        let vault = state.vault.lock().await;
+        if vault.as_ref().and_then(Vault::unlock_session) != Some(parsed_session) {
+            return Err(locked());
+        }
+    }
+    // Snapshot the monotonic ticket, ceremony, origin, and RP ID before any
+    // async owner check so a swapped or replayed request cannot consume it.
+    let (ticket, ceremony, origin, rp_id) = state
         .browser
         .desk
-        .choices(None)?
-        .filter(|choices| choices.request_id == request_id)
-        .and_then(|choices| choices.passkey)
+        .pending_passkey(&request_id)
         .ok_or_else(fill_ended)?;
     let not_verified = || CommandError {
         code: "not_verified",
         message: "you were not verified".into(),
     };
     // The system's check, before the vault is held: the owner may take a
-    // while over it.
+    // while over it. Watch desk changes concurrently so if the browser request
+    // disappears mid-prompt we invalidate the OS prompt immediately.
     let checked = if owner_check {
-        let reason = match asked.ceremony {
-            Ceremony::Create => format!("save a passkey for {}", asked.rp_id),
-            Ceremony::Get => format!("sign in to {} with a passkey", asked.rp_id),
+        let reason = match ceremony {
+            Ceremony::Create => format!("save a passkey for {rp_id}"),
+            Ceremony::Get => format!("sign in to {rp_id} with a passkey"),
         };
-        let (passed, said) = tokio::sync::oneshot::channel();
-        osm_desktop_session::check_owner(&reason, move |result| {
+        let mut changes = state.browser.desk.changes();
+        let (passed, mut said) = tokio::sync::oneshot::channel();
+        let owner_check_guard = osm_desktop_session::check_owner(&reason, move |result| {
             let _ = passed.send(result);
         });
-        if !said.await.unwrap_or(false) {
+        let verified = loop {
+            tokio::select! {
+                result = &mut said => break result.unwrap_or(false),
+                changed = changes.changed() => {
+                    if changed.is_err() || !state.browser.desk.is_pending_ticket(ticket) {
+                        owner_check_guard.cancel();
+                        return Err(fill_ended());
+                    }
+                }
+            }
+        };
+        drop(owner_check_guard);
+        if !verified {
             return Err(not_verified());
         }
         true
@@ -912,6 +942,9 @@ pub async fn approve_passkey<R: Runtime>(
     {
         let mut vault = state.vault.lock().await;
         let vault = vault.as_mut().ok_or_else(locked)?;
+        if vault.unlock_session() != Some(parsed_session) {
+            return Err(locked());
+        }
         let verified = checked
             || match &password {
                 Some(password) => {
@@ -923,12 +956,18 @@ pub async fn approve_passkey<R: Runtime>(
                 }
                 None => false,
             };
-        let session = session.parse().map_err(|_| locked())?;
         let desk = &state.browser.desk;
-        let outcome = match asked.ceremony {
-            Ceremony::Create => {
-                desk.approve_passkey_create(&request_id, session, vault, into.as_deref(), verified)
-            }
+        let outcome = match ceremony {
+            Ceremony::Create => desk.approve_passkey_create_bound(
+                ticket,
+                &request_id,
+                &origin,
+                &rp_id,
+                parsed_session,
+                vault,
+                into.as_deref(),
+                verified,
+            ),
             Ceremony::Get => {
                 let (Some(item), Some(credential)) = (&item_id, &credential_id) else {
                     return Err(CommandError {
@@ -936,7 +975,17 @@ pub async fn approve_passkey<R: Runtime>(
                         message: "choose a passkey".into(),
                     });
                 };
-                desk.approve_passkey_get(&request_id, session, vault, item, credential, verified)
+                desk.approve_passkey_get_bound(
+                    ticket,
+                    &request_id,
+                    &origin,
+                    &rp_id,
+                    parsed_session,
+                    vault,
+                    item,
+                    credential,
+                    verified,
+                )
             }
         };
         outcome.map_err(|refused| match refused {

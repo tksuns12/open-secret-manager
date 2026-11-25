@@ -189,24 +189,37 @@ impl CardRequest {
             return Err(Refusal::InvalidMessage);
         }
         let mut frames = std::collections::BTreeSet::new();
+        let mut seen_fields = std::collections::BTreeSet::new();
         for frame in &self.frames {
-            let mut fields = frame.fields.clone();
-            fields.sort();
-            fields.dedup();
             if !is_id(&frame.document_id)
                 || frame.frame_id < 0
                 || !frames.insert(frame.frame_id)
                 || frame.fields.is_empty()
-                || fields.len() != frame.fields.len()
             {
                 return Err(Refusal::InvalidMessage);
             }
+            for &field in &frame.fields {
+                if !seen_fields.insert(field) {
+                    return Err(Refusal::InvalidMessage);
+                }
+            }
+        }
+        if !seen_fields.contains(&CardField::Number) {
+            return Err(Refusal::InvalidMessage);
         }
         let top = Origin::parse(&self.top_origin).ok_or(Refusal::OriginRejected)?;
+        let mut other_origin: Option<Origin> = None;
         for frame in &self.frames {
             let origin = Origin::parse(&frame.origin).ok_or(Refusal::OriginRejected)?;
             if frame.frame_id == 0 && origin != top {
                 return Err(Refusal::FrameRejected);
+            }
+            if origin != top {
+                match &other_origin {
+                    None => other_origin = Some(origin),
+                    Some(existing) if existing != &origin => return Err(Refusal::FrameRejected),
+                    Some(_) => {}
+                }
             }
         }
         Ok(top)
@@ -926,6 +939,34 @@ mod tests {
             refused(&card_with(
                 |card| card["topOrigin"] = "https://shop.example:8443".into()
             )),
+            (id.clone(), Refusal::FrameRejected)
+        );
+        // Card number must be requested, fields cannot repeat across frames,
+        // and at most one non-top origin may receive card fields.
+        assert_eq!(
+            refused(&card_with(|card| {
+                card["frames"][1]["fields"] = serde_json::json!(["security_code"]);
+            })),
+            (id.clone(), Refusal::InvalidMessage)
+        );
+        assert_eq!(
+            refused(&card_with(|card| {
+                card["frames"][0]["fields"] = serde_json::json!(["cardholder", "security_code"]);
+            })),
+            (id.clone(), Refusal::InvalidMessage)
+        );
+        assert_eq!(
+            refused(&card_with(|card| {
+                card["frames"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "frameId": 4,
+                        "documentId": "doc-4",
+                        "origin": "https://attacker.example",
+                        "fields": ["expiry"],
+                    }));
+            })),
             (id.clone(), Refusal::FrameRejected)
         );
     }

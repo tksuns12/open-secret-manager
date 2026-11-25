@@ -13,6 +13,7 @@ use dbus::{
     message::{MatchRule, SignalArgs},
     Path,
 };
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::Away;
@@ -139,12 +140,22 @@ fn our_session(connection: &Connection) -> Option<Path<'static>> {
 /// away with it otherwise.
 struct Served {
     clipboard: arboard::Clipboard,
+    /// Per-process random key so no copied secret is retained in plaintext.
+    key: [u8; 32],
     copies: isize,
-    /// The last secret put there, and which copy it was.
-    last: Option<(isize, Zeroizing<String>)>,
+    /// Keyed SHA-256 digest of the last secret put there, and which copy it was.
+    last: Option<(isize, [u8; 32])>,
 }
 
 static SERVED: Mutex<Option<Served>> = Mutex::new(None);
+
+fn keyed_digest(key: &[u8; 32], text: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"osm-clipboard-v1");
+    hasher.update(key);
+    hasher.update(text.as_bytes());
+    hasher.finalize().into()
+}
 
 /// Puts `text` on the clipboard with the hint that clipboard managers
 /// honor (`x-kde-passwordManagerHint`: `secret`), so that they keep it out
@@ -152,8 +163,11 @@ static SERVED: Mutex<Option<Served>> = Mutex::new(None);
 pub(crate) fn copy_secret(text: &str) -> Option<isize> {
     let mut served = SERVED.lock().unwrap_or_else(PoisonError::into_inner);
     if served.is_none() {
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key).ok()?;
         *served = Some(Served {
             clipboard: arboard::Clipboard::new().ok()?,
+            key,
             copies: 0,
             last: None,
         });
@@ -167,7 +181,8 @@ pub(crate) fn copy_secret(text: &str) -> Option<isize> {
         .text(text.to_owned())
         .ok()?;
     served.copies += 1;
-    served.last = Some((served.copies, Zeroizing::new(text.to_owned())));
+    let digest = keyed_digest(&served.key, text);
+    served.last = Some((served.copies, digest));
     Some(served.copies)
 }
 
@@ -178,15 +193,24 @@ pub(crate) fn clear(copy: Option<isize>) {
     let Some(served) = served.as_mut() else {
         return;
     };
-    let Some((last, text)) = &served.last else {
+    let Some((last, expected)) = served.last else {
         return;
     };
-    if copy.is_some_and(|copy| copy != *last) {
+    if copy.is_some_and(|copy| copy != last) {
         return;
     }
-    // Something copied since, by this program or another, stays.
-    if served.clipboard.get_text().ok().as_deref() == Some(text.as_str()) {
-        let _ = served.clipboard.clear();
+    // Something copied since, by this program or another, stays; if reading the
+    // clipboard fails, clear defensively so a secret is never left behind.
+    match served.clipboard.get_text() {
+        Ok(current) => {
+            let current = Zeroizing::new(current);
+            if keyed_digest(&served.key, &current) == expected {
+                let _ = served.clipboard.clear();
+            }
+        }
+        Err(_) => {
+            let _ = served.clipboard.clear();
+        }
     }
     served.last = None;
 }

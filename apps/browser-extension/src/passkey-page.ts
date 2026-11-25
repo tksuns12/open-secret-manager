@@ -34,7 +34,7 @@ type Credential = {
     const id = crypto.randomUUID();
     return new Promise((resolve) => {
       const heard = (event: MessageEvent) => {
-        if (event.source !== window || !isAnswer(event.data) || event.data.id !== id) return;
+        if (event.source !== window || event.origin !== origin || !isAnswer(event.data) || event.data.id !== id) return;
         window.removeEventListener("message", heard);
         resolve(event.data.outcome);
       };

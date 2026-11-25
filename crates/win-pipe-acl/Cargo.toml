@@ -1,0 +1,16 @@
+[package]
+name = "osm-win-pipe-acl"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.85"
+license.workspace = true
+description = "Isolated Windows Named Pipe owner-only SID DACL wrapper"
+
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1.53.1", features = ["net"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }

@@ -118,7 +118,8 @@ pub async fn list_archives(
             let archived_at = archived_at(&name)?;
             let folder = archive_folder(&state, &name).ok()?;
             Some(ArchiveInfo {
-                has_vault: vault_file(&state, &folder).is_file(),
+                has_vault: std::fs::symlink_metadata(vault_file(&state, &folder))
+                    .is_ok_and(|meta| meta.is_file()),
                 path: folder.to_string_lossy().into_owned(),
                 archived_at,
                 name,
@@ -193,7 +194,7 @@ pub async fn open_archive(
     let password = zeroize::Zeroizing::new(password);
     let folder = archive_folder(&state, &name)?;
     let path = vault_file(&state, &folder);
-    if !path.is_file() {
+    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
         return Err(no_archive());
     }
     let mut vault = Vault::open(&path)?;

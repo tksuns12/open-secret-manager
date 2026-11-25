@@ -384,8 +384,18 @@ fn generate_identity() -> Result<TransportIdentity> {
 #[cfg(unix)]
 fn restrict_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|_| Error::Transport("could not restrict peer store permissions"))
+    let mode = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, mode.clone())
+        .map_err(|_| Error::Transport("could not restrict peer store permissions"))?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = std::path::PathBuf::from(candidate);
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::set_permissions(&candidate, mode.clone());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]

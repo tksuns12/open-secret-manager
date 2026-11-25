@@ -20,6 +20,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// Why the owner's session went away from the app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,16 +112,53 @@ pub fn can_check_owner() -> bool {
     }
 }
 
+/// Handle to an in-flight system owner check. Dropping or cancelling it
+/// invalidates the underlying OS prompt (e.g. `LAContext::invalidate()` on
+/// macOS) if the request ends before the owner finishes verifying.
+pub struct OwnerCheck {
+    #[cfg(target_os = "macos")]
+    cancel: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl OwnerCheck {
+    /// Cancels the in-flight owner verification prompt, if still pending.
+    pub fn cancel(mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = &mut self;
+        }
+    }
+}
+
+impl Drop for OwnerCheck {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
+        }
+    }
+}
+
 /// Asks the system to check the owner, telling them `reason`; `done` is
 /// called once, on a thread of the system's, with whether the check
 /// passed. Where [`can_check_owner`] says no, at once with `false`.
-pub fn check_owner(reason: &str, done: impl FnOnce(bool) + Send + 'static) {
+/// Dropping the returned [`OwnerCheck`] cancels an unfinished prompt.
+pub fn check_owner(reason: &str, done: impl FnOnce(bool) + Send + 'static) -> OwnerCheck {
     #[cfg(target_os = "macos")]
-    macos::check_owner(reason, Box::new(done));
+    {
+        OwnerCheck {
+            cancel: Some(macos::check_owner(reason, Box::new(done))),
+        }
+    }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = reason;
         done(false);
+        OwnerCheck {}
     }
 }
 
@@ -127,15 +166,19 @@ pub fn check_owner(reason: &str, done: impl FnOnce(bool) + Send + 'static) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Copied {
     /// What the clipboard counted when the secret was put there; it counts
-    /// every change. On Linux, which has no such count, this process's own
-    /// count of the secrets it put there.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    /// every change. On Linux and Windows, this process's own count of the
+    /// secrets it put there.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        allow(dead_code)
+    )]
     change: isize,
 }
 
 /// Puts `text` on the clipboard, marked for clipboard history apps to leave
 /// out: on macOS as concealed and transient, and for this Mac only (not for
-/// the owner's other devices); on Linux with `x-kde-passwordManagerHint`.
+/// the owner's other devices); on Linux with `x-kde-passwordManagerHint`; on
+/// Windows excluded from monitoring, clipboard history, and cloud clipboard.
 /// `None` where this system cannot.
 pub fn copy_secret(text: &str) -> Option<Copied> {
     #[cfg(target_os = "macos")]
@@ -147,7 +190,11 @@ pub fn copy_secret(text: &str) -> Option<Copied> {
     {
         linux::copy_secret(text).map(|change| Copied { change })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::copy_secret(text).map(|change| Copied { change })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = text;
         None
@@ -161,6 +208,8 @@ pub fn clear_last_secret() {
     macos::clear_last(&objc2_app_kit::NSPasteboard::generalPasteboard());
     #[cfg(target_os = "linux")]
     linux::clear(None);
+    #[cfg(target_os = "windows")]
+    windows::clear(None);
 }
 
 /// Clears the clipboard if nothing was put there since `copied`.
@@ -172,6 +221,8 @@ pub fn clear_if_unchanged(copied: Copied) {
     );
     #[cfg(target_os = "linux")]
     linux::clear(Some(copied.change));
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    windows::clear(Some(copied.change));
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let _ = copied;
 }

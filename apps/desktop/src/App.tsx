@@ -124,12 +124,13 @@ function App() {
   /** The generator's choice kept on this device, once read. */
   const [generator, setGenerator] = useState<GeneratorChoice | null>(null);
   const autoLockRef = useRef(autoLockMinutes);
-  // When the vault locks for want of activity, by the clock. Hidden or
-  // covered, the window leaves the vault unlocked for that time as well, but
-  // its timers can run late then: it hands the rest of the time to the
-  // native side, which locks on time, and its coming back and a browser's
-  // request check the clock first.
+  // When the vault locks for want of activity. Tracks both monotonic
+  // `performance.now()` (blocks backward wall-clock jumps) and `Date.now()`
+  // (catches sleep/throttle jumps), taking whichever elapsed more.
   const lockDue = useRef(Infinity);
+  const lastActivePerf = useRef(performance.now());
+  const lastActiveWall = useRef(Date.now());
+  const idleWaitMs = useRef(autoLockMinutes * 60 * 1000);
   // The open item's details: its notes and which secrets it has.
   const [shown, setShown] = useState<EntryDetail | null>(null);
   // A request from a browser extension that waits for a decision here.
@@ -243,9 +244,15 @@ function App() {
     showIdleLocked();
     return locking;
   }
+  function remainingIdleMs(): number {
+    if (!Number.isFinite(lockDue.current)) return Infinity;
+    const perfElapsed = Math.max(0, performance.now() - lastActivePerf.current);
+    const wallElapsed = Math.max(0, Date.now() - lastActiveWall.current);
+    return Math.max(0, idleWaitMs.current - Math.max(perfElapsed, wallElapsed));
+  }
   /** Locks if the time without activity has run out, as the timer, late, would have. */
   function lockIfDue() {
-    return Date.now() >= lockDue.current ? lockQuietly() : null;
+    return remainingIdleMs() <= 0 ? lockQuietly() : null;
   }
   useEffect(() => {
     void bridge.settings().then((settings) => { setAutoLockMinutes(settings.autoLockMinutes); setGenerator(settings.generator); }).catch(() => {});
@@ -255,7 +262,12 @@ function App() {
     const wait = autoLockMinutes * 60 * 1000;
     let timer = 0;
     const reset = () => {
-      window.clearTimeout(timer); lockDue.current = Date.now() + wait; timer = window.setTimeout(lockQuietly, wait);
+      window.clearTimeout(timer);
+      lastActivePerf.current = performance.now();
+      lastActiveWall.current = Date.now();
+      idleWaitMs.current = wait;
+      lockDue.current = lastActiveWall.current + wait;
+      timer = window.setTimeout(lockQuietly, wait);
       // Input while hidden, should a system give it: the native side's time starts again too.
       if (document.visibilityState === "hidden") void bridge.lockWhenIdle(wait).catch(() => {});
     };
@@ -263,7 +275,8 @@ function App() {
     // a browser's request does too.
     const onVisibility = () => {
       if (document.visibilityState === "hidden") {
-        if (Number.isFinite(lockDue.current)) void bridge.lockWhenIdle(Math.max(0, lockDue.current - Date.now())).catch(() => {});
+        const left = remainingIdleMs();
+        if (Number.isFinite(left)) void bridge.lockWhenIdle(left).catch(() => {});
         return;
       }
       void bridge.lockWhenIdle(null).catch(() => {});
@@ -802,7 +815,7 @@ function App() {
       {heldOpen && !locked && held.length > 0 && <div className="modal-backdrop" onClick={() => setHeldOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HELD FOR REVIEW</p><h2>Changes from outside this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHeldOpen(false)}><X size={18} /></button></div><HeldPanel held={held} otherDevices={sync.devices > 0} onDecide={(change, keep) => void decideHeld(change, keep)} /></div></div>}
       {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onSaved={loadBackupAge} onNotice={setNotice} /></div></div>}
       {archivesOpen && <div className="modal-backdrop" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">ARCHIVE</p><h2>Copies put away on this device</h2></div><button className="icon-button" aria-label="Close" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><X size={18} /></button></div><ArchivesPanel canCopy={!locked} onCopied={() => { void bridge.listEntries().then(setEntries).catch(() => {}); }} onNotice={setNotice} /></div></div>}
-      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes, away) => void startInvite(votes, away)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { navigator.clipboard?.writeText(text); setNotice("Invitation copied · it works once"); }}  onRelayChanged={() => { void bridge.devices().then(setDevices).catch(() => {}); }} /></div></div>}
+      {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes, away) => void startInvite(votes, away)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { void bridge.copyInvitation(text).then(() => setNotice("Invitation copied · it works once · cleared in 30 seconds"), (error) => setNotice(commandMessage(error, "Nothing was copied"))); }}  onRelayChanged={() => { void bridge.devices().then(setDevices).catch(() => {}); }} /></div></div>}
       {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
       {history && !locked && <div className="modal-backdrop" onClick={() => setHistory(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HISTORY</p><h2>{history.title}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHistory(null)}><X size={18} /></button></div><HistoryPanel versions={history.versions} onRestore={(revision) => void restore(history.id, revision, history.versions.filter((version) => version.current).map((version) => version.revision), "Version restored")} /></div></div>}
       {deleted && !locked && <div className="modal-backdrop" onClick={() => setDeleted(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DELETED</p><h2>Recently deleted</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDeleted(null)}><X size={18} /></button></div><DeletedPanel items={deleted} onRestore={(item) => void restore(item.id, item.last, item.heads, `${item.title} restored`)} /></div></div>}

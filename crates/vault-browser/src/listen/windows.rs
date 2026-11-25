@@ -16,7 +16,7 @@ use osm_browser_link::{
     handshake,
 };
 use tokio::{
-    net::windows::named_pipe::{ClientOptions, ServerOptions},
+    net::windows::named_pipe::{ClientOptions, NamedPipeServer},
     runtime::Builder,
     task::JoinSet,
     time::{sleep, timeout},
@@ -28,6 +28,13 @@ use crate::Desk;
 /// How long a connection has to prove it holds the secret before it is
 /// closed unanswered.
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(2);
+
+/// Win32 `ERROR_PIPE_BUSY`: all pipe instances are busy; wait briefly and retry.
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// Maximum consecutive errors when creating a replacement pipe instance before
+/// `serve` gives up rather than spinning forever.
+const MAX_CONSECUTIVE_INSTANCE_ERRORS: usize = 50;
 
 /// The session's pipe, named and not yet served.
 pub struct Bound {
@@ -79,7 +86,15 @@ fn answers(link: Link) -> bool {
                 runtime.block_on(async {
                     matches!(
                         timeout(HANDSHAKE_LIMIT, async {
-                            let mut pipe = ClientOptions::new().open(&link.name)?;
+                            let mut pipe = loop {
+                                match ClientOptions::new().open(&link.name) {
+                                    Ok(pipe) => break pipe,
+                                    Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                                        sleep(Duration::from_millis(25)).await;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            };
                             handshake::as_host(&mut pipe, &link.name, &link.secret).await
                         })
                         .await,
@@ -114,10 +129,8 @@ fn in_use() -> io::Error {
     io::Error::new(io::ErrorKind::AddrInUse, "another session is listening")
 }
 
-fn instance(name: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    ServerOptions::new()
-        .reject_remote_clients(true)
-        .create(name)
+fn instance(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+    osm_win_pipe_acl::create_owner_only_pipe(name, first)
 }
 
 /// Serves the session's pipe until dropped: each connection brings one
@@ -126,12 +139,9 @@ fn instance(name: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipe
 pub async fn serve(bound: Bound, desk: Arc<Desk>) -> io::Result<()> {
     let Bound { link, file } = bound;
     let Link { name, secret } = link;
-    // The first instance is made by this session or not at all: if somebody
-    // made the pipe first under this name, this fails.
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .reject_remote_clients(true)
-        .create(&name)?;
+    // The first instance is made by this session with an owner-only SID DACL
+    // or not at all: if somebody made the pipe first under this name, this fails.
+    let mut server = instance(&name, true)?;
     // Only now can the host find it.
     Link {
         name: name.clone(),
@@ -149,11 +159,18 @@ pub async fn serve(bound: Bound, desk: Arc<Desk>) -> io::Result<()> {
             connected = server.connect() => {
                 // A pipe with no instance waiting refuses the next host, so
                 // the next one is made before this one is served.
+                let mut errors = 0usize;
                 let next = loop {
-                    match instance(&name) {
+                    match instance(&name, false) {
                         Ok(next) => break next,
-                        // Out of handles, most likely: let some close.
-                        Err(_) => sleep(Duration::from_millis(100)).await,
+                        Err(error) => {
+                            errors += 1;
+                            if errors >= MAX_CONSECUTIVE_INSTANCE_ERRORS {
+                                return Err(error);
+                            }
+                            let backoff_ms = 50_u64.saturating_mul(errors as u64).min(500);
+                            sleep(Duration::from_millis(backoff_ms)).await;
+                        }
                     }
                 };
                 let mut stream = std::mem::replace(&mut server, next);

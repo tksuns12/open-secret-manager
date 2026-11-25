@@ -326,15 +326,48 @@ fn populate_legacy_enrolled(connection: &Connection, state: &mut ControlState) -
     Ok(())
 }
 
+#[cfg(unix)]
+fn restrict_db_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::Permissions::from_mode(0o600);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = std::path::PathBuf::from(candidate);
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::set_permissions(&candidate, mode.clone());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_permissions(_path: &Path) {}
+
+#[cfg(unix)]
+fn precreate_owner_only(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
+}
+
+#[cfg(not(unix))]
+fn precreate_owner_only(_path: &Path) {}
+
 /// Opens (or creates) a node's control-plane database for `vault_id`.
 pub fn open(
     path: impl AsRef<Path>,
     vault_id: [u8; 32],
     crash: CrashPlan,
 ) -> Result<(LogStore, StateMachineStore)> {
+    let path = path.as_ref();
+    precreate_owner_only(path);
     let connection = Connection::open(path).map_err(read_error)?;
     osm_vault_sync::claim_store_version(&connection, STORE_VERSION).map_err(read_error)?;
     connection.execute_batch(SCHEMA).map_err(write_error)?;
+    restrict_db_permissions(path);
     let mut state = match connection
         .query_row(
             "SELECT state FROM control_state WHERE singleton = 1",

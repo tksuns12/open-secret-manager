@@ -13,12 +13,91 @@ type Target = { username: HTMLInputElement | null; password: HTMLInputElement | 
 /** Names this document. A navigation loads another, with another name. */
 const documentId = crypto.randomUUID();
 
+/** An input or select the owner can see and type into now. */
+function isVisibleControl(element: CardElement): boolean {
+  if (element.disabled || (element instanceof HTMLInputElement && element.readOnly)) return false;
+  if (window.innerWidth < 4 || window.innerHeight < 4) return false;
+  if (element.getClientRects().length === 0) return false;
+  const box = element.getBoundingClientRect();
+  if (box.width < 4 || box.height < 4) return false;
+  const check = (element as { checkVisibility?: (options: object) => boolean }).checkVisibility;
+  if (check && !check.call(element, { opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true })) {
+    return false;
+  }
+  let visLeft = box.left;
+  let visTop = box.top;
+  let visRight = box.right;
+  let visBottom = box.bottom;
+  let opacity = 1;
+  let current: Element | null = element;
+  while (current) {
+    const style = getComputedStyle(current);
+    if (style.display === "none" || style.visibility !== "visible") return false;
+    const value = Number(style.opacity);
+    if (Number.isFinite(value)) opacity *= value;
+    if (opacity < 0.1) return false;
+    const clipPath = style.clipPath;
+    if (
+      clipPath
+      && clipPath !== "none"
+      && (
+        /^inset\(\s*(?:[5-9]\d|100)%/.test(clipPath)
+        || /^circle\(\s*0(?:px|%)?\b/.test(clipPath)
+        || /^polygon\(\s*0(?:px)?\s+0(?:px)?\s*\)/.test(clipPath)
+      )
+    ) {
+      return false;
+    }
+    if (style.clip === "rect(0px, 0px, 0px, 0px)") return false;
+    if (
+      current !== element
+      && (style.overflowX === "hidden" || style.overflowX === "clip" || style.overflowY === "hidden" || style.overflowY === "clip")
+    ) {
+      const parentBox = current.getBoundingClientRect();
+      if (style.overflowX === "hidden" || style.overflowX === "clip") {
+        visLeft = Math.max(visLeft, parentBox.left);
+        visRight = Math.min(visRight, parentBox.right);
+      }
+      if (style.overflowY === "hidden" || style.overflowY === "clip") {
+        visTop = Math.max(visTop, parentBox.top);
+        visBottom = Math.min(visBottom, parentBox.bottom);
+      }
+      if (visRight - visLeft < 4 || visBottom - visTop < 4) return false;
+    }
+    const root: Node | null = current.parentElement
+      ?? (current.getRootNode() instanceof ShadowRoot ? (current.getRootNode() as ShadowRoot).host : null);
+    current = root instanceof Element ? root : null;
+  }
+  if (visRight < 4 || visBottom < 4) return false;
+  if (window.top !== window) {
+    const frameVisLeft = Math.max(visLeft, 0);
+    const frameVisTop = Math.max(visTop, 0);
+    const frameVisRight = Math.min(visRight, window.innerWidth);
+    const frameVisBottom = Math.min(visBottom, window.innerHeight);
+    if (frameVisRight - frameVisLeft < 4 || frameVisBottom - frameVisTop < 4) return false;
+    try {
+      const frame = window.frameElement;
+      if (frame instanceof Element) {
+        const frameBox = frame.getBoundingClientRect();
+        const frameStyle = getComputedStyle(frame);
+        if (
+          frameBox.width < 4
+          || frameBox.height < 4
+          || frameStyle.display === "none"
+          || frameStyle.visibility !== "visible"
+          || Number(frameStyle.opacity) < 0.1
+        ) {
+          return false;
+        }
+      }
+    } catch { /* cross-origin iframe */ }
+  }
+  return true;
+}
+
 /** An input the owner could type into now. */
 function usable(element: Element | null): element is HTMLInputElement {
-  return element instanceof HTMLInputElement
-    && !element.disabled
-    && !element.readOnly
-    && element.getClientRects().length > 0;
+  return element instanceof HTMLInputElement && isVisibleControl(element);
 }
 
 function isPassword(input: HTMLInputElement): boolean {
@@ -75,7 +154,7 @@ const CC_AUTOCOMPLETE: Record<string, CardField> = {
 /** What else an `autocomplete` may say without saying the field is something else. */
 const SAYS_NOTHING = /^(on|off|shipping|billing|section-.*)$/;
 /** The kinds of input a card's field can be. */
-const CARD_INPUTS = new Set(["", "text", "tel", "number", "password", "search"]);
+const CARD_INPUTS = new Set(["", "text", "tel", "number", "password"]);
 // In a name, anywhere; Korean words take particles after them.
 const CODE_PARTS = ["cvc", "cvv", "csc", "securitycode", "security_code", "security-code", "cardcode", "card_code", "보안코드", "보안 코드"];
 const NUMBER_PARTS = ["cardnumber", "card_number", "card-number", "cardno", "card_no", "ccnumber", "cc_number", "ccnum", "카드번호", "카드 번호"];
@@ -99,9 +178,12 @@ function cardFieldOf(element: CardElement): CardField | null {
   const words = new Set(names.flatMap(wordsOf));
   const has = (parts: string[]) => names.some((name) => parts.some((part) => name.toLowerCase().includes(part)));
   const card = words.has("card") || words.has("cc");
-  if (has(CODE_PARTS) || words.has("cid")) return "security_code";
+  if (has(CODE_PARTS) || (card && words.has("cid"))) return "security_code";
   if (has(NUMBER_PARTS) || (card && ["number", "num", "no"].some((word) => words.has(word)))) return "number";
-  if (has(EXPIRY_PARTS) || words.has("exp")) {
+  if (
+    has(EXPIRY_PARTS)
+    || (words.has("exp") && (card || has(["month", "year", "월", "년", "valid", "thru"]) || words.has("mm") || words.has("yy") || words.has("yyyy")))
+  ) {
     if (has(["month", "월"]) || words.has("mm")) return "expiry_month";
     if (has(["year", "년"]) || words.has("yy") || words.has("yyyy")) return "expiry_year";
     return "expiry";
@@ -112,17 +194,11 @@ function cardFieldOf(element: CardElement): CardField | null {
 
 /**
  * A card's field the owner can see and change now: enabled, drawn with a
- * size, and not hidden by its style. A page cannot hide a second field to
- * have the security code beside the number.
+ * size, and not hidden by its style or an ancestor's. A page cannot hide a
+ * second field to have the security code beside the number.
  */
 function shown(element: CardElement): boolean {
-  if (element.disabled || (element instanceof HTMLInputElement && element.readOnly)) return false;
-  const box = element.getBoundingClientRect();
-  if (box.width <= 0 || box.height <= 0) return false;
-  const style = getComputedStyle(element);
-  if (style.visibility !== "visible" || Number(style.opacity) === 0) return false;
-  const check = (element as { checkVisibility?: (options: object) => boolean }).checkVisibility;
-  return check ? check.call(element, { opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true }) : true;
+  return isVisibleControl(element);
 }
 
 /** The card form's fields in this document, if it has any. */
@@ -175,11 +251,14 @@ function fillCard(target: CardTarget, card: CardValues): CardField[] {
     let done = false;
     switch (field) {
       case "number": {
-        // Whole in one field, or in turn over several, as many digits in
-        // each as it takes, or 4 where it says not; the last the rest.
+        // Whole in one field, or in turn over a split-PAN group in the same
+        // container and form (at most 4 short inputs, maxLength <= 6).
+        const splitPan = elements.length > 1 && elements.length <= 4
+          && elements.every((part) => part instanceof HTMLInputElement && part.maxLength > 0 && part.maxLength <= 6 && part.form === element.form && part.parentElement === element.parentElement);
+        const targets = splitPan ? elements : [element];
         let at = 0;
-        elements.forEach((part, index) => {
-          const length = index === elements.length - 1 ? card.number.length - at : part instanceof HTMLInputElement && part.maxLength > 0 ? part.maxLength : 4;
+        targets.forEach((part, index) => {
+          const length = index === targets.length - 1 ? card.number.length - at : part instanceof HTMLInputElement && part.maxLength > 0 ? part.maxLength : 4;
           if (putCard(part, card.number.slice(at, at + length))) done = true;
           at += length;
         });
@@ -218,64 +297,79 @@ function isTopHttpsDocument(): boolean {
   return window.top === window && window.location.protocol === "https:" && self.origin === window.location.origin;
 }
 
+function attachPort(port: chrome.runtime.Port) {
+  let target: Target | null = null;
+  let card: CardTarget | null = null;
+  let used = false;
+  const say = (message: FromPage) => port.postMessage(message);
+  // A browser may keep a document it has left, for the Back button, and
+  // with it this connection. Leaving ends the request all the same: the
+  // connection is closed here, and nothing is filled into this document
+  // afterwards even if it is shown again.
+  window.addEventListener("pagehide", () => {
+    used = true;
+    target = null;
+    card = null;
+    port.disconnect();
+  }, { once: true });
+  port.onMessage.addListener((message: ToPage) => {
+    if (message.type === "prepare") {
+      target = isTopHttpsDocument() ? findTarget() : null;
+      card = isHttpsDocument() ? findCard() : null;
+      const found = card;
+      say({
+        type: "prepared",
+        documentId,
+        origin: self.origin,
+        fields: target ? [...(target.username ? ["username" as const] : []), ...(target.password ? ["password" as const] : [])] : [],
+        card: found ? CARD_FIELDS.filter((field) => found.has(field)) : [],
+      });
+      return;
+    }
+    if (message.type === "fill_card") {
+      // One fill for one request, into the document it was asked for.
+      const allowed = !used && card !== null && isHttpsDocument()
+        && message.documentId === documentId && message.origin === self.origin;
+      used = true;
+      const filled = allowed && card ? fillCard(card, message.card) : [];
+      card = null;
+      say({ type: "filled_card", fields: filled });
+      return;
+    }
+    if (message.type !== "fill") return;
+    // One fill for one request, into the document it was asked for.
+    const allowed = !used && target !== null && isTopHttpsDocument()
+      && message.documentId === documentId && message.origin === self.origin;
+    used = true;
+    const filled: ("username" | "password")[] = [];
+    if (allowed && target) {
+      if (target.username?.isConnected && usable(target.username)) { put(target.username, message.username); filled.push("username"); }
+      if (target.password?.isConnected && usable(target.password)) { put(target.password, message.password); filled.push("password"); }
+    }
+    target = null;
+    say({ type: "filled", fields: filled });
+  });
+}
+
 // Done once per document: putting the script in again does nothing. The
 // name stays where the extension can ask the browser for it later, to see
 // that the tab still shows this document.
 if (globalThis.osmFillDocument === undefined) {
   globalThis.osmFillDocument = documentId;
-  // Each request has its own connection from the extension. It closes when
-  // this document goes away, which is how the extension learns of that.
-  chrome.runtime.onConnect.addListener((port) => {
-    let target: Target | null = null;
-    let card: CardTarget | null = null;
-    let used = false;
-    const say = (message: FromPage) => port.postMessage(message);
-    // A browser may keep a document it has left, for the Back button, and
-    // with it this connection. Leaving ends the request all the same: the
-    // connection is closed here, and nothing is filled into this document
-    // afterwards even if it is shown again.
-    window.addEventListener("pagehide", () => {
-      used = true;
-      target = null;
-      card = null;
-      port.disconnect();
-    }, { once: true });
-    port.onMessage.addListener((message: ToPage) => {
-      if (message.type === "prepare") {
-        target = isTopHttpsDocument() ? findTarget() : null;
-        card = isHttpsDocument() ? findCard() : null;
-        const found = card;
-        say({
-          type: "prepared",
-          documentId,
-          origin: self.origin,
-          fields: target ? [...(target.username ? ["username" as const] : []), ...(target.password ? ["password" as const] : [])] : [],
-          card: found ? CARD_FIELDS.filter((field) => found.has(field)) : [],
-        });
-        return;
-      }
-      if (message.type === "fill_card") {
-        // One fill for one request, into the document it was asked for.
-        const allowed = !used && card !== null && isHttpsDocument()
-          && message.documentId === documentId && message.origin === self.origin;
-        used = true;
-        const filled = allowed && card ? fillCard(card, message.card) : [];
-        card = null;
-        say({ type: "filled_card", fields: filled });
-        return;
-      }
-      if (message.type !== "fill") return;
-      // One fill for one request, into the document it was asked for.
-      const allowed = !used && target !== null && isTopHttpsDocument()
-        && message.documentId === documentId && message.origin === self.origin;
-      used = true;
-      const filled: ("username" | "password")[] = [];
-      if (allowed && target) {
-        if (target.username?.isConnected && usable(target.username)) { put(target.username, message.username); filled.push("username"); }
-        if (target.password?.isConnected && usable(target.password)) { put(target.password, message.password); filled.push("password"); }
-      }
-      target = null;
-      say({ type: "filled", fields: filled });
-    });
+  // The background asks this document to open its own connection back so
+  // that the browser process attests `port.sender` (tab, frame, origin, url).
+  chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+    if (sender.id !== chrome.runtime.id) return;
+    if (
+      typeof message === "object"
+      && message !== null
+      && (message as { type?: unknown }).type === "connect"
+      && typeof (message as { name?: unknown }).name === "string"
+      && (message as { name: string }).name.startsWith("fill:")
+    ) {
+      const port = chrome.runtime.connect({ name: (message as { name: string }).name });
+      attachPort(port);
+      sendResponse({ ok: true });
+    }
   });
 }

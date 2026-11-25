@@ -45,6 +45,7 @@ impl Bound {
 pub fn bind(path: &Path) -> io::Result<Bound> {
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder)?;
+        let _ = std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700));
     }
     match std::fs::symlink_metadata(path) {
         Ok(found) if found.file_type().is_socket() => {

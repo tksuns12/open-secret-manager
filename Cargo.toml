@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/origin",
     "crates/browser-link",
+    "crates/win-pipe-acl",
     "crates/vault-core",
     "crates/vault-browser",
     "crates/vault-sync",

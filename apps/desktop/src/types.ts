@@ -441,6 +441,8 @@ export type DesktopBridge = {
   generatePassword: (choice: GeneratorChoice) => Promise<string>;
   /** Copies a password the generator made, for 30 seconds. */
   copyGenerated: (value: string) => Promise<void>;
+  /** Copies a one-time pairing invitation code via the OS secret clipboard, for 30 seconds. */
+  copyInvitation: (code: string) => Promise<void>;
   copyTotp: (id: string) => Promise<void>;
   /** Copies an item's password for 30 seconds; the password never reaches the window. */
   copyPassword: (id: string) => Promise<void>;

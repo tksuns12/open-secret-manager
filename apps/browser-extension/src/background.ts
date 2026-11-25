@@ -27,7 +27,13 @@ type Waiting = { tabId: number; giveUp: ReturnType<typeof setTimeout> } & (
 );
 
 /** A document of the tab, connected to, and what its script found. */
-type Document = { frameId: number; port: chrome.runtime.Port; found: Prepared };
+type Document = { frameId: number; port: chrome.runtime.Port; found: Prepared; attested: string | "null" | null };
+
+type PendingFillPort = {
+  tabId: number;
+  frameId: number;
+  resolve: (connected: { port: chrome.runtime.Port; attested: string | "null" | null }) => void;
+};
 
 type Mark = "waiting" | "filled" | "problem" | "none";
 
@@ -39,6 +45,9 @@ const PAGE_ANSWERS_WITHIN_MS = 5_000;
 const FILLED_MARK_MS = 6_000;
 /** How long a site's requests for passkeys go to the browser's own after the owner turned one down, or let it run out. */
 const PASSKEY_PAUSE_MS = 60_000;
+/** How many silent `no_passkey` responses in a window trigger a per-origin cooldown. */
+const NO_PASSKEY_LIMIT = 3;
+const NO_PASSKEY_WINDOW_MS = 60_000;
 /** The access the owner gives on the options page: every https site, which is all the extension ever serves. */
 const ALL_SITES = ["https://*/*"];
 
@@ -51,6 +60,10 @@ const waiting = new Map<string, Waiting>();
 let host: chrome.runtime.Port | undefined;
 /** Until when each origin's requests for passkeys are the browser's own. */
 const paused = new Map<string, number>();
+/** Recent `no_passkey` response timestamps per origin, to bound probing. */
+const noPasskeyHits = new Map<string, number[]>();
+/** Reverse-connect handshakes waiting for content scripts to connect back. */
+const pendingFillPorts = new Map<string, PendingFillPort>();
 
 /** Says on the toolbar button, for one tab, how its request stands. */
 function show(tabId: number, mark: Mark, text: string) {
@@ -97,6 +110,52 @@ async function reachable(tabId: number): Promise<number[]> {
   return [0];
 }
 
+/** The origin the browser process attests for a connected frame's sender. */
+function attestedOrigin(sender: chrome.runtime.MessageSender | undefined): string | "null" | null {
+  if (!sender) return null;
+  if (sender.origin === "null") return "null";
+  const fromUrl = pageOrigin(sender.url);
+  if (!fromUrl) return null;
+  if (sender.origin !== undefined && sender.origin !== fromUrl) return null;
+  return fromUrl;
+}
+
+/** Completes a reverse-connect handshake initiated by `connectFrame`. */
+function acceptFillPort(port: chrome.runtime.Port) {
+  const pending = pendingFillPorts.get(port.name);
+  if (!pending || port.sender?.tab?.id !== pending.tabId || port.sender?.frameId !== pending.frameId) {
+    try { port.disconnect(); } catch { /* already closed */ }
+    return;
+  }
+  pendingFillPorts.delete(port.name);
+  pending.resolve({ port, attested: attestedOrigin(port.sender) });
+}
+
+/** Asks `frameId` in `tabId` to open a connection back so `port.sender` is browser-attested. */
+function connectFrame(tabId: number, requestId: string, frameId: number): Promise<{ port: chrome.runtime.Port; attested: string | "null" | null }> {
+  const portName = `fill:${requestId}:${frameId}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingFillPorts.delete(portName);
+      reject(new Error("the page did not connect"));
+    }, PAGE_ANSWERS_WITHIN_MS);
+    pendingFillPorts.set(portName, {
+      tabId,
+      frameId,
+      resolve: (connected) => {
+        clearTimeout(timer);
+        resolve(connected);
+      },
+    });
+    void chrome.tabs.sendMessage(tabId, { type: "connect", name: portName }, { frameId }).catch(() => {
+      if (pendingFillPorts.delete(portName)) {
+        clearTimeout(timer);
+        reject(new Error("the page could not be reached"));
+      }
+    });
+  });
+}
+
 /** The owner pressed the button on this tab. */
 async function ask(tab: chrome.tabs.Tab) {
   const tabId = tab.id;
@@ -118,8 +177,8 @@ async function ask(tab: chrome.tabs.Tab) {
     const frames = await reachable(tabId);
     documents = (await Promise.all(frames.map(async (frameId) => {
       try {
-        const port = chrome.tabs.connect(tabId, { name: `${requestId}-${frameId}`, frameId });
-        return { frameId, port, found: await prepared(port) };
+        const { port, attested } = await connectFrame(tabId, requestId, frameId);
+        return { frameId, port, found: await prepared(port), attested };
       } catch {
         return null;
       }
@@ -138,26 +197,48 @@ async function ask(tab: chrome.tabs.Tab) {
     show(tabId, "problem", "This page cannot be filled.");
     return;
   }
-  if (top.found.origin === "null") {
+  if (top.attested === "null" || top.found.origin === "null") {
     release();
     show(tabId, "problem", "This page is sandboxed by its site and has no origin of its own, so no login can be filled into it.");
     return;
   }
-  if (top.found.origin !== origin) {
+  if (top.attested !== origin || top.found.origin !== origin) {
     release();
     show(tabId, "problem", "The page changed while you asked. Try again.");
     return;
   }
 
   // A card form, when one of the documents asks for the number: each
-  // document with a card's fields, as its own origin, which its script
-  // reports and its page cannot change.
+  // document with a card's fields, verified against the browser-attested
+  // `port.sender` origin.
   const carded = documents
-    .filter((document) => document.found.card.length > 0 && pageOrigin(`${document.found.origin}/`) === document.found.origin)
+    .filter((document): document is Document & { attested: string } =>
+      document.found.card.length > 0
+      && typeof document.attested === "string"
+      && document.attested !== "null"
+      && document.attested === document.found.origin
+      && pageOrigin(`${document.attested}/`) === document.attested)
     .slice(0, MAX_CARD_FRAMES);
   if (carded.some((document) => document.found.card.includes("number"))) {
+    const otherOrigins = new Set(carded.map((document) => document.attested).filter((frameOrigin) => frameOrigin !== origin));
+    if (otherOrigins.size > 1) {
+      release();
+      show(tabId, "problem", "This page has card fields from more than one other site. Nothing was filled.");
+      return;
+    }
+    const seenFields = new Set<CardField>();
+    for (const document of carded) {
+      for (const field of document.found.card) {
+        if (seenFields.has(field)) {
+          release();
+          show(tabId, "problem", "This page has more than one card form. Nothing was filled.");
+          return;
+        }
+        seenFields.add(field);
+      }
+    }
     release(carded.map((document) => document.frameId));
-    const frames: CardFrame[] = carded.map((document) => ({ frameId: document.frameId, documentId: document.found.documentId, origin: document.found.origin, fields: document.found.card }));
+    const frames: CardFrame[] = carded.map((document) => ({ frameId: document.frameId, documentId: document.found.documentId, origin: document.attested, fields: document.found.card }));
     const pages = new Map(carded.map((document) => [document.frameId, document.port]));
     begin(requestId, { kind: "card", request: cardRequest(requestId, tabId, origin, frames), pages, tabId, giveUp: giveUp(requestId) });
     // A document went away: a navigation, a reload, or the tab closing.
@@ -264,6 +345,13 @@ function fromHost(message: unknown) {
       // A request the owner turned down, or let run out, is not asked
       // again at once: the page may not ask over and over.
       if (response.code === "denied" || response.code === "expired") paused.set(request.request.origin, Date.now() + PASSKEY_PAUSE_MS);
+      if (response.code === "no_passkey") {
+        const now = Date.now();
+        const recent = (noPasskeyHits.get(request.request.origin) ?? []).filter((at) => now - at < NO_PASSKEY_WINDOW_MS);
+        recent.push(now);
+        noPasskeyHits.set(request.request.origin, recent);
+        if (recent.length >= NO_PASSKEY_LIMIT) paused.set(request.request.origin, now + PASSKEY_PAUSE_MS);
+      }
       end(response.requestId, response.code === "denied" ? "problem" : "none", response.code === "denied" ? "You turned down the page's request for a passkey." : "", false, outcomeOf(response.code));
       return;
     }
@@ -459,7 +547,15 @@ function tabLeft(tabId: number) {
 
 chrome.action.onClicked.addListener((tab) => { void ask(tab); });
 chrome.tabs.onRemoved.addListener(tabLeft);
-chrome.runtime.onConnect.addListener((port) => { if (port.name === "passkey") servePasskey(port); });
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === "passkey") {
+    servePasskey(port);
+  } else if (port.name.startsWith("fill:")) {
+    acceptFillPort(port);
+  } else {
+    try { port.disconnect(); } catch { /* already closed */ }
+  }
+});
 chrome.permissions.onAdded.addListener(followAccess);
 chrome.permissions.onRemoved.addListener(followAccess);
 chrome.runtime.onInstalled.addListener(followAccess);

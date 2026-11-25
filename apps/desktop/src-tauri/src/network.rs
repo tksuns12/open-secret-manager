@@ -170,7 +170,7 @@ impl Network {
     /// `keystore` seals this device's TLS key.
     pub fn open(vault_path: &Path, keystore: Arc<dyn Keystore>) -> Result<Self, CommandError> {
         let directory = vault_path.parent().unwrap_or(Path::new(".")).to_owned();
-        std::fs::create_dir_all(&directory).map_err(storage_error)?;
+        crate::ensure_private_dir(&directory).map_err(storage_error)?;
         let peers_path = directory.join("peers.sqlite3");
         let peers = PeerStore::open(&peers_path, keystore.clone())
             .map_err(|error| store_error("peers.sqlite3", error))?;
@@ -208,7 +208,7 @@ impl Network {
     /// Records that this device was removed, durably.
     fn mark_removed(&self) {
         self.removed.store(true, Ordering::SeqCst);
-        let _ = std::fs::write(self.directory.join(REMOVED_MARKER), b"");
+        let _ = crate::atomic_write(&self.directory.join(REMOVED_MARKER), b"");
     }
 
     fn is_removed(&self) -> bool {
@@ -340,6 +340,11 @@ fn new_archive(directory: &Path) -> std::io::Result<PathBuf> {
         attempt += 1;
     }
     std::fs::create_dir(&archive)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(archive)
 }
 
@@ -425,9 +430,9 @@ fn move_vault_files(vault_path: &Path, archive: &Path, vault_first: bool) -> std
 pub(crate) fn put_away(vault_path: &Path, reason: PutAway) -> std::io::Result<PathBuf> {
     let directory = vault_path.parent().unwrap_or(Path::new("."));
     let archive = new_archive(directory)?;
-    std::fs::write(
-        directory.join(PUTTING_AWAY),
-        putting_away_note(reason, &archive),
+    crate::atomic_write(
+        &directory.join(PUTTING_AWAY),
+        putting_away_note(reason, &archive).as_bytes(),
     )?;
     finish_put_away(vault_path, reason, &archive)?;
     Ok(archive)
@@ -441,8 +446,8 @@ pub(crate) fn putting_away_note(reason: PutAway, archive: &Path) -> String {
 fn finish_put_away(vault_path: &Path, reason: PutAway, archive: &Path) -> std::io::Result<()> {
     let directory = vault_path.parent().unwrap_or(Path::new("."));
     move_vault_files(vault_path, archive, true)?;
-    std::fs::write(
-        directory.join(reason.note()),
+    crate::atomic_write(
+        &directory.join(reason.note()),
         archive.to_string_lossy().as_bytes(),
     )?;
     std::fs::remove_file(directory.join(PUTTING_AWAY))

@@ -258,9 +258,8 @@ export const bridge: DesktopBridge = {
   },
   async lockWhenIdle(milliseconds) {
     const invoke = native();
-    // The time of the call orders it among the others, which the native
-    // side can take out of order; two in the same millisecond are kept apart.
-    handOverTurn = Math.max(performance.timeOrigin + performance.now(), handOverTurn + 0.001);
+    // Strictly monotonic integer turn ordering out-of-order IPC calls.
+    handOverTurn += 1;
     if (invoke) await invoke("lock_when_idle", { milliseconds, turn: handOverTurn });
     // The preview has no native side: what it would have been handed is
     // kept where the window's tests can read it.
@@ -281,6 +280,11 @@ export const bridge: DesktopBridge = {
     return previewPassword(choice);
   },
   copyGenerated: (value) => nativeOnly("copy_generated", { value }),
+  async copyInvitation(code) {
+    const invoke = native();
+    if (invoke) { await invoke("copy_invitation", { code }); return; }
+    await navigator.clipboard?.writeText(code);
+  },
   async copyTotp(id) {
     const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
     if (invoke) await invoke("copy_totp", { id });

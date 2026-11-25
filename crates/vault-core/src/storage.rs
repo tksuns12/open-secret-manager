@@ -569,17 +569,14 @@ impl Vault {
             return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
         }
         let partial = partial_path(path);
-        match std::fs::remove_file(&partial) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        drop(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&partial)?,
-        );
+        drop(options.open(&partial)?);
         let (built, extra) = match build(&partial) {
             Ok(built) => built,
             Err(error) => {
@@ -2307,14 +2304,14 @@ impl Vault {
             return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
         }
         let partial = partial_path(path);
-        match std::fs::remove_file(&partial) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        let written = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let written = options
             .open(&partial)
             .and_then(|mut file| file.write_all(&encoded).and_then(|_| file.sync_all()))
             .and_then(|()| move_into_place(&partial, path));
@@ -3230,12 +3227,32 @@ fn decode_array<const N: usize>(value: &str) -> Result<[u8; N]> {
         .map_err(|_| Error::InvalidBackup("invalid field length".into()))
 }
 
-/// Where a new file for `path` is written before it is moved there.
+/// Where a new file for `path` is written before it is moved there: a random
+/// sibling name so `create_new(true)` never collides with or follows a
+/// pre-planted file or symlink.
 fn partial_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".partial");
+    let suffix = hex_encode(&random_array::<8>());
+    name.push(format!(".{suffix}.partial"));
     path.with_file_name(name)
 }
+
+#[cfg(unix)]
+fn restrict_db_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::Permissions::from_mode(0o600);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = PathBuf::from(candidate);
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::set_permissions(&candidate, mode.clone());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_permissions(_path: &Path) {}
 
 /// Moves a finished file to `to`, failing if something is there already,
 /// and makes the move durable.
@@ -3255,12 +3272,14 @@ fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {
+    restrict_db_permissions(path);
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     connection.execute_batch(
         "PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; \
          PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;",
     )?;
+    restrict_db_permissions(path);
     Ok(connection)
 }
 

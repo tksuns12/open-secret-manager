@@ -16,6 +16,17 @@ import { MAX_PASSKEY_OPTIONS } from "./protocol.ts";
   const asking = new Map<string, chrome.runtime.Port>();
   const answer = (id: string, outcome: Outcome) => window.postMessage({ channel: CHANNEL, type: "answer", id, outcome }, origin);
 
+  // Single-use trusted user gesture token in the isolated world so one click
+  // or key press cannot trigger a burst of background passkey queries.
+  const GESTURE_TTL_MS = 5_000;
+  let gestureAt = 0;
+  const markGesture = (event: Event) => {
+    if (event.isTrusted) gestureAt = Date.now();
+  };
+  for (const kind of ["pointerdown", "keydown", "click"] as const) {
+    window.addEventListener(kind, markGesture, { capture: true, passive: true });
+  }
+
   window.addEventListener("message", (event) => {
     // Only the page's own window, not a frame in it, and only to this origin.
     if (event.source !== window || event.origin !== origin) return;
@@ -26,12 +37,21 @@ import { MAX_PASSKEY_OPTIONS } from "./protocol.ts";
     }
     if (!isAsk(message) || asking.has(message.id)) return;
     const { id } = message;
-    // A call the owner did not just make, such as one a page makes as it
-    // loads, is the browser's own.
-    if (!navigator.userActivation?.isActive || message.options.length > MAX_PASSKEY_OPTIONS) {
+    const now = Date.now();
+    const freshGesture = gestureAt > 0 && now - gestureAt <= GESTURE_TTL_MS;
+    // A call the owner did not just make in the visible, focused page is the
+    // browser's own. Consume the gesture so one click serves at most one ask.
+    if (
+      document.visibilityState !== "visible"
+      || !document.hasFocus()
+      || !navigator.userActivation?.isActive
+      || !freshGesture
+      || message.options.length > MAX_PASSKEY_OPTIONS
+    ) {
       answer(id, toBrowser());
       return;
     }
+    gestureAt = 0;
     let port: chrome.runtime.Port;
     try {
       port = chrome.runtime.connect({ name: "passkey" });

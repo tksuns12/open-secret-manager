@@ -113,11 +113,9 @@ pub fn read(vault: &Path) -> Settings {
 
 fn write(vault: &Path, settings: &Settings) -> Result<(), CommandError> {
     let path = file(vault);
-    let partial = path.with_extension("json.partial");
     serde_json::to_vec_pretty(settings)
         .map_err(std::io::Error::from)
-        .and_then(|bytes| std::fs::write(&partial, bytes))
-        .and_then(|()| std::fs::rename(&partial, &path))
+        .and_then(|bytes| crate::atomic_write(&path, &bytes))
         .map_err(|error| CommandError {
             code: "storage",
             message: format!("the settings could not be saved: {error}"),
@@ -132,11 +130,14 @@ pub fn settings(state: tauri::State<'_, AppState>) -> Settings {
 /// Sets how many minutes without activity lock the vault: one of
 /// [`AUTO_LOCK_CHOICES`].
 #[tauri::command]
-pub fn set_auto_lock(
+pub fn set_auto_lock<R: tauri::Runtime>(
     minutes: u32,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle<R>,
 ) -> Result<Settings, CommandError> {
-    set_auto_lock_at(&state.path, minutes)
+    let updated = set_auto_lock_at(&state.path, minutes)?;
+    crate::idle::arm_backstop(&app);
+    Ok(updated)
 }
 
 pub(crate) fn set_auto_lock_at(vault: &Path, minutes: u32) -> Result<Settings, CommandError> {

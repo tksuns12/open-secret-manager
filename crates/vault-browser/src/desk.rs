@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -15,6 +16,12 @@ use osm_vault_core::{
 use tokio::sync::{oneshot, watch};
 
 use crate::broker::{Asked, Broker};
+
+/// Maximum silent `no_passkey` fast fallbacks allowed per origin within
+/// [`NO_PASSKEY_WINDOW`] before consulting the vault is suppressed.
+const NO_PASSKEY_LIMIT: usize = 3;
+const NO_PASSKEY_WINDOW: Duration = Duration::from_secs(60);
+const MAX_NO_PASSKEY_ORIGINS: usize = 256;
 
 /// The time limits of a request.
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +137,52 @@ struct State {
     broker: Broker,
     /// The connection that brought the waiting request.
     answer: Option<(u64, String, Answer)>,
+    /// Recent `no_passkey` fast-fallback timestamps per origin.
+    no_passkey_hits: HashMap<String, VecDeque<Instant>>,
+}
+
+impl State {
+    fn prune_no_passkey(&mut self, origin: &str, now: Instant) {
+        if let Some(hits) = self.no_passkey_hits.get_mut(origin) {
+            while hits
+                .front()
+                .is_some_and(|at| now.saturating_duration_since(*at) >= NO_PASSKEY_WINDOW)
+            {
+                hits.pop_front();
+            }
+            if hits.is_empty() {
+                self.no_passkey_hits.remove(origin);
+            }
+        }
+    }
+
+    fn is_no_passkey_limited(&mut self, origin: &str, now: Instant) -> bool {
+        self.prune_no_passkey(origin, now);
+        self.no_passkey_hits
+            .get(origin)
+            .is_some_and(|hits| hits.len() >= NO_PASSKEY_LIMIT)
+    }
+
+    fn record_no_passkey(&mut self, origin: &str, now: Instant) {
+        self.prune_no_passkey(origin, now);
+        if !self.no_passkey_hits.contains_key(origin)
+            && self.no_passkey_hits.len() >= MAX_NO_PASSKEY_ORIGINS
+        {
+            self.no_passkey_hits.retain(|_, hits| {
+                hits.back()
+                    .is_some_and(|at| now.saturating_duration_since(*at) < NO_PASSKEY_WINDOW)
+            });
+            if self.no_passkey_hits.len() >= MAX_NO_PASSKEY_ORIGINS {
+                if let Some(key) = self.no_passkey_hits.keys().next().cloned() {
+                    self.no_passkey_hits.remove(&key);
+                }
+            }
+        }
+        self.no_passkey_hits
+            .entry(origin.to_owned())
+            .or_default()
+            .push_back(now);
+    }
 }
 
 /// Where a request from the browser waits for the owner.
@@ -150,6 +203,7 @@ impl Desk {
             state: Mutex::new(State {
                 broker: Broker::new(config.decide_within),
                 answer: None,
+                no_passkey_hits: HashMap::new(),
             }),
             changed: watch::Sender::new(0),
             holds: Mutex::new(None),
@@ -252,19 +306,63 @@ impl Desk {
         true
     }
 
+    /// Metadata binding the waiting passkey request: monotonic ticket,
+    /// ceremony, page origin, and validated RP ID. Used across asynchronous
+    /// owner-verification prompts (e.g. Touch ID) so a swapped or replayed
+    /// request cannot consume the approval.
+    pub fn pending_passkey(&self, request_id: &str) -> Option<(u64, Ceremony, String, String)> {
+        let now = Instant::now();
+        let state = self.state();
+        let pending = state
+            .broker
+            .pending(now)
+            .filter(|pending| pending.asked.request_id() == request_id)?;
+        let Asked::Passkey(ceremony, request) = &pending.asked else {
+            return None;
+        };
+        let rp_id = match ceremony {
+            Ceremony::Create => {
+                Registering::from_options(&request.options, Some(&pending.origin))
+                    .ok()?
+                    .rp_id
+            }
+            Ceremony::Get => {
+                Signing::from_options(&request.options, Some(&pending.origin))
+                    .ok()?
+                    .rp_id
+            }
+        };
+        Some((pending.ticket, *ceremony, pending.origin.to_string(), rp_id))
+    }
+
+    /// Whether the request identified by `ticket` is still waiting.
+    pub fn is_pending_ticket(&self, ticket: u64) -> bool {
+        self.state()
+            .broker
+            .pending(Instant::now())
+            .is_some_and(|pending| pending.ticket == ticket)
+    }
+
     /// The waiting passkey's request of `ceremony` with this ID, if it is
-    /// one, and the page's origin.
+    /// one, and the page's origin. When `expected_ticket` and
+    /// `expected_origin` are given, both must match the waiting request.
     fn waiting_passkey(
         &self,
         state: &State,
         request_id: &str,
         wanted: Ceremony,
+        expected_ticket: Option<u64>,
+        expected_origin: Option<&str>,
         now: Instant,
     ) -> Result<(PasskeyRequest, Origin), Refused> {
         let pending = state
             .broker
             .pending(now)
-            .filter(|pending| pending.asked.request_id() == request_id)
+            .filter(|pending| {
+                pending.asked.request_id() == request_id
+                    && expected_ticket.is_none_or(|ticket| pending.ticket == ticket)
+                    && expected_origin.is_none_or(|origin| pending.origin.to_string() == origin)
+            })
             .ok_or(Refused::NotPending)?;
         match &pending.asked {
             Asked::Passkey(ceremony, request) if *ceremony == wanted => {
@@ -289,14 +387,68 @@ impl Desk {
         into: Option<&str>,
         verified: bool,
     ) -> Result<(), Refused> {
+        self.approve_passkey_create_inner(
+            request_id, None, None, None, session, vault, into, verified,
+        )
+    }
+
+    /// As [`Desk::approve_passkey_create`], additionally verifying that the
+    /// waiting request still has the exact `ticket`, `expected_origin`, and
+    /// `expected_rp_id` inspected before an async verification prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn approve_passkey_create_bound(
+        &self,
+        ticket: u64,
+        request_id: &str,
+        expected_origin: &str,
+        expected_rp_id: &str,
+        session: UnlockSession,
+        vault: &mut Vault,
+        into: Option<&str>,
+        verified: bool,
+    ) -> Result<(), Refused> {
+        self.approve_passkey_create_inner(
+            request_id,
+            Some(ticket),
+            Some(expected_origin),
+            Some(expected_rp_id),
+            session,
+            vault,
+            into,
+            verified,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn approve_passkey_create_inner(
+        &self,
+        request_id: &str,
+        expected_ticket: Option<u64>,
+        expected_origin: Option<&str>,
+        expected_rp_id: Option<&str>,
+        session: UnlockSession,
+        vault: &mut Vault,
+        into: Option<&str>,
+        verified: bool,
+    ) -> Result<(), Refused> {
         if vault.unlock_session() != Some(session) {
             return Err(Refused::Locked);
         }
         let now = Instant::now();
         let state = self.state();
-        let (request, origin) = self.waiting_passkey(&state, request_id, Ceremony::Create, now)?;
+        let (request, origin) = self.waiting_passkey(
+            &state,
+            request_id,
+            Ceremony::Create,
+            expected_ticket,
+            expected_origin,
+            now,
+        )?;
         let registering = Registering::from_options(&request.options, Some(&origin))
             .map_err(|_| Refused::NotPending)?;
+        if expected_rp_id.is_some_and(|rp_id| registering.rp_id != rp_id) {
+            return Err(Refused::NotPending);
+        }
         if registering.user_verification == UserVerification::Required && !verified {
             return Err(Refused::NotVerified);
         }
@@ -365,14 +517,78 @@ impl Desk {
         credential_id: &str,
         verified: bool,
     ) -> Result<(), Refused> {
+        self.approve_passkey_get_inner(
+            request_id,
+            None,
+            None,
+            None,
+            session,
+            vault,
+            item_id,
+            credential_id,
+            verified,
+        )
+    }
+
+    /// As [`Desk::approve_passkey_get`], additionally verifying `ticket`,
+    /// `expected_origin`, and `expected_rp_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn approve_passkey_get_bound(
+        &self,
+        ticket: u64,
+        request_id: &str,
+        expected_origin: &str,
+        expected_rp_id: &str,
+        session: UnlockSession,
+        vault: &Vault,
+        item_id: &str,
+        credential_id: &str,
+        verified: bool,
+    ) -> Result<(), Refused> {
+        self.approve_passkey_get_inner(
+            request_id,
+            Some(ticket),
+            Some(expected_origin),
+            Some(expected_rp_id),
+            session,
+            vault,
+            item_id,
+            credential_id,
+            verified,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn approve_passkey_get_inner(
+        &self,
+        request_id: &str,
+        expected_ticket: Option<u64>,
+        expected_origin: Option<&str>,
+        expected_rp_id: Option<&str>,
+        session: UnlockSession,
+        vault: &Vault,
+        item_id: &str,
+        credential_id: &str,
+        verified: bool,
+    ) -> Result<(), Refused> {
         if vault.unlock_session() != Some(session) {
             return Err(Refused::Locked);
         }
         let now = Instant::now();
         let state = self.state();
-        let (request, origin) = self.waiting_passkey(&state, request_id, Ceremony::Get, now)?;
+        let (request, origin) = self.waiting_passkey(
+            &state,
+            request_id,
+            Ceremony::Get,
+            expected_ticket,
+            expected_origin,
+            now,
+        )?;
         let signing = Signing::from_options(&request.options, Some(&origin))
             .map_err(|_| Refused::NotPending)?;
+        if expected_rp_id.is_some_and(|rp_id| signing.rp_id != rp_id) {
+            return Err(Refused::NotPending);
+        }
         if signing.user_verification == UserVerification::Required && !verified {
             return Err(Refused::NotVerified);
         }
@@ -595,17 +811,58 @@ impl Desk {
         asked: Asked,
     ) -> Result<(u64, Instant, oneshot::Receiver<Response>), Failure> {
         let request_id = asked.request_id().to_owned();
-        // A sign-in the vault holds no passkey for is the browser's to answer,
-        // before the owner is asked anything.
-        if let Some(signing) = asked.sign_in() {
-            let holds = self
-                .holds
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if holds
-                .as_ref()
-                .is_some_and(|holds| holds(&signing.rp_id, &signing.allowed) == Some(false))
-            {
+        if !caller.is_allowed() {
+            return Err(Failure::new(&request_id, Refusal::ExtensionNotAllowed));
+        }
+        let origin = match asked.check() {
+            Ok(origin) => origin,
+            Err(Refusal::InvalidMessage) => return Err(Failure::unnamed(Refusal::InvalidMessage)),
+            Err(code) => return Err(Failure::new(&request_id, code)),
+        };
+        let now = Instant::now();
+        // Enforce replay and busy checks before consulting the vault so an
+        // untrusted caller cannot probe passkey presence without a fresh,
+        // allowed, non-busy request.
+        let discoverable_rp_id = {
+            let mut state = self.state();
+            if state.broker.has_seen(&request_id) {
+                return Err(Failure::new(&request_id, Refusal::Replayed));
+            }
+            if asked.started_by_page() && state.broker.pending(now).is_some() {
+                return Err(Failure::new(&request_id, Refusal::Busy));
+            }
+            // Only discoverable sign-ins (empty `allowCredentials`) may
+            // short-circuit to the browser. Never pass `allowCredentials` to
+            // `holds`, preventing batch credential-ID membership probing.
+            asked
+                .sign_in()
+                .filter(|signing| signing.allowed.is_empty())
+                .map(|signing| {
+                    let origin_str = origin.to_string();
+                    let limited = state.is_no_passkey_limited(&origin_str, now);
+                    if limited {
+                        state.broker.remember(&request_id);
+                    }
+                    (signing.rp_id, origin_str, limited)
+                })
+        };
+        if let Some((rp_id, origin_str, limited)) = discoverable_rp_id {
+            if limited {
+                return Err(Failure::new(&request_id, Refusal::NoPasskey));
+            }
+            let holds_none = {
+                let holds = self
+                    .holds
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                holds
+                    .as_ref()
+                    .is_some_and(|holds| holds(&rp_id, &[]) == Some(false))
+            };
+            if holds_none {
+                let mut state = self.state();
+                state.record_no_passkey(&origin_str, Instant::now());
+                state.broker.remember(&request_id);
                 return Err(Failure::new(&request_id, Refusal::NoPasskey));
             }
         }

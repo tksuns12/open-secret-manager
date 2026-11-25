@@ -185,9 +185,57 @@ async fn vault_status(state: tauri::State<'_, AppState>) -> Result<&'static str,
     )
 }
 
+/// Creates `dir` (and parents) and restricts `dir` to owner-only (`0o700`) on Unix.
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Atomically writes `bytes` to `path` via a random sibling file created with
+/// `create_new(true)`, owner-only `0o600` permissions on Unix, `sync_all()`,
+/// and `rename()`, preventing partial reads and symlink-following overwrites.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut suffix_bytes = [0_u8; 8];
+    getrandom::fill(&mut suffix_bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    for byte in suffix_bytes {
+        name.push(format!("{byte:02x}"));
+    }
+    name.push(".tmp");
+    let temp = path.with_file_name(name);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    drop(file);
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
 /// Locks the vault and closes an opened archived copy, which is unlocked
-/// too. Says whether either was open.
+/// too. Clears any secret last copied to the clipboard. Says whether either
+/// was open.
 async fn lock_everything(state: &AppState) -> bool {
+    osm_desktop_session::clear_last_secret();
     let mut vault = state.vault.lock().await;
     let unlocked = vault.as_ref().is_some_and(Vault::is_unlocked);
     if let Some(vault) = vault.as_mut() {
@@ -310,6 +358,14 @@ fn copy_generated(value: String) -> Result<(), CommandError> {
     copy_for_a_while(&Zeroizing::new(value))
 }
 
+/// Copies a one-time pairing invitation code via the OS secret-clipboard path
+/// (excluded from clipboard history/cloud sync, auto-cleared in 30 seconds,
+/// and cleared immediately on lock).
+#[tauri::command]
+fn copy_invitation(code: String) -> Result<(), CommandError> {
+    copy_for_a_while(&Zeroizing::new(code))
+}
+
 #[tauri::command]
 async fn copy_totp(id: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
     let vault = state.vault.lock().await;
@@ -380,7 +436,11 @@ fn copy_for_a_while(secret: &str) -> Result<(), CommandError> {
         message: "operating-system clipboard is unavailable".into(),
     };
     const WHILE: std::time::Duration = std::time::Duration::from_secs(30);
-    if cfg!(any(target_os = "macos", target_os = "linux")) {
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    )) {
         let copied = osm_desktop_session::copy_secret(secret).ok_or_else(unavailable)?;
         std::thread::spawn(move || {
             std::thread::sleep(WHILE);
@@ -960,7 +1020,7 @@ async fn create_vault<R: tauri::Runtime>(
             });
         }
         if let Some(parent) = state.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| CommandError {
+            ensure_private_dir(parent).map_err(|error| CommandError {
                 code: "storage",
                 message: error.to_string(),
             })?;
@@ -973,6 +1033,7 @@ async fn create_vault<R: tauri::Runtime>(
         *vault = Some(created);
         recovery.to_string()
     };
+    idle::arm_backstop(&app);
     network::after_create(&app).await;
     Ok(recovery)
 }
@@ -992,6 +1053,7 @@ async fn unlock_vault<R: tauri::Runtime>(
         })?;
         vault.unlock(&password)?;
     }
+    idle::arm_backstop(&app);
     // The vault is brought in line with committed membership before
     // anything received while locked is verified; then this device catches
     // up with the others.
@@ -1144,6 +1206,7 @@ pub fn run() {
             password_health,
             generate_password,
             copy_generated,
+            copy_invitation,
             copy_totp,
             copy_password,
             copy_field,
@@ -1482,5 +1545,34 @@ mod tests {
         assert!(!budget.take_at(start + std::time::Duration::from_secs(4)));
         assert!(budget.take_at(start + HealthBudget::REFILL_EVERY));
         assert!(!budget.take_at(start + HealthBudget::REFILL_EVERY));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_and_atomic_write_enforce_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let target = private.join("settings.json");
+        atomic_write(&target, b"{\"autoLockMinutes\":5}").unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"{\"autoLockMinutes\":5}");
+
+        let vault_path = private.join("vault.sqlite3");
+        Vault::create(&vault_path, "correct horse battery staple").unwrap();
+        assert_eq!(
+            std::fs::metadata(&vault_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

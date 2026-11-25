@@ -13,7 +13,7 @@ description = "What the desktop app needs from the system that Tauri does not gi
 block2 = "0.6.2"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSDistributedNotificationCenter", "NSOperation", "NSString", "NSArray", "NSRunLoop", "NSDate"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard", "NSPasteboardItem"] }
 # The owner's check for a passkey: Touch ID, or the Mac's password.
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError"] }
 
@@ -25,6 +25,16 @@ objc2-local-authentication = { version = "0.3.2", default-features = false, feat
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 dbus = "0.9.12"
+getrandom = "0.3.4"
+sha2 = "0.10.9"
+zeroize = "1.8.2"
+
+# On Windows, exclude copied secrets from clipboard monitoring, local history,
+# and cloud sync, and clear them by keyed digest on timeout or lock.
+[target.'cfg(target_os = "windows")'.dependencies]
+arboard = "3.6.1"
+getrandom = "0.3.4"
+sha2 = "0.10.9"
 zeroize = "1.8.2"
 
 [[test]]
