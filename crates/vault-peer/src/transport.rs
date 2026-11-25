@@ -602,8 +602,9 @@ impl PreparedJoin {
             &self.identity,
             self.pending.inviter_transport_pin(),
         )?);
-        let (mut stream, relay) = reach_inviter(&self.pending, &self.identity, &connector).await?;
-        let (joiner, reveal) = with_timeout(HANDSHAKE_TIMEOUT, async {
+        let (mut stream, relay, direct_peer_ip) =
+            reach_inviter(&self.pending, &self.identity, &connector).await?;
+        let (mut joiner, reveal) = with_timeout(HANDSHAKE_TIMEOUT, async {
             write_frame(&mut stream, &self.commit).await?;
             let body = read_body(&mut stream, MAX_HANDSHAKE_FRAME_BYTES).await?;
             if body.first().copied() != Some(PAIRING_WIRE_VERSION) {
@@ -613,6 +614,9 @@ impl PreparedJoin {
             self.pending.accept_challenge(&challenge)
         })
         .await??;
+        if let Some(ip) = direct_peer_ip.filter(IpAddr::is_loopback) {
+            joiner.set_connected_loopback(ip);
+        }
         with_timeout(HANDSHAKE_TIMEOUT, write_frame(&mut stream, &reveal)).await??;
         Ok(PairingConnection {
             joiner,
@@ -633,6 +637,7 @@ async fn reach_inviter(
 ) -> Result<(
     tokio_rustls::client::TlsStream<TcpStream>,
     Option<(Relay, mpsc::Receiver<TcpStream>)>,
+    Option<IpAddr>,
 )> {
     // A way counts as reached when the inviter has taken the handshake, not
     // when the connection opened: one the inviter drops is not the one kept.
@@ -643,10 +648,13 @@ async fn reach_inviter(
     };
     let direct = async {
         let (tcp, _) = connect_any(joiner.inviter_addresses()).await?;
-        shake(tcp).await
+        let peer_ip = tcp.peer_addr().ok().map(|addr| addr.ip().to_canonical());
+        let stream = shake(tcp).await?;
+        Ok::<_, Error>((stream, peer_ip))
     };
     let Some(code) = joiner.invitation_relay() else {
-        return Ok((direct.await?, None));
+        let (stream, peer_ip) = direct.await?;
+        return Ok((stream, None, peer_ip));
     };
     let (relay, relayed) = Relay::start(code.clone(), identity.clone());
     let dialer = relay.clone();
@@ -659,17 +667,17 @@ async fn reach_inviter(
         shake(tcp).await
     };
     tokio::pin!(direct, through);
-    let stream = tokio::select! {
+    let (stream, peer_ip) = tokio::select! {
         outcome = &mut direct => match outcome {
-            Ok(stream) => stream,
-            Err(_) => through.await?,
+            Ok((stream, peer_ip)) => (stream, peer_ip),
+            Err(_) => (through.await?, None),
         },
         outcome = &mut through => match outcome {
-            Ok(stream) => stream,
+            Ok(stream) => (stream, None),
             Err(_) => direct.await?,
         },
     };
-    Ok((stream, Some((relay, relayed))))
+    Ok((stream, Some((relay, relayed)), peer_ip))
 }
 
 /// How long the addresses an invitation names have to answer before the

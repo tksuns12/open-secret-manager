@@ -1920,4 +1920,131 @@ fn address_book_rejects_hostnames_link_local_and_loopback_by_default() {
     local.suggest(2, "169.254.169.254:80");
     local.suggest(2, "metadata.internal:80");
     assert_eq!(local.all(2), ["127.0.0.1:47820", "[::1]:47820"]);
+
+    // Session-scoped inviter loopback is usable in memory but never persisted
+    // to SQLite and never relaxes suggest/claim/observe on a default book.
+    book.suggest_inviter_loopback(3, "127.0.0.1:47820");
+    book.suggest_inviter_loopback(3, "169.254.169.254:80");
+    book.suggest_inviter_loopback(3, "192.0.2.10:47820");
+    assert_eq!(book.all(3), ["127.0.0.1:47820"]);
+    book.suggest(3, "127.0.0.1:6379");
+    assert_eq!(book.all(3), ["127.0.0.1:47820"]);
+    drop(book);
+    let reopened = AddressBook::open(&path).unwrap();
+    assert!(reopened.all(3).is_empty());
+    assert_eq!(
+        reopened.all(1),
+        ["192.0.2.10:47820", "[2001:db8::10]:47820"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_loopback_pairing_reaches_inviter_on_default_address_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Member::found(&dir).await;
+    a.vault.put(login("Local", "local-secret")).unwrap();
+    let a_port = a.host.endpoint.listen_port().unwrap();
+
+    // B opens a production AddressBook (allow_loopback = false) and pairs
+    // directly over 127.0.0.1, as Android/iOS do over adb reverse / simulator.
+    let listener = PairingListener::bind("127.0.0.1:0", &mut a.host.peers)
+        .await
+        .unwrap();
+    let inv_addr = listener.local_addr().unwrap().to_string();
+    let invitation = invite(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.host.peers,
+        vec![inv_addr, "[::1]:6379".to_owned()],
+        NOW,
+        300,
+    )
+    .unwrap();
+    listener.expect_token(invitation.token_digest());
+
+    let b_peers_path = dir.path().join("b-peers.db");
+    let mut b_peers = PeerStore::open(&b_peers_path, Arc::new(crate::NoKeystore)).unwrap();
+    let prepared = crate::PreparedJoin::new(invitation, &mut b_peers, NOW).unwrap();
+    let connect = tokio::spawn(prepared.connect());
+
+    let incoming = listener.next_request().await.unwrap();
+    let challenged = incoming
+        .review(
+            &a.vault,
+            &a.invitations,
+            &mut a.host.peers,
+            Voting::WithoutVote,
+            None,
+            NOW,
+        )
+        .unwrap();
+    let pending = challenged.complete().await.unwrap();
+    let connection = connect.await.unwrap().unwrap();
+    assert_eq!(pending.sas(), connection.sas());
+
+    let b_addresses = AddressBook::open(&b_peers_path).unwrap();
+    let b_endpoint = MemberEndpoint::new(
+        connection.joiner().vault_id(),
+        &mut b_peers,
+        b_addresses.clone(),
+    )
+    .unwrap();
+    let b_id = connection.joiner().control_device();
+    let b_node = start_node(
+        dir.path().join("b-control.db"),
+        b_id,
+        &b_endpoint,
+        NodeOptions::default(),
+    )
+    .await
+    .unwrap();
+    let b_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    b_endpoint.set_listen_port(b_listener.local_addr().unwrap().port());
+    let b_server = tokio::spawn(serve_members(
+        b_listener,
+        b_endpoint.clone(),
+        b_node.clone(),
+        None,
+    ));
+
+    let (proposal, approved) = pending
+        .approve_enrollment(
+            &a.vault,
+            &mut a.invitations,
+            a.host.endpoint.roster(),
+            Voting::WithoutVote,
+            Some(a_port),
+            NOW,
+        )
+        .unwrap();
+    control::submit(&a.host.node, proposal).await.unwrap();
+    approved.send().await.unwrap();
+
+    let (joiner, grant) = connection.receive_enrollment().await.unwrap();
+    b_endpoint.introduce_grant(&joiner, &grant).unwrap();
+    // Only the connected loopback IP (127.0.0.1) is recorded, NOT [::1]:6379.
+    assert_eq!(b_addresses.all(a.host.id), [format!("127.0.0.1:{a_port}")]);
+    // Peer hints/claims on the same production AddressBook still refuse loopback.
+    b_addresses.suggest(a.host.id, "127.0.0.1:6379");
+    b_addresses.claim(a.host.id, &["127.0.0.1:6379".to_owned()]);
+    assert_eq!(b_addresses.all(a.host.id), [format!("127.0.0.1:{a_port}")]);
+
+    // Announcing to A succeeds over 127.0.0.1 and A brings B up to date.
+    assert_eq!(b_endpoint.announce_all().await, 1);
+    until("B settles as a member", || {
+        a.host.state().is_settled_member(b_id)
+    })
+    .await;
+    for request in control::grant_requests(&a.vault, &a.host.state()).unwrap() {
+        control::submit(&a.host.node, request).await.unwrap();
+    }
+    until("B holds every key", || joiner.enrolled(&b_node.state())).await;
+
+    b_server.abort();
+    let _ = b_node.shutdown().await;
+    // Reopening from disk does not persist loopback entries.
+    assert!(AddressBook::open(&b_peers_path)
+        .unwrap()
+        .all(a.host.id)
+        .is_empty());
 }

@@ -745,6 +745,7 @@ impl PendingJoiner {
                 transport_pin: self.transport_pin,
                 transcript,
                 voting,
+                connected_loopback: None,
             },
             reveal,
         ))
@@ -765,6 +766,11 @@ pub struct Joiner {
     transport_pin: [u8; 32],
     transcript: [u8; 32],
     voting: Voting,
+    /// Set only when pairing directly reached the inviter over a loopback IP
+    /// (for example USB `adb reverse` or a local simulator tunnel), so
+    /// [`crate::MemberEndpoint::introduce_grant`] can dial that exact loopback
+    /// IP in memory without relaxing peer address validation globally.
+    connected_loopback: Option<std::net::IpAddr>,
 }
 
 impl Joiner {
@@ -898,6 +904,16 @@ impl Joiner {
 
     pub(crate) fn inviter_device_id(&self) -> [u8; 16] {
         self.invitation.body.inviter_device_id
+    }
+
+    pub(crate) fn set_connected_loopback(&mut self, ip: std::net::IpAddr) {
+        if ip.is_loopback() {
+            self.connected_loopback = Some(ip);
+        }
+    }
+
+    pub(crate) fn connected_loopback(&self) -> Option<std::net::IpAddr> {
+        self.connected_loopback
     }
 
     /// The relay the invitation named, if it named one.

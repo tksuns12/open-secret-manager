@@ -332,7 +332,11 @@ impl Book {
                 "DELETE FROM device_addresses WHERE device_id = ?1",
                 [id.as_slice()],
             )?;
-            for (position, known) in list.iter().enumerate() {
+            for (position, known) in list
+                .iter()
+                .filter(|known| valid_peer_address(&known.address, self.allow_loopback))
+                .enumerate()
+            {
                 transaction.execute(
                     "INSERT INTO device_addresses(device_id, position, address) VALUES (?1, ?2, ?3)",
                     params![id.as_slice(), position as i64, known.address],
@@ -483,6 +487,24 @@ impl AddressBook {
             if !valid_peer_address(address, book.allow_loopback) {
                 return;
             }
+            book.add(device, address);
+        }
+    }
+
+    /// Records an inviter's loopback member address in memory after pairing
+    /// directly authenticated that inviter on that exact loopback IP (such as
+    /// via USB `adb reverse` or a local simulator tunnel). Persisted storage
+    /// still omits loopback addresses unless `allow_loopback` is enabled, and
+    /// `suggest`, `claim`, and `observe` continue rejecting loopback.
+    pub(crate) fn suggest_inviter_loopback(&self, device: DeviceId, address: &str) {
+        let is_valid_loopback = valid_peer_address(address, true)
+            && address
+                .parse::<SocketAddr>()
+                .is_ok_and(|socket| socket.ip().to_canonical().is_loopback());
+        if !is_valid_loopback {
+            return;
+        }
+        if let Ok(mut book) = self.book.lock() {
             book.add(device, address);
         }
     }
@@ -979,8 +1001,19 @@ impl MemberEndpoint {
     pub fn introduce_grant(&self, joiner: &Joiner, grant: &EnrollmentGrant) -> Result<()> {
         self.introduce(&joiner.members(grant)?)?;
         let inviter = device_id_from_bytes(joiner.inviter_device_id());
+        let connected_loopback = joiner.connected_loopback();
         for address in joiner.inviter_member_addresses(grant) {
-            self.inner.addresses.suggest(inviter, &address);
+            if connected_loopback.is_some_and(|ip| {
+                address
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|socket| socket.port() != 0 && socket.ip().to_canonical() == ip)
+            }) {
+                self.inner
+                    .addresses
+                    .suggest_inviter_loopback(inviter, &address);
+            } else {
+                self.inner.addresses.suggest(inviter, &address);
+            }
         }
         Ok(())
     }
