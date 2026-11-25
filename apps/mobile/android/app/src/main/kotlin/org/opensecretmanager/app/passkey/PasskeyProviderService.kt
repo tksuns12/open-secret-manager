@@ -21,8 +21,10 @@ import androidx.credentials.provider.CredentialProviderService
 import androidx.credentials.provider.ProviderClearCredentialStateRequest
 import androidx.credentials.provider.PublicKeyCredentialEntry
 import java.util.concurrent.atomic.AtomicInteger
+import org.json.JSONObject
 import org.opensecretmanager.app.R
 import org.opensecretmanager.app.VaultApp
+import org.opensecretmanager.app.autofill.Requester
 import org.opensecretmanager.vault.PasskeySignIn
 import org.opensecretmanager.vault.checkPasskeyRequest
 
@@ -109,9 +111,16 @@ internal object PasskeyEntries {
     /** The requests for a passkey this app answers, each with who asks. */
     fun asked(context: Context, request: BeginGetCredentialRequest): List<Pair<BeginGetPublicKeyCredentialOption, PasskeyAsker>> {
         val info = request.callingAppInfo ?: return emptyList()
+        val apps = PasskeyApps(context)
         return request.beginGetCredentialOptions.filterIsInstance<BeginGetPublicKeyCredentialOption>().mapNotNull { option ->
-            PasskeyAsker.of(context, info, option.clientDataHash)
-                ?.takeIf { runCatching { checkPasskeyRequest(option.requestJson, it.caller, false) }.isSuccess }
+            val asker = PasskeyAsker.of(context, info, option.clientDataHash) ?: return@mapNotNull null
+            if (asker.requester is Requester.App) {
+                val rpId = runCatching { JSONObject(option.requestJson).optString("rpId") }.getOrNull()?.trim().orEmpty()
+                if (rpId.isEmpty() || (!apps.allowed(asker.requester, rpId) && !asker.linkedTo(rpId))) {
+                    return@mapNotNull null
+                }
+            }
+            asker.takeIf { runCatching { checkPasskeyRequest(option.requestJson, it.caller, false) }.isSuccess }
                 ?.let { option to it }
         }
     }
@@ -121,21 +130,30 @@ internal object PasskeyEntries {
         context: Context,
         asked: List<Pair<BeginGetPublicKeyCredentialOption, PasskeyAsker>>,
         found: List<PasskeySignIn?>,
-    ): BeginGetCredentialResponse = BeginGetCredentialResponse(
-        credentialEntries = asked.zip(found).flatMap { (request, signIn) ->
-            signIn?.passkeys.orEmpty().map { passkey ->
-                val intent = Intent(context, PasskeyActivity::class.java)
-                    .setAction(PasskeyActivity.GET)
-                    .putExtra(PasskeyActivity.ITEM, passkey.itemId)
-                    .putExtra(PasskeyActivity.CREDENTIAL, passkey.credentialId)
-                PublicKeyCredentialEntry(
-                    context,
-                    passkey.userName.ifEmpty { passkey.title },
-                    pending(context, intent),
-                    request.first,
-                    displayName = passkey.userDisplayName.takeIf { it.isNotEmpty() && it != passkey.userName },
-                )
-            }
-        },
-    )
+    ): BeginGetCredentialResponse {
+        val apps = PasskeyApps(context)
+        return BeginGetCredentialResponse(
+            credentialEntries = asked.zip(found).flatMap { (request, signIn) ->
+                val asker = request.second
+                val app = asker.requester as? Requester.App
+                if (signIn == null || (app != null && !apps.allowed(app, signIn.rpId) && !asker.linkedTo(signIn.rpId))) {
+                    emptyList()
+                } else {
+                    signIn.passkeys.map { passkey ->
+                        val intent = Intent(context, PasskeyActivity::class.java)
+                            .setAction(PasskeyActivity.GET)
+                            .putExtra(PasskeyActivity.ITEM, passkey.itemId)
+                            .putExtra(PasskeyActivity.CREDENTIAL, passkey.credentialId)
+                        PublicKeyCredentialEntry(
+                            context,
+                            passkey.userName.ifEmpty { passkey.title },
+                            pending(context, intent),
+                            request.first,
+                            displayName = passkey.userDisplayName.takeIf { it.isNotEmpty() && it != passkey.userName },
+                        )
+                    }
+                }
+            },
+        )
+    }
 }

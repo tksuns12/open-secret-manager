@@ -41,12 +41,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
-import androidx.fragment.app.FragmentActivity
 import org.opensecretmanager.app.BiometricUnlock
-import org.opensecretmanager.app.BuildConfig
 import org.opensecretmanager.app.Busy
 import org.opensecretmanager.app.FingerprintPrompts
 import org.opensecretmanager.app.Message
+import org.opensecretmanager.app.ProtectedActivity
 import org.opensecretmanager.app.Screen
 import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
@@ -67,14 +66,11 @@ import org.opensecretmanager.vault.ItemSummary
  * this screen showing, or once unlocked if the vault locked meanwhile.
  * Once this screen goes, the vault locks as when the app is left.
  */
-class CardFillActivity : FragmentActivity() {
+class CardFillActivity : ProtectedActivity() {
     private lateinit var form: CardForm
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!BuildConfig.ALLOW_SCREENSHOTS) {
-            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        }
         setResult(RESULT_CANCELED)
         form = intent.extras?.let(CardForm::fromBundle) ?: return finish()
         val session = (application as VaultApp).session

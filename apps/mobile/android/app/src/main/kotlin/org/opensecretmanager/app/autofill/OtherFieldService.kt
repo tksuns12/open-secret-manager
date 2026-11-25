@@ -43,6 +43,8 @@ class OtherFieldService : AccessibilityService() {
     private class Pending(val packageName: String, val password: Boolean, val value: String, val filled: String, val deadline: Long) {
         /** When the app's window was first seen in front. */
         var inFront = 0L
+        /** Whether the target app was already observed in the foreground. */
+        var seenInFront = false
     }
 
     override fun onServiceConnected() {
@@ -64,35 +66,51 @@ class OtherFieldService : AccessibilityService() {
     override fun onInterrupt() {}
 
     private fun expect(next: Pending) {
-        handler.removeCallbacksAndMessages(null)
-        pending = next
-        handler.post(::look)
+        handler.post {
+            handler.removeCallbacksAndMessages(null)
+            pending = next
+            look()
+        }
+    }
+
+    private fun clearPending() {
+        handler.post {
+            handler.removeCallbacksAndMessages(null)
+            pending = null
+        }
     }
 
     private fun look() {
         val wanted = pending ?: return
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
         if (now > wanted.deadline) {
             pending = null
             return
         }
         // The fill screen goes first, and the app that asked comes back.
         val root = rootInActiveWindow
-        if (root != null && root.packageName?.toString() == wanted.packageName) {
+        val activePackage = root?.packageName?.toString()
+        if (root != null && activePackage == wanted.packageName) {
             if (wanted.inFront == 0L) wanted.inFront = now
+            wanted.seenInFront = true
             if (fill(root, wanted, settled = now - wanted.inFront >= SETTLE_MILLIS)) {
                 pending = null
                 return
             }
+        } else if (wanted.seenInFront && activePackage != null && activePackage != wanted.packageName) {
+            // The target app left the foreground: cancel immediately so the
+            // secret is never injected if the user switches back later.
+            pending = null
+            return
         }
         handler.postDelayed(::look, POLL_MILLIS)
     }
 
     /**
-     * Fills the other field, once the system has filled the one that asked,
-     * or after a while if what it shows cannot be told: setting another
-     * field first can move the page's focus, and the system's fill would
-     * then be refused. False if not filled yet.
+     * Fills the other field once the companion field that asked is confirmed
+     * filled. Password injection never falls back to a blind time delay: the
+     * companion username filled by the system must be present in the same
+     * window. False if not filled yet.
      */
     private fun fill(root: AccessibilityNodeInfo, wanted: Pending, settled: Boolean): Boolean {
         val fields = fields(root)
@@ -103,7 +121,7 @@ class OtherFieldService : AccessibilityService() {
         val ready: Boolean
         if (wanted.password) {
             target = password
-            ready = settled || fields.any { !it.isPassword && shown(it) == wanted.filled }
+            ready = wanted.filled.isNotEmpty() && fields.any { !it.isPassword && shown(it) == wanted.filled }
         } else {
             // The field nearest before the password that is named a username,
             // or else the one just before it, as for a screen's fields ([Form]).
@@ -168,7 +186,12 @@ class OtherFieldService : AccessibilityService() {
          */
         fun fillAfter(packageName: String, password: Boolean, value: String, filled: String) {
             val service = running?.get() ?: return
-            service.expect(Pending(packageName, password, value, filled, SystemClock.uptimeMillis() + DEADLINE_MILLIS))
+            service.expect(Pending(packageName, password, value, filled, SystemClock.elapsedRealtime() + DEADLINE_MILLIS))
+        }
+
+        /** Discards any pending accessibility fill immediately (thread-safe). */
+        fun cancel() {
+            running?.get()?.clearPending()
         }
     }
 }

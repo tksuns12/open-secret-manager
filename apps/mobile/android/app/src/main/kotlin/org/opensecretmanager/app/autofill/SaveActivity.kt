@@ -41,12 +41,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
-import androidx.fragment.app.FragmentActivity
 import org.opensecretmanager.app.BiometricUnlock
-import org.opensecretmanager.app.BuildConfig
 import org.opensecretmanager.app.Busy
 import org.opensecretmanager.app.FingerprintPrompts
 import org.opensecretmanager.app.Message
+import org.opensecretmanager.app.ProtectedActivity
 import org.opensecretmanager.app.Screen
 import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
@@ -62,14 +61,11 @@ import org.opensecretmanager.vault.SaveCandidate
  * its origin; one for an app, for that app. Once this screen goes, the vault
  * locks as when the app is left.
  */
-class SaveActivity : FragmentActivity() {
+class SaveActivity : ProtectedActivity() {
     private var id = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!BuildConfig.ALLOW_SCREENSHOTS) {
-            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        }
         id = intent.getIntExtra(SAVE, 0)
         val save = PendingSave.open(id)
         // Android can start this screen late, once the form's app is opened

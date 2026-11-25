@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Unlocking with a fingerprint or the face, if the owner turns it on. -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- Hide non-system overlay windows above vault, autofill, and passkey screens (API 31+). -->
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
     <!-- Only to scan the QR code of an invitation, asked for when the owner
          chooses to; a phone without a camera pastes the invitation. -->
     <uses-permission android:name="android.permission.CAMERA" />

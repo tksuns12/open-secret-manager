@@ -26,8 +26,11 @@ internal class PasskeyAsker(
     /** For an app, the sites Android verified name it as theirs ([LinkedSites]). */
     val linkedSites: Set<String>,
 ) {
-    /** Whether Android verified that [rpId], or a site under it, names this app as its own. */
-    fun linkedTo(rpId: String) = linkedSites.any { it == rpId || it.endsWith(".$rpId") }
+    /** Whether Android verified that [rpId] itself (exact host match) names this app as its own. */
+    fun linkedTo(rpId: String): Boolean {
+        val norm = rpId.lowercase()
+        return norm.isNotEmpty() && linkedSites.any { it == norm }
+    }
 
     companion object {
         /**
@@ -57,7 +60,7 @@ internal class PasskeyAsker(
             return PasskeyAsker(
                 Requester.App(info.packageName, label, sha256(original.toByteArray()).joinToString("") { "%02X".format(it) }, null),
                 PasskeyCaller.App(sha256(current.toByteArray())),
-                LinkedSites.of(context, info.packageName),
+                LinkedSites.exactOf(context, info.packageName),
             )
         }
 
@@ -80,9 +83,11 @@ internal class PasskeyApps(context: Context) {
 
     private fun key(app: Requester.App) = "${app.packageName}:${app.certificate}"
 
-    fun allowed(app: Requester.App, rpId: String): Boolean = rpId in preferences.getStringSet(key(app), emptySet()).orEmpty()
+    fun allowed(app: Requester.App, rpId: String): Boolean =
+        rpId.lowercase() in preferences.getStringSet(key(app), emptySet()).orEmpty()
 
     fun allow(app: Requester.App, rpId: String) {
-        preferences.edit().putStringSet(key(app), preferences.getStringSet(key(app), emptySet()).orEmpty() + rpId).apply()
+        val norm = rpId.lowercase()
+        preferences.edit().putStringSet(key(app), preferences.getStringSet(key(app), emptySet()).orEmpty() + norm).apply()
     }
 }

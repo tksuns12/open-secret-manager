@@ -15,6 +15,7 @@ class FingerprintPrompts(
     private val biometric: BiometricUnlock,
     private val session: VaultSession,
     private val asker: String? = null,
+    private val onUnlocked: (() -> Unit)? = null,
 ) {
     /** A prompt is shown: another would cancel it. */
     private var prompting = false
@@ -59,7 +60,7 @@ class FingerprintPrompts(
             session.notify("Unlock with the password once: the fingerprints on this phone changed")
             return
         }
-        prompt("Unlock the vault", asker, "Use the password", cipher) { session.unlock(biometric.read(it)) }
+        prompt("Unlock the vault", asker, "Use the password", cipher) { session.unlock(biometric.read(it), onUnlocked) }
     }
 
     /** After an unlock with [password]: keeps it for the next unlock, once a fingerprint allows. */

@@ -27,4 +27,20 @@ object LinkedSites {
             .filter { '.' in it }
             .toSet()
     }
+
+    /**
+     * Exact verified hosts for passkey authorization: preserves `www.` and
+     * drops wildcard entries (`*.example.com`) so a subdomain or wildcard app
+     * link cannot silently authorize a parent or sibling RP ID.
+     */
+    fun exactOf(context: Context, packageName: String): Set<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptySet()
+        val manager = context.getSystemService(DomainVerificationManager::class.java) ?: return emptySet()
+        val state = runCatching { manager.getDomainVerificationUserState(packageName) }.getOrNull() ?: return emptySet()
+        return state.hostToStateMap
+            .filterValues { it == DomainVerificationUserState.DOMAIN_STATE_VERIFIED }
+            .keys.map { it.lowercase() }
+            .filter { !it.startsWith("*.") && '.' in it }
+            .toSet()
+    }
 }

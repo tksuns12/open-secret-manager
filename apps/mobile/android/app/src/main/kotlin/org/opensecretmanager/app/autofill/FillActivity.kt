@@ -47,12 +47,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
-import androidx.fragment.app.FragmentActivity
 import org.opensecretmanager.app.BiometricUnlock
-import org.opensecretmanager.app.BuildConfig
 import org.opensecretmanager.app.Busy
 import org.opensecretmanager.app.FingerprintPrompts
 import org.opensecretmanager.app.Message
+import org.opensecretmanager.app.ProtectedActivity
 import org.opensecretmanager.app.Screen
 import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
@@ -79,15 +78,12 @@ import org.opensecretmanager.vault.Offer
  * app that told of the username alone, or the password alone, gets the
  * other through [OtherFieldService], if the owner turned it on.
  */
-class FillActivity : FragmentActivity() {
+class FillActivity : ProtectedActivity() {
     private lateinit var form: Form
     private var requester: Requester? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!BuildConfig.ALLOW_SCREENSHOTS) {
-            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        }
         setResult(RESULT_CANCELED)
         form = intent.extras?.let(Form::fromBundle) ?: return finish()
         val session = (application as VaultApp).session
@@ -131,7 +127,6 @@ class FillActivity : FragmentActivity() {
 
     /** Hands what was chosen to the form that asked, which fills it at once. */
     private fun finishWith(credentials: FillCredentials?, code: String?) {
-        credentials?.let(::fillOther)
         val values = buildList {
             credentials?.let { login ->
                 // An empty username leaves what the owner typed there alone.
@@ -141,8 +136,9 @@ class FillActivity : FragmentActivity() {
             code?.let { value -> form.oneTimeCode?.let { add(it to value) } }
         }
         // A login with no username, for a field that asks for the username
-        // alone: nothing to fill.
+        // alone: nothing to fill — and do not arm OtherFieldService either.
         if (values.isEmpty()) return finish()
+        credentials?.let(::fillOther)
         val presentation = entry(this, getString(org.opensecretmanager.app.R.string.app_name), credentials?.username)
         @Suppress("DEPRECATION")
         val dataset = Dataset.Builder(presentation).apply {
@@ -160,9 +156,14 @@ class FillActivity : FragmentActivity() {
      * can be another site's before the other field is filled.
      */
     private fun fillOther(login: FillCredentials) {
-        if (!form.page || requester !is Requester.App || form.oneTimeCode != null || opensAnyAddress(form.packageName)) return
+        val app = requester as? Requester.App ?: return
+        if (!form.page || form.oneTimeCode != null || opensAnyAddress(form.packageName)) return
+        // Only fill over HTTPS web pages with an identified domain, and only
+        // inject the password when a non-empty username was filled into the
+        // companion field so OtherFieldService can verify it.
+        if (app.claimedDomain == null || !form.webScheme.equals("https", ignoreCase = true)) return
         when {
-            form.username != null && form.password == null && login.password.isNotEmpty() ->
+            form.username != null && form.password == null && login.username.isNotEmpty() && login.password.isNotEmpty() ->
                 OtherFieldService.fillAfter(form.packageName, password = true, value = login.password, filled = login.username)
             form.password != null && form.username == null && login.username.isNotEmpty() ->
                 OtherFieldService.fillAfter(form.packageName, password = false, value = login.username, filled = login.password)

@@ -64,21 +64,25 @@ sealed interface Requester {
         /** Packages trusted as browsers in tests only, whatever their certificate. */
         internal val trustedForTests = mutableSetOf<String>()
 
+        @Volatile private var trustedBrowsers: Map<String, Set<String>>? = null
+
         fun of(context: Context, form: Form): Requester? = of(context, form.packageName, form.webDomain, form.webScheme)
 
         fun of(context: Context, form: CardForm): Requester? = of(context, form.packageName, form.webDomain, form.webScheme)
 
-        private fun of(context: Context, packageName: String, webDomain: String?, webScheme: String?): Requester? {
+        internal fun of(context: Context, packageName: String, webDomain: String?, webScheme: String?): Requester? {
             val certificates = certificates(context, packageName)
             val domain = webDomain?.takeIf { it.isNotBlank() }
             val label = runCatching {
                 val manager = context.packageManager
                 manager.getApplicationLabel(manager.getApplicationInfo(packageName, 0)).toString()
             }.getOrDefault(packageName)
-            // Pages over https only, as on the desktop and on iOS: a trusted
-            // browser's page over http is filled, saved, and offered nothing.
-            if (domain != null && trusts(context, packageName, certificates)) {
-                return if (webScheme == "https") Web("https://${domain.lowercase()}", packageName, label) else null
+            // Branch on trusted browsers FIRST: a trusted browser without a
+            // valid https webDomain (chrome://, about:blank, file://, http://,
+            // or a missing webDomain) must NEVER fall through to Requester.App.
+            if (trusts(context, packageName, certificates)) {
+                if (domain == null || !webScheme.equals("https", ignoreCase = true)) return null
+                return Web("https://${domain.lowercase()}", packageName, label)
             }
             // The original certificate, which stays first in its history when
             // the app moves to a new one: the app keeps its identity here.
@@ -86,17 +90,26 @@ sealed interface Requester {
             return App(packageName, label, certificate, domain?.lowercase())
         }
 
+        private fun trustedMap(context: Context): Map<String, Set<String>> =
+            trustedBrowsers ?: synchronized(this) {
+                trustedBrowsers ?: run {
+                    val list = context.resources.openRawResource(R.raw.trusted_browsers).bufferedReader().use { JSONObject(it.readText()) }
+                    val apps = list.getJSONArray("apps")
+                    buildMap {
+                        for (index in 0 until apps.length()) {
+                            val app = apps.getJSONObject(index)
+                            val pkg = app.getString("package")
+                            val hashes = app.getJSONArray("sha256")
+                            put(pkg, (0 until hashes.length()).map { hashes.getString(it) }.toSet())
+                        }
+                    }.also { trustedBrowsers = it }
+                }
+            }
+
         private fun trusts(context: Context, packageName: String, certificates: Set<String>): Boolean {
             if (packageName in trustedForTests) return true
-            val list = context.resources.openRawResource(R.raw.trusted_browsers).bufferedReader().use { JSONObject(it.readText()) }
-            val apps = list.getJSONArray("apps")
-            for (index in 0 until apps.length()) {
-                val app = apps.getJSONObject(index)
-                if (app.getString("package") != packageName) continue
-                val trusted = app.getJSONArray("sha256")
-                return (0 until trusted.length()).any { trusted.getString(it) in certificates }
-            }
-            return false
+            val trusted = trustedMap(context)[packageName] ?: return false
+            return certificates.any { it in trusted }
         }
 
         /**

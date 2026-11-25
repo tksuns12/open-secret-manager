@@ -1199,14 +1199,16 @@ class AutofillTest {
         // A page's, its password the current one.
         openAndFind(OFFER, "WebLoginActivity", "https://mail.example.test")
         assertNull(device.findObject(MAKE))
+        // A sign-up whose two password fields say nothing is known by them.
+        openAndFind(MAKE, "WebLoginActivity", "https://new.example.test", extras = " --es page signup-plain")
+        // Native app forms: not a trusted browser (a trusted browser without an https webDomain is refused).
+        Requester.trustedForTests.clear()
         // An app's, with one password field.
         openAndFind(OFFER, "NativeLoginActivity")
         assertNull(device.findObject(MAKE))
         // An ID typed as a password shown as typed, before the password.
         openAndFind(OFFER, "NamedLoginActivity", field = "login_id", extras = " --es form shown")
         assertNull(device.findObject(MAKE))
-        // A sign-up whose two password fields say nothing is known by them.
-        openAndFind(MAKE, "WebLoginActivity", "https://new.example.test", extras = " --es page signup-plain")
     }
 
     /** The code of RFC 6238 for a base32 [secret] at [unixTime], as the shared code makes it. */

@@ -45,14 +45,13 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
-import androidx.fragment.app.FragmentActivity
 import org.opensecretmanager.app.BiometricUnlock
-import org.opensecretmanager.app.BuildConfig
 import org.opensecretmanager.app.Busy
 import org.opensecretmanager.app.FingerprintPrompts
 import org.opensecretmanager.app.Generator
 import org.opensecretmanager.app.GeneratorOptions
 import org.opensecretmanager.app.Message
+import org.opensecretmanager.app.ProtectedActivity
 import org.opensecretmanager.app.R
 import org.opensecretmanager.app.Screen
 import org.opensecretmanager.app.Unlock
@@ -73,14 +72,11 @@ import org.opensecretmanager.vault.generatePassword
  * Then the form's new password fields get it, and its username field the
  * username, if one is given here.
  */
-class GenerateActivity : FragmentActivity() {
+class GenerateActivity : ProtectedActivity() {
     private lateinit var form: Form
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!BuildConfig.ALLOW_SCREENSHOTS) {
-            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        }
         setResult(RESULT_CANCELED)
         form = intent.extras?.let(Form::fromBundle)?.takeIf { it.newPasswords.isNotEmpty() } ?: return finish()
         val session = (application as VaultApp).session

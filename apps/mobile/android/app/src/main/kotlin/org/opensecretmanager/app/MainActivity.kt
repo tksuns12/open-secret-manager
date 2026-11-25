@@ -111,19 +111,13 @@ import org.opensecretmanager.vault.SyncState
 import org.opensecretmanager.vault.SyncStatus
 import org.opensecretmanager.vault.checkCardNumber
 
-class MainActivity : FragmentActivity() {
+class MainActivity : ProtectedActivity() {
     private lateinit var biometric: BiometricUnlock
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Status and navigation bars drawn to suit the theme, light or dark.
         enableEdgeToEdge()
-        // Nothing of the vault in screenshots, screen recordings, or the
-        // preview of recent apps. Only a debug build made for reviewing the
-        // screens leaves this out (see app/build.gradle.kts).
-        if (!BuildConfig.ALLOW_SCREENSHOTS) {
-            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        }
         val session = (application as VaultApp).session
         biometric = BiometricUnlock(this)
         val prompts = FingerprintPrompts(this, biometric, session)
@@ -492,6 +486,7 @@ internal fun Unlock(
     biometric: BiometricUnlock,
     onUnlockWithBiometric: () -> Unit,
     onRememberWithBiometric: (String) -> Unit,
+    onUnlocked: () -> Unit = {},
 ) {
     var password by remember { mutableStateOf("") }
     var keepForFingerprint by remember { mutableStateOf(false) }
@@ -529,7 +524,10 @@ internal fun Unlock(
             onClick = {
                 val typed = password
                 password = ""
-                session.unlock(typed, onUnlocked = if (keepForFingerprint) ({ onRememberWithBiometric(typed) }) else null)
+                session.unlock(typed) {
+                    onUnlocked()
+                    if (keepForFingerprint) onRememberWithBiometric(typed)
+                }
             },
             enabled = password.isNotEmpty() && state.busy == null,
             modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("unlock"),

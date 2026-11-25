@@ -8,6 +8,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,11 +24,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.opensecretmanager.app.autofill.EarlierAppLogins
+import org.opensecretmanager.app.autofill.OtherFieldService
 import org.opensecretmanager.vault.Asks
 import org.opensecretmanager.vault.CardFill
 import org.opensecretmanager.vault.DeletedEntry
@@ -109,7 +109,11 @@ data class Editor(
  */
 class VaultSession(private val context: Context, private val folder: File) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val calls = Mutex()
+    /** Strictly FIFO queue for device calls so lock/unlock/lifecycle transitions cannot reorder. */
+    private val calls = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+    /** Protects [unlockedNow], [lockAt], and [lockEpoch] transitions across threads. */
+    private val stateLock = Any()
+    private val lockEpoch = AtomicLong(0)
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
     @Volatile private var device: Device? = null
@@ -118,7 +122,7 @@ class VaultSession(private val context: Context, private val folder: File) {
     @Volatile private var inFront = false
     /**
      * While the vault stays unlocked after the app left the screen: when it
-     * locks, by [SystemClock.elapsedRealtime]. Written under [calls].
+     * locks, by [SystemClock.elapsedRealtime]. Written under [stateLock].
      */
     @Volatile private var lockAt: Long? = null
     /**
@@ -165,11 +169,27 @@ class VaultSession(private val context: Context, private val folder: File) {
     private val opened = CompletableDeferred<Unit>()
 
     init {
+        scope.launch {
+            for (work in calls) runCatching { work() }
+        }
         openDevice()
         scope.launch {
             opened.await()
             for (work in network) runCatching { work() }
         }
+    }
+
+    private fun enqueueCall(work: suspend () -> Unit): Job {
+        val done = CompletableDeferred<Unit>()
+        val result = calls.trySend {
+            try {
+                work()
+            } finally {
+                done.complete(Unit)
+            }
+        }
+        if (result.isFailure) done.complete(Unit)
+        return done
     }
 
     private fun openDevice() = run(null) {
@@ -196,18 +216,22 @@ class VaultSession(private val context: Context, private val folder: File) {
         network.send {
             reopened.completeWith(
                 runCatching {
-                    calls.withLock {
+                    enqueueCall {
                         device?.let {
                             it.goOffline()
                             it.close()
                         }
                         device = null
-                        unlockedNow = false
+                        synchronized(stateLock) {
+                            unlockedNow = false
+                            lockAt = null
+                            lockEpoch.incrementAndGet()
+                        }
                         _state.value = UiState()
                         folder.deleteRecursively()
                         folder.mkdirs()
                         prepare(folder)
-                    }
+                    }.join()
                     openDevice().join()
                 },
             )
@@ -232,21 +256,19 @@ class VaultSession(private val context: Context, private val folder: File) {
         return { release.complete(Unit) }
     }
 
-    /** Runs [work] off the main thread, showing [busy] meanwhile, and any failure. */
+    /** Runs [work] off the main thread in FIFO order, showing [busy] meanwhile, and any failure. */
     private fun run(busy: String?, work: suspend () -> Unit): Job =
-        scope.launch {
-            calls.withLock {
-                if (busy != null) _state.update { it.copy(busy = busy, notice = null) }
-                // What the owner asked for may change a password: the next read checks them again.
-                healthStale = true
-                try {
-                    work()
-                } catch (error: Exception) {
-                    report(error)
-                    runCatching { refresh() }
-                } finally {
-                    if (busy != null) _state.update { it.copy(busy = null) }
-                }
+        enqueueCall {
+            if (busy != null) _state.update { it.copy(busy = busy, notice = null) }
+            // What the owner asked for may change a password: the next read checks them again.
+            healthStale = true
+            try {
+                work()
+            } catch (error: Exception) {
+                report(error)
+                runCatching { refresh() }
+            } finally {
+                if (busy != null) _state.update { it.copy(busy = null) }
             }
         }
 
@@ -269,10 +291,10 @@ class VaultSession(private val context: Context, private val folder: File) {
                         if (busy != null) _state.update { it.copy(busy = null) }
                     }
                     // What was fetched may have changed a password: checked again at this read.
-                    calls.withLock {
+                    enqueueCall {
                         healthStale = true
                         runCatching { refresh() }
-                    }
+                    }.join()
                 }
             } finally {
                 finished.complete(Unit)
@@ -301,7 +323,14 @@ class VaultSession(private val context: Context, private val folder: File) {
             DeviceState.UNLOCKED -> Screen.UNLOCKED
             DeviceState.REMOVED -> Screen.REMOVED
         }
-        unlockedNow = screen == Screen.UNLOCKED
+        synchronized(stateLock) {
+            val wasUnlocked = unlockedNow
+            unlockedNow = screen == Screen.UNLOCKED
+            if (screen != Screen.UNLOCKED) {
+                lockAt = null
+                if (wasUnlocked) lockEpoch.incrementAndGet()
+            }
+        }
         val items = if (screen == Screen.UNLOCKED) device.items().sortedBy { it.title.lowercase() } else emptyList()
         // Checked again when owed (healthStale), as a password edited alone leaves the list as it was.
         val before = _state.value
@@ -353,14 +382,62 @@ class VaultSession(private val context: Context, private val folder: File) {
         if (onUnlocked != null) withContext(Dispatchers.Main) { onUnlocked() }
     }
 
+    /**
+     * Re-verifies this phone's vault password while already unlocked (for
+     * passkey user verification when strong biometrics are unavailable or
+     * declined). Locks and immediately re-unlocks inside [calls] so an
+     * incorrect password fails closed and leaves the vault locked.
+     */
+    fun verifyVaultPassword(password: String, done: (Boolean) -> Unit): Job = enqueueCall {
+        val dev = device
+        if (dev == null) {
+            withContext(Dispatchers.Main) { done(false) }
+            return@enqueueCall
+        }
+        _state.update { it.copy(busy = "Verifying…", notice = null) }
+        val verified = try {
+            if (dev.state() == DeviceState.UNLOCKED) dev.lock()
+            dev.unlock(password)
+            refresh()
+            true
+        } catch (error: MobileException.InvalidCredentials) {
+            synchronized(stateLock) {
+                unlockedNow = false
+                lockAt = null
+                lockEpoch.incrementAndGet()
+            }
+            _state.update { it.copy(notice = describe(error)) }
+            runCatching { refresh() }
+            false
+        } catch (error: Exception) {
+            synchronized(stateLock) {
+                unlockedNow = false
+                lockAt = null
+                lockEpoch.incrementAndGet()
+            }
+            report(error)
+            runCatching { refresh() }
+            false
+        } finally {
+            _state.update { it.copy(busy = null) }
+        }
+        withContext(Dispatchers.Main) { done(verified) }
+    }
+
     /** The owner's own Lock, which asks for no fingerprint until the app leaves the screen. */
     fun lock(): Job {
+        OtherFieldService.cancel()
         askAtOnce.set(false)
         locksAsked.incrementAndGet()
         lockLater?.cancel()
+        lockLater = null
+        synchronized(stateLock) {
+            unlockedNow = false
+            lockAt = null
+            lockEpoch.incrementAndGet()
+        }
         return run(null) {
             try {
-                lockAt = null
                 device?.let(::lockVault)
                 refresh()
             } finally {
@@ -382,7 +459,11 @@ class VaultSession(private val context: Context, private val folder: File) {
     /** Locks the vault, and lets go of what the screens held of it. Under [calls]. */
     private fun lockVault(device: Device) {
         device.lock()
-        unlockedNow = false
+        synchronized(stateLock) {
+            unlockedNow = false
+            lockAt = null
+            lockEpoch.incrementAndGet()
+        }
         _state.update { it.copy(detail = null, editor = null, history = null, deleted = null, passwordChange = false, locks = it.locks + 1) }
     }
 
@@ -398,7 +479,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      */
     private fun lockIfDue() {
         if (!lockDue()) return
-        lockAt = null
+        synchronized(stateLock) { lockAt = null }
         device?.let(::lockIfUnlocked)
     }
 
@@ -684,21 +765,33 @@ class VaultSession(private val context: Context, private val folder: File) {
      * thread, [done].
      */
     private fun <T> offer(read: (Device) -> T, done: (T?) -> Unit) {
-        val device = device
+        val currentDevice = device
         val due = lockDue()
         if (due) run(null) { lockIfDue(); refresh() }
-        if (device == null || !unlockedNow || locksAsked.get() > 0 || due) {
+        val epoch = synchronized(stateLock) {
+            if (currentDevice == null || !unlockedNow || locksAsked.get() > 0 || due) null else lockEpoch.get()
+        }
+        if (currentDevice == null || epoch == null) {
             scope.launch(Dispatchers.Main.immediate) { done(null) }
             return
+        }
+        fun stillValid(): Boolean = synchronized(stateLock) {
+            lockEpoch.get() == epoch && unlockedNow && locksAsked.get() == 0 && !lockDue()
         }
         // Not a child of the timeout, which would wait for it to end: a call
         // into the device cannot be stopped part-way.
         val reading = scope.async {
-            runCatching { if (device.state() == DeviceState.UNLOCKED) read(device) else null }.getOrNull()
+            if (!stillValid()) return@async null
+            val result = runCatching {
+                if (currentDevice.state() == DeviceState.UNLOCKED) read(currentDevice) else null
+            }.getOrNull()
+            if (stillValid()) result else null
         }
         scope.launch {
             val found = withTimeoutOrNull(OFFER_MILLIS) { reading.await() }
-            withContext(Dispatchers.Main) { done(found) }
+            withContext(Dispatchers.Main) {
+                done(if (stillValid()) found else null)
+            }
         }
     }
 
@@ -714,13 +807,11 @@ class VaultSession(private val context: Context, private val folder: File) {
      * the fill screen to take over. Nothing is shown meanwhile.
      */
     fun fillCardChosen(id: String, done: (CardFill?) -> Unit) {
-        scope.launch {
-            val filled = calls.withLock {
-                runCatching {
-                    lockIfDue()
-                    device?.takeIf { it.state() == DeviceState.UNLOCKED }?.fillCard(id)
-                }.getOrNull()
-            }
+        enqueueCall {
+            val filled = runCatching {
+                lockIfDue()
+                device?.takeIf { it.state() == DeviceState.UNLOCKED }?.fillCard(id)
+            }.getOrNull()
             withContext(Dispatchers.Main) { done(filled) }
         }
     }
@@ -743,13 +834,11 @@ class VaultSession(private val context: Context, private val folder: File) {
      * failed, which the passkey screen tells the app that asked.
      */
     fun <T> forPasskey(work: (Device) -> T, done: (Result<T>) -> Unit) {
-        scope.launch {
-            val result = calls.withLock {
-                runCatching {
-                    lockIfDue()
-                    work(device ?: throw MobileException.NoVault())
-                }.also { runCatching { refresh() } }
-            }
+        enqueueCall {
+            val result = runCatching {
+                lockIfDue()
+                work(device ?: throw MobileException.NoVault())
+            }.also { runCatching { refresh() } }
             withContext(Dispatchers.Main) { done(result) }
         }
     }
@@ -762,13 +851,11 @@ class VaultSession(private val context: Context, private val folder: File) {
      * Nothing is shown meanwhile.
      */
     fun fillListed(requester: Requester, id: String, asks: Asks, done: (Filled?) -> Unit) {
-        scope.launch {
-            val filled = calls.withLock {
-                runCatching {
-                    lockIfDue()
-                    device?.takeIf { it.state() == DeviceState.UNLOCKED }?.fill(requester, id, asks)
-                }.getOrNull()
-            }
+        enqueueCall {
+            val filled = runCatching {
+                lockIfDue()
+                device?.takeIf { it.state() == DeviceState.UNLOCKED }?.fill(requester, id, asks)
+            }.getOrNull()
             withContext(Dispatchers.Main) { done(filled) }
         }
     }
@@ -838,7 +925,7 @@ class VaultSession(private val context: Context, private val folder: File) {
         lockLater = null
         run(null) {
             lockIfDue()
-            lockAt = null
+            synchronized(stateLock) { lockAt = null }
             refresh()
         }
         online { device ->
@@ -849,7 +936,7 @@ class VaultSession(private val context: Context, private val folder: File) {
         foreground = scope.launch {
             while (isActive) {
                 delay(5_000)
-                calls.withLock { runCatching { refresh() } }
+                enqueueCall { runCatching { refresh() } }.join()
             }
         }
     }
@@ -868,14 +955,25 @@ class VaultSession(private val context: Context, private val folder: File) {
         foreground = null
         val stay = StayUnlocked.millis(context)
         val atOnce = stay <= 0
+        val deadline = if (stay > 0) SystemClock.elapsedRealtime() + stay else null
+        val bgEpoch = synchronized(stateLock) {
+            if (atOnce) {
+                unlockedNow = false
+                lockAt = null
+                lockEpoch.incrementAndGet()
+            } else {
+                if (unlockedNow) lockAt = deadline
+                lockEpoch.get()
+            }
+        }
         if (atOnce) locksAsked.incrementAndGet()
         lockLater?.cancel()
         lockLater = if (stay > 0) {
             scope.launch {
                 delay(stay)
                 run(null) {
-                    if (inFront) return@run
-                    lockAt = null
+                    if (inFront || lockEpoch.get() != bgEpoch) return@run
+                    synchronized(stateLock) { lockAt = null }
                     device?.let(::lockIfUnlocked)
                     refresh()
                 }
@@ -888,9 +986,13 @@ class VaultSession(private val context: Context, private val folder: File) {
                 val device = device ?: return@run
                 if (device.state() == DeviceState.JOINING) return@run
                 if (stay > 0 && device.state() == DeviceState.UNLOCKED) {
-                    lockAt = SystemClock.elapsedRealtime() + stay
+                    if (!inFront && lockEpoch.get() == bgEpoch) {
+                        synchronized(stateLock) {
+                            if (lockAt == null) lockAt = deadline
+                        }
+                    }
                 } else {
-                    lockAt = null
+                    synchronized(stateLock) { lockAt = null }
                     lockVault(device)
                 }
                 refresh()
@@ -910,14 +1012,19 @@ class VaultSession(private val context: Context, private val folder: File) {
      * which follows if it was in front); otherwise it locks at once.
      */
     fun onScreenOff() {
+        OtherFieldService.cancel()
         askAtOnce.set(true)
         if (StayUnlocked.throughScreenOff(context)) return
         locksAsked.incrementAndGet()
         lockLater?.cancel()
         lockLater = null
+        synchronized(stateLock) {
+            unlockedNow = false
+            lockAt = null
+            lockEpoch.incrementAndGet()
+        }
         run(null) {
             try {
-                lockAt = null
                 device?.let(::lockIfUnlocked)
                 refresh()
             } finally {

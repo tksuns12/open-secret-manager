@@ -4,16 +4,14 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
-import android.view.WindowManager
+import android.os.SystemClock
 import org.opensecretmanager.app.OsmTheme
 import androidx.activity.compose.setContent
 import androidx.annotation.RequiresApi
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
-import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,18 +20,18 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -46,6 +44,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.credentials.CreatePublicKeyCredentialRequest
@@ -67,13 +67,13 @@ import androidx.credentials.exceptions.publickeycredential.CreatePublicKeyCreden
 import androidx.credentials.exceptions.publickeycredential.GetPublicKeyCredentialDomException
 import androidx.credentials.provider.BeginGetCredentialRequest
 import androidx.credentials.provider.PendingIntentHandler
-import androidx.fragment.app.FragmentActivity
 import org.opensecretmanager.app.BiometricUnlock
-import org.opensecretmanager.app.BuildConfig
 import org.opensecretmanager.app.Busy
 import org.opensecretmanager.app.FingerprintPrompts
 import org.opensecretmanager.app.Message
+import org.opensecretmanager.app.ProtectedActivity
 import org.opensecretmanager.app.Screen
+import org.opensecretmanager.app.UiState
 import org.opensecretmanager.app.Unlock
 import org.opensecretmanager.app.VaultApp
 import org.opensecretmanager.app.VaultSession
@@ -92,38 +92,48 @@ import org.opensecretmanager.vault.PasskeyVerification
  * new passkey, choose where it goes. An app that is not a browser is named
  * as such the first time it asks for a site's passkeys, with whether
  * Android verified the site names it as its own; the owner's choice is
- * remembered for that app and site. The owner is verified when the site
- * asks for it and does not refuse it: the vault unlocked here verifies the
- * owner, and otherwise the phone's own check (a fingerprint, the face, or
- * the screen lock) does, every time; nothing is said to be verified that
- * was not. Signing in with a passkey chosen in the system's list from an
- * unlocked vault draws nothing but that check.
+ * remembered for that app and site only after verification and signing
+ * succeed. The owner is verified when the site asks for it and does not
+ * refuse it: an explicit unlock performed inside this screen verifies the
+ * owner once within [UNLOCK_VERIFICATION_TTL_MS], and otherwise a Class 3
+ * strong biometric (`BIOMETRIC_STRONG`) or this phone's vault password does,
+ * every time; nothing is said to be verified that was not.
  */
 @RequiresApi(34)
-class PasskeyActivity : FragmentActivity() {
+class PasskeyActivity : ProtectedActivity() {
     private lateinit var session: VaultSession
     private lateinit var asked: Asked
-    /** The vault was locked when this opened: unlocking it here verifies the owner. */
-    private var startedLocked = false
+
+    /**
+     * Monotonic timestamp when the owner explicitly unlocked the vault inside
+     * this Activity instance. Cleared on [onStop] and consumed once by
+     * [consumeUnlockedHere] so an external unlock cannot spoof UV=1.
+     */
+    private var unlockedInActivityAt: Long? = null
+
+    /** Pending vault-password verification fallback when strong biometrics are unavailable or declined. */
+    internal var verifyPasswordPrompt by mutableStateOf<VerifyPasswordRequest?>(null)
+        private set
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!BuildConfig.ALLOW_SCREENSHOTS) {
-            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        }
         setResult(RESULT_CANCELED)
         session = (application as VaultApp).session
         if (savedInstanceState == null) session.askAtOnceNext()
         asked = read(intent) ?: return finish()
-        startedLocked = session.state.value.screen != Screen.UNLOCKED
         val current = asked
-        if (current is Asked.Get && !startedLocked && passkeyAllowed(current.asker, null)) {
+        if (current is Asked.Get && session.state.value.screen == Screen.UNLOCKED && passkeyAllowed(current.asker, null)) {
             // Chosen from an unlocked vault: nothing drawn but the check.
             background = window.decorView.background
             window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
             return signIn(current)
         }
         show()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        unlockedInActivityAt = null
     }
 
     /** What [onCreate] drew over, while nothing is drawn. */
@@ -133,7 +143,7 @@ class PasskeyActivity : FragmentActivity() {
         background?.let(window::setBackgroundDrawable)
         background = null
         val biometric = BiometricUnlock(this)
-        val prompts = FingerprintPrompts(this, biometric, session, asked.asker?.requester?.said)
+        val prompts = FingerprintPrompts(this, biometric, session, asked.asker?.requester?.said, ::markUnlockedHere)
         setContent {
             OsmTheme {
                 PasskeyScreen(asked, session, biometric, prompts, this)
@@ -167,22 +177,51 @@ class PasskeyActivity : FragmentActivity() {
         (asker.requester as? Requester.App)?.let { PasskeyApps(this).allow(it, rpId) }
     }
 
-    /** The owner unlocked the vault here. */
-    private val unlockedHere: Boolean
-        get() = startedLocked && session.state.value.screen == Screen.UNLOCKED
+    /** Records an explicit unlock completed inside this Activity. */
+    internal fun markUnlockedHere() {
+        unlockedInActivityAt = SystemClock.elapsedRealtime()
+    }
+
+    /** Consumes a fresh in-activity unlock once for user verification. */
+    private fun consumeUnlockedHere(): Boolean {
+        val at = unlockedInActivityAt ?: return false
+        unlockedInActivityAt = null
+        return session.state.value.screen == Screen.UNLOCKED &&
+            SystemClock.elapsedRealtime() - at <= UNLOCK_VERIFICATION_TTL_MS
+    }
+
+    private fun askVaultPassword(title: String, done: (Boolean) -> Unit) {
+        verifyPasswordPrompt = VerifyPasswordRequest(title, done)
+        if (background != null) show()
+    }
+
+    internal fun finishPasswordVerification(password: String) {
+        val pending = verifyPasswordPrompt ?: return
+        if (pending.submitting) return
+        verifyPasswordPrompt = pending.copy(submitting = true)
+        session.verifyVaultPassword(password) { verified ->
+            if (verified) {
+                pending.done(true)
+            } else {
+                verifyPasswordPrompt = null
+                cancel()
+            }
+        }
+    }
 
     /**
      * Verifies the owner as the site asks, then [done] with whether the owner
-     * was verified, or ends the request if the owner cancelled or the site
-     * requires what the phone cannot do.
+     * was verified, or ends the request if the owner cancelled. Only Class 3
+     * strong biometrics (`BIOMETRIC_STRONG`) or this phone's vault password
+     * satisfy user verification (never weak device credentials).
      */
     internal fun verify(verification: PasskeyVerification, title: String, done: (Boolean) -> Unit) {
-        if (unlockedHere) return done(true)
+        if (consumeUnlockedHere()) return done(true)
         if (verification == PasskeyVerification.DISCOURAGED) return done(false)
-        val allowed = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
-        if (BiometricManager.from(this).canAuthenticate(allowed) != BiometricManager.BIOMETRIC_SUCCESS) {
+        val canStrong = BiometricManager.from(this).canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
+        if (!canStrong) {
             if (verification == PasskeyVerification.PREFERRED) return done(false)
-            return fail(NotAllowedError(), "The site asks to verify it is you: set a screen lock on this phone first")
+            return askVaultPassword(title, done)
         }
         BiometricPrompt(
             this,
@@ -190,24 +229,30 @@ class PasskeyActivity : FragmentActivity() {
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) = done(true)
 
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) = cancel()
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    if (errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON) {
+                        askVaultPassword(title, done)
+                    } else {
+                        cancel()
+                    }
+                }
             },
         ).authenticate(
             BiometricPrompt.PromptInfo.Builder()
                 .setTitle(title)
                 .setSubtitle(asked.asker?.requester?.said ?: "")
-                .setAllowedAuthenticators(allowed)
+                .setAllowedAuthenticators(BIOMETRIC_STRONG)
+                .setNegativeButtonText("Use vault password")
                 .build(),
         )
     }
 
     /** Signs in with the passkey the owner chose, once the site's request is read and the owner verified. */
-    internal fun signIn(get: Asked.Get) {
+    internal fun signIn(get: Asked.Get, allowOnSuccess: Boolean = false) {
         session.forPasskey({ it.passkeySignIn(get.options, get.asker.caller) }) { read ->
             val signIn = read.getOrElse { error ->
                 // Locked since the system's list: unlocked here, then signed.
                 if (error is MobileException.Locked && background != null) {
-                    startedLocked = true
                     return@forPasskey show()
                 }
                 return@forPasskey fail(error)
@@ -217,7 +262,10 @@ class PasskeyActivity : FragmentActivity() {
             }
             verify(signIn.verification, "Sign in to ${signIn.rpId}") { verified ->
                 session.forPasskey({ it.signInWithPasskey(get.options, get.asker.caller, get.item, get.credential, verified) }) { signed ->
-                    signed.onSuccess(::signedIn).onFailure(::fail)
+                    signed.onSuccess { json ->
+                        if (allowOnSuccess) allow(get.asker, signIn.rpId)
+                        signedIn(json)
+                    }.onFailure(::fail)
                 }
             }
         }
@@ -225,10 +273,12 @@ class PasskeyActivity : FragmentActivity() {
 
     /** Makes the passkey once the owner chose to save it, into the login [into] or a new one. */
     internal fun create(create: Asked.Create, creation: PasskeyCreation, into: String?) {
-        allow(create.asker, creation.rpId)
         verify(creation.verification, "Save a passkey for ${creation.rpId}") { verified ->
             session.forPasskey({ it.createPasskey(create.options, create.asker.caller, verified, into) }) { made ->
-                made.onSuccess(::created).onFailure(::fail)
+                made.onSuccess { json ->
+                    allow(create.asker, creation.rpId)
+                    created(json)
+                }.onFailure(::fail)
             }
         }
     }
@@ -313,8 +363,16 @@ class PasskeyActivity : FragmentActivity() {
         /** For [GET]: the login and the passkey the owner chose. */
         const val ITEM = "item"
         const val CREDENTIAL = "credential"
+        /** Maximum age of an in-activity unlock counted as fresh user verification. */
+        private const val UNLOCK_VERIFICATION_TTL_MS = 60_000L
     }
 }
+
+internal data class VerifyPasswordRequest(
+    val title: String,
+    val done: (Boolean) -> Unit,
+    val submitting: Boolean = false,
+)
 
 /** What the system asked for. */
 internal sealed interface Asked {
@@ -342,6 +400,7 @@ private fun PasskeyScreen(
     activity: PasskeyActivity,
 ) {
     val state by session.screenState()
+    val passwordPrompt = activity.verifyPasswordPrompt
     Scaffold(
         // Tags as resource ids: the tests drive this screen from outside the
         // app, as the system shows it over another one.
@@ -362,18 +421,68 @@ private fun PasskeyScreen(
         },
     ) { padding ->
         Box(Modifier.padding(padding).fillMaxSize()) {
-            when (state.screen) {
-                Screen.OPENING -> Message("Opening…")
-                Screen.LOCKED -> Column {
+            when {
+                passwordPrompt != null -> VerifyPasswordScreen(passwordPrompt, asked.asker?.requester, state, activity)
+                state.screen == Screen.OPENING -> Message("Opening…")
+                state.screen == Screen.LOCKED -> Column {
                     asked.asker?.let { Asker(it.requester) }
-                    Unlock(state, session, biometric, prompts::unlock, prompts::keep)
+                    Unlock(state, session, biometric, prompts::unlock, prompts::keep, activity::markUnlockedHere)
                 }
-                Screen.UNLOCKED -> Unlocked(asked, session, activity)
-                Screen.REMOVED -> Message("This phone was removed from the vault")
-                Screen.UNREADABLE -> Message("The vault on this phone cannot be opened", state.unreadable)
+                state.screen == Screen.UNLOCKED -> Unlocked(asked, session, activity)
+                state.screen == Screen.REMOVED -> Message("This phone was removed from the vault")
+                state.screen == Screen.UNREADABLE -> Message("The vault on this phone cannot be opened", state.unreadable)
                 else -> Message("This phone has no vault yet", "Join your vault in Open Secret Manager first.")
             }
             state.busy?.let { Busy(it) }
+        }
+    }
+}
+
+@Composable
+private fun VerifyPasswordScreen(
+    request: VerifyPasswordRequest,
+    requester: Requester?,
+    state: UiState,
+    activity: PasskeyActivity,
+) {
+    var password by remember { mutableStateOf("") }
+    Column(Modifier.verticalScroll(rememberScrollState())) {
+        requester?.let { Asker(it) }
+        Column(
+            Modifier.padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(request.title, style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Enter this phone's vault password to verify it is you.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("Vault password") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth().testTag("verify-password"),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(
+                    onClick = {
+                        val typed = password
+                        password = ""
+                        activity.finishPasswordVerification(typed)
+                    },
+                    enabled = password.isNotEmpty() && !request.submitting && state.busy == null,
+                    modifier = Modifier.testTag("verify-password-confirm"),
+                ) {
+                    Text("Verify")
+                }
+                TextButton(onClick = activity::cancel) {
+                    Text("Cancel")
+                }
+            }
         }
     }
 }
@@ -401,7 +510,7 @@ private fun Unlocked(asked: Asked, session: VaultSession, activity: PasskeyActiv
                 Asker(asked.asker.requester)
                 AppWarning(asked.asker, found.rpId, "to sign in to ${found.rpId} with a passkey")
                 Row(Modifier.padding(24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(onClick = { activity.allow(asked.asker, found.rpId); activity.signIn(asked) }, modifier = Modifier.testTag("allow-passkey")) {
+                    Button(onClick = { activity.signIn(asked, allowOnSuccess = true) }, modifier = Modifier.testTag("allow-passkey")) {
                         Text("Sign in")
                     }
                 }
