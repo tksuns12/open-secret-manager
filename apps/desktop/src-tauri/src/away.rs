@@ -12,19 +12,49 @@ use crate::AppState;
 pub fn start<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     osm_desktop_session::watch(move |away| {
+        // Clear clipboard and attempt an immediate non-blocking lock on the
+        // notification callback thread so keys are wiped before the OS finishes
+        // suspending the process, without ever deadlocking against commands.
+        osm_desktop_session::clear_last_secret();
+        let locked_now = lock_try_now(&app.state::<AppState>());
         let app = app.clone();
-        // Called on the main thread (on Linux, on a thread of the session
-        // crate's), which must not wait for the vault: a command holding it
-        // may be waiting for the main thread.
-        tauri::async_runtime::spawn(async move { went_away(&app, away).await });
+        tauri::async_runtime::spawn(async move { went_away_after(&app, away, locked_now).await });
     });
+}
+
+fn lock_try_now(state: &AppState) -> bool {
+    let mut was_open = false;
+    if let Ok(mut vault) = state.vault.try_lock() {
+        if let Some(vault) = vault.as_mut() {
+            if vault.is_unlocked() {
+                state.rows_seen.keep_up(vault);
+                was_open = true;
+            }
+            vault.lock();
+        }
+    }
+    if let Ok(mut archive) = state.archive.try_lock() {
+        if archive.take().is_some() {
+            was_open = true;
+        }
+    }
+    if let Ok(mut import) = state.import.try_lock() {
+        import.take();
+    }
+    was_open
 }
 
 /// Locks everything and takes a copied secret off the clipboard. Tells the
 /// interface why, if anything was open.
+#[cfg(test)]
 pub(crate) async fn went_away<R: Runtime>(app: &AppHandle<R>, away: Away) {
+    went_away_after(app, away, false).await;
+}
+
+async fn went_away_after<R: Runtime>(app: &AppHandle<R>, away: Away, already_locked: bool) {
     osm_desktop_session::clear_last_secret();
-    if crate::lock_everything(&app.state::<AppState>()).await {
+    let locked_more = crate::lock_everything(&app.state::<AppState>()).await;
+    if already_locked || locked_more {
         let _ = app.emit("vault-locked", away.as_str());
     }
 }
@@ -52,7 +82,7 @@ mod tests {
             network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
         let app = mock_builder()
             .manage(AppState {
-                vault: Mutex::new(Vault::open(&path).ok()),
+                vault: Arc::new(Mutex::new(Vault::open(&path).ok())),
                 archive: Mutex::new(None),
                 browser: browser::Browser::open(&path),
                 path,

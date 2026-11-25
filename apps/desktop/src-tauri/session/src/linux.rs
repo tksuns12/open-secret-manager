@@ -27,48 +27,95 @@ pub const SESSION: &str = "org.freedesktop.login1.Session";
 pub const USER: &str = "org.freedesktop.login1.User";
 const ASKING: Duration = Duration::from_secs(5);
 
-/// Watches logind on the system bus. False if there is no system bus.
+/// Watches logind on the system bus, reconnecting with bounded exponential
+/// backoff if the bus restarts or drops the connection. Returns `false` if
+/// there is no system bus or no session matches could be installed initially.
 pub(crate) fn watch(on_away: OnAway) -> bool {
-    Connection::new_system().is_ok_and(|connection| start(connection, on_away))
+    let Ok(connection) = Connection::new_system() else {
+        return false;
+    };
+    if !register_matches(&connection, &on_away) {
+        return false;
+    }
+    std::thread::Builder::new()
+        .name("osm-session".into())
+        .spawn(move || {
+            let mut active = Some(connection);
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                if let Some(conn) = active.take() {
+                    let started = std::time::Instant::now();
+                    while conn.process(Duration::from_secs(60)).is_ok() {}
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        backoff = Duration::from_secs(1);
+                    }
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                if let Ok(conn) = Connection::new_system() {
+                    if register_matches(&conn, &on_away) {
+                        active = Some(conn);
+                    }
+                }
+            }
+        })
+        .is_ok()
 }
 
-/// The same on the bus at `address`, for tests.
+/// The same on the bus at `address`, for tests (single-session, no reconnect).
 pub(crate) fn watch_bus(address: &str, on_away: OnAway) -> bool {
     let Ok(mut channel) = dbus::channel::Channel::open_private(address) else {
         return false;
     };
-    channel.register().is_ok() && start(Connection::from(channel), on_away)
+    if channel.register().is_err() {
+        return false;
+    }
+    let connection = Connection::from(channel);
+    if !register_matches(&connection, &on_away) {
+        return false;
+    }
+    std::thread::Builder::new()
+        .name("osm-session".into())
+        .spawn(
+            move || {
+                while connection.process(Duration::from_secs(60)).is_ok() {}
+            },
+        )
+        .is_ok()
 }
 
-/// Listens, on a thread of its own, for what logind says: the computer
-/// going to sleep, and, for this program's session, a request to lock it,
-/// the screen locker saying it locked, and the session leaving the seat to
-/// another. Only logind's own messages count: anyone on the bus can send a
-/// signal, but only logind holds its name.
-fn start(connection: Connection, on_away: OnAway) -> bool {
-    let tell = move |away| {
+/// Registers logind sleep, lock, and seat-change match rules on `connection`.
+/// Returns `false` if this process's session cannot be located or any match
+/// rule fails, rather than silently pretending session locking is active.
+fn register_matches(connection: &Connection, on_away: &OnAway) -> bool {
+    let tell = |away| {
         let on_away = on_away.clone();
         move || on_away(away)
     };
     let sleep = tell(Away::Sleep);
-    let added = connection.add_match(
-        MatchRule::new_signal(MANAGER, "PrepareForSleep")
-            .with_sender(LOGIND)
-            .with_path(MANAGER_PATH),
-        move |(going,): (bool,), _: &Connection, _: &dbus::Message| {
-            // It says so again, false, on waking.
-            if going {
-                sleep();
-            }
-            true
-        },
-    );
-    if added.is_err() {
+    if connection
+        .add_match(
+            MatchRule::new_signal(MANAGER, "PrepareForSleep")
+                .with_sender(LOGIND)
+                .with_path(MANAGER_PATH),
+            move |(going,): (bool,), _: &Connection, _: &dbus::Message| {
+                // It says so again, false, on waking.
+                if going {
+                    sleep();
+                }
+                true
+            },
+        )
+        .is_err()
+    {
         return false;
     }
-    if let Some(session) = our_session(&connection) {
-        let locked = tell(Away::ScreenLocked);
-        let _ = connection.add_match(
+    let Some(session) = our_session(connection) else {
+        return false;
+    };
+    let locked = tell(Away::ScreenLocked);
+    if connection
+        .add_match(
             MatchRule::new_signal(SESSION, "Lock")
                 .with_sender(LOGIND)
                 .with_path(session.clone()),
@@ -76,9 +123,14 @@ fn start(connection: Connection, on_away: OnAway) -> bool {
                 locked();
                 true
             },
-        );
-        let (locked, switched) = (tell(Away::ScreenLocked), tell(Away::SwitchedOut));
-        let _ = connection.add_match(
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let (locked, switched) = (tell(Away::ScreenLocked), tell(Away::SwitchedOut));
+    connection
+        .add_match(
             PropertiesPropertiesChanged::match_rule(
                 Some(&dbus::strings::BusName::from(LOGIND)),
                 Some(&session),
@@ -95,14 +147,6 @@ fn start(connection: Connection, on_away: OnAway) -> bool {
                     }
                 }
                 true
-            },
-        );
-    }
-    std::thread::Builder::new()
-        .name("osm-session".into())
-        .spawn(
-            move || {
-                while connection.process(Duration::from_secs(60)).is_ok() {}
             },
         )
         .is_ok()

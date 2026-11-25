@@ -15,6 +15,10 @@
 //! [`copy_secret`] declines, and the app does without.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    forbid(unsafe_code)
+)]
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -62,9 +66,28 @@ pub fn watch(on_away: impl Fn(Away) + Send + Sync + 'static) -> bool {
     {
         linux::watch(std::sync::Arc::new(on_away))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::watch(std::sync::Arc::new(on_away))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = on_away;
+        false
+    }
+}
+
+/// Whether `path` sits on a read-only mounted filesystem (e.g. a mounted macOS
+/// `.dmg` disk image). Returns `false` when the path does not exist or on
+/// non-macOS systems.
+pub fn is_read_only_mount(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::is_read_only_mount(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
         false
     }
 }

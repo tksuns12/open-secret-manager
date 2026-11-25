@@ -128,13 +128,25 @@ pub fn settings(state: tauri::State<'_, AppState>) -> Settings {
 }
 
 /// Sets how many minutes without activity lock the vault: one of
-/// [`AUTO_LOCK_CHOICES`].
+/// [`AUTO_LOCK_CHOICES`]. Requires the vault to be unlocked.
 #[tauri::command]
-pub fn set_auto_lock<R: tauri::Runtime>(
+pub async fn set_auto_lock<R: tauri::Runtime>(
     minutes: u32,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle<R>,
 ) -> Result<Settings, CommandError> {
+    if !state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(osm_vault_core::Vault::is_unlocked)
+    {
+        return Err(CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        });
+    }
     let updated = set_auto_lock_at(&state.path, minutes)?;
     crate::idle::arm_backstop(&app);
     Ok(updated)
@@ -155,12 +167,25 @@ pub(crate) fn set_auto_lock_at(vault: &Path, minutes: u32) -> Result<Settings, C
     Ok(settings)
 }
 
-/// Sets what the generator makes, from now on in this window.
+/// Sets what the generator makes, from now on in this window. Requires the
+/// vault to be unlocked.
 #[tauri::command]
-pub fn set_generator(
+pub async fn set_generator(
     choice: GeneratorChoice,
     state: tauri::State<'_, AppState>,
 ) -> Result<Settings, CommandError> {
+    if !state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(osm_vault_core::Vault::is_unlocked)
+    {
+        return Err(CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        });
+    }
     set_generator_at(&state.path, choice)
 }
 

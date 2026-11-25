@@ -1,3 +1,5 @@
+import { invoke as tauriInvoke, isTauri, type InvokeArgs } from "@tauri-apps/api/core";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 import { cardBrand, cardDigits } from "./card";
 import type { ArchiveInfo, BackupAge, BrowserStatus, CardDetail, DeletedEntry, DesktopBridge, DevicesInfo, EntryDetail, EntryInput, FillAsked, GeneratorChoice, HeldChange, HistoryEntry, ImportSummary, PasskeySummary, PasswordHealth, Settings, SyncStatus, VaultEntry, VersionSummary } from "./types";
 
@@ -6,6 +8,7 @@ type Listen = (event: string, handler: (event: { payload: unknown }) => void) =>
 type TauriGlobal = { __TAURI__?: { core?: { invoke?: Invoke }; event?: { listen?: Listen } } };
 
 function native(): Invoke | undefined {
+  if (isTauri()) return (cmd, args) => tauriInvoke(cmd, args as InvokeArgs);
   return (globalThis as TauriGlobal).__TAURI__?.core?.invoke;
 }
 
@@ -216,7 +219,7 @@ function savePreview(id: string, input: EntryInput, previous?: EntryDetail): Vau
 }
 
 export function hasNativeBridge(): boolean {
-  return Boolean((globalThis as { __TAURI__?: { core?: { invoke?: unknown } } }).__TAURI__?.core?.invoke);
+  return Boolean(native());
 }
 
 /** The preview's sample invitation as a QR code, drawn as the app's `qr_of` (`src-tauri/src/qr.rs`) draws it. */
@@ -234,26 +237,26 @@ let handOverTurn = 0;
 
 export const bridge: DesktopBridge = {
   async status() {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return String(await invoke("vault_status")) as "missing" | "locked" | "unlocked";
     return "unlocked";
   },
   async listEntries() {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return (await invoke("list_entries")) as VaultEntry[];
     // A new list each time, as the shell's is: the window reloads what goes
     // with the items when the list changes.
     return [...previewEntries];
   },
   async passwordHealth() {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return (await invoke("password_health")) as PasswordHealth;
     // The preview keeps no password, so it answers with a sample: a short
     // password on the Wi-Fi login, and one shared by the two first logins.
     return { weak: [{ id: "5", reasons: ["too_short", "one_kind"] }], reused: [["1", "2"]] };
   },
   async lock() {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) await invoke("lock_vault");
   },
   async lockWhenIdle(milliseconds) {
@@ -266,11 +269,11 @@ export const bridge: DesktopBridge = {
     else (globalThis as { osmHandedOver?: number | null }).osmHandedOver = milliseconds;
   },
   async unlock(password) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) await invoke("unlock_vault", { password });
   },
   async createVault(password) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return String(await invoke("create_vault", { password }));
     return "";
   },
@@ -286,37 +289,37 @@ export const bridge: DesktopBridge = {
     await navigator.clipboard?.writeText(code);
   },
   async copyTotp(id) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) await invoke("copy_totp", { id });
   },
   copyPassword: (id) => nativeOnly("copy_password", { id }),
   copyField: (id, name) => nativeOnly("copy_field", { id, name }),
   async getEntry(id) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return (await invoke("get_entry", { id })) as EntryDetail;
     const entry = previewEntries.find((existing) => existing.id === id);
     if (!entry) throw new Error("not_found");
     return previewDetail(entry);
   },
   async createEntry(input) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return (await invoke("create_entry", { input })) as VaultEntry;
     return savePreview(crypto.randomUUID(), input);
   },
   async updateEntry(id, expectedRevision, input) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return (await invoke("update_entry", { id, expectedRevision, input })) as VaultEntry;
     const entry = previewEntries.find((existing) => existing.id === id);
     if (!entry) throw new Error("not_found");
     return savePreview(id, input, previewDetail(entry));
   },
-  async removePasskey(id, expectedRevision, credentialId) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
-    if (invoke) return (await invoke("remove_passkey", { id, expectedRevision, credentialId })) as VaultEntry;
+  async removePasskey(id, expectedRevision, rpId, credentialId) {
+    const invoke = native();
+    if (invoke) return (await invoke("remove_passkey", { id, expectedRevision, rpId, credentialId })) as VaultEntry;
     const entry = previewEntries.find((existing) => existing.id === id);
     if (!entry) throw new Error("not_found");
     const detail = previewDetail(entry);
-    const passkeys = (detail.passkeys ?? []).filter((passkey) => passkey.credentialId !== credentialId);
+    const passkeys = (detail.passkeys ?? []).filter((passkey) => !(passkey.rpId === rpId && passkey.credentialId === credentialId));
     const revision = crypto.randomUUID();
     previewDetails.set(id, { ...detail, passkeys, revision });
     const updated: VaultEntry = { ...entry, revision, passkeys: passkeys.length };
@@ -324,7 +327,7 @@ export const bridge: DesktopBridge = {
     return updated;
   },
   async deleteEntry(id, expectedRevision) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) { await invoke("delete_entry", { id, expectedRevision }); return; }
     const gone = previewEntries.find((existing) => existing.id === id);
     if (!gone) throw new Error("not_found");
@@ -335,7 +338,7 @@ export const bridge: DesktopBridge = {
   // Conflicts only arise from revisions received from another device, so
   // the browser preview has one only when its address asks (`?conflict`).
   async listVersions(id) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) return (await invoke("list_versions", { id })) as VersionSummary[];
     if (previewEntries.find((entry) => entry.id === id)?.conflict) return previewConflict;
     throw new Error("preview");
@@ -579,12 +582,13 @@ export const bridge: DesktopBridge = {
     return previewSettings;
   },
   async listen(event, handler) {
+    if (isTauri()) return tauriListen(event, (message) => handler(message.payload as never));
     const listen = (globalThis as TauriGlobal).__TAURI__?.event?.listen;
     if (!listen) return () => {};
     return listen(event, (message) => handler(message.payload as never));
   },
   async resolveEntry(id, keepRevision, heads) {
-    const invoke = (globalThis as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } } }).__TAURI__?.core?.invoke;
+    const invoke = native();
     if (invoke) { await invoke("resolve_entry", { id, keepRevision, heads }); return; }
     const kept = previewConflict.find((version) => version.revision === keepRevision);
     const entry = previewEntries.find((existing) => existing.id === id);

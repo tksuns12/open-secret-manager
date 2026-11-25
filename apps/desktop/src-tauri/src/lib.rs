@@ -25,10 +25,14 @@ mod settings;
 #[cfg(test)]
 mod side_files_tests;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use osm_vault_core::{card, Item, ItemKind, ItemSummary, PasskeySummary, Vault, VaultItem};
 use serde::{Deserialize, Serialize};
+use tauri::Manager as _;
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -38,7 +42,7 @@ use zeroize::{Zeroize, Zeroizing};
 /// The browser session's own locks are taken last and never held across a
 /// wait.
 struct AppState {
-    vault: Mutex<Option<Vault>>,
+    vault: Arc<Mutex<Option<Vault>>>,
     /// A copy of a vault put away earlier that the owner has opened.
     archive: Mutex<Option<archive::Opened>>,
     path: PathBuf,
@@ -165,13 +169,20 @@ async fn change_password(
     let current_password = Zeroizing::new(current_password);
     let new_password = Zeroizing::new(new_password);
     check_new_password(&new_password)?;
-    let mut vault = state.vault.lock().await;
-    let vault = vault.as_mut().ok_or_else(|| CommandError {
-        code: "vault_missing",
-        message: "vault has not been configured".into(),
-    })?;
-    vault.change_password(&current_password, &new_password)?;
-    Ok(())
+    let mut vault = state.vault.clone().lock_owned().await;
+    tokio::task::spawn_blocking(move || -> Result<(), CommandError> {
+        let vault = vault.as_mut().ok_or_else(|| CommandError {
+            code: "vault_missing",
+            message: "vault has not been configured".into(),
+        })?;
+        vault.change_password(&current_password, &new_password)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "storage",
+        message: error.to_string(),
+    })?
 }
 
 #[tauri::command]
@@ -232,21 +243,27 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Locks the vault and closes an opened archived copy, which is unlocked
-/// too. Clears any secret last copied to the clipboard. Says whether either
-/// was open.
+/// too. Clears any secret last copied to the clipboard and aborts/revokes any
+/// pending pairing. Says whether either was open.
 async fn lock_everything(state: &AppState) -> bool {
     osm_desktop_session::clear_last_secret();
-    let mut vault = state.vault.lock().await;
-    let unlocked = vault.as_ref().is_some_and(Vault::is_unlocked);
-    if let Some(vault) = vault.as_mut() {
-        if unlocked {
-            state.rows_seen.keep_up(vault);
+    let was_open = {
+        let mut vault = state.vault.lock().await;
+        let unlocked = vault.as_ref().is_some_and(Vault::is_unlocked);
+        if let Some(vault) = vault.as_mut() {
+            if unlocked {
+                state.rows_seen.keep_up(vault);
+            }
+            vault.lock();
         }
-        vault.lock();
-    }
-    let archive = state.archive.lock().await.take();
-    state.import.lock().await.take();
-    unlocked || archive.is_some()
+        let archive = state.archive.lock().await.take();
+        state.import.lock().await.take();
+        unlocked || archive.is_some()
+    };
+    // Drop `vault`/`archive`/`import` locks before cancelling pairing so we
+    // never invert lock order with `start_invite` (`invite -> vault`).
+    state.network.cancel_pairing().await;
+    was_open
 }
 
 /// Why the vault file on this device cannot be opened, if one is here and
@@ -353,16 +370,47 @@ fn generate_password(choice: settings::GeneratorChoice) -> Result<String, Comman
 }
 
 /// Copies a password the generator made, for 30 seconds, as an item's are.
+/// Requires the vault to be unlocked.
 #[tauri::command]
-fn copy_generated(value: String) -> Result<(), CommandError> {
+async fn copy_generated(
+    value: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    if !state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(Vault::is_unlocked)
+    {
+        return Err(CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        });
+    }
     copy_for_a_while(&Zeroizing::new(value))
 }
 
 /// Copies a one-time pairing invitation code via the OS secret-clipboard path
 /// (excluded from clipboard history/cloud sync, auto-cleared in 30 seconds,
-/// and cleared immediately on lock).
+/// and cleared immediately on lock). Requires the vault to be unlocked.
 #[tauri::command]
-fn copy_invitation(code: String) -> Result<(), CommandError> {
+async fn copy_invitation(
+    code: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    if !state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(Vault::is_unlocked)
+    {
+        return Err(CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        });
+    }
     copy_for_a_while(&Zeroizing::new(code))
 }
 
@@ -723,13 +771,14 @@ async fn update_entry<R: tauri::Runtime>(
     Ok(vault.get(&id)?.into())
 }
 
-/// Removes a login's passkey on every device, as read at
-/// `expected_revision`. Its key stays in the login's earlier versions and in
-/// backups.
+/// Removes a login's passkey for `(rp_id, credential_id)` on every device, as
+/// read at `expected_revision`. Its key stays in the login's earlier versions
+/// and in backups.
 #[tauri::command]
 async fn remove_passkey<R: tauri::Runtime>(
     id: String,
     expected_revision: String,
+    rp_id: String,
     credential_id: String,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle<R>,
@@ -739,7 +788,8 @@ async fn remove_passkey<R: tauri::Runtime>(
         code: "locked",
         message: "vault is locked".into(),
     })?;
-    vault.remove_passkey(&id, &expected_revision, &credential_id)?;
+    vault.remove_passkey_for_rp(&id, &expected_revision, &rp_id, &credential_id)?;
+    state.rows_seen.keep_up(vault);
     network::schedule_sync(&app);
     Ok(vault.get(&id)?.into())
 }
@@ -1012,26 +1062,37 @@ async fn create_vault<R: tauri::Runtime>(
     let password = Zeroizing::new(password);
     check_new_password(&password)?;
     let recovery = {
-        let mut vault = state.vault.lock().await;
+        let mut vault = state.vault.clone().lock_owned().await;
         if vault.is_some() {
             return Err(CommandError {
                 code: "vault_exists",
                 message: "vault is already configured".into(),
             });
         }
-        if let Some(parent) = state.path.parent() {
-            ensure_private_dir(parent).map_err(|error| CommandError {
+        let path = state.path.clone();
+        let (created, recovery) =
+            tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
+                if let Some(parent) = path.parent() {
+                    ensure_private_dir(parent).map_err(|error| CommandError {
+                        code: "storage",
+                        message: error.to_string(),
+                    })?;
+                }
+                let (mut created, recovery) =
+                    Vault::create(&path, &password).map_err(CommandError::from)?;
+                // Kept in the vault until the owner confirms having stored it, in
+                // case the app stops before the key has been shown.
+                let _ = created.keep_recovery_key_until_confirmed(&recovery);
+                Ok((created, recovery.to_string()))
+            })
+            .await
+            .map_err(|error| CommandError {
                 code: "storage",
                 message: error.to_string(),
-            })?;
-        }
-        let (mut created, recovery) =
-            Vault::create(&state.path, &password).map_err(CommandError::from)?;
-        // Kept in the vault until the owner confirms having stored it, in
-        // case the app stops before the key has been shown.
-        let _ = created.keep_recovery_key_until_confirmed(&recovery);
+            })??;
+        state.rows_seen.keep_up(&created);
         *vault = Some(created);
-        recovery.to_string()
+        recovery
     };
     idle::arm_backstop(&app);
     network::after_create(&app).await;
@@ -1046,12 +1107,27 @@ async fn unlock_vault<R: tauri::Runtime>(
 ) -> Result<(), CommandError> {
     let password = Zeroizing::new(password);
     {
-        let mut vault = state.vault.lock().await;
-        let vault = vault.as_mut().ok_or_else(|| CommandError {
-            code: "vault_missing",
-            message: "vault has not been configured".into(),
-        })?;
-        vault.unlock(&password)?;
+        let mut vault = state.vault.clone().lock_owned().await;
+        vault = tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
+            {
+                let inner = vault.as_mut().ok_or_else(|| CommandError {
+                    code: "vault_missing",
+                    message: "vault has not been configured".into(),
+                })?;
+                inner.unlock(&password)?;
+            }
+            Ok(vault)
+        })
+        .await
+        .map_err(|error| CommandError {
+            code: "storage",
+            message: error.to_string(),
+        })??;
+        // Check rollback state atomically inside the same unlock lock before
+        // any concurrent sync or command can observe or append rows.
+        if let Some(vault) = vault.as_mut().filter(|vault| vault.is_unlocked()) {
+            state.rows_seen.check(vault);
+        }
     }
     idle::arm_backstop(&app);
     // The vault is brought in line with committed membership before
@@ -1113,12 +1189,18 @@ async fn confirm_rows_changed(state: tauri::State<'_, AppState>) -> Result<(), C
 }
 
 /// The owner has stored the recovery key: the vault stops keeping it.
+/// Requires the vault to be unlocked.
 #[tauri::command]
 async fn confirm_recovery_key(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
     let mut vault = state.vault.lock().await;
-    if let Some(vault) = vault.as_mut() {
-        vault.confirm_recovery_key_stored()?;
-    }
+    let vault = vault
+        .as_mut()
+        .filter(|vault| vault.is_unlocked())
+        .ok_or_else(|| CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        })?;
+    vault.confirm_recovery_key_stored()?;
     Ok(())
 }
 
@@ -1177,7 +1259,7 @@ pub fn run() {
         .manage(StartupProblem(None))
         .manage(idle::IdleLock::default())
         .manage(AppState {
-            vault: Mutex::new(Vault::open(&path).ok()),
+            vault: Arc::new(Mutex::new(Vault::open(&path).ok())),
             archive: Mutex::new(None),
             path,
             network,
@@ -1275,8 +1357,13 @@ pub fn run() {
             settings::set_auto_lock,
             settings::set_generator
         ])
-        .run(context)
-        .expect("error while running Open Secret Manager");
+        .build(context)
+        .expect("error while building Open Secret Manager")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(lock_everything(&app.state::<AppState>()));
+            }
+        });
 }
 
 fn default_vault_path() -> PathBuf {

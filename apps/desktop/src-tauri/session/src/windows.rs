@@ -1,8 +1,147 @@
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arboard::SetExtWindows;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+use crate::Away;
+
+type OnAway = Arc<dyn Fn(Away) + Send + Sync>;
+
+/// Watches Windows session lock, console/remote disconnect, and suspend events
+/// via a hidden top-level window registered with `WTSRegisterSessionNotification`.
+pub(crate) fn watch(on_away: OnAway) -> bool {
+    use core::ffi::c_void;
+    use std::sync::mpsc;
+
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION},
+        },
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+            GetWindowLongPtrW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
+            TranslateMessage, GWLP_USERDATA, MSG, PBT_APMSUSPEND, WM_NCDESTROY, WM_POWERBROADCAST,
+            WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_CONSOLE_DISCONNECT,
+            WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK,
+        },
+    };
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        let user_data = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+        if user_data != 0 {
+            match msg {
+                WM_WTSSESSION_CHANGE => {
+                    // SAFETY: `user_data` holds a live `Box<OnAway>` installed
+                    // immediately after `CreateWindowExW` and freed on `WM_NCDESTROY`.
+                    let callback = unsafe { &*(user_data as *const OnAway) };
+                    match wparam as u32 {
+                        WTS_SESSION_LOCK => callback(Away::ScreenLocked),
+                        WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT => {
+                            callback(Away::SwitchedOut);
+                        }
+                        _ => {}
+                    }
+                    return 0;
+                }
+                WM_POWERBROADCAST => {
+                    if wparam as u32 == PBT_APMSUSPEND {
+                        // SAFETY: as above.
+                        let callback = unsafe { &*(user_data as *const OnAway) };
+                        callback(Away::Sleep);
+                    }
+                    return 1;
+                }
+                WM_NCDESTROY => {
+                    unsafe {
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                        drop(Box::from_raw(user_data as *mut OnAway));
+                        PostQuitMessage(0);
+                    }
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<bool>(1);
+    let spawned = std::thread::Builder::new()
+        .name("osm-session-win".into())
+        .spawn(move || {
+            let class_name: Vec<u16> = "OpenSecretManagerSessionWatcher\0".encode_utf16().collect();
+            // SAFETY: NULL asks for the current process module handle.
+            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            let wc = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: instance,
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+            // SAFETY: `wc` is fully initialized and `class_name` is NUL-terminated.
+            let _ = unsafe { RegisterClassW(&wc) };
+            // Top-level hidden `WS_OVERLAPPED` window (NOT `HWND_MESSAGE`) so
+            // Windows delivers broadcast `WM_POWERBROADCAST` suspend messages.
+            // SAFETY: valid class name, process instance, and null optional params.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    class_name.as_ptr(),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    instance,
+                    std::ptr::null::<c_void>(),
+                )
+            };
+            if hwnd.is_null() {
+                let _ = ready_tx.send(false);
+                return;
+            }
+            let boxed = Box::into_raw(Box::new(on_away));
+            // SAFETY: `hwnd` is a valid window owned by this thread; `boxed`
+            // is reclaimed on `WM_NCDESTROY`.
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, boxed as isize) };
+            // SAFETY: `hwnd` is a valid top-level window for this session.
+            if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } == 0 {
+                unsafe { DestroyWindow(hwnd) };
+                let _ = ready_tx.send(false);
+                return;
+            }
+            let _ = ready_tx.send(true);
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            // SAFETY: standard Win32 message loop for the thread's window.
+            while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+    if spawned.is_err() {
+        return false;
+    }
+    ready_rx.recv().unwrap_or(false)
+}
 
 struct Served {
     key: [u8; 32],

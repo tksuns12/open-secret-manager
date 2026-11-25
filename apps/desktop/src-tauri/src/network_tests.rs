@@ -36,7 +36,7 @@ pub(crate) fn shell_keeping(
         network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
     mock_builder()
         .manage(AppState {
-            vault: Mutex::new(Vault::open(&path).ok()),
+            vault: Arc::new(Mutex::new(Vault::open(&path).ok())),
             archive: Mutex::new(None),
             browser: crate::browser::Browser::open(&path),
             path,
@@ -1044,13 +1044,22 @@ fn a_removed_device_is_reset_and_joins_again() {
         )
         .await;
 
-        // Locking the vault closes the archived copy.
+        // Locking the vault closes the archived copy and refuses deletion until unlocked.
         crate::lock_vault(b.state()).await.unwrap();
         let closed = archive::copy_from_archive(held[0].id.clone(), b.state(), b.clone())
             .await
             .err()
             .unwrap();
         assert_eq!(closed.code, "no_archive");
+        let locked_delete = archive::delete_archive(name.clone(), b.state(), b.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(locked_delete.code, "locked");
+
+        // Unlock again to verify bad names and authorized deletion.
+        crate::unlock_vault("second password".into(), b.state(), b.clone())
+            .await
+            .unwrap();
 
         // Only a folder this app made is ever opened or deleted.
         for bad in [

@@ -137,7 +137,7 @@ fn without_a_keystore_nothing_is_kept_and_an_unlock_says_nothing() {
     let (dir, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (dir, copy) = (dir.path(), elsewhere.path().join("earlier.sqlite3"));
     let rows = Arc::new(MemoryRowsSeen::default());
-    rows.set_unavailable();
+    rows.set_absent();
     tauri::async_runtime::block_on(async {
         a_vault_and_its_copy(dir, &copy, &rows).await;
         run_app(dir, &rows, async |app| {
@@ -151,6 +151,22 @@ fn without_a_keystore_nothing_is_kept_and_an_unlock_says_nothing() {
             unlock(app).await;
             assert!(!told(app).await);
             assert_eq!(titles(app).await, ["Kept"]);
+        })
+        .await;
+    });
+}
+
+#[test]
+fn when_an_installed_keystore_fails_rollback_check_fails_closed() {
+    let (dir, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (dir, copy) = (dir.path(), elsewhere.path().join("earlier.sqlite3"));
+    let rows = Arc::new(MemoryRowsSeen::default());
+    tauri::async_runtime::block_on(async {
+        a_vault_and_its_copy(dir, &copy, &rows).await;
+        rows.set_unavailable();
+        run_app(dir, &rows, async |app| {
+            unlock(app).await;
+            assert!(told(app).await);
         })
         .await;
     });

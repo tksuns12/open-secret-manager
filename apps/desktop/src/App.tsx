@@ -183,8 +183,9 @@ function App() {
       // that it was removed or because the owner asked for it here: it is a
       // device without a vault again.
       bridge.listen<string>("device-reset", () => {
-        setEntries([]); setLocked(true); setVaultStatus("missing"); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false); setArchivesOpen(false);
-        setInvite(null); setRejoining(false); setJoining(false); setDevicesOpen(false);
+        showLocked();
+        setVaultStatus("missing");
+        setInvite(null); setRejoining(false); setJoining(false);
         void bridge.devices().then((info) => {
           setDevices(info);
           setNotice(info.resetReason === "left" ? "This device's copy was moved to an archive folder · join the new vault with an invitation" : "This device was removed from the vault · its copy was moved to an archive folder");
@@ -232,6 +233,7 @@ function App() {
   }
   function showLocked() {
     setEntries([]); setLocked(true); setRecoveryKey(null); setEditor(null); setReview(null); setHeldOpen(false); setArchivesOpen(false); setImportOpen(false); setShown(null); setHistory(null); setDeleted(null);
+    setGeneratorOpen(false); setDevicesOpen(false); setBackupOpen(false); setBrowserOpen(false); setSettingsOpen(false); setQuery(""); setHealth(null); setSelected("");
   }
   /** A lock for want of activity, which says nothing unless it ends a pairing. */
   function showIdleLocked() {
@@ -496,10 +498,10 @@ function App() {
     }
   }
 
-  async function removePasskey(credentialId: string) {
+  async function removePasskey(rpId: string, credentialId: string) {
     if (!shown) return;
     try {
-      await bridge.removePasskey(shown.id, shown.revision, credentialId);
+      await bridge.removePasskey(shown.id, shown.revision, rpId, credentialId);
       setEntries(await bridge.listEntries());
       setNotice("Passkey removed");
     } catch (error) {
@@ -740,13 +742,7 @@ function App() {
 
   async function lock() {
     await bridge.lock();
-    setEntries([]);
-    setLocked(true);
-    setRecoveryKey(null);
-    setEditor(null);
-    setReview(null);
-    setHeldOpen(false);
-    setArchivesOpen(false);
+    showLocked();
     setNotice(endPairing() ? "Vault locked · the pairing was cancelled" : "Vault locked");
   }
 
@@ -804,7 +800,7 @@ function App() {
             <label className="search-box"><Search size={17} /><input ref={searchRef} aria-label="Search vault" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" /><kbd>⌘ K</kbd></label>
             <div className="entry-list">{visible.map((entry) => <button key={entry.id} className={`entry-row ${active?.id === entry.id ? "selected" : ""}`} onClick={() => setSelected(entry.id)}><div className={`entry-logo logo-${entry.kind}`}>{entry.kind === "secure_note" ? "▤" : entry.title.slice(0, 1)}</div><div className="entry-copy"><strong>{entry.title}</strong><span>{subtitle(entry)}</span></div><div className="entry-meta">{attention.has(entry.id) && <span className="attention" title={attention.get(entry.id)?.join(" ")} aria-label="Needs attention">!</span>}{entry.favorite && <span className="favorite">★</span>}</div></button>)}{visible.length === 0 && <div className="empty-list"><Search size={22} /><strong>No matching items</strong><span>Try a different search or filter.</span></div>}</div>
           </div>
-          <div className="detail-column">{locked && vaultStatus === "missing" && vaultProblem ? <UnreadablePanel problem={vaultProblem} onPutAway={() => void putUnreadableAway()} /> : locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked && vaultStatus === "missing" && restoring ? <RestorePanel onCancel={() => setRestoring(false)} onRestored={(result) => void restored(result)} onNotice={setNotice} /> : locked && vaultStatus === "locked" && resetting ? <ResetPasswordPanel onCancel={() => setResetting(false)} onReset={() => void passwordReset()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{fill && <div className="conflict-banner fill-banner"><CircleAlert size={16} /><div><strong>{fill.passkey ? `${fill.origin} asks for a passkey in ${fill.browser}` : `${fill.browser} asks to fill a ${fill.card ? "card" : "login"} into ${fill.origin}`}</strong><span>{vaultStatus === "missing" ? "This device has no vault to fill from." : `Unlock to choose ${fill.passkey ? "how to answer" : `a ${fill.card ? "card" : "login"}`}. Nothing is sent until you choose.`}</span></div><button className="conflict-action" onClick={() => void denyFill()}>Deny</button></div>}{vaultStatus === "missing" ? devices.resetArchive ? devices.resetReason === "left" ? <><CircleAlert size={25} /><h2>This device's copy was put away</h2><span>You had it moved to {devices.resetArchive}. Nothing was deleted. Join the new vault with an invitation from the device that started it, or create a new vault here.</span></> : <><CircleAlert size={25} /><h2>This device was removed from its vault</h2><span>Your other devices removed it, so its copy was moved to {devices.resetArchive}. Nothing was deleted. Join again with an invitation from one of your other devices, or create a new vault here.</span></> : <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setRestoring(true)}>Restore from a backup instead</button>}{vaultStatus === "locked" && !previewMode && <button className="link-button" onClick={() => setResetting(true)}>Forgot the password? Use the recovery key</button>}{vaultStatus === "missing" && devices.resetArchive && <button className="link-button" onClick={() => setArchivesOpen(true)}>Look into the copy that was put away</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button>{shown?.hasPassword && <button onClick={() => void copySecret("password")}><Copy size={15} /> Copy password</button>}{shown?.hasTotp && <button onClick={() => void copySecret("code")}><Copy size={15} /> Copy one-time code</button>}</div><ItemRecord entry={active} detail={shown?.id === active.id ? shown : null} onCopyUsername={() => { void navigator.clipboard?.writeText(active.username ?? ""); setNotice("Username copied"); }} onCopy={(what, name) => void copySecret(what, name)} onRemovePasskey={(credentialId) => void removePasskey(credentialId)} />{attention.has(active.id) && <div className="conflict-banner attention-note"><CircleAlert size={16} /><div><strong>Worth changing this password</strong><span>{attention.get(active.id)?.join(" ")}</span></div></div>}<button className="history-note" onClick={() => void openHistory()}><Clock3 size={15} /><div><strong>History</strong><span>Every version of this item, which device made it, and what it changed</span></div><ChevronRight size={15} /></button>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
+          <div className="detail-column">{locked && vaultStatus === "missing" && vaultProblem ? <UnreadablePanel problem={vaultProblem} onPutAway={() => void putUnreadableAway()} /> : locked && vaultStatus === "missing" && joining ? <JoinPanel onCancel={() => setJoining(false)} onJoined={() => void joined()} onNotice={setNotice} /> : locked && vaultStatus === "missing" && restoring ? <RestorePanel onCancel={() => setRestoring(false)} onRestored={(result) => void restored(result)} onNotice={setNotice} /> : locked && vaultStatus === "locked" && resetting ? <ResetPasswordPanel onCancel={() => setResetting(false)} onReset={() => void passwordReset()} onNotice={setNotice} /> : locked ? <div className="empty-detail">{fill && <div className="conflict-banner fill-banner"><CircleAlert size={16} /><div><strong>{fill.passkey ? `${fill.origin} asks for a passkey in ${fill.browser}` : `${fill.browser} asks to fill a ${fill.card ? "card" : "login"} into ${fill.origin}`}</strong><span>{vaultStatus === "missing" ? "This device has no vault to fill from." : `Unlock to choose ${fill.passkey ? "how to answer" : `a ${fill.card ? "card" : "login"}`}. Nothing is sent until you choose.`}</span></div><button className="conflict-action" onClick={() => void denyFill()}>Deny</button></div>}{vaultStatus === "missing" ? devices.resetArchive ? devices.resetReason === "left" ? <><CircleAlert size={25} /><h2>This device's copy was put away</h2><span>You had it moved to {devices.resetArchive}. Nothing was deleted. Join the new vault with an invitation from the device that started it, or create a new vault here.</span></> : <><CircleAlert size={25} /><h2>This device was removed from its vault</h2><span>Your other devices removed it, so its copy was moved to {devices.resetArchive}. Nothing was deleted. Join again with an invitation from one of your other devices, or create a new vault here.</span></> : <><Sparkles size={25} /><h2>Create your encrypted vault</h2><span>This device keeps its own vault. Choose a strong local password.</span></> : <><LockKeyhole size={25} /><h2>Vault locked</h2><span>{sync.pending > 0 ? `${sync.pending} received ${sync.pending === 1 ? "change is" : "changes are"} waiting to be verified when you unlock.` : "Unlock in the desktop window to view encrypted records."}</span></>}<div className="unlock-form"><input aria-label="Vault password" type="password" placeholder={vaultStatus === "missing" ? "New device password" : "Vault password"} value={unlockPassword} onChange={(event) => setUnlockPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (vaultStatus === "missing" ? createVault() : unlock()); }} /><button onClick={() => void (vaultStatus === "missing" ? createVault() : unlock())}>{vaultStatus === "missing" ? <><Plus size={15} /> Create</> : <><UnlockKeyhole size={15} /> Unlock</>}</button></div>{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setJoining(true)}>Join a vault from another device instead</button>}{vaultStatus === "missing" && !previewMode && <button className="link-button" onClick={() => setRestoring(true)}>Restore from a backup instead</button>}{vaultStatus === "locked" && !previewMode && <button className="link-button" onClick={() => setResetting(true)}>Forgot the password? Use the recovery key</button>}{vaultStatus === "missing" && devices.resetArchive && <button className="link-button" onClick={() => setArchivesOpen(true)}>Look into the copy that was put away</button>}</div> : active ? <><div className="detail-head"><div className={`detail-logo logo-${active.kind}`}>{active.kind === "secure_note" ? "▤" : active.title.slice(0, 1)}</div><div className="detail-title"><div><h2>{active.title}</h2>{active.url && <span>{active.url}</span>}</div></div></div><div className="detail-actions"><button onClick={() => void openEditor()}><span className="action-icon">✎</span> Edit</button>{shown?.hasPassword && <button onClick={() => void copySecret("password")}><Copy size={15} /> Copy password</button>}{shown?.hasTotp && <button onClick={() => void copySecret("code")}><Copy size={15} /> Copy one-time code</button>}</div><ItemRecord entry={active} detail={shown?.id === active.id ? shown : null} onCopyUsername={() => { void navigator.clipboard?.writeText(active.username ?? ""); setNotice("Username copied"); }} onCopy={(what, name) => void copySecret(what, name)} onRemovePasskey={(rpId, credentialId) => void removePasskey(rpId, credentialId)} />{attention.has(active.id) && <div className="conflict-banner attention-note"><CircleAlert size={16} /><div><strong>Worth changing this password</strong><span>{attention.get(active.id)?.join(" ")}</span></div></div>}<button className="history-note" onClick={() => void openHistory()}><Clock3 size={15} /><div><strong>History</strong><span>Every version of this item, which device made it, and what it changed</span></div><ChevronRight size={15} /></button>{active.conflict && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>Needs your decision</strong><span>Two signed revisions changed this item concurrently. Autofill is paused.</span></div><button className="conflict-action" onClick={() => void openReview()}>Review versions</button></div>}</> : <div className="empty-detail"><Sparkles size={25} /><h2>Select an item</h2><span>Your encrypted record will appear here after selection.</span></div>}</div>
         </div>
         {rowsChanged && !locked ? <div className="recovery-overlay"><div className="recovery-card rows-changed-card"><strong>Something in this vault's file was taken out, changed, or set back</strong><span>Since this computer last wrote to it, something outside Open Secret Manager removed or changed records in the vault's file, or put an earlier copy of the file in its place: an item, an edit, or a device's keys may be missing. Your other devices send back what they have at the next sync. If this is your only device, restore a backup to get it back. If you did not put back an earlier copy yourself, check this computer for software you do not trust.</span><button onClick={() => { setRowsChanged(false); void bridge.confirmRowsChanged().catch(() => {}); }}>I understand</button></div></div> : recoveryKey && !locked && <div className="recovery-overlay"><div className="recovery-card"><strong>Recovery key · store this offline</strong><code>{recoveryKey}</code><span>It is shown after every unlock until you confirm here that you stored it.</span><button onClick={() => { setRecoveryKey(null); void bridge.confirmRecoveryKey().catch(() => {}); }}>I stored it</button></div></div>}
         <footer className="footer-bar"><div><Wifi size={14} /><span>{previewMode ? "Development preview" : "Local vault"}</span><span className="footer-separator">•</span><span>{previewMode ? "No native sync session" : syncDetail(sync)}</span></div><button onClick={() => devicesUnavailable ? setNotice("Sync is unavailable in the browser preview") : setDevicesOpen(true)}>Devices <ChevronRight size={14} /></button></footer>
@@ -816,7 +812,7 @@ function App() {
       {backupOpen && !locked && <div className="modal-backdrop" onClick={() => setBackupOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BACKUP</p><h2>Back up this vault</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBackupOpen(false)}><X size={18} /></button></div><BackupPanel recoveryOn={recoveryOn} onOpenDevices={() => { setBackupOpen(false); setDevicesOpen(true); }} onSaved={loadBackupAge} onNotice={setNotice} /></div></div>}
       {archivesOpen && <div className="modal-backdrop" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">ARCHIVE</p><h2>Copies put away on this device</h2></div><button className="icon-button" aria-label="Close" onClick={() => { setArchivesOpen(false); void bridge.closeArchive().catch(() => {}); }}><X size={18} /></button></div><ArchivesPanel canCopy={!locked} onCopied={() => { void bridge.listEntries().then(setEntries).catch(() => {}); }} onNotice={setNotice} /></div></div>}
       {devicesOpen && <div className="modal-backdrop" onClick={() => setDevicesOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DEVICES</p><h2>Devices and sync</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDevicesOpen(false)}><X size={18} /></button></div>{!locked && !recoveryOn && devices.setup === "ready" && <RecoveryPrompt onEnable={(key) => void enableRecovery(key)} />}<DevicesPanel sync={sync} devices={devices} invite={invite} locked={locked} onInvite={(votes, away) => void startInvite(votes, away)} onAnswer={(accept) => void answerInvite(accept)} onCancelInvite={() => void cancelInvite()} onSync={() => void syncNow()} onFound={() => void foundControlPlane()} onRemove={(device) => void removeDevice(device)} onCancelEnrollment={() => void cancelEnrollment()} onRejoined={() => void rejoined()} onRecovered={(key, summary) => void recovered(key, summary)} onUnlock={() => { setDevicesOpen(false); setNotice("Enter the vault password to unlock"); }} rejoining={rejoining} onRejoining={setRejoining} onReset={() => void resetDevice()} onNotice={setNotice} onCopy={(text) => { void bridge.copyInvitation(text).then(() => setNotice("Invitation copied · it works once · cleared in 30 seconds"), (error) => setNotice(commandMessage(error, "Nothing was copied"))); }}  onRelayChanged={() => { void bridge.devices().then(setDevices).catch(() => {}); }} /></div></div>}
-      {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel onNotice={setNotice} /></div></div>}
+      {browserOpen && <div className="modal-backdrop" onClick={() => setBrowserOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">BROWSER</p><h2>Filling into a browser</h2></div><button className="icon-button" aria-label="Close" onClick={() => setBrowserOpen(false)}><X size={18} /></button></div><BrowserPanel locked={locked} onNotice={setNotice} /></div></div>}
       {history && !locked && <div className="modal-backdrop" onClick={() => setHistory(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">HISTORY</p><h2>{history.title}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setHistory(null)}><X size={18} /></button></div><HistoryPanel versions={history.versions} onRestore={(revision) => void restore(history.id, revision, history.versions.filter((version) => version.current).map((version) => version.revision), "Version restored")} /></div></div>}
       {deleted && !locked && <div className="modal-backdrop" onClick={() => setDeleted(null)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">DELETED</p><h2>Recently deleted</h2></div><button className="icon-button" aria-label="Close" onClick={() => setDeleted(null)}><X size={18} /></button></div><DeletedPanel items={deleted} onRestore={(item) => void restore(item.id, item.last, item.heads, `${item.title} restored`)} /></div></div>}
       {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><div className="generator-modal entry-editor" onClick={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">SETTINGS</p><h2>On this computer</h2></div><button className="icon-button" aria-label="Close" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div><SettingsPanel minutes={autoLockMinutes} locked={locked} onChange={(minutes) => void changeAutoLock(minutes)} onNotice={setNotice} /></div></div>}
@@ -1024,6 +1020,12 @@ function FillPanel({ asked, onFill, onDeny }: { asked: FillAsked; onFill: (login
   const [chosen, setChosen] = useState<string | null>(asked.logins.length === 1 ? asked.logins[0].id : null);
   const [left, setLeft] = useState(asked.secondsLeft);
   const [sending, setSending] = useState(false);
+  const [cooling, setCooling] = useState(true);
+  useEffect(() => {
+    setCooling(true);
+    const delay = window.setTimeout(() => setCooling(false), 500);
+    return () => window.clearTimeout(delay);
+  }, [asked.requestId]);
   useEffect(() => {
     const started = Date.now();
     const timer = window.setInterval(() => setLeft(Math.max(0, asked.secondsLeft - Math.floor((Date.now() - started) / 1000))), 1000);
@@ -1040,7 +1042,7 @@ function FillPanel({ asked, onFill, onDeny }: { asked: FillAsked; onFill: (login
     {asked.logins.length === 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>No login is stored for this page</strong><span>A login is offered only if its address is on exactly {asked.origin}: the same name, over https, on the same port.</span></div></div>}
     {asked.notOffered.map((other) => <p key={`${other.title} ${other.url}`} className="review-hint">“{other.title}” has the address {other.url}. {other.reason === "no_scheme" ? "Put https:// in front of that address for it to be offered here." : "That is an http address, and a login is only sent to an https page."}</p>)}
     <p className="review-hint">{left > 0 ? `The browser waits ${left} more ${left === 1 ? "second" : "seconds"}.` : "The browser has stopped waiting."}</p>
-    <div className="form-actions"><button className="secondary" disabled={sending} onClick={onDeny}>Deny</button><button className="generate-button" disabled={!login || sending} onClick={() => { if (login) { setSending(true); onFill(login); } }}>{login ? `Fill ${login.title}` : asked.logins.length === 0 ? "Nothing to fill" : "Choose a login"}</button></div>
+    <div className="form-actions"><button className="secondary" disabled={sending} onClick={onDeny}>Deny</button><button className="generate-button" disabled={!login || sending || cooling} onClick={() => { if (login && !cooling) { setSending(true); onFill(login); } }}>{login ? `Fill ${login.title}` : asked.logins.length === 0 ? "Nothing to fill" : "Choose a login"}</button></div>
   </div>;
 }
 
@@ -1060,6 +1062,12 @@ function CardFillPanel({ asked, onFill, onDeny }: { asked: FillAsked; onFill: (c
   const [chosen, setChosen] = useState<string | null>(cards.length === 1 ? cards[0].id : null);
   const [left, setLeft] = useState(asked.secondsLeft);
   const [sending, setSending] = useState(false);
+  const [cooling, setCooling] = useState(true);
+  useEffect(() => {
+    setCooling(true);
+    const delay = window.setTimeout(() => setCooling(false), 500);
+    return () => window.clearTimeout(delay);
+  }, [asked.requestId]);
   useEffect(() => {
     const started = Date.now();
     const timer = window.setInterval(() => setLeft(Math.max(0, asked.secondsLeft - Math.floor((Date.now() - started) / 1000))), 1000);
@@ -1076,7 +1084,7 @@ function CardFillPanel({ asked, onFill, onDeny }: { asked: FillAsked; onFill: (c
     </button>)}
     {cards.length === 0 && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>No card is stored</strong><span>Add a card in this app first. A card two devices changed at once is filled only once you settle which version to keep.</span></div></div>}
     <p className="review-hint">{left > 0 ? `The browser waits ${left} more ${left === 1 ? "second" : "seconds"}.` : "The browser has stopped waiting."}</p>
-    <div className="form-actions"><button className="secondary" disabled={sending} onClick={onDeny}>Deny</button><button className="generate-button" disabled={!card || sending} onClick={() => { if (card) { setSending(true); onFill(card); } }}>{card ? `Fill ${card.title}` : cards.length === 0 ? "Nothing to fill" : "Choose a card"}</button></div>
+    <div className="form-actions"><button className="secondary" disabled={sending} onClick={onDeny}>Deny</button><button className="generate-button" disabled={!card || sending || cooling} onClick={() => { if (card && !cooling) { setSending(true); onFill(card); } }}>{card ? `Fill ${card.title}` : cards.length === 0 ? "Nothing to fill" : "Choose a card"}</button></div>
   </div>;
 }
 
@@ -1094,6 +1102,12 @@ function PasskeyPanel({ asked, passkey, onSend, onUseBrowser, onDeny }: { asked:
   const [password, setPassword] = useState("");
   const [left, setLeft] = useState(asked.secondsLeft);
   const [sending, setSending] = useState(false);
+  const [cooling, setCooling] = useState(true);
+  useEffect(() => {
+    setCooling(true);
+    const delay = window.setTimeout(() => setCooling(false), 500);
+    return () => window.clearTimeout(delay);
+  }, [asked.requestId]);
   useEffect(() => {
     const started = Date.now();
     const timer = window.setInterval(() => setLeft(Math.max(0, asked.secondsLeft - Math.floor((Date.now() - started) / 1000))), 1000);
@@ -1102,7 +1116,7 @@ function PasskeyPanel({ asked, passkey, onSend, onUseBrowser, onDeny }: { asked:
   const verifying = passkey.verification !== "discouraged";
   const signIn = passkey.passkeys.find((candidate) => candidate.credentialId === chosen);
   const account = (name: string, shown: string) => shown && shown !== name ? `${name} (${shown})` : name || "No account name";
-  const ready = (creating || signIn) && (!verifying || password.length > 0 || passkey.ownerCheck);
+  const ready = !cooling && (creating || signIn) && (!verifying || password.length > 0 || passkey.ownerCheck);
   const send = () => {
     if (!ready) return;
     setSending(true);
@@ -1150,7 +1164,7 @@ function PasskeyPanel({ asked, passkey, onSend, onUseBrowser, onDeny }: { asked:
 }
 
 /** Which browsers can reach this app, and the switch for each. */
-function BrowserPanel({ onNotice }: { onNotice: (text: string) => void }) {
+function BrowserPanel({ locked, onNotice }: { locked: boolean; onNotice: (text: string) => void }) {
   const [status, setStatus] = useState<BrowserStatus | null>(null);
   useEffect(() => { void bridge.browserStatus().then(setStatus).catch(() => {}); }, []);
 
@@ -1172,13 +1186,14 @@ function BrowserPanel({ onNotice }: { onNotice: (text: string) => void }) {
   return <div className="device-panel">
     <p className="review-hint">A browser extension can ask this app to fill a login into the page you are on. Each time, this window comes forward and you choose the login here; only its user name and password go to that page. The extension never sees what your vault holds.</p>
     {!status.listening && <div className="conflict-banner"><CircleAlert size={16} /><div><strong>This app is not listening for the browser</strong><span>{status.problem ?? "It could not start listening."}</span></div></div>}
+    {locked && <p className="review-hint">Unlock the vault to connect or disconnect browsers.</p>}
     {status.browsers.length === 0 && <p className="review-hint">No browser this app can connect was found on this account.</p>}
     {status.browsers.map((browser) => <div key={browser.id} className="peer-row">
       <div className="device-icon"><Globe size={18} /></div>
       <div><strong>{browser.name}</strong><span>{browser.state === "connected" ? "Connected" : browser.state === "other" ? browser.pointsTo ? `Set up to start another program: ${browser.pointsTo}` : "Set up for something other than this app" : "Not connected"}</span></div>
       {browser.state === "connected"
-        ? <button className="secondary" onClick={() => void change(browser, false)}>Disconnect</button>
-        : <button className="secondary" disabled={!status.host || status.temporaryPlace} onClick={() => void change(browser, true)}>{browser.state === "other" ? "Repair" : "Connect"}</button>}
+        ? <button className="secondary" disabled={locked} onClick={() => void change(browser, false)}>Disconnect</button>
+        : <button className="secondary" disabled={locked || !status.host || status.temporaryPlace} onClick={() => void change(browser, true)}>{browser.state === "other" ? "Repair" : "Connect"}</button>}
     </div>)}
     {!status.host && <p className="review-hint">The program that browsers start to reach this app was not found beside it, so no browser can be connected.</p>}
     {status.temporaryPlace && <p className="review-hint">This app is running from a place that is gone when it quits, so no browser can be pointed at it. Install the app first (on a Mac, move it into Applications and open it from there), then connect the browser.</p>}
@@ -1584,7 +1599,7 @@ function JoinPanel({ keepsVault, onCancel, onJoined, onNotice }: { keepsVault?: 
  * that it has a password, its other fields by name, and its notes. A secret
  * is copied by the shell and never shown here.
  */
-function ItemRecord({ entry, detail, onCopyUsername, onCopy, onRemovePasskey }: { entry: VaultEntry; detail: EntryDetail | null; onCopyUsername: () => void; onCopy: (what: "password" | "field", name?: string) => void; onRemovePasskey: (credentialId: string) => void }) {
+function ItemRecord({ entry, detail, onCopyUsername, onCopy, onRemovePasskey }: { entry: VaultEntry; detail: EntryDetail | null; onCopyUsername: () => void; onCopy: (what: "password" | "field", name?: string) => void; onRemovePasskey: (rpId: string, credentialId: string) => void }) {
   const card = detail?.card;
   const fields = [
     ...(card ? [
@@ -1603,14 +1618,17 @@ function ItemRecord({ entry, detail, onCopyUsername, onCopy, onRemovePasskey }: 
 }
 
 /** A login's passkeys, by site and account; each is removed after the owner is told what that does. */
-function PasskeyList({ passkeys, onRemove }: { passkeys: PasskeySummary[]; onRemove: (credentialId: string) => void }) {
+function PasskeyList({ passkeys, onRemove }: { passkeys: PasskeySummary[]; onRemove: (rpId: string, credentialId: string) => void }) {
   const [confirming, setConfirming] = useState<string | null>(null);
   const account = (passkey: PasskeySummary) => passkey.userDisplayName && passkey.userDisplayName !== passkey.userName ? `${passkey.userName} (${passkey.userDisplayName})` : passkey.userName || "No account name";
-  return <div className="record-card passkey-list">{passkeys.map((passkey) => <div key={passkey.credentialId} className="record-field">
-    <label>Passkey for {passkey.rpId}</label>
-    <div><span>{account(passkey)}{passkey.createdAt > 0 && <span className="passkey-made"> · made {new Date(passkey.createdAt * 1000).toLocaleDateString(undefined, { dateStyle: "medium" })}</span>}</span>{confirming !== passkey.credentialId && <button className="field-action" title="Remove passkey" aria-label={`Remove the passkey for ${passkey.rpId}`} onClick={() => setConfirming(passkey.credentialId)}><Trash2 size={14} /></button>}</div>
-    {confirming === passkey.credentialId && <div className="delete-confirm"><span>Remove this passkey on all your devices? You will no longer sign in to {passkey.rpId} with it. Its key stays in this item's history and in backups.</span><div className="form-actions"><button type="button" className="secondary" onClick={() => setConfirming(null)}>Keep</button><button type="button" className="generate-button" onClick={() => { setConfirming(null); onRemove(passkey.credentialId); }}>Remove passkey</button></div></div>}
-  </div>)}</div>;
+  return <div className="record-card passkey-list">{passkeys.map((passkey) => {
+    const key = `${passkey.rpId}\0${passkey.credentialId}`;
+    return <div key={key} className="record-field">
+      <label>Passkey for {passkey.rpId}</label>
+      <div><span>{account(passkey)}{passkey.createdAt > 0 && <span className="passkey-made"> · made {new Date(passkey.createdAt * 1000).toLocaleDateString(undefined, { dateStyle: "medium" })}</span>}</span>{confirming !== key && <button className="field-action" title="Remove passkey" aria-label={`Remove the passkey for ${passkey.rpId}`} onClick={() => setConfirming(key)}><Trash2 size={14} /></button>}</div>
+      {confirming === key && <div className="delete-confirm"><span>Remove this passkey on all your devices? You will no longer sign in to {passkey.rpId} with it. Its key stays in this item's history and in backups.</span><div className="form-actions"><button type="button" className="secondary" onClick={() => setConfirming(null)}>Keep</button><button type="button" className="generate-button" onClick={() => { setConfirming(null); onRemove(passkey.rpId, passkey.credentialId); }}>Remove passkey</button></div></div>}
+    </div>;
+  })}</div>;
 }
 
 function RecordField({ label, value, masked, onCopy }: { label: string; value: string; masked?: boolean; onCopy?: () => void }) {
@@ -1661,7 +1679,7 @@ function DeletedPanel({ items, onRestore }: { items: DeletedEntry[]; onRestore: 
 /** What the owner sets on this computer. */
 function SettingsPanel({ minutes, locked, onChange, onNotice }: { minutes: number; locked: boolean; onChange: (minutes: number) => void; onNotice: (text: string) => void }) {
   return <div className="entry-form">
-    <label>Lock the vault after<select aria-label="Lock the vault after" value={minutes} onChange={(event) => onChange(Number(event.target.value))}>{AUTO_LOCK_CHOICES.map((choice) => <option key={choice} value={choice}>{minutesText(choice)} without activity</option>)}</select></label>
+    <label>Lock the vault after<select aria-label="Lock the vault after" value={minutes} disabled={locked} onChange={(event) => onChange(Number(event.target.value))}>{AUTO_LOCK_CHOICES.map((choice) => <option key={choice} value={choice}>{minutesText(choice)} without activity</option>)}</select></label>
     <p className="review-hint">Hiding or covering the window leaves the vault unlocked for this long too. The computer going to sleep and the screen locking lock it at once, whatever this says. This setting stays on this computer; your other devices keep their own.</p>
     {locked ? <p className="review-hint">Unlock the vault to change this device's password.</p> : <ChangePassword onNotice={onNotice} />}
   </div>;
@@ -1789,6 +1807,8 @@ function commandMessage(error: unknown, fallback: string): string {
   if (code === "no_password") return "This item has no password";
   if (code === "clipboard") return "The clipboard is not available · nothing was copied";
   if (code === "invalid_setting") return "That is not one of the choices";
+  if (code === "too_soon") return "Wait a moment before approving this request";
+  if (code === "rows_changed") return "Confirm the file change warning before starting over";
   return fallback;
 }
 

@@ -117,31 +117,48 @@ pub(crate) async fn preview_file(
     path: &Path,
     format: ImportFormat,
 ) -> Result<ImportSummary, CommandError> {
-    let size = std::fs::metadata(path)
-        .map_err(|error| CommandError {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).map_err(|error| CommandError {
+        code: "invalid_import",
+        message: format!("the file cannot be read: {error}"),
+    })?;
+    let meta = file.metadata().map_err(|error| CommandError {
+        code: "invalid_import",
+        message: format!("the file cannot be read: {error}"),
+    })?;
+    if !meta.is_file() {
+        return Err(CommandError {
             code: "invalid_import",
-            message: format!("the file cannot be read: {error}"),
-        })?
-        .len();
-    if size > MAX_FILE_BYTES {
+            message: "the chosen path is not a regular file".into(),
+        });
+    }
+    if meta.len() > MAX_FILE_BYTES {
         return Err(CommandError {
             code: "invalid_import",
             message: "the file is too large to be an export of logins".into(),
         });
     }
-    let bytes = Zeroizing::new(std::fs::read(path).map_err(|error| CommandError {
-        code: "invalid_import",
-        message: format!("the file cannot be read: {error}"),
-    })?);
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CommandError {
+            code: "invalid_import",
+            message: format!("the file cannot be read: {error}"),
+        })?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(CommandError {
+            code: "invalid_import",
+            message: "the file is too large to be an export of logins".into(),
+        });
+    }
     let preview = preview_import(format, &bytes)?;
-    let existing = {
-        let vault = state.vault.lock().await;
-        vault
-            .as_ref()
-            .filter(|vault| vault.is_unlocked())
-            .ok_or_else(locked)?
-            .list()?
-    };
+    let vault = state.vault.lock().await;
+    let existing = vault
+        .as_ref()
+        .filter(|vault| vault.is_unlocked())
+        .ok_or_else(locked)?
+        .list()?;
     let count = |kind: ItemKind| {
         preview
             .items()
@@ -181,6 +198,9 @@ pub(crate) async fn preview_file(
             })
             .collect(),
     };
+    // Store while still holding `state.vault` (respecting `vault -> import`
+    // lock order) so a concurrent lock cannot clear `state.import` before the
+    // plaintext preview is installed.
     *state.import.lock().await = Some(preview);
     Ok(summary)
 }
@@ -198,6 +218,11 @@ pub async fn confirm_import<R: Runtime>(
 }
 
 pub(crate) async fn confirm(state: &AppState) -> Result<usize, CommandError> {
+    let mut vault = state.vault.lock().await;
+    let vault = vault
+        .as_mut()
+        .filter(|vault| vault.is_unlocked())
+        .ok_or_else(locked)?;
     let preview = state
         .import
         .lock()
@@ -207,12 +232,9 @@ pub(crate) async fn confirm(state: &AppState) -> Result<usize, CommandError> {
             code: "no_import",
             message: "choose an export first".into(),
         })?;
-    let mut vault = state.vault.lock().await;
-    let vault = vault
-        .as_mut()
-        .filter(|vault| vault.is_unlocked())
-        .ok_or_else(locked)?;
-    Ok(vault.confirm_import(preview)?.len())
+    let added = vault.confirm_import(preview)?.len();
+    state.rows_seen.keep_up(vault);
+    Ok(added)
 }
 
 /// Drops the export read for an import the owner did not confirm.

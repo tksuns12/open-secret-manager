@@ -133,6 +133,10 @@ impl PeerStore {
                  CREATE TABLE IF NOT EXISTS relay (
                      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                      code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 1024)
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS relay_sealed (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     sealed_code BLOB NOT NULL
                  ) STRICT;",
             )?;
             let old: bool = transaction.query_row(
@@ -160,6 +164,7 @@ impl PeerStore {
             identity: None,
         };
         store.seal_kept_key()?;
+        store.seal_kept_relay()?;
         Ok(store)
     }
 
@@ -180,12 +185,39 @@ impl PeerStore {
             .optional()?
             .map(Zeroizing::new);
         if let Some(key) = kept {
-            if let Some(sealed) = seal_checked(self.keystore.as_ref(), &key) {
+            if let Ok(sealed) = seal_checked(self.keystore.as_ref(), &key) {
                 transaction.execute(
                     "UPDATE transport_key SET sealed_key = ?1, private_key = NULL
                      WHERE singleton = 1",
                     params![sealed],
                 )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Seals a relay code kept unsealed (from an earlier build or while no
+    /// keystore was installed) once a keystore answers, and removes the
+    /// plaintext row (`secure_delete = ON` overwrites the freed pages).
+    fn seal_kept_relay(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let kept = transaction
+            .query_row("SELECT code FROM relay WHERE singleton = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(Zeroizing::new);
+        if let Some(code) = kept {
+            if let Ok(sealed) = seal_checked(self.keystore.as_ref(), code.as_bytes()) {
+                transaction.execute(
+                    "INSERT INTO relay_sealed(singleton, sealed_code) VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET sealed_code = excluded.sealed_code",
+                    params![sealed],
+                )?;
+                transaction.execute("DELETE FROM relay", [])?;
             }
         }
         transaction.commit()?;
@@ -248,16 +280,17 @@ impl PeerStore {
             None => {
                 let identity = generate_identity()?;
                 match seal_checked(self.keystore.as_ref(), &identity.private_key) {
-                    Some(sealed) => transaction.execute(
+                    Ok(sealed) => transaction.execute(
                         "INSERT INTO transport_key(singleton, certificate, sealed_key)
                          VALUES (1, ?1, ?2)",
                         params![identity.certificate, sealed],
                     )?,
-                    None => transaction.execute(
+                    Err(crate::KeystoreError::Absent) => transaction.execute(
                         "INSERT INTO transport_key(singleton, certificate, private_key)
                          VALUES (1, ?1, ?2)",
                         params![identity.certificate, identity.private_key.as_slice()],
                     )?,
+                    Err(error) => return Err(Error::Keystore(error)),
                 };
                 identity
             }
@@ -267,14 +300,26 @@ impl PeerStore {
         Ok(identity)
     }
 
-    /// The device this one was paired with before the vault had a control
-    /// plane, if any. Nothing adds to this list any more.
     /// The code of the relay this device uses, as the vault last said when
     /// it was unlocked: kept here so that a locked device, which cannot read
-    /// the vault, can still sync through it. It is kept as it is, unsealed:
-    /// its token lets a device onto the relay, which passes bytes it cannot
-    /// read, and opens nothing of the vault.
+    /// the vault, can still sync through it. Sealed by the system's keystore
+    /// whenever one is installed; stored unsealed only when no keystore is
+    /// present ([`crate::KeystoreError::Absent`]).
     pub fn relay_code(&self) -> Result<Option<Zeroizing<String>>> {
+        if let Some(sealed) = self
+            .connection
+            .query_row(
+                "SELECT sealed_code FROM relay_sealed WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            let mut opened = self.keystore.open(&sealed).map_err(Error::Keystore)?;
+            let code = String::from_utf8(std::mem::take(&mut *opened))
+                .map_err(|_| Error::MalformedFrame)?;
+            return Ok(Some(Zeroizing::new(code)));
+        }
         Ok(self
             .connection
             .query_row("SELECT code FROM relay WHERE singleton = 1", [], |row| {
@@ -284,16 +329,43 @@ impl PeerStore {
             .map(Zeroizing::new))
     }
 
-    /// Keeps `code` as the relay's, or forgets it with `None`.
+    /// Keeps `code` as the relay's (sealed by the keystore when installed), or
+    /// forgets it with `None`.
     pub fn set_relay_code(&mut self, code: Option<&str>) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         match code {
-            Some(code) => self.connection.execute(
-                "INSERT INTO relay(singleton, code) VALUES (1, ?1)
-                 ON CONFLICT(singleton) DO UPDATE SET code = excluded.code",
-                [code],
-            )?,
-            None => self.connection.execute("DELETE FROM relay", [])?,
-        };
+            Some(code) => {
+                if code.is_empty() || code.len() > 1024 {
+                    return Err(Error::MalformedFrame);
+                }
+                match seal_checked(self.keystore.as_ref(), code.as_bytes()) {
+                    Ok(sealed) => {
+                        transaction.execute(
+                            "INSERT INTO relay_sealed(singleton, sealed_code) VALUES (1, ?1)
+                             ON CONFLICT(singleton) DO UPDATE SET sealed_code = excluded.sealed_code",
+                            params![sealed],
+                        )?;
+                        transaction.execute("DELETE FROM relay", [])?;
+                    }
+                    Err(crate::KeystoreError::Absent) => {
+                        transaction.execute(
+                            "INSERT INTO relay(singleton, code) VALUES (1, ?1)
+                             ON CONFLICT(singleton) DO UPDATE SET code = excluded.code",
+                            [code],
+                        )?;
+                        transaction.execute("DELETE FROM relay_sealed", [])?;
+                    }
+                    Err(error) => return Err(Error::Keystore(error)),
+                }
+            }
+            None => {
+                transaction.execute("DELETE FROM relay", [])?;
+                transaction.execute("DELETE FROM relay_sealed", [])?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -359,12 +431,19 @@ impl PeerStore {
 }
 
 /// What `keystore` sealed `key` into, once it has opened that again to the
-/// same key; `None` when it did not, for whatever reason, so that the key
-/// stays kept unsealed rather than sealed into something that will not open.
-fn seal_checked(keystore: &dyn Keystore, key: &[u8]) -> Option<Vec<u8>> {
-    let sealed = keystore.seal(key).ok()?;
-    let opened = keystore.open(&sealed).ok()?;
-    (opened.as_slice() == key).then_some(sealed)
+/// same key. Returns `Err(KeystoreError::Absent)` only when no keystore is
+/// installed; any other failure or round-trip mismatch returns an error so the
+/// caller never silently downgrades to plaintext.
+fn seal_checked(
+    keystore: &dyn Keystore,
+    key: &[u8],
+) -> std::result::Result<Vec<u8>, crate::KeystoreError> {
+    let sealed = keystore.seal(key)?;
+    let opened = keystore.open(&sealed)?;
+    if opened.as_slice() != key {
+        return Err(crate::KeystoreError::Unavailable);
+    }
+    Ok(sealed)
 }
 
 fn generate_identity() -> Result<TransportIdentity> {
@@ -443,16 +522,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_key_made_while_the_keystore_did_not_answer_is_sealed_when_it_does() {
+    fn an_unavailable_keystore_fails_closed_while_an_absent_keystore_falls_back_and_migrates() {
         let keystore = Arc::new(MemoryKeystore::default());
         keystore.set_unavailable(true);
         let (_dir, path, mut peers) = store(keystore.clone());
+        assert!(matches!(
+            peers.transport_identity(),
+            Err(Error::Keystore(KeystoreError::Unavailable))
+        ));
+        assert_eq!(peers.key_kept().unwrap(), None);
+        drop(peers);
+
+        // When no keystore is installed (`Absent`), the key stays in the file
+        // until opened with a working keystore, which seals and scrubs it.
+        let mut peers = PeerStore::open(&path, Arc::new(NoKeystore)).unwrap();
         let identity = peers.transport_identity().unwrap();
         assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::InFile));
         drop(peers);
         assert!(in_file(&path, &secret(&identity)));
 
-        // Still not answering: the store opens, and the key is read as it is.
+        // Still not answering: an existing in-file key remains readable as-is.
         let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
         assert_eq!(peers.transport_identity().unwrap().pin(), identity.pin());
         drop(peers);
@@ -517,12 +606,65 @@ pub(crate) mod tests {
 
     #[test]
     fn a_key_is_not_sealed_into_something_that_does_not_open_to_it() {
+        // Creating a new identity with a garbling keystore fails closed instead
+        // of silently downgrading to plaintext.
         let (_dir, path, mut peers) = store(Arc::new(Garbling));
+        assert!(matches!(
+            peers.transport_identity(),
+            Err(Error::Keystore(KeystoreError::Unavailable))
+        ));
+        assert_eq!(peers.key_kept().unwrap(), None);
+        drop(peers);
+
+        // An existing in-file key is never replaced with garbled sealed bytes.
+        let mut peers = PeerStore::open(&path, Arc::new(NoKeystore)).unwrap();
         let identity = peers.transport_identity().unwrap();
         assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::InFile));
         drop(peers);
         let mut peers = PeerStore::open(&path, Arc::new(Garbling)).unwrap();
         assert_eq!(peers.key_kept().unwrap(), Some(KeyKept::InFile));
         assert_eq!(peers.transport_identity().unwrap().pin(), identity.pin());
+    }
+
+    #[test]
+    fn relay_code_is_sealed_and_migrated_from_plaintext() {
+        let code = "OSM-RELAY1-secret-relay-token-value";
+        let keystore = Arc::new(MemoryKeystore::default());
+        let (_dir, path, mut peers) = store(keystore.clone());
+        peers.set_relay_code(Some(code)).unwrap();
+        assert_eq!(
+            peers.relay_code().unwrap().as_deref().map(String::as_str),
+            Some(code)
+        );
+        drop(peers);
+        assert!(!in_file(&path, code.as_bytes()));
+
+        // Unavailable keystore fails closed rather than writing plaintext.
+        keystore.set_unavailable(true);
+        let mut peers = PeerStore::open(&path, keystore.clone()).unwrap();
+        assert!(matches!(
+            peers.set_relay_code(Some("OSM-RELAY1-another-token")),
+            Err(Error::Keystore(KeystoreError::Unavailable))
+        ));
+        drop(peers);
+
+        // Plaintext stored with NoKeystore migrates to sealed on reopen.
+        let (_dir2, path2, mut plain) = store(Arc::new(NoKeystore));
+        plain.set_relay_code(Some(code)).unwrap();
+        drop(plain);
+        assert!(in_file(&path2, code.as_bytes()));
+
+        keystore.set_unavailable(false);
+        let migrated = PeerStore::open(&path2, keystore).unwrap();
+        assert_eq!(
+            migrated
+                .relay_code()
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some(code)
+        );
+        drop(migrated);
+        assert!(!in_file(&path2, code.as_bytes()));
     }
 }

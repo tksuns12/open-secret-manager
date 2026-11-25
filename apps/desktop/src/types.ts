@@ -452,8 +452,8 @@ export type DesktopBridge = {
   createEntry: (input: EntryInput) => Promise<VaultEntry>;
   updateEntry: (id: string, expectedRevision: string, input: EntryInput) => Promise<VaultEntry>;
   deleteEntry: (id: string, expectedRevision: string) => Promise<void>;
-  /** Removes a login's passkey on every device; its key stays in the item's history and in backups. */
-  removePasskey: (id: string, expectedRevision: string, credentialId: string) => Promise<VaultEntry>;
+  /** Removes a login's passkey for `(rpId, credentialId)` on every device; its key stays in the item's history and in backups. */
+  removePasskey: (id: string, expectedRevision: string, rpId: string, credentialId: string) => Promise<VaultEntry>;
   listVersions: (id: string) => Promise<VersionSummary[]>;
   resolveEntry: (id: string, keepRevision: string, heads: string[]) => Promise<void>;
   /** Changes held for the owner's review; needs the vault unlocked. */

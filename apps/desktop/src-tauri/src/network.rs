@@ -268,6 +268,29 @@ impl Network {
         self.control.lock().await.clone()
     }
 
+    /// Aborts and revokes any pending pairing invitation and abandons any
+    /// in-flight join. Callers MUST NOT hold `state.vault`, `state.archive`,
+    /// or `state.import` when calling this (lock order with `start_invite`).
+    pub(crate) async fn cancel_pairing(&self) {
+        if let Some(invite) = self.invite.lock().await.take() {
+            invite.task.abort();
+            let _ = self
+                .invitations
+                .lock()
+                .await
+                .revoke_by_digest(&invite.token_digest, now());
+        }
+        if let Some(join) = self.join.lock().await.take() {
+            if let Some(control) = self.control.lock().await.take() {
+                control.stop().await;
+            } else {
+                join.control.stop().await;
+            }
+            let _ = self.peers.lock().await.set_relay_code(None);
+            self.delete_control_database();
+        }
+    }
+
     /// Deletes the control-plane database of a node that never became part
     /// of a control plane.
     fn delete_control_database(&self) {
@@ -746,7 +769,7 @@ async fn receive<R: Runtime>(
         update_status(&app, |status| status.state = "syncing");
         let state = app.state::<AppState>();
         let result = connection
-            .run_shared(&state.vault, &control.node.state())
+            .run_shared(&*state.vault, &control.node.state())
             .await;
         finish_sync(&app, result.map(|report| vec![report])).await;
     }
@@ -1035,17 +1058,9 @@ pub async fn after_create<R: Runtime>(app: &AppHandle<R>) {
 
 /// After unlock: the vault is first brought in line with committed
 /// membership, only then is what arrived while locked verified, and then
-/// this device catches up with the others.
+/// this device catches up with the others. Rollback checking
+/// (`rows_seen.check`) already ran atomically under the unlock lock.
 pub async fn after_unlock<R: Runtime>(app: &AppHandle<R>) {
-    // Before anything received is taken in, which adds to the file and
-    // would hide an earlier copy put in its place.
-    {
-        let app_state = app.state::<AppState>();
-        let mut vault = app_state.vault.lock().await;
-        if let Some(vault) = vault.as_mut().filter(|vault| vault.is_unlocked()) {
-            app_state.rows_seen.check(vault);
-        }
-    }
     match ensure_control(app).await {
         Some(control) => maintain(app, &control).await,
         None => {
@@ -1053,7 +1068,12 @@ pub async fn after_unlock<R: Runtime>(app: &AppHandle<R>) {
             let app_state = app.state::<AppState>();
             let mut vault = app_state.vault.lock().await;
             if let Some(vault) = vault.as_mut().filter(|vault| vault.is_unlocked()) {
-                let _ = vault.process_staged();
+                if vault
+                    .process_staged()
+                    .is_ok_and(|processed| processed.applied > 0 || processed.quarantined > 0)
+                {
+                    app_state.rows_seen.keep_up(vault);
+                }
             }
         }
     }
@@ -1066,19 +1086,26 @@ async fn finish_sync<R: Runtime>(
     app: &AppHandle<R>,
     result: Result<Vec<osm_vault_peer::SyncReport>, osm_vault_peer::Error>,
 ) {
-    let unlocked = app
-        .state::<AppState>()
-        .vault
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|vault| vault.is_unlocked());
+    let changed = result.as_ref().is_ok_and(|reports| {
+        reports
+            .iter()
+            .any(|report| report.applied > 0 || report.quarantined > 0)
+    });
+    let unlocked = {
+        let state = app.state::<AppState>();
+        let vault = state.vault.lock().await;
+        if let Some(vault) = vault.as_ref().filter(|vault| vault.is_unlocked()) {
+            if changed {
+                state.rows_seen.keep_up(vault);
+            }
+            true
+        } else {
+            false
+        }
+    };
     match result {
         Ok(reports) => {
             let received: usize = reports.iter().map(|report| report.received).sum();
-            let changed = reports
-                .iter()
-                .any(|report| report.applied > 0 || report.quarantined > 0);
             let pending = reports.iter().map(|report| report.pending).max();
             update_status(app, |status| {
                 if status.state == "removed" {
@@ -1151,7 +1178,7 @@ async fn sync_with_members<R: Runtime>(app: &AppHandle<R>) -> Result<(), Command
             let connection = control.endpoint.connect_sync(device).await?;
             let state = app.state::<AppState>();
             connection
-                .run_shared(&state.vault, &control.node.state())
+                .run_shared(&*state.vault, &control.node.state())
                 .await
         };
         let id = hex(&device_id_to_bytes(device));
@@ -1562,21 +1589,48 @@ pub async fn recover_vault<R: Runtime>(
         });
     }
     // The password is asked again: it confirms the owner's intent and
-    // becomes the new vault's password.
+    // becomes the new vault's password. Offload Argon2id to the blocking pool
+    // and verify rollback state inside the same lock before forking.
     {
-        let mut vault = state.vault.lock().await;
-        let vault = vault.as_mut().ok_or(CommandError {
-            code: "vault_missing",
-            message: "vault has not been configured".into(),
-        })?;
-        if vault.is_unlocked() {
-            osm_vault_core::Vault::open(&state.path)?.unlock(&password)?;
-        } else {
-            vault.unlock(&password)?;
+        let mut vault = state.vault.clone().lock_owned().await;
+        let path = state.path.clone();
+        let verify_password = password.clone();
+        vault = tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
+            {
+                let inner = vault.as_mut().ok_or(CommandError {
+                    code: "vault_missing",
+                    message: "vault has not been configured".into(),
+                })?;
+                if inner.is_unlocked() {
+                    osm_vault_core::Vault::open(&path)?.unlock(&verify_password)?;
+                } else {
+                    inner.unlock(&verify_password)?;
+                }
+            }
+            Ok(vault)
+        })
+        .await
+        .map_err(|error| CommandError {
+            code: "storage",
+            message: error.to_string(),
+        })??;
+        if let Some(inner) = vault.as_mut() {
+            state.rows_seen.check(inner);
+            if inner.rows_changed() {
+                return Err(CommandError {
+                    code: "rows_changed",
+                    message: "records in this vault's file changed outside the app: confirm the warning before starting over".into(),
+                });
+            }
         }
     }
     if let Some(invite) = net.invite.lock().await.take() {
         invite.task.abort();
+        let _ = net
+            .invitations
+            .lock()
+            .await
+            .revoke_by_digest(&invite.token_digest, now());
     }
     // Take in whatever committed state and received revisions this device
     // already has, then stop taking part in the old vault.
@@ -1592,38 +1646,61 @@ pub async fn recover_vault<R: Runtime>(
     let directory = net.directory.clone();
     let (partial, complete) = (directory.join(RECOVERED_PARTIAL), directory.join(RECOVERED));
     let (recovery_key, report) = {
-        let vault = state.vault.lock().await;
-        let vault = vault
-            .as_ref()
-            .filter(|vault| vault.is_unlocked())
-            .ok_or_else(locked)?;
-        let _ = std::fs::remove_file(&partial);
-        let (mut fork, recovery, report) = vault.fork(&partial, &password)?;
-        // The new vault keeps its recovery key until the owner confirms
-        // having stored it: this can stop before the key is shown.
-        fork.keep_recovery_key_until_confirmed(&recovery)?;
-        drop(fork);
-        // From here on the recovery is finished at the next launch even if
-        // the app stops.
-        std::fs::rename(&partial, &complete).map_err(storage_error)?;
-        (recovery.to_string(), report)
+        let vault = state.vault.clone().lock_owned().await;
+        let fork_password = password.clone();
+        tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
+            let inner = vault
+                .as_ref()
+                .filter(|vault| vault.is_unlocked())
+                .ok_or_else(locked)?;
+            let _ = std::fs::remove_file(&partial);
+            let (mut fork, recovery, report) = inner.fork(&partial, &fork_password)?;
+            // The new vault keeps its recovery key until the owner confirms
+            // having stored it: this can stop before the key is shown.
+            fork.keep_recovery_key_until_confirmed(&recovery)?;
+            drop(fork);
+            // From here on the recovery is finished at the next launch even if
+            // the app stops.
+            std::fs::rename(&partial, &complete).map_err(storage_error)?;
+            Ok((recovery.to_string(), report))
+        })
+        .await
+        .map_err(|error| CommandError {
+            code: "storage",
+            message: error.to_string(),
+        })??
     };
 
     let archive = {
-        let mut vault = state.vault.lock().await;
-        let mut invitations = net.invitations.lock().await;
-        let mut peers = net.peers.lock().await;
-        // Close every file of the old vault before moving it. The new vault
-        // has its own transport identity and address book.
-        *vault = None;
-        let archive = with_stores_closed(net, &mut peers, &mut invitations, || {
-            replace_with_recovered(&state.path).map_err(storage_error)
-        })?;
-        let mut recovered = osm_vault_core::Vault::open(&state.path)?;
-        recovered.unlock(&password)?;
+        let mut vault = state.vault.clone().lock_owned().await;
+        let archive = {
+            let mut invitations = net.invitations.lock().await;
+            let mut peers = net.peers.lock().await;
+            // Close every file of the old vault before moving it. The new vault
+            // has its own transport identity and address book.
+            *vault = None;
+            with_stores_closed(net, &mut peers, &mut invitations, || {
+                replace_with_recovered(&state.path).map_err(storage_error)
+            })?
+        };
+        let path = state.path.clone();
+        let unlock_password = password.clone();
+        let recovered =
+            tokio::task::spawn_blocking(move || -> Result<osm_vault_core::Vault, CommandError> {
+                let mut recovered = osm_vault_core::Vault::open(&path)?;
+                recovered.unlock(&unlock_password)?;
+                Ok(recovered)
+            })
+            .await
+            .map_err(|error| CommandError {
+                code: "storage",
+                message: error.to_string(),
+            })??;
+        state.rows_seen.keep_up(&recovered);
         *vault = Some(recovered);
         archive
     };
+    crate::idle::arm_backstop(&app);
     net.removed.store(false, Ordering::SeqCst);
     update_status(&app, |status| {
         *status = SyncStatus {
@@ -1685,7 +1762,7 @@ pub async fn restore<R: Runtime>(
         });
     }
     // Held throughout, so that no vault is made here meanwhile.
-    let mut vault = state.vault.lock().await;
+    let mut vault = state.vault.clone().lock_owned().await;
     if vault.is_some() {
         return Err(CommandError {
             code: "vault_exists",
@@ -1696,36 +1773,52 @@ pub async fn restore<R: Runtime>(
         return Err(unreadable_here());
     }
     let directory = net.directory.clone();
-    let kept = new_archive(&directory).map_err(storage_error)?;
-    let file_name = state.path.file_name().unwrap_or_default();
-    let restored = match osm_vault_core::Vault::restore_backup(
-        backup,
-        kept.join(file_name),
-        recovery,
-        password,
-    ) {
-        Ok(restored) => restored,
-        Err(error) => {
-            // The folder was made above and holds nothing.
-            let _ = std::fs::remove_dir_all(&kept);
-            return Err(error.into());
-        }
-    };
-    let (partial, complete) = (directory.join(RECOVERED_PARTIAL), directory.join(RECOVERED));
-    let _ = std::fs::remove_file(&partial);
-    let (mut fork, new_recovery, report) = restored.fork(&partial, password)?;
-    // Kept until the owner confirms having stored it: this can stop before
-    // the key is shown.
-    fork.keep_recovery_key_until_confirmed(&new_recovery)?;
-    drop((fork, restored));
-    // From here on the new vault takes its place at the next launch even if
-    // the app stops.
-    std::fs::rename(&partial, &complete).map_err(storage_error)?;
-    std::fs::rename(&complete, &state.path).map_err(storage_error)?;
-    let mut made = osm_vault_core::Vault::open(&state.path)?;
-    made.unlock(password)?;
+    let backup = backup.to_path_buf();
+    let recovery = osm_vault_core::RecoveryKey::parse(&Zeroizing::new(recovery.to_string()))?;
+    let password = Zeroizing::new(password.to_owned());
+    let vault_path = state.path.clone();
+    let (made, new_recovery_text, report, kept) =
+        tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
+            let kept = new_archive(&directory).map_err(storage_error)?;
+            let file_name = vault_path.file_name().unwrap_or_default();
+            let restored = match osm_vault_core::Vault::restore_backup(
+                &backup,
+                kept.join(file_name),
+                &recovery,
+                &password,
+            ) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    // The folder was made above and holds nothing.
+                    let _ = std::fs::remove_dir_all(&kept);
+                    return Err(error.into());
+                }
+            };
+            let (partial, complete) =
+                (directory.join(RECOVERED_PARTIAL), directory.join(RECOVERED));
+            let _ = std::fs::remove_file(&partial);
+            let (mut fork, new_recovery, report) = restored.fork(&partial, &password)?;
+            // Kept until the owner confirms having stored it: this can stop before
+            // the key is shown.
+            fork.keep_recovery_key_until_confirmed(&new_recovery)?;
+            drop((fork, restored));
+            // From here on the new vault takes its place at the next launch even if
+            // the app stops.
+            std::fs::rename(&partial, &complete).map_err(storage_error)?;
+            std::fs::rename(&complete, &vault_path).map_err(storage_error)?;
+            let mut made = osm_vault_core::Vault::open(&vault_path)?;
+            made.unlock(&password)?;
+            Ok((made, new_recovery.to_string(), report, kept))
+        })
+        .await
+        .map_err(|error| CommandError {
+            code: "storage",
+            message: error.to_string(),
+        })??;
+    state.rows_seen.keep_up(&made);
     *vault = Some(made);
     drop(vault);
+    crate::idle::arm_backstop(app);
     update_status(app, |status| {
         *status = SyncStatus {
             state: "local",
@@ -1737,7 +1830,7 @@ pub async fn restore<R: Runtime>(
     let _ = app.emit("vault-changed", ());
     let _ = app.emit("devices-changed", ());
     Ok(Restored {
-        recovery_key: new_recovery.to_string(),
+        recovery_key: new_recovery_text,
         items: report.items,
         conflicts: report.conflicts,
         held_left_behind: report.held_left_behind,
@@ -1816,6 +1909,11 @@ async fn put_copy_away<R: Runtime>(
     let result = async {
         if let Some(invite) = net.invite.lock().await.take() {
             invite.task.abort();
+            let _ = net
+                .invitations
+                .lock()
+                .await
+                .revoke_by_digest(&invite.token_digest, now());
         }
         net.join.lock().await.take();
         if let Some(control) = net.control.lock().await.take() {
@@ -1913,15 +2011,26 @@ pub async fn leave_vault<R: Runtime>(
     }
     {
         // The password is the owner's confirmation. It is checked on a
-        // second handle, so a locked vault stays locked if it is wrong.
-        let vault = state.vault.lock().await;
+        // second handle on the blocking pool, so a locked vault stays locked
+        // if it is wrong and Argon2id does not starve async tasks.
+        let vault = state.vault.clone().lock_owned().await;
         if vault.is_none() {
             return Err(CommandError {
                 code: "vault_missing",
                 message: "this device has no vault".into(),
             });
         }
-        osm_vault_core::Vault::open(&state.path)?.unlock(&password)?;
+        let path = state.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), CommandError> {
+            let _hold = vault;
+            osm_vault_core::Vault::open(&path)?.unlock(&password)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| CommandError {
+            code: "storage",
+            message: error.to_string(),
+        })??;
     }
     put_copy_away(&app, PutAway::Left).await
 }
@@ -2169,12 +2278,24 @@ struct PairingFinished {
     message: Option<String>,
 }
 
-/// The owner's answer after comparing the codes on both devices.
+/// The owner's answer after comparing the codes on both devices. Requires the
+/// vault to be unlocked.
 #[tauri::command]
 pub async fn confirm_invite(
     accept: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
+    // Check and release `vault` before locking `invite` (avoiding ABBA with
+    // `start_invite`).
+    if !state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(osm_vault_core::Vault::is_unlocked)
+    {
+        return Err(locked());
+    }
     let mut invite = state.network.invite.lock().await;
     let decision = invite
         .as_mut()
@@ -2344,6 +2465,7 @@ pub async fn join_finish<R: Runtime>(
     if let Some(code) = from_invitation {
         let _ = net.peers.lock().await.set_relay_code(Some(&code));
     }
+    crate::idle::arm_backstop(&app);
     maintain(&app, &control).await;
     // Fetch the vault's contents right away.
     let sync_app = app.clone();
@@ -2401,17 +2523,28 @@ async fn finish_join<R: Runtime>(
             .clear_legacy_peers()
             .map_err(network_error)?;
     } else {
+        drop(vault);
+        let mut vault = state.vault.clone().lock_owned().await;
         if vault.is_some() {
             return Err(CommandError {
                 code: "vault_exists",
                 message: "this device already has a vault".into(),
             });
         }
-        *vault = Some(
+        let path = state.path.clone();
+        let password = Zeroizing::new(password.to_owned());
+        let enrolled = tokio::task::spawn_blocking(move || {
             joiner
-                .finish_enrollment(&grant, true, &committed, &state.path, password)
-                .map_err(network_error)?,
-        );
+                .finish_enrollment(&grant, true, &committed, &path, &password)
+                .map_err(network_error)
+        })
+        .await
+        .map_err(|error| CommandError {
+            code: "storage",
+            message: error.to_string(),
+        })??;
+        state.rows_seen.keep_up(&enrolled);
+        *vault = Some(enrolled);
     }
     Ok(())
 }

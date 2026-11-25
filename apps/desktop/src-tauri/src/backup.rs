@@ -313,6 +313,12 @@ pub async fn choose_backup<R: Runtime>(
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<Option<String>, CommandError> {
+    if state.vault.lock().await.is_some() {
+        return Err(CommandError {
+            code: "vault_exists",
+            message: "this device has a vault; only a device without one restores".into(),
+        });
+    }
     let ask = dialog(&app).set_title("Choose a backup to restore");
     let path = chosen(|answer| ask.pick_file(answer)).await;
     let name = path.as_ref().map(|path| {
@@ -365,13 +371,27 @@ pub async fn reset_password<R: Runtime>(
     crate::check_new_password(&new_password)?;
     let recovery = RecoveryKey::parse(recovery_key.trim())?;
     {
-        let mut vault = state.vault.lock().await;
-        let vault = vault.as_mut().ok_or_else(|| CommandError {
-            code: "vault_missing",
-            message: "vault has not been configured".into(),
-        })?;
-        vault.reset_password(&recovery, &new_password)?;
+        let mut vault = state.vault.clone().lock_owned().await;
+        vault = tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
+            {
+                let inner = vault.as_mut().ok_or_else(|| CommandError {
+                    code: "vault_missing",
+                    message: "vault has not been configured".into(),
+                })?;
+                inner.reset_password(&recovery, &new_password)?;
+            }
+            Ok(vault)
+        })
+        .await
+        .map_err(|error| CommandError {
+            code: "storage",
+            message: error.to_string(),
+        })??;
+        if let Some(vault) = vault.as_mut().filter(|vault| vault.is_unlocked()) {
+            state.rows_seen.check(vault);
+        }
     }
+    crate::idle::arm_backstop(&app);
     // As after any unlock: membership first, then what arrived while locked.
     network::after_unlock(&app).await;
     Ok(())

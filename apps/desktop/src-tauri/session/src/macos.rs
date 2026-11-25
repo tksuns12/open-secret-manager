@@ -47,8 +47,77 @@ pub(crate) fn watch(on_away: OnAway) {
         observe(&workspace, name, away, on_away.clone());
     }
     for (name, away) in FROM_SYSTEM {
-        observe(&system, name, away, on_away.clone());
+        if away == Away::ScreenLocked {
+            let verified = on_away.clone();
+            observe(
+                &system,
+                name,
+                away,
+                Arc::new(move |event| {
+                    if is_screen_locked() {
+                        verified(event);
+                    }
+                }),
+            );
+        } else {
+            observe(&system, name, away, on_away.clone());
+        }
     }
+}
+
+/// Queries CoreGraphics session state to confirm `com.apple.screenIsLocked`
+/// reflects an actual screen lock rather than an unprivileged spoofed
+/// distributed notification.
+fn is_screen_locked() -> bool {
+    use core::ffi::c_void;
+    use objc2::rc::Retained;
+    use objc2_foundation::{NSDictionary, NSNumber, NSObject};
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> *const c_void;
+    }
+
+    autoreleasepool(|_| {
+        // SAFETY: `CGSessionCopyCurrentDictionary` returns a +1 retained
+        // `CFDictionaryRef` (toll-free bridged to `NSDictionary`), or NULL
+        // when no WindowServer session is active.
+        let raw =
+            unsafe { CGSessionCopyCurrentDictionary() } as *mut NSDictionary<NSString, NSObject>;
+        if raw.is_null() {
+            return true;
+        }
+        // SAFETY: `raw` is non-null and owned (+1 retained) per CoreGraphics
+        // Create Rule; `Retained::from_raw` releases it on drop.
+        let Some(dict) = (unsafe { Retained::from_raw(raw) }) else {
+            return true;
+        };
+        let key = NSString::from_str("CGSSessionScreenIsLocked");
+        let Some(value) = dict.objectForKey(&key) else {
+            return false;
+        };
+        value
+            .downcast::<NSNumber>()
+            .map(|num| num.boolValue())
+            .unwrap_or(false)
+    })
+}
+
+/// Returns `true` when `path` exists on a read-only mounted filesystem
+/// (`MNT_RDONLY`, such as a mounted `.dmg` image).
+pub(crate) fn is_read_only_mount(path: &std::path::Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated path and `stat` is writable.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+    (u64::from(stat.f_flags) & (libc::MNT_RDONLY as u64)) != 0
 }
 
 /// The system posts its notifications to every process of the user, so a
@@ -133,8 +202,11 @@ pub(crate) fn clear_last(pasteboard: &NSPasteboard) {
 /// password, as the system chooses.
 pub(crate) fn can_check_owner() -> bool {
     use objc2_local_authentication::{LAContext, LAPolicy};
-    // SAFETY: a new context, asked one question on this thread.
-    unsafe { LAContext::new().canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_ok()
+    autoreleasepool(|_| {
+        // SAFETY: a new context, asked one question on this thread.
+        unsafe { LAContext::new().canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }
+            .is_ok()
+    })
 }
 
 /// Wrapper allowing `LAContext` to be invalidated from another thread when a
@@ -155,36 +227,49 @@ pub(crate) fn check_owner(
     use objc2::runtime::Bool;
     use objc2_foundation::NSError;
     use objc2_local_authentication::{LAContext, LAPolicy};
-    // SAFETY: a new context, used for this one check.
-    let context = unsafe { LAContext::new() };
-    let done = Arc::new(Mutex::new(Some(done)));
-    let kept = Arc::new(Mutex::new(Some(SendContext(context.clone()))));
-    let reply_done = done.clone();
-    let reply_kept = kept.clone();
-    let reply = RcBlock::new(move |passed: Bool, _: *mut NSError| {
-        if let Some(done) = reply_done.lock().ok().and_then(|mut done| done.take()) {
-            done(passed.as_bool());
-        }
-        drop(reply_kept.lock().ok().and_then(|mut kept| kept.take()));
-    });
-    // SAFETY: the system runs the block on a queue of its own; the block
-    // only calls `done`, which is `Send`, and lets go of the context.
-    unsafe {
-        context.evaluatePolicy_localizedReason_reply(
-            LAPolicy::DeviceOwnerAuthentication,
-            &NSString::from_str(reason),
-            &reply,
-        )
-    };
-    Box::new(move || {
-        if let Some(ctx) = kept.lock().ok().and_then(|mut kept| kept.take()) {
-            // SAFETY: `LAContext::invalidate` cancels any pending evaluation
-            // and is safe to invoke from any thread.
-            unsafe { ctx.0.invalidate() };
-        }
-        if let Some(done) = done.lock().ok().and_then(|mut done| done.take()) {
-            done(false);
-        }
+    // `evaluatePolicy:localizedReason:reply:` throws `NSInvalidArgumentException`
+    // (aborting across FFI) when `localizedReason` is empty.
+    if reason.trim().is_empty() {
+        done(false);
+        return Box::new(|| {});
+    }
+    autoreleasepool(|_| {
+        // SAFETY: a new context, used for this one check.
+        let context = unsafe { LAContext::new() };
+        let done = Arc::new(Mutex::new(Some(done)));
+        let kept = Arc::new(Mutex::new(Some(SendContext(context.clone()))));
+        let reply_done = done.clone();
+        let reply_kept = kept.clone();
+        let reply = RcBlock::new(move |passed: Bool, error: *mut NSError| {
+            autoreleasepool(|_| {
+                let verified = passed.as_bool() && error.is_null();
+                if let Some(done) = reply_done.lock().ok().and_then(|mut done| done.take()) {
+                    done(verified);
+                }
+                drop(reply_kept.lock().ok().and_then(|mut kept| kept.take()));
+            });
+        });
+        // SAFETY: the system runs the block on a queue of its own; the block
+        // only calls `done`, which is `Send`, and lets go of the context.
+        unsafe {
+            context.evaluatePolicy_localizedReason_reply(
+                LAPolicy::DeviceOwnerAuthentication,
+                &NSString::from_str(reason),
+                &reply,
+            )
+        };
+        Box::new(move || {
+            autoreleasepool(|_| {
+                if let Some(ctx) = kept.lock().ok().and_then(|mut kept| kept.take()) {
+                    // SAFETY: `LAContext::invalidate` cancels any pending evaluation
+                    // and is safe to invoke from any thread.
+                    unsafe { ctx.0.invalidate() };
+                }
+                if let Some(done) = done.lock().ok().and_then(|mut done| done.take()) {
+                    done(false);
+                }
+            });
+        })
     })
 }
 
@@ -292,5 +377,27 @@ mod tests {
         // leave this method out.
         // SAFETY: `releaseGlobally` takes nothing and returns nothing.
         unsafe { objc2::msg_send![&*pasteboard, releaseGlobally] }
+    }
+
+    #[test]
+    fn empty_owner_check_reason_fails_safely_without_aborting() {
+        let called = Arc::new(Mutex::new(None));
+        let sink = called.clone();
+        let cancel = check_owner(
+            "   ",
+            Box::new(move |passed| {
+                *sink.lock().unwrap() = Some(passed);
+            }),
+        );
+        cancel();
+        assert_eq!(*called.lock().unwrap(), Some(false));
+    }
+
+    #[test]
+    fn read_only_mount_check_is_false_for_missing_and_writable_paths() {
+        assert!(!is_read_only_mount(std::path::Path::new(
+            "/Volumes/NoSuchOsmTestDisk/Apps/osm-native-host"
+        )));
+        assert!(!is_read_only_mount(std::env::temp_dir().as_path()));
     }
 }

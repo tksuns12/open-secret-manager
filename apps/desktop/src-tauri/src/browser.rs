@@ -20,6 +20,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 
 use osm_browser_link::{
@@ -281,6 +282,10 @@ impl Known {
     }
 }
 
+/// Minimum time a browser prompt must be visible before an approval command is
+/// accepted, defending against clickjacking/focus-steal races.
+const APPROVAL_COOLDOWN: Duration = Duration::from_millis(500);
+
 /// The app's browser session.
 pub struct Browser {
     desk: Arc<Desk>,
@@ -293,12 +298,17 @@ pub struct Browser {
     host: Option<PathBuf>,
     /// The request this window was brought forward for.
     raised: StdMutex<Option<String>>,
+    /// When the currently pending request was first surfaced to the owner.
+    shown_at: StdMutex<Option<(String, Instant)>>,
+    /// Minimum delay before accepting approvals (500ms in production, 0 in
+    /// fast unit tests unless explicitly enabled).
+    approve_cooldown: Duration,
 }
 
 impl Browser {
     pub fn open(vault_path: &Path) -> Self {
-        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut browser = Self::with(vault_path, dirs::home_dir(), find_host());
+        browser.approve_cooldown = APPROVAL_COOLDOWN;
         // On Windows the pipe link lives in LocalAppData (`endpoint::socket_path`)
         // so the machine-local secret never syncs via Roaming Profiles.
         #[cfg(windows)]
@@ -319,7 +329,43 @@ impl Browser {
             home,
             host,
             raised: StdMutex::new(None),
+            shown_at: StdMutex::new(None),
+            approve_cooldown: Duration::ZERO,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.approve_cooldown = cooldown;
+        self
+    }
+
+    fn note_shown(&self, request_id: &str) {
+        let mut shown = lock(&self.shown_at);
+        if shown.as_ref().map(|(id, _)| id.as_str()) != Some(request_id) {
+            *shown = Some((request_id.to_owned(), Instant::now()));
+        }
+    }
+
+    fn clear_shown(&self) {
+        *lock(&self.shown_at) = None;
+    }
+
+    fn check_cooldown(&self, request_id: &str) -> Result<(), CommandError> {
+        if self.approve_cooldown.is_zero() {
+            return Ok(());
+        }
+        let shown = lock(&self.shown_at);
+        let ready = shown
+            .as_ref()
+            .is_some_and(|(id, at)| id == request_id && at.elapsed() >= self.approve_cooldown);
+        if !ready {
+            return Err(CommandError {
+                code: "too_soon",
+                message: "wait a moment before approving this request".into(),
+            });
+        }
+        Ok(())
     }
 
     fn known(&self, id: &str) -> Result<(&'static Known, &Path), CommandError> {
@@ -400,15 +446,29 @@ pub(crate) fn host_beside(program: &Path) -> Option<PathBuf> {
     beside.is_file().then_some(beside)
 }
 
-/// Whether `host` is in a place that is gone when the app quits, so that a
-/// browser pointed at it would find nothing there later. macOS runs an app
-/// that was downloaded and not moved since from a copy in a folder of its
-/// own making, and an AppImage runs from a folder mounted for the one run.
+/// Whether `host` is in a place that is gone when the app quits, or a
+/// world-writable temp location, so that a browser pointed at it would fail or
+/// run an untrusted binary later. Covers macOS AppTranslocation, AppImage
+/// FUSE mounts, temp directories (`/tmp`, `/var/tmp`), and read-only macOS
+/// disk images under `/Volumes/`.
 pub(crate) fn is_passing(host: &Path) -> bool {
-    host.components().any(|part| {
+    if host.components().any(|part| {
         let part = part.as_os_str().to_string_lossy();
         part == "AppTranslocation" || part.starts_with(".mount_")
-    })
+    }) {
+        return true;
+    }
+    if ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"]
+        .iter()
+        .any(|prefix| host.starts_with(prefix))
+    {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if host.starts_with("/Volumes") && osm_desktop_session::is_read_only_mount(host) {
+        return true;
+    }
+    false
 }
 
 /// The host program: beside the app's own, where a packaged app has it,
@@ -508,10 +568,14 @@ fn look<R: Runtime>(app: &AppHandle<R>, shown: &mut Option<String>) {
         // A new request: the owner asked for it in the browser and decides
         // it here.
         Some(request) => {
+            state.browser.note_shown(request);
             let was_behind = come_forward(app);
             *lock(&state.browser.raised) = was_behind.then(|| request.clone());
         }
-        None => stop_asking_for_attention(app),
+        None => {
+            state.browser.clear_shown();
+            stop_asking_for_attention(app);
+        }
     }
     *shown = asked;
 }
@@ -706,6 +770,7 @@ pub async fn fill_request(
     let Some(choices) = state.browser.desk.choices(vault.as_ref())? else {
         return Ok(None);
     };
+    state.browser.note_shown(&choices.request_id);
     let not_offered = match vault.as_ref() {
         Some(vault)
             if choices.session.is_some() && choices.card.is_none() && choices.passkey.is_none() =>
@@ -800,6 +865,7 @@ pub async fn approve_fill<R: Runtime>(
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<(), CommandError> {
+    state.browser.check_cooldown(&request_id)?;
     let locked = || CommandError {
         code: "locked",
         message: "the vault locked before the login was sent".into(),
@@ -837,6 +903,7 @@ pub async fn approve_card<R: Runtime>(
     state: tauri::State<'_, AppState>,
     app: AppHandle<R>,
 ) -> Result<(), CommandError> {
+    state.browser.check_cooldown(&request_id)?;
     let locked = || CommandError {
         code: "locked",
         message: "the vault locked before the card was sent".into(),
@@ -884,6 +951,7 @@ pub async fn approve_passkey<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<(), CommandError> {
     let password = password.map(Zeroizing::new);
+    state.browser.check_cooldown(&request_id)?;
     let locked = || CommandError {
         code: "locked",
         message: "the vault locked before the passkey was sent".into(),
@@ -941,22 +1009,36 @@ pub async fn approve_passkey<R: Runtime>(
         false
     };
     {
-        let mut vault = state.vault.lock().await;
+        let mut vault = state.vault.clone().lock_owned().await;
+        let verified = if checked {
+            true
+        } else if let Some(password) = password {
+            vault = tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
+                {
+                    let inner = vault.as_ref().ok_or_else(locked)?;
+                    if inner.unlock_session() != Some(parsed_session) {
+                        return Err(locked());
+                    }
+                    inner.check_password(&password).map_err(|_| CommandError {
+                        code: "wrong_password",
+                        message: "that is not this device's password".into(),
+                    })?;
+                }
+                Ok(vault)
+            })
+            .await
+            .map_err(|error| CommandError {
+                code: "storage",
+                message: error.to_string(),
+            })??;
+            true
+        } else {
+            false
+        };
         let vault = vault.as_mut().ok_or_else(locked)?;
         if vault.unlock_session() != Some(parsed_session) {
             return Err(locked());
         }
-        let verified = checked
-            || match &password {
-                Some(password) => {
-                    vault.check_password(password).map_err(|_| CommandError {
-                        code: "wrong_password",
-                        message: "that is not this device's password".into(),
-                    })?;
-                    true
-                }
-                None => false,
-            };
         let desk = &state.browser.desk;
         let outcome = match ceremony {
             Ceremony::Create => desk.approve_passkey_create_bound(
@@ -1006,6 +1088,13 @@ pub async fn approve_passkey<R: Runtime>(
             }
             Refused::Vault(error) => error.into(),
         })?;
+        if ceremony == Ceremony::Create {
+            state.rows_seen.keep_up(vault);
+        }
+    }
+    if ceremony == Ceremony::Create {
+        crate::network::schedule_sync(&app);
+        let _ = app.emit("vault-changed", ());
     }
     step_back(&app, &request_id);
     Ok(())
@@ -1096,12 +1185,24 @@ fn storage(error: std::io::Error) -> CommandError {
 
 /// Tells a browser where the host is, so that its extension can reach this
 /// app: writes the host's manifest into the browser's folder, replacing one
-/// that is there under the same name.
+/// that is there under the same name. Requires the vault to be unlocked.
 #[tauri::command]
 pub async fn connect_browser(
     browser: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<BrowserStatus, CommandError> {
+    if !state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(Vault::is_unlocked)
+    {
+        return Err(CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        });
+    }
     let (known, home) = state.browser.known(&browser)?;
     let host = state.browser.host.as_ref().ok_or_else(|| CommandError {
         code: "host_missing",
@@ -1123,12 +1224,24 @@ pub async fn connect_browser(
 }
 
 /// Takes the host's manifest out of a browser's folder: its extension can
-/// no longer reach this app.
+/// no longer reach this app. Requires the vault to be unlocked.
 #[tauri::command]
 pub async fn disconnect_browser(
     browser: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<BrowserStatus, CommandError> {
+    if !state
+        .vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(Vault::is_unlocked)
+    {
+        return Err(CommandError {
+            code: "locked",
+            message: "vault is locked".into(),
+        });
+    }
     let (known, home) = state.browser.known(&browser)?;
     known.disconnect(home).map_err(storage)?;
     Ok(state.browser.status())

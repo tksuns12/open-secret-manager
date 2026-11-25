@@ -10,11 +10,11 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [{ "title": "Open Secret Manager", "width": 1200, "height": 760, "minWidth": 960, "minHeight": 680 }],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost",
-      "devCsp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420"
+      "csp": "default-src 'self'; style-src 'self'; font-src 'self'; connect-src ipc: http://ipc.localhost; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+      "devCsp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"
     }
   },
   "bundle": {

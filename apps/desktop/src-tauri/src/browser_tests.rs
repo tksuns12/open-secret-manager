@@ -47,7 +47,7 @@ fn shell(dir: &Path, home: &Path, host: Option<PathBuf>) -> App<MockRuntime> {
         network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
     mock_builder()
         .manage(AppState {
-            vault: Mutex::new(Vault::open(&path).ok()),
+            vault: Arc::new(Mutex::new(Vault::open(&path).ok())),
             archive: Mutex::new(None),
             browser: browser::Browser::with(&path, Some(home.to_owned()), host),
             path,
@@ -751,9 +751,10 @@ fn folders(home: &Path, browser: &str) -> (PathBuf, PathBuf) {
 #[test]
 fn a_browser_is_connected_by_writing_the_hosts_manifest_into_its_folder() {
     let dir = folder();
+    Vault::create(dir.path().join("vault.sqlite3"), PASSWORD).unwrap();
     let home = dir.path().join("home");
-    let host = dir.path().join("osm-native-host");
-    std::fs::write(&host, b"").unwrap();
+    let host =
+        PathBuf::from("/Applications/Open Secret Manager.app/Contents/MacOS/osm-native-host");
     for browser in ["chrome", "firefox"] {
         std::fs::create_dir_all(folders(&home, browser).0).unwrap();
     }
@@ -761,6 +762,17 @@ fn a_browser_is_connected_by_writing_the_hosts_manifest_into_its_folder() {
     let handle = app.handle().clone();
 
     tauri::async_runtime::block_on(async move {
+        // Locked vault refuses browser manifest changes.
+        assert_eq!(
+            code(browser::connect_browser("chrome".into(), handle.state()).await),
+            "locked"
+        );
+        assert_eq!(
+            code(browser::disconnect_browser("chrome".into(), handle.state()).await),
+            "locked"
+        );
+        unlock(&handle).await;
+
         let state_of = |status: &browser::BrowserStatus| -> Vec<(&'static str, &'static str)> {
             status
                 .browsers
@@ -896,6 +908,7 @@ fn a_browser_is_connected_by_writing_the_hosts_manifest_into_its_folder() {
     let app = shell(dir.path(), &dir.path().join("home"), None);
     let handle = app.handle().clone();
     tauri::async_runtime::block_on(async move {
+        unlock(&handle).await;
         let status = browser::browser_status(handle.state()).await.unwrap();
         assert_eq!(status.host, None);
         // The manifest that is still there is not this app's to vouch for.
@@ -944,6 +957,8 @@ fn a_browser_is_not_pointed_at_a_place_that_is_gone_when_the_app_quits() {
             "/private/var/folders/q7/x/T/AppTranslocation/9F0C7B6E-1E0B-4A7B-9C3D-1D2E3F4A5B6C/d",
         ),
         PathBuf::from("/tmp/.mount_Open SrT3k9/usr/bin/osm-native-host"),
+        PathBuf::from("/tmp/osm-native-host"),
+        PathBuf::from("/var/tmp/osm-native-host"),
     ];
     for passing in &passing {
         assert!(browser::is_passing(passing), "{}", passing.display());
@@ -951,11 +966,13 @@ fn a_browser_is_not_pointed_at_a_place_that_is_gone_when_the_app_quits() {
 
     // The app says so, and writes nothing into the browser's folder.
     let dir = folder();
+    Vault::create(dir.path().join("vault.sqlite3"), PASSWORD).unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(folders(&home, "chrome").0).unwrap();
     let app = shell(dir.path(), &home, Some(passing[0].clone()));
     let handle = app.handle().clone();
     tauri::async_runtime::block_on(async move {
+        unlock(&handle).await;
         let status = browser::browser_status(handle.state()).await.unwrap();
         assert!(status.temporary_place);
         assert_eq!(status.browsers[0].state, "not_connected");
@@ -964,6 +981,77 @@ fn a_browser_is_not_pointed_at_a_place_that_is_gone_when_the_app_quits() {
             "temporary_place"
         );
         assert!(!folders(&home, "chrome").1.exists());
+    });
+}
+
+#[test]
+fn browser_approval_cooldown_rejects_premature_clickjacking_approval() {
+    let dir = folder();
+    let mut vault = Vault::create(dir.path().join("vault.sqlite3"), PASSWORD)
+        .unwrap()
+        .0;
+    let item = login("GitHub", "https://github.com");
+    let item_id = item.id.clone();
+    vault.put(item).unwrap();
+    drop(vault);
+
+    let path = dir.path().join("vault.sqlite3");
+    let home = dir.path().join("home");
+    let network =
+        network::Network::open(&path, std::sync::Arc::new(osm_vault_peer::NoKeystore)).unwrap();
+    let app = mock_builder()
+        .manage(AppState {
+            vault: Arc::new(Mutex::new(Vault::open(&path).ok())),
+            archive: Mutex::new(None),
+            browser: browser::Browser::with(&path, Some(home), None)
+                .with_cooldown(Duration::from_millis(120)),
+            path,
+            network,
+            chosen_backup: std::sync::Mutex::new(None),
+            import: Mutex::new(None),
+            rows_seen: crate::rows_seen::Checkpoint::new(std::sync::Arc::new(
+                crate::rows_seen::MemoryRowsSeen::default(),
+            )),
+            health_budget: std::sync::Mutex::new(crate::HealthBudget::default()),
+        })
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let handle = app.handle().clone();
+    tauri::async_runtime::block_on(async move {
+        browser::start(&handle);
+        unlock(&handle).await;
+        let mut host = Host::bring(dir.path(), &request("cooldown-1", "https://github.com")).await;
+        assert!(matches!(host.next().await, Some(Response::Waiting(_))));
+        let asked = browser::fill_request(handle.state())
+            .await
+            .unwrap()
+            .expect("waiting request");
+        let session = asked.session.unwrap();
+        // Immediate approval is refused while cooldown is active.
+        assert_eq!(
+            code(
+                browser::approve_fill(
+                    "cooldown-1".into(),
+                    item_id.clone(),
+                    session.clone(),
+                    handle.state(),
+                    handle.clone(),
+                )
+                .await
+            ),
+            "too_soon"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        browser::approve_fill(
+            "cooldown-1".into(),
+            item_id,
+            session,
+            handle.state(),
+            handle.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(host.answer().await, Some(Response::FillReply(_))));
     });
 }
 

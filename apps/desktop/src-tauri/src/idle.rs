@@ -106,7 +106,7 @@ mod tests {
         let app = mock_builder()
             .manage(IdleLock::default())
             .manage(AppState {
-                vault: Mutex::new(Vault::open(&path).ok()),
+                vault: Arc::new(Mutex::new(Vault::open(&path).ok())),
                 archive: Mutex::new(None),
                 browser: browser::Browser::open(&path),
                 path,

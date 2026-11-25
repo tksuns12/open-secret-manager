@@ -26,8 +26,17 @@ const NONCE: usize = 24;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemKeystore;
 
+fn map_keyring_error(error: keyring::Error) -> KeystoreError {
+    match error {
+        keyring::Error::NoEntry => KeystoreError::Lost,
+        #[cfg(target_os = "linux")]
+        keyring::Error::NoStorageAccess(_) => KeystoreError::Absent,
+        _ => KeystoreError::Unavailable,
+    }
+}
+
 fn entry(name: &[u8]) -> Result<keyring::Entry, KeystoreError> {
-    keyring::Entry::new(SERVICE, &hex(name)).map_err(|_| KeystoreError::Unavailable)
+    keyring::Entry::new(SERVICE, &hex(name)).map_err(map_keyring_error)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -62,7 +71,7 @@ impl Keystore for SystemKeystore {
             .map_err(|_| KeystoreError::Unavailable)?;
         entry(&name)?
             .set_secret(wrapping.as_ref())
-            .map_err(|_| KeystoreError::Unavailable)?;
+            .map_err(map_keyring_error)?;
         Ok([&[FORM][..], &name, &nonce, &sealed].concat())
     }
 
@@ -76,10 +85,7 @@ impl Keystore for SystemKeystore {
         }
         let (name, rest) = rest.split_at(NAME);
         let (nonce, sealed) = rest.split_at(NONCE);
-        let wrapping = Zeroizing::new(entry(name)?.get_secret().map_err(|error| match error {
-            keyring::Error::NoEntry => KeystoreError::Lost,
-            _ => KeystoreError::Unavailable,
-        })?);
+        let wrapping = Zeroizing::new(entry(name)?.get_secret().map_err(map_keyring_error)?);
         if wrapping.len() != 32 {
             return Err(KeystoreError::Lost);
         }
@@ -132,10 +138,7 @@ mod tests {
     #[test]
     #[ignore = "needs a Linux system without a Secret Service"]
     fn without_a_secret_service_nothing_is_sealed() {
-        assert_eq!(
-            SystemKeystore.seal(b"a key"),
-            Err(KeystoreError::Unavailable)
-        );
+        assert_eq!(SystemKeystore.seal(b"a key"), Err(KeystoreError::Absent));
     }
 
     #[test]

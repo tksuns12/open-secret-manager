@@ -197,8 +197,16 @@ pub async fn open_archive(
     if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
         return Err(no_archive());
     }
-    let mut vault = Vault::open(&path)?;
-    vault.unlock(&password)?;
+    let vault = tokio::task::spawn_blocking(move || -> Result<Vault, osm_vault_core::Error> {
+        let mut vault = Vault::open(&path)?;
+        vault.unlock(&password)?;
+        Ok(vault)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "storage",
+        message: error.to_string(),
+    })??;
     let current = state.vault.lock().await;
     let mut archive = state.archive.lock().await;
     let opened = archive.insert(Opened { name, vault });
@@ -231,24 +239,43 @@ pub async fn copy_from_archive<R: Runtime>(
         Err(osm_vault_core::Error::NotFound) => false,
         Err(error) => return Err(error.into()),
     };
+    // Exhaustive destructuring ensures every field (including `passkeys` and
+    // any future fields) is carried into the copied item.
+    let Item {
+        id: _,
+        title,
+        kind,
+        username,
+        password,
+        url,
+        notes,
+        totp_secret,
+        custom_fields,
+        tags,
+        favorite,
+        passkeys,
+        unknown_fields,
+    } = &source;
     // A new item: the vault's own item of that ID, live or deleted, keeps
     // its history untouched.
     let mut copy = Item::new(if held {
-        format!("{}{COPY_SUFFIX}", source.title)
+        format!("{title}{COPY_SUFFIX}")
     } else {
-        source.title.clone()
+        title.clone()
     });
-    copy.kind = source.kind;
-    copy.username = source.username.clone();
-    copy.password = source.password.clone();
-    copy.url = source.url.clone();
-    copy.notes = source.notes.clone();
-    copy.totp_secret = source.totp_secret.clone();
-    copy.custom_fields = source.custom_fields.clone();
-    copy.tags = source.tags.clone();
-    copy.favorite = source.favorite;
-    copy.unknown_fields = source.unknown_fields.clone();
+    copy.kind = *kind;
+    copy.username = username.clone();
+    copy.password = password.clone();
+    copy.url = url.clone();
+    copy.notes = notes.clone();
+    copy.totp_secret = totp_secret.clone();
+    copy.custom_fields = custom_fields.clone();
+    copy.tags = tags.clone();
+    copy.favorite = *favorite;
+    copy.passkeys = passkeys.clone();
+    copy.unknown_fields = unknown_fields.clone();
     vault.put(copy)?;
+    state.rows_seen.keep_up(vault);
     network::schedule_sync(&app);
     items(opened, Some(vault))
 }
@@ -260,6 +287,9 @@ pub async fn close_archive(state: tauri::State<'_, AppState>) -> Result<(), Comm
 }
 
 /// Deletes an archived copy for good: the folder and everything in it.
+/// Requires the active vault to be unlocked, or (when this device currently
+/// has no vault) that the owner has already unlocked this archive with its
+/// password.
 #[tauri::command]
 pub async fn delete_archive<R: Runtime>(
     name: String,
@@ -268,8 +298,25 @@ pub async fn delete_archive<R: Runtime>(
 ) -> Result<(), CommandError> {
     let folder = archive_folder(&state, &name)?;
     {
-        // Close its files first.
+        // Respect lock order: `vault`, then `archive`.
+        let vault = state.vault.lock().await;
         let mut archive = state.archive.lock().await;
+        match vault.as_ref() {
+            Some(vault) if !vault.is_unlocked() => {
+                return Err(CommandError {
+                    code: "locked",
+                    message: "unlock the vault first".into(),
+                });
+            }
+            None if !archive.as_ref().is_some_and(|opened| opened.name == name) => {
+                return Err(CommandError {
+                    code: "locked",
+                    message: "open this archived copy with its password first".into(),
+                });
+            }
+            _ => {}
+        }
+        // Close its files first.
         if archive.as_ref().is_some_and(|opened| opened.name == name) {
             *archive = None;
         }

@@ -23,15 +23,32 @@ use crate::AppState;
 /// count in decimal the secret.
 const SERVICE: &str = "org.opensecretmanager.rows-seen";
 
-/// No keystore answered.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Unavailable;
+/// Why the keystore could not provide or update the rollback checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowsSeenError {
+    /// No keystore service is installed on this platform (e.g., Linux without
+    /// Secret Service). Rollback checks cannot run and do not warn.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+    Absent,
+    /// A keystore exists (or an entry was malformed/tampered), but could not
+    /// be read or written. Unlock checks fail closed so an attacker cannot
+    /// suppress rollback detection by blocking or corrupting the keystore.
+    Unavailable,
+}
 
 /// Where the counts are kept.
 pub trait RowsSeen: Send + Sync {
     /// The count kept for `device`, or none.
-    fn get(&self, device: &[u8]) -> Result<Option<u64>, Unavailable>;
-    fn set(&self, device: &[u8], rows: u64) -> Result<(), Unavailable>;
+    fn get(&self, device: &[u8]) -> Result<Option<u64>, RowsSeenError>;
+    fn set(&self, device: &[u8], rows: u64) -> Result<(), RowsSeenError>;
+}
+
+fn map_keyring_error(error: keyring::Error) -> RowsSeenError {
+    match error {
+        #[cfg(target_os = "linux")]
+        keyring::Error::NoStorageAccess(_) => RowsSeenError::Absent,
+        _ => RowsSeenError::Unavailable,
+    }
 }
 
 /// The login Keychain on macOS, the Secret Service on Linux, the Credential
@@ -47,48 +64,57 @@ impl Default for KeychainRowsSeen {
 }
 
 impl KeychainRowsSeen {
-    fn entry(&self, device: &[u8]) -> Result<keyring::Entry, Unavailable> {
+    fn entry(&self, device: &[u8]) -> Result<keyring::Entry, RowsSeenError> {
         let account: String = device.iter().map(|byte| format!("{byte:02x}")).collect();
-        keyring::Entry::new(self.service, &account).map_err(|_| Unavailable)
+        keyring::Entry::new(self.service, &account).map_err(map_keyring_error)
     }
 }
 
 impl RowsSeen for KeychainRowsSeen {
-    fn get(&self, device: &[u8]) -> Result<Option<u64>, Unavailable> {
+    fn get(&self, device: &[u8]) -> Result<Option<u64>, RowsSeenError> {
         match self.entry(device)?.get_password() {
-            // What is not a count was not written here, and is written over.
-            Ok(text) => Ok(text.parse().ok()),
+            // A malformed or tampered entry fails closed instead of silently
+            // resetting rollback detection.
+            Ok(text) => text
+                .trim()
+                .parse()
+                .map(Some)
+                .map_err(|_| RowsSeenError::Unavailable),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err(Unavailable),
+            Err(error) => Err(map_keyring_error(error)),
         }
     }
 
-    fn set(&self, device: &[u8], rows: u64) -> Result<(), Unavailable> {
+    fn set(&self, device: &[u8], rows: u64) -> Result<(), RowsSeenError> {
         self.entry(device)?
             .set_password(&rows.to_string())
-            .map_err(|_| Unavailable)
+            .map_err(map_keyring_error)
     }
 }
 
-/// The counts in memory, for tests; [`MemoryRowsSeen::set_unavailable`]
-/// makes it a keystore that does not answer.
+/// The counts in memory, for tests; [`MemoryRowsSeen::set_absent`] simulates a
+/// platform without a keystore and [`MemoryRowsSeen::set_unavailable`]
+/// simulates an installed keystore that failed or refused access.
 #[cfg(test)]
 #[derive(Default)]
 pub struct MemoryRowsSeen {
     counts: Mutex<std::collections::HashMap<Vec<u8>, u64>>,
-    unavailable: std::sync::atomic::AtomicBool,
+    error: Mutex<Option<RowsSeenError>>,
 }
 
 #[cfg(test)]
 impl MemoryRowsSeen {
-    pub fn set_unavailable(&self) {
-        self.unavailable
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    pub fn set_absent(&self) {
+        *self.error.lock().unwrap() = Some(RowsSeenError::Absent);
     }
 
-    fn answer(&self) -> Result<(), Unavailable> {
-        if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(Unavailable);
+    pub fn set_unavailable(&self) {
+        *self.error.lock().unwrap() = Some(RowsSeenError::Unavailable);
+    }
+
+    fn answer(&self) -> Result<(), RowsSeenError> {
+        if let Some(error) = *self.error.lock().unwrap() {
+            return Err(error);
         }
         Ok(())
     }
@@ -96,12 +122,12 @@ impl MemoryRowsSeen {
 
 #[cfg(test)]
 impl RowsSeen for MemoryRowsSeen {
-    fn get(&self, device: &[u8]) -> Result<Option<u64>, Unavailable> {
+    fn get(&self, device: &[u8]) -> Result<Option<u64>, RowsSeenError> {
         self.answer()?;
         Ok(self.counts.lock().unwrap().get(device).copied())
     }
 
-    fn set(&self, device: &[u8], rows: u64) -> Result<(), Unavailable> {
+    fn set(&self, device: &[u8], rows: u64) -> Result<(), RowsSeenError> {
         self.answer()?;
         self.counts.lock().unwrap().insert(device.to_vec(), rows);
         Ok(())
@@ -139,12 +165,22 @@ impl Checkpoint {
     /// file holds fewer rows than this device last saw, which the vault
     /// then records for the owner to be told. What is kept is then brought
     /// up to the file, never down.
+    ///
+    /// When a platform has no keystore ([`RowsSeenError::Absent`]), nothing is
+    /// flagged. When an installed keystore is unavailable or holds a corrupt
+    /// entry ([`RowsSeenError::Unavailable`]), this fails closed by marking the
+    /// vault as changed without overwriting the keystore entry.
     pub fn check(&self, vault: &mut Vault) -> bool {
         let (Some(device), Ok(rows)) = (vault.device_id(), vault.sealed_rows()) else {
             return false;
         };
-        let Ok(seen) = self.store.get(&device) else {
-            return false;
+        let seen = match self.store.get(&device) {
+            Ok(seen) => seen,
+            Err(RowsSeenError::Absent) => return false,
+            Err(RowsSeenError::Unavailable) => {
+                let _ = vault.note_set_back(u64::MAX);
+                return true;
+            }
         };
         let set_back = seen.is_some_and(|seen| vault.note_set_back(seen).unwrap_or(false));
         let highest = seen.map_or(rows, |seen| seen.max(rows));
@@ -166,7 +202,7 @@ impl Checkpoint {
             Some((kept, count)) if kept == device => Some(count),
             _ => match self.store.get(&device) {
                 Ok(seen) => seen,
-                Err(Unavailable) => return,
+                Err(RowsSeenError::Absent | RowsSeenError::Unavailable) => return,
             },
         };
         if known.is_none_or(|known| rows > known) {
@@ -224,7 +260,7 @@ mod tests {
     #[ignore = "needs a Linux system without a Secret Service"]
     fn without_a_secret_service_no_count_is_kept() {
         let store = KeychainRowsSeen::default();
-        assert_eq!(store.get(&[1; 16]), Err(Unavailable));
-        assert_eq!(store.set(&[1; 16], 1), Err(Unavailable));
+        assert_eq!(store.get(&[1; 16]), Err(RowsSeenError::Absent));
+        assert_eq!(store.set(&[1; 16], 1), Err(RowsSeenError::Absent));
     }
 }

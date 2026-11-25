@@ -6,13 +6,16 @@ license = "GPL-3.0-only"
 description = "What the desktop app needs from the system that Tauri does not give it"
 
 # This crate holds the desktop app's only `unsafe` calls: registering for
-# the system's notifications, and asking the system to check the owner.
-# Everything else here is safe Rust.
+# the system's notifications, querying read-only DMG mounts, and asking the
+# system to check the owner (macOS and Windows only; Linux forbids unsafe).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
+libc = "0.2"
 objc2 = "0.6.4"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSDistributedNotificationCenter", "NSOperation", "NSString", "NSArray", "NSRunLoop", "NSDate"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSDistributedNotificationCenter", "NSOperation", "NSString", "NSArray", "NSDictionary", "NSValue", "NSRunLoop", "NSDate"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard", "NSPasteboardItem"] }
 # The owner's check for a passkey: Touch ID, or the Mac's password.
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError"] }
@@ -35,6 +38,7 @@ zeroize = "1.8.2"
 arboard = "3.6.1"
 getrandom = "0.3.4"
 sha2 = "0.10.9"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_RemoteDesktop", "Win32_UI_WindowsAndMessaging"] }
 zeroize = "1.8.2"
 
 [[test]]
