@@ -1334,11 +1334,10 @@ pub async fn serve_relayed(
             let seen = with_timeout(HANDSHAKE_TIMEOUT, tcp.peek(&mut first)).await;
             match seen {
                 Ok(Ok(1)) if first[0] == PAIRING_OPENING => {
-                    if tcp.read_exact(&mut first).await.is_ok() {
-                        // Taken only while an invitation is open.
-                        if let Some(sink) = endpoint.pairing_sink() {
-                            let _ = sink.try_send(tcp);
-                        }
+                    let consumed = tcp.read_exact(&mut first).await.is_ok();
+                    // Taken only while an invitation is open.
+                    if let (true, Some(sink)) = (consumed, endpoint.pairing_sink()) {
+                        let _ = sink.try_send(tcp);
                     }
                 }
                 Ok(Ok(_)) => {
