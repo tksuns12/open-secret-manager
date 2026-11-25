@@ -121,7 +121,7 @@ impl ControlNode {
             dialer: dialer.clone(),
         };
         let raft = Raft::new(device, options.config, network, log, state_machine).await?;
-        let directory = Directory::new(state.clone(), raft.metrics());
+        let directory = Directory::new(device, state.clone(), raft.metrics());
         let (stop, stopped) = watch::channel(false);
         let driver = tokio::spawn(drive(
             raft.clone(),

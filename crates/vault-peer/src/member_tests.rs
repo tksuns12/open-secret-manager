@@ -1249,12 +1249,32 @@ impl Member {
 
         // The joiner runs its control-plane node from the start.
         let mut peers = PeerStore::open_in_memory().unwrap();
-        let (incoming, connection) = tokio::join!(pairing.next_request(), async {
-            match &existing {
-                Some(vault) => start_pairing_with_vault(invitation, vault, &mut peers, NOW).await,
-                None => start_pairing(invitation, &mut peers, NOW).await,
+        let (pending, connection) = tokio::join!(
+            async {
+                let incoming = pairing.next_request().await.unwrap();
+                incoming
+                    .review(
+                        &self.vault,
+                        &self.invitations,
+                        &mut self.host.peers,
+                        voting,
+                        None,
+                        NOW,
+                    )
+                    .unwrap()
+                    .complete()
+                    .await
+                    .unwrap()
+            },
+            async {
+                match &existing {
+                    Some(vault) => {
+                        start_pairing_with_vault(invitation, vault, &mut peers, NOW).await
+                    }
+                    None => start_pairing(invitation, &mut peers, NOW).await,
+                }
             }
-        });
+        );
         let connection = connection.unwrap();
         let device = connection.joiner().control_device();
         let vault_id = connection.joiner().vault_id();
@@ -1266,10 +1286,6 @@ impl Member {
         host.restart(vault_id).await;
         host.listen().await;
 
-        let pending = incoming
-            .unwrap()
-            .review(&self.vault, &self.invitations, &mut self.host.peers, NOW)
-            .unwrap();
         assert_eq!(pending.sas(), connection.sas());
         let (proposal, approved) = pending
             .approve_enrollment(
@@ -1383,9 +1399,25 @@ impl Member {
         );
 
         let mut peers = PeerStore::open_in_memory().unwrap();
-        let (incoming, connection) = tokio::join!(pairing.next_request(), async {
-            start_pairing(invitation, &mut peers, NOW).await
-        });
+        let (pending, connection) = tokio::join!(
+            async {
+                let incoming = pairing.next_request().await.unwrap();
+                incoming
+                    .review(
+                        &self.vault,
+                        &self.invitations,
+                        &mut self.host.peers,
+                        Voting::Votes,
+                        Some(relay),
+                        NOW,
+                    )
+                    .unwrap()
+                    .complete()
+                    .await
+                    .unwrap()
+            },
+            async { start_pairing(invitation, &mut peers, NOW).await }
+        );
         let mut connection = connection.unwrap();
         let (joiner_relay, relayed) = connection.take_relay().unwrap();
         let device = connection.joiner().control_device();
@@ -1403,10 +1435,6 @@ impl Member {
             host.sync.clone(),
         )));
 
-        let pending = incoming
-            .unwrap()
-            .review(&self.vault, &self.invitations, &mut self.host.peers, NOW)
-            .unwrap();
         assert_eq!(pending.sas(), connection.sas());
         let (proposal, approved) = pending
             .approve_enrollment(
@@ -1614,12 +1642,13 @@ async fn devices_pair_sync_and_rotate_over_tls() {
     assert_eq!(b.vault.revoked_devices().unwrap().len(), 1);
     assert_eq!(titles(&b.vault), vec!["After removal", "From A", "From C"]);
 
-    // C is cut off in both directions and is told why. Nothing gives it the
-    // new key or the new revisions.
-    assert!(matches!(
-        c.host.endpoint.connect_sync(a.host.id).await,
-        Err(Error::Removed)
-    ));
+    // C is cut off in both directions and learns it was removed once a quorum
+    // of remaining voters confirms it (or 1 if C already applied its pending
+    // removal). Nothing gives it the new key or the new revisions.
+    let first = c.host.endpoint.connect_sync(a.host.id).await;
+    let second = c.host.endpoint.connect_sync(b.host.id).await;
+    assert!(matches!(first, Err(Error::Removed | Error::NotAMember)));
+    assert!(matches!(second, Err(Error::Removed)));
     assert!(c.host.endpoint.told_removed());
     assert!(matches!(
         a.host.endpoint.connect_sync(c.host.id).await,
@@ -1795,4 +1824,51 @@ async fn a_device_paired_before_the_control_plane_joins_with_its_vault() {
     // voters both are needed, and it can no longer be skipped.
     let c = b.invite(&dir, "c", Some(&a)).await;
     assert!(a.host.state().members().contains(&c.host.id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_refuses_self_dial() {
+    let (code, _relay) = relay().await;
+    let identity = PeerStore::open_in_memory()
+        .unwrap()
+        .transport_identity()
+        .unwrap();
+    let pin = identity.pin();
+    let (client, _incoming) = Relay::start(code, identity);
+    until("the device is registered with the relay", || {
+        client.connected()
+    })
+    .await;
+    assert!(matches!(client.dial(pin).await, Err(Error::RelayAbsent)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_peer_claiming_removed_cannot_wipe_a_member_without_quorum() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, mut c) = three(&dir).await;
+    // Start a spoofed member listener holding C's transport identity that
+    // replies OpenReply::Removed to A (e.g. a compromised minority voter).
+    let fake = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake_addr = fake.local_addr().unwrap().to_string();
+    let c_identity = c.peers.transport_identity().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        crate::transport::server_config(&c_identity, crate::transport::ClientPolicy::AnyForPairing)
+            .unwrap(),
+    );
+    let rogue = tokio::spawn(async move {
+        if let Ok((tcp, _)) = fake.accept().await {
+            if let Ok(mut stream) = acceptor.accept(tcp).await {
+                crate::members::read_open_and_reply_removed(&mut stream).await;
+            }
+        }
+    });
+    a.addresses.observe(c.id, &fake_addr);
+    // In a 3-voter cluster {a, b, c}, one voter claiming Removed must NOT set
+    // `told_removed()` or return `Error::Removed` to A.
+    let result = a.endpoint.connect_sync(c.id).await;
+    assert!(matches!(result, Err(Error::NotAMember)));
+    assert!(!a.endpoint.told_removed());
+    // B is still healthy and reachable.
+    let _ = b.endpoint.announce(a.id, a.pin()).await;
+    let _ = rogue.await;
 }

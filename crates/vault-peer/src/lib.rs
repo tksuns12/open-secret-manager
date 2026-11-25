@@ -35,15 +35,16 @@ pub use members::{
     MEMBER_PROTOCOL_VERSION,
 };
 pub use pairing::{
-    approve_enrollment, invite, invite_through_relay, review_join, EnrollmentGrant, Invitation,
-    JoinRequest, JoinReview, Joiner, MAX_INVITATION_TTL_SECS,
+    approve_enrollment, invite, invite_through_relay, review_commit, EnrollmentGrant, Invitation,
+    JoinChallenge, JoinCommit, JoinRequest, JoinReveal, JoinReview, Joiner, PendingJoiner,
+    VerifiedCommit, MAX_INVITATION_TTL_SECS, PAIRING_WIRE_VERSION,
 };
 pub use peers::{KeyKept, Peer, PeerStore, TransportIdentity};
 pub use relay::{serve_relay, Relay, RelayCode, RELAY_PROTOCOL_VERSION};
 pub use session::{SyncMessage, SyncReport, SyncSession, PROTOCOL_VERSION};
 pub use transport::{
-    listen, start_pairing, start_pairing_with_vault, ApprovedEnrollment, IncomingJoin,
-    PairingConnection, PairingListener, PendingJoin, PreparedJoin, SharedVault,
+    listen, start_pairing, start_pairing_with_vault, ApprovedEnrollment, ChallengedJoin,
+    IncomingJoin, PairingConnection, PairingListener, PendingJoin, PreparedJoin, SharedVault,
 };
 
 #[cfg(test)]

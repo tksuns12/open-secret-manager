@@ -37,11 +37,11 @@
 //! completed, so that it can be told it was removed.
 
 use std::{
-    collections::BTreeMap,
-    net::SocketAddr,
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, SocketAddr},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicU16, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, Semaphore},
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::{client, server, TlsAcceptor, TlsConnector, TlsStream};
@@ -68,8 +68,8 @@ use crate::{
     transport::{
         client_config, connect_any, handshake_error, read_frame_within, read_json_frame,
         run_session, server_config, server_name, with_timeout, write_frame, write_json_frame,
-        ClientPolicy, PinPolicy, SharedVault, HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_FRAME_BYTES,
-        NO_VAULT,
+        ClientPolicy, KeyLimiter, PinPolicy, SharedVault, HANDSHAKE_TIMEOUT,
+        MAX_HANDSHAKE_FRAME_BYTES, NO_VAULT,
     },
     EnrollmentGrant, Error, Joiner, PeerStore, Relay, Result, SyncReport,
 };
@@ -93,8 +93,14 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// A control connection with no RPC for this long is closed. A leader sends
 /// heartbeats far more often.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Connections served at once, handshakes in progress included.
+/// Pre-auth handshakes accepted at once, and per source IP.
+const MAX_PREAUTH: usize = 32;
+const MAX_PREAUTH_PER_IP: usize = 16;
+/// Authenticated member connections served at once, and per device.
 const MAX_CONNECTIONS: usize = 64;
+const MAX_CONNECTIONS_PER_DEVICE: usize = 8;
+/// Concurrent removed-device refusal notices served at once.
+const MAX_REMOVED_NOTICES: usize = 4;
 
 /// A member of the vault as another member describes it: the certificate
 /// to accept control connections from, and where it was last reached.
@@ -536,8 +542,11 @@ struct Inner {
     addresses: AddressBook,
     /// 0 until this device listens.
     listen_port: AtomicU16,
-    /// A member answered that this device was removed.
-    removed: AtomicBool,
+    /// Committed voting members that answered `OpenReply::Removed`. Removal
+    /// is only accepted once `Directory::removal_confirmed` holds.
+    removed_by: Mutex<BTreeSet<DeviceId>>,
+    /// Concurrency cap on telling removed peers they were removed.
+    removed_notices: Arc<Semaphore>,
     /// The relay this device reaches others through when their addresses do
     /// not answer, if the owner set one up.
     relay: Mutex<Option<Relay>>,
@@ -575,7 +584,8 @@ impl MemberEndpoint {
                 trust,
                 addresses,
                 listen_port: AtomicU16::new(0),
-                removed: AtomicBool::new(false),
+                removed_by: Mutex::new(BTreeSet::new()),
+                removed_notices: Arc::new(Semaphore::new(MAX_REMOVED_NOTICES)),
                 relay: Mutex::new(None),
                 pairing: Mutex::new(None),
                 own_addresses: Mutex::new(None),
@@ -747,11 +757,23 @@ impl MemberEndpoint {
         }
     }
 
-    /// Whether a member has told this device that the vault's devices
-    /// removed it. A removed device may never receive the log entry that
-    /// completes its removal, so this is how it finds out.
+    /// Whether a quorum of committed voting members has told this device that
+    /// the vault's devices removed it (or one remaining voter after this
+    /// device already applied its own pending removal). A removed device may
+    /// never receive the log entry that completes its removal, so this is how
+    /// it finds out without letting a single non-voter or minority peer wipe
+    /// the vault.
     pub fn told_removed(&self) -> bool {
-        self.inner.removed.load(Ordering::SeqCst)
+        let Ok(directory) = self.directory() else {
+            return false;
+        };
+        let reporters = self
+            .inner
+            .removed_by
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        directory.removal_confirmed(&reporters)
     }
 
     /// The other members this device may sync with: those its committed
@@ -910,33 +932,39 @@ impl MemberEndpoint {
         tcp: TcpStream,
         remote: Option<std::net::IpAddr>,
     ) -> Result<Incoming> {
-        let mut stream = with_timeout(HANDSHAKE_TIMEOUT, self.inner.acceptor.accept(tcp))
-            .await?
-            .map_err(handshake_error)?;
-        let pin = pin_of(
-            stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|chain| chain.first())
-                .ok_or(Error::Handshake)?,
-        );
         let directory = self.directory()?.clone();
-        let Some(device) = directory.device_for_pin(&pin) else {
-            if directory.removed_device_for_pin(&pin).is_none() {
-                return Err(Error::PinMismatch);
-            }
-            let _: Open = with_timeout(
-                OPEN_TIMEOUT,
-                read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES),
-            )
-            .await??;
-            return refuse(stream, OpenReply::Removed, Error::NotAMember).await;
-        };
-        let open: Open = with_timeout(
-            OPEN_TIMEOUT,
-            read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES),
-        )
+        // Combined deadline covering both TLS handshake and the opening frame.
+        let (mut stream, device, pin, open) = with_timeout(HANDSHAKE_TIMEOUT, async {
+            let mut stream = self
+                .inner
+                .acceptor
+                .accept(tcp)
+                .await
+                .map_err(handshake_error)?;
+            let pin = pin_of(
+                stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|chain| chain.first())
+                    .ok_or(Error::Handshake)?,
+            );
+            let Some(device) = directory.device_for_pin(&pin) else {
+                if directory.removed_device_for_pin(&pin).is_none() {
+                    return Err(Error::PinMismatch);
+                }
+                let Ok(_notice_permit) = self.inner.removed_notices.clone().try_acquire_owned()
+                else {
+                    return Err(Error::NotAMember);
+                };
+                let _: Open = read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES).await?;
+                return refuse(stream, OpenReply::Removed, Error::NotAMember)
+                    .await
+                    .map(|_| unreachable!());
+            };
+            let open: Open = read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES).await?;
+            Ok((stream, device, pin, open))
+        })
         .await??;
         if open.version != MEMBER_PROTOCOL_VERSION {
             return refuse(
@@ -958,13 +986,16 @@ impl MemberEndpoint {
                 .observe(device, &SocketAddr::new(remote, port).to_string());
         }
         self.learn(device, pin, &open.roster);
-        write_frame(
-            &mut stream,
-            &OpenReply::Welcome {
-                roster: self.opening_roster(),
-            },
+        with_timeout(
+            OPEN_TIMEOUT,
+            write_frame(
+                &mut stream,
+                &OpenReply::Welcome {
+                    roster: self.opening_roster(),
+                },
+            ),
         )
-        .await?;
+        .await??;
         Ok(match open.channel {
             Channel::Control => Incoming::Control(ControlConnection {
                 stream,
@@ -1029,6 +1060,11 @@ impl MemberEndpoint {
         .await??
         {
             OpenReply::Welcome { roster } => {
+                self.inner
+                    .removed_by
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&device);
                 if let Some(address) = &address {
                     addresses.observe(device, address);
                 }
@@ -1039,8 +1075,21 @@ impl MemberEndpoint {
             OpenReply::VaultMismatch => Err(Error::VaultMismatch),
             OpenReply::NotAMember => Err(Error::NotAMember),
             OpenReply::Removed => {
-                self.inner.removed.store(true, Ordering::SeqCst);
-                Err(Error::Removed)
+                if self
+                    .directory()
+                    .is_ok_and(|directory| directory.is_voter(device))
+                {
+                    self.inner
+                        .removed_by
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(device);
+                }
+                if self.told_removed() {
+                    Err(Error::Removed)
+                } else {
+                    Err(Error::NotAMember)
+                }
             }
         }
     }
@@ -1196,8 +1245,8 @@ async fn refuse(
     reply: OpenReply,
     error: Error,
 ) -> Result<Incoming> {
-    write_frame(&mut stream, &reply).await?;
-    let _ = stream.shutdown().await;
+    let _ = with_timeout(OPEN_TIMEOUT, write_frame(&mut stream, &reply)).await;
+    let _ = with_timeout(Duration::from_secs(2), stream.shutdown()).await;
     Err(error)
 }
 
@@ -1278,33 +1327,43 @@ pub async fn start_node(
 }
 
 /// Accepts connections on `listener` until dropped, which also closes the
-/// connections it is serving. Control connections are served to `node`
-/// here; sync connections are handed to `sync`, whose receiver runs them
-/// against the vault, and are refused if there is none. Strangers fail the
-/// handshake; at most [`MAX_CONNECTIONS`] connections, handshakes included,
-/// are open at once.
+/// connections it is serving. Pre-auth handshakes and authenticated member
+/// sessions have separate concurrency pools so unauthenticated floods cannot
+/// starve established members.
 pub async fn serve_members(
     listener: TcpListener,
     endpoint: MemberEndpoint,
     node: Arc<ControlNode>,
     sync: Option<mpsc::Sender<MemberSync>>,
 ) {
+    let preauth = Arc::new(Semaphore::new(MAX_PREAUTH));
+    let preauth_per_ip: KeyLimiter<IpAddr> = KeyLimiter::default();
+    let active = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_device: KeyLimiter<DeviceId> = KeyLimiter::default();
     let mut connections = JoinSet::new();
     loop {
-        let Ok((tcp, _)) = listener.accept().await else {
+        let Ok((tcp, addr)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
         while connections.try_join_next().is_some() {}
-        if connections.len() >= MAX_CONNECTIONS {
+        let Ok(preauth_permit) = preauth.clone().try_acquire_owned() else {
             continue;
-        }
+        };
+        let Some(ip_guard) =
+            preauth_per_ip.try_acquire(addr.ip().to_canonical(), MAX_PREAUTH_PER_IP)
+        else {
+            continue;
+        };
         let endpoint = endpoint.clone();
-        connections.spawn(serve_connection(
-            async move { endpoint.accept(tcp).await },
-            node.clone(),
-            sync.clone(),
-        ));
+        let (node, sync) = (node.clone(), sync.clone());
+        let (active, per_device) = (active.clone(), per_device.clone());
+        connections.spawn(async move {
+            let accepted = endpoint.accept(tcp).await;
+            drop(preauth_permit);
+            drop(ip_guard);
+            serve_authenticated(accepted, node, sync, active, per_device).await;
+        });
     }
 }
 
@@ -1317,14 +1376,18 @@ pub async fn serve_relayed(
     node: Arc<ControlNode>,
     sync: Option<mpsc::Sender<MemberSync>>,
 ) {
+    let preauth = Arc::new(Semaphore::new(MAX_PREAUTH));
+    let active = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_device: KeyLimiter<DeviceId> = KeyLimiter::default();
     let mut connections = JoinSet::new();
     while let Some(tcp) = relayed.recv().await {
         while connections.try_join_next().is_some() {}
-        if connections.len() >= MAX_CONNECTIONS {
+        let Ok(preauth_permit) = preauth.clone().try_acquire_owned() else {
             continue;
-        }
+        };
         let endpoint = endpoint.clone();
         let (node, sync) = (node.clone(), sync.clone());
+        let (active, per_device) = (active.clone(), per_device.clone());
         connections.spawn(async move {
             // A joiner away from every network the invitation names opens
             // with one byte no TLS record starts with; a member goes
@@ -1334,42 +1397,65 @@ pub async fn serve_relayed(
             let seen = with_timeout(HANDSHAKE_TIMEOUT, tcp.peek(&mut first)).await;
             match seen {
                 Ok(Ok(1)) if first[0] == PAIRING_OPENING => {
-                    let consumed = tcp.read_exact(&mut first).await.is_ok();
+                    let consumed = with_timeout(HANDSHAKE_TIMEOUT, tcp.read_exact(&mut first))
+                        .await
+                        .is_ok_and(|res| res.is_ok());
+                    drop(preauth_permit);
                     // Taken only while an invitation is open.
                     if let (true, Some(sink)) = (consumed, endpoint.pairing_sink()) {
                         let _ = sink.try_send(tcp);
                     }
                 }
                 Ok(Ok(_)) => {
-                    serve_connection(
-                        async move { endpoint.accept_relayed(tcp).await },
-                        node,
-                        sync,
-                    )
-                    .await;
+                    let accepted = endpoint.accept_relayed(tcp).await;
+                    drop(preauth_permit);
+                    serve_authenticated(accepted, node, sync, active, per_device).await;
                 }
-                _ => {}
+                _ => {
+                    drop(preauth_permit);
+                }
             }
         });
     }
 }
 
-async fn serve_connection(
-    accepted: impl std::future::Future<Output = Result<Incoming>>,
+async fn serve_authenticated(
+    accepted: Result<Incoming>,
     node: Arc<ControlNode>,
     sync: Option<mpsc::Sender<MemberSync>>,
+    active: Arc<Semaphore>,
+    per_device: KeyLimiter<DeviceId>,
 ) {
-    match accepted.await {
-        Ok(Incoming::Control(connection)) => {
+    let Ok(incoming) = accepted else {
+        return;
+    };
+    let device = match &incoming {
+        Incoming::Control(connection) => connection.device(),
+        Incoming::Sync(connection) => connection.device(),
+    };
+    let Ok(_active_permit) = active.try_acquire_owned() else {
+        return;
+    };
+    let Some(_device_guard) = per_device.try_acquire(device, MAX_CONNECTIONS_PER_DEVICE) else {
+        return;
+    };
+    match incoming {
+        Incoming::Control(connection) => {
             let _ = connection.serve(&node).await;
         }
-        Ok(Incoming::Sync(connection)) => {
+        Incoming::Sync(connection) => {
             if let Some(sync) = sync {
-                let _ = sync.send(connection).await;
+                let _ = with_timeout(OPEN_TIMEOUT, sync.send(connection)).await;
             }
         }
-        Err(_) => {}
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn read_open_and_reply_removed(stream: &mut server::TlsStream<TcpStream>) {
+    let _: Result<Open> = read_frame_within(stream, MAX_HANDSHAKE_FRAME_BYTES).await;
+    let _ = write_frame(stream, &OpenReply::Removed).await;
+    let _ = stream.shutdown().await;
 }
 
 #[cfg(test)]

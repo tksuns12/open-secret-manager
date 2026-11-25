@@ -369,3 +369,149 @@ fn an_invitation_with_a_relay_is_the_frozen_one() {
     assert_eq!(relay.pin(), counting::<32>(0xe0));
     assert_eq!(read.addresses(), ["192.0.2.10:47820"]);
 }
+
+/// Wire protocol v2 pairing messages (3-flight commit-before-reveal binding
+/// both nonces, `voting`, and `relay_binding`) frozen in `pairing-2.json`.
+#[test]
+fn pairing_v2_messages_are_the_frozen_ones() {
+    let vault_id: [u8; 32] = counting(0x10);
+    let inviter_id: [u8; 16] = counting(0x40);
+    let inviter_key = SigningKey::from_bytes(&counting(0x60));
+    let inviter_public = inviter_key.verifying_key().to_bytes();
+    let inviter_pin: [u8; 32] = counting(0x20);
+    let token: [u8; 32] = counting(0x70);
+    let joiner_id: [u8; 16] = counting(0x90);
+    let joiner_key = SigningKey::from_bytes(&counting(0xb0));
+    let joiner_public = joiner_key.verifying_key().to_bytes();
+    let joiner_hpke = HpkeKeyPair::from_secret(&counting(0x30))
+        .public()
+        .as_bytes();
+    let joiner_pin: [u8; 32] = counting(0xd0);
+    let joiner_nonce: [u8; 32] = counting(0x50);
+    let inviter_nonce: [u8; 32] = counting(0x80);
+    let relay = RelayCode::new("relay.example.test:47830", counting(0xe0), counting(0xf0)).unwrap();
+
+    let joiner_commit = commit_nonce(&joiner_nonce);
+    let binding = relay_binding(Some(&relay));
+    let mut commit = JoinCommit {
+        version: PAIRING_WIRE_VERSION,
+        vault_id,
+        token,
+        joiner_device_id: joiner_id,
+        joiner_public_key: joiner_public,
+        joiner_hpke_key: joiner_hpke,
+        joiner_transport_pin: joiner_pin,
+        joiner_commit,
+        relay_binding: binding,
+        signature: Vec::new(),
+    };
+    let pre = pre_transcript_v2(
+        &Inviter {
+            vault_id: &vault_id,
+            device_id: &inviter_id,
+            public_key: &inviter_public,
+            transport_pin: &inviter_pin,
+            token: &token,
+        },
+        &commit,
+    );
+    commit.signature = signed(&joiner_key, &commit_message(&pre));
+    verify_pairing_signature(&joiner_public, &commit_message(&pre), &commit.signature).unwrap();
+    // JoinCommit must never leak the bearer token in Debug output.
+    assert!(!format!("{commit:?}").contains(&hex(&token)));
+    assert!(!format!("{commit:?}").contains(&format!("{token:?}")));
+
+    let challenge = JoinChallenge {
+        version: PAIRING_WIRE_VERSION,
+        inviter_nonce,
+        voting: true,
+    };
+    let reveal = JoinReveal {
+        version: PAIRING_WIRE_VERSION,
+        joiner_nonce,
+    };
+    let transcript = transcript_v2(&pre, &inviter_nonce, &joiner_nonce, Voting::Votes);
+    let members = vec![MemberContact {
+        device_id: inviter_id,
+        transport_pin: inviter_pin,
+        address: Some("192.0.2.10:47821".into()),
+    }];
+    let mut grant = EnrollmentGrant {
+        version: PAIRING_WIRE_VERSION,
+        vault_id,
+        request_id: counting(0xe0),
+        recovery_check: Some(counting(0x01)),
+        members,
+        inviter_port: Some(47821),
+        signature: Vec::new(),
+    };
+    grant.signature = signed(&inviter_key, &grant.signed_message(&transcript));
+    verify_pairing_signature(
+        &inviter_public,
+        &grant.signed_message(&transcript),
+        &grant.signature,
+    )
+    .unwrap();
+
+    let made = json!({
+        "about": "Pairing wire v2 messages (3-flight commit-before-reveal binding both nonces, voting, and relay_binding) as this code made them when frozen. Bytes are lowercase hexadecimal; messages are postcard in a 4-byte big-endian length frame. The keys and tokens are counting patterns and protect nothing.",
+        "inputs": {
+            "vault_id": hex(&vault_id),
+            "inviter_device_id": hex(&inviter_id),
+            "inviter_public_key": hex(&inviter_public),
+            "inviter_transport_pin": hex(&inviter_pin),
+            "token": hex(&token),
+            "joiner_device_id": hex(&joiner_id),
+            "joiner_public_key": hex(&joiner_public),
+            "joiner_hpke_key": hex(&joiner_hpke),
+            "joiner_transport_pin": hex(&joiner_pin),
+            "joiner_nonce": hex(&joiner_nonce),
+            "inviter_nonce": hex(&inviter_nonce),
+            "voting": true,
+        },
+        "joiner_commit": hex(&joiner_commit),
+        "relay_binding": hex(&binding),
+        "pre_transcript": hex(&pre),
+        "transcript": hex(&transcript),
+        "short_code": short_code_v2(&transcript),
+        "join_commit": {
+            "signed_message": hex(&commit_message(&pre)),
+            "signature": hex(&commit.signature),
+            "sent": sent(&commit),
+        },
+        "join_challenge": sent(&challenge),
+        "join_reveal": sent(&reveal),
+        "enrollment_grant": {
+            "signed_message": hex(&grant.signed_message(&transcript)),
+            "signature": hex(&grant.signature),
+            "sent": sent(&grant),
+        },
+    });
+    let frozen = frozen("pairing-2.json", &made);
+
+    let read_commit: JoinCommit = crate::wire::decode_body(&unhex(
+        frozen["join_commit"]["sent"]["body"].as_str().unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(read_commit.version, PAIRING_WIRE_VERSION);
+    assert_eq!(read_commit.joiner_commit, joiner_commit);
+    assert_eq!(read_commit.relay_binding, binding);
+    let read_challenge: JoinChallenge =
+        crate::wire::decode_body(&unhex(frozen["join_challenge"]["body"].as_str().unwrap()))
+            .unwrap();
+    assert_eq!(read_challenge, challenge);
+    let read_reveal: JoinReveal =
+        crate::wire::decode_body(&unhex(frozen["join_reveal"]["body"].as_str().unwrap())).unwrap();
+    assert_eq!(read_reveal, reveal);
+    let read_grant: EnrollmentGrant = crate::wire::decode_body(&unhex(
+        frozen["enrollment_grant"]["sent"]["body"].as_str().unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(read_grant.version, PAIRING_WIRE_VERSION);
+    verify_pairing_signature(
+        &inviter_public,
+        &read_grant.signed_message(&transcript),
+        &read_grant.signature,
+    )
+    .unwrap();
+}

@@ -22,19 +22,22 @@
 
 use std::{
     collections::HashMap,
+    net::IpAddr,
+    pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -44,7 +47,9 @@ use crate::{
     peers::{pin_of, TransportIdentity},
     transport::{
         client_config, handshake_error, read_frame_within, server_config, server_name,
-        with_timeout, write_frame, ClientPolicy, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT,
+        watched::{Moved, Watched},
+        with_timeout, write_frame, ClientPolicy, KeyGuard, KeyLimiter, CONNECT_TIMEOUT,
+        HANDSHAKE_TIMEOUT,
     },
     wire::{decode_body, encode_frame},
     Error, Result,
@@ -70,10 +75,23 @@ const SILENT_FOR: Duration = Duration::from_secs(90);
 /// After its connection to the relay ends, a device tries again this soon.
 const RECONNECT_AFTER: Duration = Duration::from_secs(5);
 /// Devices registered at once, connections waiting for their other half,
-/// and connections open at once, on one relay.
+/// pre-auth handshakes, and active bridges on one relay.
 const MAX_DEVICES: usize = 64;
 const MAX_WAITING: usize = 256;
-const MAX_CONNECTIONS: usize = 512;
+const MAX_UNAUTH: usize = 64;
+const MAX_UNAUTH_PER_IP: usize = 16;
+const MAX_BRIDGES: usize = 256;
+const MAX_BRIDGES_PER_DEVICE: usize = 16;
+const MAX_TICKETS_PER_DEVICE: usize = 16;
+/// Periodic sweep of expired tickets and unmatched `JOIN` sockets.
+const CLEANUP_EVERY: Duration = Duration::from_secs(10);
+/// Idle, lifetime, and volume limits for a bridged relay stream.
+const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const BRIDGE_MAX_LIFETIME: Duration = Duration::from_secs(3600);
+const BRIDGE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// Client-side bounds for concurrent incoming joins and in-flight dial asks.
+const MAX_INCOMING_JOINS: usize = 16;
+const MAX_ASKED: usize = 64;
 
 /// What the owner gives each device to use a relay: where it is, its
 /// certificate's pin, and its token. Made by the relay when it is set up
@@ -212,9 +230,12 @@ fn ticket() -> Result<[u8; 32]> {
     Ok(ticket)
 }
 
-/// A ticket handed out, and the ticket of the other end it is joined to.
+/// A ticket handed out, the ticket of the other end it is joined to, and the
+/// pins of both participating devices for per-device budgeting.
 struct Pending {
     partner: [u8; 32],
+    dialer: [u8; 32],
+    target: [u8; 32],
     expires: Instant,
 }
 
@@ -234,6 +255,61 @@ impl Relayed {
         self.tickets.retain(|_, pending| pending.expires > now);
         self.waiting.retain(|_, (_, expires)| *expires > now);
     }
+
+    fn tickets_for_dialer(&self, dialer: &[u8; 32]) -> usize {
+        self.tickets
+            .values()
+            .filter(|pending| &pending.dialer == dialer)
+            .count()
+    }
+}
+
+struct Limited<S> {
+    inner: S,
+    transferred: Arc<AtomicU64>,
+    limit: u64,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Limited<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let read = (buf.filled().len() - before) as u64;
+        if read > 0 && self.transferred.fetch_add(read, Ordering::Relaxed) + read > self.limit {
+            return Poll::Ready(Err(std::io::Error::other(
+                "relay bridge byte limit exceeded",
+            )));
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Limited<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Clone)]
+struct RelayBudgets {
+    bridges: Arc<Semaphore>,
+    device_bridges: KeyLimiter<[u8; 32]>,
 }
 
 /// Runs a relay on `listener` under `identity`, for devices that hold
@@ -246,20 +322,56 @@ pub async fn serve_relay(
     let acceptor = TlsAcceptor::from(server_config(&identity, ClientPolicy::AnyForPairing)?);
     let state = Arc::new(Mutex::new(Relayed::default()));
     let token = Arc::new(Zeroizing::new(token));
+    let unauth = Arc::new(Semaphore::new(MAX_UNAUTH));
+    let unauth_per_ip: KeyLimiter<IpAddr> = KeyLimiter::default();
+    let budgets = RelayBudgets {
+        bridges: Arc::new(Semaphore::new(MAX_BRIDGES)),
+        device_bridges: KeyLimiter::default(),
+    };
     let mut connections = JoinSet::new();
+    let mut cleanup = tokio::time::interval(CLEANUP_EVERY);
+    cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let Ok((tcp, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        while connections.try_join_next().is_some() {}
-        if connections.len() >= MAX_CONNECTIONS {
-            continue;
+        tokio::select! {
+            _ = cleanup.tick() => {
+                while connections.try_join_next().is_some() {}
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .forget_expired();
+            }
+            accepted = listener.accept() => {
+                let Ok((tcp, peer)) = accepted else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                while connections.try_join_next().is_some() {}
+                let Ok(unauth_permit) = unauth.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let Some(ip_guard) = unauth_per_ip.try_acquire(peer.ip().to_canonical(), MAX_UNAUTH_PER_IP) else {
+                    continue;
+                };
+                let (acceptor, state, token, budgets) = (
+                    acceptor.clone(),
+                    state.clone(),
+                    token.clone(),
+                    budgets.clone(),
+                );
+                connections.spawn(async move {
+                    let _ = relay_connection(
+                        tcp,
+                        &acceptor,
+                        &state,
+                        &token,
+                        &budgets,
+                        unauth_permit,
+                        ip_guard,
+                    )
+                    .await;
+                });
+            }
         }
-        let (acceptor, state, token) = (acceptor.clone(), state.clone(), token.clone());
-        connections.spawn(async move {
-            let _ = relay_connection(tcp, &acceptor, &state, &token).await;
-        });
     }
 }
 
@@ -268,11 +380,31 @@ async fn relay_connection(
     acceptor: &TlsAcceptor,
     state: &Arc<Mutex<Relayed>>,
     token: &[u8; 32],
+    budgets: &RelayBudgets,
+    unauth_permit: OwnedSemaphorePermit,
+    ip_guard: KeyGuard<IpAddr>,
 ) -> Result<()> {
-    let kind = with_timeout(HANDSHAKE_TIMEOUT, tcp.read_u8()).await??;
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let remaining = || {
+        deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(Error::Timeout)
+    };
+    let kind = with_timeout(remaining()?, tcp.read_u8()).await??;
     match kind {
-        CONTROL => serve_device(tcp, acceptor, state, token).await,
-        JOIN => join(tcp, state).await,
+        CONTROL => {
+            serve_device(
+                tcp,
+                acceptor,
+                state,
+                token,
+                deadline,
+                unauth_permit,
+                ip_guard,
+            )
+            .await
+        }
+        JOIN => join(tcp, state, budgets, deadline, unauth_permit, ip_guard).await,
         _ => Ok(()),
     }
 }
@@ -284,23 +416,33 @@ async fn serve_device(
     acceptor: &TlsAcceptor,
     state: &Arc<Mutex<Relayed>>,
     token: &[u8; 32],
+    deadline: tokio::time::Instant,
+    unauth_permit: OwnedSemaphorePermit,
+    ip_guard: KeyGuard<IpAddr>,
 ) -> Result<()> {
-    let mut stream = with_timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
-        .await?
-        .map_err(handshake_error)?;
-    let pin = pin_of(
-        stream
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|chain| chain.first())
-            .ok_or(Error::Handshake)?,
-    );
-    let registered = matches!(
-        with_timeout(HANDSHAKE_TIMEOUT, read_frame_within(&mut stream, MAX_FRAME)).await??,
-        ToRelay::Register { version, token: offered }
-            if version == RELAY_PROTOCOL_VERSION && same(&offered, token)
-    );
+    let remaining = || {
+        deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(Error::Timeout)
+    };
+    let (mut stream, pin, registered) = with_timeout(remaining()?, async {
+        let mut stream = acceptor.accept(tcp).await.map_err(handshake_error)?;
+        let pin = pin_of(
+            stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .ok_or(Error::Handshake)?,
+        );
+        let registered = matches!(
+            read_frame_within(&mut stream, MAX_FRAME).await?,
+            ToRelay::Register { version, token: offered }
+                if version == RELAY_PROTOCOL_VERSION && same(&offered, token)
+        );
+        Ok::<_, Error>((stream, pin, registered))
+    })
+    .await??;
     let (sender, mut outgoing) = mpsc::channel::<FromRelay>(16);
     let accepted = registered && {
         let mut relayed = state
@@ -314,11 +456,22 @@ async fn serve_device(
         room
     };
     if !accepted {
-        write_frame(&mut stream, &FromRelay::Refused).await?;
-        let _ = stream.shutdown().await;
+        let _ = with_timeout(
+            HANDSHAKE_TIMEOUT,
+            write_frame(&mut stream, &FromRelay::Refused),
+        )
+        .await;
+        let _ = with_timeout(Duration::from_secs(2), stream.shutdown()).await;
         return Err(Error::RelayRefused);
     }
-    write_frame(&mut stream, &FromRelay::Registered).await?;
+    // Authentication succeeded: release pre-auth handshake slots immediately.
+    drop(unauth_permit);
+    drop(ip_guard);
+    with_timeout(
+        HANDSHAKE_TIMEOUT,
+        write_frame(&mut stream, &FromRelay::Registered),
+    )
+    .await??;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let writing = tokio::spawn(async move {
         while let Some(message) = outgoing.recv().await {
@@ -335,36 +488,49 @@ async fn serve_device(
                 ToRelay::Register { .. } => return Err(Error::ProtocolViolation),
                 ToRelay::Ping => FromRelay::Pong,
                 ToRelay::Dial { request, to } => {
-                    let (mine, theirs) = (ticket()?, ticket()?);
-                    let mut relayed = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    relayed.forget_expired();
-                    let target = relayed.devices.get(&to).cloned();
-                    match target {
-                        Some(target) if relayed.tickets.len() + 2 <= MAX_WAITING => {
-                            let expires = Instant::now() + TICKET_LIFETIME;
-                            relayed.tickets.insert(
-                                mine,
-                                Pending {
-                                    partner: theirs,
-                                    expires,
-                                },
-                            );
-                            relayed.tickets.insert(
-                                theirs,
-                                Pending {
-                                    partner: mine,
-                                    expires,
-                                },
-                            );
-                            let _ = target.try_send(FromRelay::Incoming { ticket: theirs });
-                            FromRelay::Ticket {
-                                request,
-                                ticket: mine,
-                            }
+                    if to == pin {
+                        FromRelay::Absent { request }
+                    } else {
+                        let (mine, theirs) = (ticket()?, ticket()?);
+                        let mut relayed = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        relayed.forget_expired();
+                        let target = relayed.devices.get(&to).cloned();
+                        let under_budget = relayed.tickets.len() + 2 <= MAX_WAITING
+                            && relayed.tickets_for_dialer(&pin) + 2 <= MAX_TICKETS_PER_DEVICE;
+                        match target {
+                            Some(target) if under_budget => match target.try_reserve() {
+                                Ok(permit) => {
+                                    let expires = Instant::now() + TICKET_LIFETIME;
+                                    relayed.tickets.insert(
+                                        mine,
+                                        Pending {
+                                            partner: theirs,
+                                            dialer: pin,
+                                            target: to,
+                                            expires,
+                                        },
+                                    );
+                                    relayed.tickets.insert(
+                                        theirs,
+                                        Pending {
+                                            partner: mine,
+                                            dialer: pin,
+                                            target: to,
+                                            expires,
+                                        },
+                                    );
+                                    permit.send(FromRelay::Incoming { ticket: theirs });
+                                    FromRelay::Ticket {
+                                        request,
+                                        ticket: mine,
+                                    }
+                                }
+                                Err(_) => FromRelay::Absent { request },
+                            },
+                            _ => FromRelay::Absent { request },
                         }
-                        _ => FromRelay::Absent { request },
                     }
                 }
             };
@@ -393,10 +559,20 @@ async fn serve_device(
 
 /// A connection to be joined: its ticket, then the bytes of the session it
 /// carries, passed both ways once the other end has come.
-async fn join(mut tcp: TcpStream, state: &Arc<Mutex<Relayed>>) -> Result<()> {
+async fn join(
+    mut tcp: TcpStream,
+    state: &Arc<Mutex<Relayed>>,
+    budgets: &RelayBudgets,
+    deadline: tokio::time::Instant,
+    unauth_permit: OwnedSemaphorePermit,
+    ip_guard: KeyGuard<IpAddr>,
+) -> Result<()> {
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .ok_or(Error::Timeout)?;
     let mut ticket = [0u8; 32];
-    with_timeout(HANDSHAKE_TIMEOUT, tcp.read_exact(&mut ticket)).await??;
-    let partner = {
+    with_timeout(remaining, tcp.read_exact(&mut ticket)).await??;
+    let (partner, dialer, target) = {
         let mut relayed = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -405,7 +581,7 @@ async fn join(mut tcp: TcpStream, state: &Arc<Mutex<Relayed>>) -> Result<()> {
             return Ok(());
         };
         match relayed.waiting.remove(&pending.partner) {
-            Some((partner, _)) => partner,
+            Some((partner, _)) => (partner, pending.dialer, pending.target),
             None => {
                 if relayed.waiting.len() >= MAX_WAITING {
                     return Ok(());
@@ -415,8 +591,40 @@ async fn join(mut tcp: TcpStream, state: &Arc<Mutex<Relayed>>) -> Result<()> {
             }
         }
     };
-    let mut partner = partner;
-    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut partner).await;
+    drop(unauth_permit);
+    drop(ip_guard);
+    let Ok(_bridge_permit) = budgets.bridges.clone().try_acquire_owned() else {
+        return Ok(());
+    };
+    let Some(_dialer_guard) = budgets
+        .device_bridges
+        .try_acquire(dialer, MAX_BRIDGES_PER_DEVICE)
+    else {
+        return Ok(());
+    };
+    let Some(_target_guard) = budgets
+        .device_bridges
+        .try_acquire(target, MAX_BRIDGES_PER_DEVICE)
+    else {
+        return Ok(());
+    };
+    let moved = Moved::new();
+    let transferred = Arc::new(AtomicU64::new(0));
+    let mut left = Limited {
+        inner: Watched::new(tcp, moved.clone()),
+        transferred: transferred.clone(),
+        limit: BRIDGE_MAX_BYTES,
+    };
+    let mut right = Limited {
+        inner: Watched::new(partner, moved.clone()),
+        transferred,
+        limit: BRIDGE_MAX_BYTES,
+    };
+    tokio::select! {
+        _ = tokio::io::copy_bidirectional(&mut left, &mut right) => {}
+        () = moved.stalled(BRIDGE_IDLE_TIMEOUT) => {}
+        () = tokio::time::sleep(BRIDGE_MAX_LIFETIME) => {}
+    }
     Ok(())
 }
 
@@ -512,7 +720,7 @@ async fn joining(address: &str, ticket: [u8; 32]) -> Result<TcpStream> {
     let mut opening = [0u8; 33];
     opening[0] = JOIN;
     opening[1..].copy_from_slice(&ticket);
-    tcp.write_all(&opening).await?;
+    with_timeout(CONNECT_TIMEOUT, tcp.write_all(&opening)).await??;
     Ok(tcp)
 }
 
@@ -557,7 +765,7 @@ async fn registered(
 ) -> Result<()> {
     let mut tcp =
         with_timeout(CONNECT_TIMEOUT, TcpStream::connect(code.address.as_str())).await??;
-    tcp.write_u8(CONTROL).await?;
+    with_timeout(CONNECT_TIMEOUT, tcp.write_u8(CONTROL)).await??;
     let connector = TlsConnector::from(client_config(identity, code.pin)?);
     let mut stream = with_timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name(), tcp))
         .await?
@@ -588,6 +796,7 @@ async fn registered(
         }
     });
     let mut asked: HashMap<u32, oneshot::Sender<Result<[u8; 32]>>> = HashMap::new();
+    let mut incoming_joins = JoinSet::new();
     let mut next = 0u32;
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut last_heard = Instant::now();
@@ -608,12 +817,15 @@ async fn registered(
                         }
                     }
                     Some(FromRelay::Incoming { ticket }) => {
-                        let (address, incoming) = (code.address.clone(), incoming.clone());
-                        tokio::spawn(async move {
-                            if let Ok(tcp) = joining(&address, ticket).await {
-                                let _ = incoming.send(tcp).await;
-                            }
-                        });
+                        while incoming_joins.try_join_next().is_some() {}
+                        if incoming_joins.len() < MAX_INCOMING_JOINS {
+                            let (address, incoming) = (code.address.clone(), incoming.clone());
+                            incoming_joins.spawn(async move {
+                                if let Ok(tcp) = joining(&address, ticket).await {
+                                    let _ = with_timeout(CONNECT_TIMEOUT, incoming.send(tcp)).await;
+                                }
+                            });
+                        }
                     }
                     Some(FromRelay::Pong) => {}
                     Some(FromRelay::Registered | FromRelay::Refused) => {
@@ -624,6 +836,11 @@ async fn registered(
             request = requests.recv() => match request {
                 None => break Ok(()),
                 Some(Request::Dial { to, answer }) => {
+                    asked.retain(|_, waiting| !waiting.is_closed());
+                    if asked.len() >= MAX_ASKED {
+                        let _ = answer.send(Err(Error::RelayUnavailable));
+                        continue;
+                    }
                     let request = next;
                     next = next.wrapping_add(1);
                     if let Err(error) = write_frame(&mut writer, &ToRelay::Dial { request, to }).await {
@@ -634,6 +851,8 @@ async fn registered(
                 }
             },
             _ = ping.tick() => {
+                while incoming_joins.try_join_next().is_some() {}
+                asked.retain(|_, waiting| !waiting.is_closed());
                 if last_heard.elapsed() > SILENT_FOR {
                     break Err(Error::Timeout);
                 }
@@ -644,6 +863,7 @@ async fn registered(
         }
     };
     reading.abort();
+    incoming_joins.abort_all();
     for (_, answer) in asked {
         let _ = answer.send(Err(Error::RelayUnavailable));
     }

@@ -1148,9 +1148,19 @@ async fn sync_with_members<R: Runtime>(app: &AppHandle<R>) -> Result<(), Command
                 answered.push(id);
                 reports.push(report);
             }
-            Err(osm_vault_peer::Error::Removed) => {
+            Err(osm_vault_peer::Error::Removed)
+                if control.endpoint.told_removed()
+                    || control
+                        .node
+                        .state()
+                        .removed
+                        .contains_key(&control.node.device()) =>
+            {
                 failure = Some(osm_vault_peer::Error::Removed);
                 break;
+            }
+            Err(osm_vault_peer::Error::Removed) => {
+                failure = Some(osm_vault_peer::Error::NotAMember);
             }
             Err(error) => {
                 if matches!(error, osm_vault_peer::Error::PinMismatch) {
@@ -2009,6 +2019,7 @@ pub async fn start_invite<R: Runtime>(
         control,
         listener,
         voting,
+        relay_code,
         decided,
     ));
     *invite_slot = Some(InviteState {
@@ -2023,11 +2034,19 @@ async fn wait_for_joiner<R: Runtime>(
     control: Arc<Control>,
     listener: PairingListener,
     voting: Voting,
+    relay_code: Option<RelayCode>,
     decided: oneshot::Receiver<bool>,
 ) {
     let outcome = tokio::time::timeout(
         Duration::from_secs(MAX_INVITATION_TTL_SECS),
-        pair_one(&app, &control, &listener, voting, decided),
+        pair_one(
+            &app,
+            &control,
+            &listener,
+            voting,
+            relay_code.as_ref(),
+            decided,
+        ),
     )
     .await
     .unwrap_or_else(|_| {
@@ -2056,6 +2075,7 @@ async fn pair_one<R: Runtime>(
     control: &Control,
     listener: &PairingListener,
     voting: Voting,
+    relay: Option<&RelayCode>,
     decided: oneshot::Receiver<bool>,
 ) -> Result<(), CommandError> {
     let state = app.state::<AppState>();
@@ -2066,12 +2086,17 @@ async fn pair_one<R: Runtime>(
     };
     let pending: PendingJoin = loop {
         let incoming = listener.next_request().await.map_err(network_error)?;
-        let vault = state.vault.lock().await;
-        let invitations = net.invitations.lock().await;
-        let mut peers = net.peers.lock().await;
-        let vault = vault.as_ref().ok_or_else(gone)?;
-        let reviewed = incoming.review(vault, &invitations, &mut peers, now());
-        if let Ok(pending) = reviewed {
+        let challenged = {
+            let vault = state.vault.lock().await;
+            let invitations = net.invitations.lock().await;
+            let mut peers = net.peers.lock().await;
+            let vault = vault.as_ref().ok_or_else(gone)?;
+            incoming.review(vault, &invitations, &mut peers, voting, relay, now())
+        };
+        let Ok(challenged) = challenged else {
+            continue;
+        };
+        if let Ok(pending) = challenged.complete().await {
             break pending;
         }
     };

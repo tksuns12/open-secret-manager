@@ -217,18 +217,27 @@ impl Desktop {
         let (shown, codes) = std_mpsc::channel();
         let (answer, answers) = std_mpsc::channel::<bool>();
         let desktop = self.clone();
+        let relay = relay.cloned();
         tokio::spawn(async move {
             let incoming = listener.next_request().await.unwrap();
-            let pending = {
+            let challenged = {
                 // Every guard first: a `&Vault` cannot be held across an
                 // await.
                 let vault = desktop.vault.lock().await;
                 let invitations = desktop.invitations.lock().await;
                 let mut peers = desktop.peers.lock().await;
                 incoming
-                    .review(&vault, &invitations, &mut peers, now())
+                    .review(
+                        &vault,
+                        &invitations,
+                        &mut peers,
+                        Voting::WithoutVote,
+                        relay.as_ref(),
+                        now(),
+                    )
                     .unwrap()
             };
+            let pending = challenged.complete().await.unwrap();
             shown.send(pending.sas()).unwrap();
             let confirmed = tokio::task::spawn_blocking(move || answers.recv().unwrap_or(false))
                 .await

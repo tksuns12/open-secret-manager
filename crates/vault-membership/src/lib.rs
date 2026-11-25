@@ -23,8 +23,6 @@ mod state;
 mod store;
 mod types;
 
-use std::io::Cursor;
-
 pub use error::{Error, Result};
 pub use network::{
     verify_rpc_sender, ControlReply, ControlRpc, Dialer, Directory, Link, LinkError, Router,
@@ -32,7 +30,7 @@ pub use network::{
 };
 pub use node::{default_config, timing, ControlNode, NodeOptions};
 pub use state::{ControlState, PendingChange};
-pub use store::{CrashPlan, CrashPoint};
+pub use store::{BoundedSnapshotData, CrashPlan, CrashPoint, MAX_SNAPSHOT_BYTES};
 pub use types::{
     device_id_from_bytes, device_id_to_bytes, ControlEntry, ControlRequest, DeviceId, DeviceNode,
     KeySigner, MembershipChange, Outcome, Rejection, RequestSigner, Rotation, SignedRequest,
@@ -46,6 +44,7 @@ openraft::declare_raft_types!(
         R = Outcome,
         NodeId = DeviceId,
         Node = DeviceNode,
+        SnapshotData = BoundedSnapshotData,
 );
 
 #[cfg(test)]

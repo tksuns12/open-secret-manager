@@ -10,7 +10,17 @@
 //! it accepts any client certificate and then requires that the join
 //! request, signed by the joiner's device key, names that certificate.
 
-use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    hash::Hash,
+    net::{IpAddr, SocketAddr},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use osm_vault_core::Vault;
 use osm_vault_sync::InvitationStore;
@@ -33,6 +43,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, Mutex},
+    task::JoinSet,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -43,17 +54,83 @@ use crate::{
     control::Voting,
     members::MemberContact,
     members::PAIRING_OPENING,
-    pairing::JoinReview,
+    pairing::{JoinReview, PendingJoiner, VerifiedCommit, PAIRING_WIRE_VERSION},
     peers::{pin_of, TransportIdentity},
-    review_join,
+    review_commit,
     wire::{decode_body, encode_frame, MAX_FRAME_BYTES},
-    EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, PeerStore, Relay, Result, SyncMessage,
-    SyncReport, SyncSession, MAX_INVITATION_TTL_SECS,
+    EnrollmentGrant, Error, Invitation, JoinChallenge, JoinCommit, JoinReveal, Joiner, PeerStore,
+    Relay, RelayCode, Result, SyncMessage, SyncReport, SyncSession, MAX_INVITATION_TTL_SECS,
 };
 
-mod watched;
+pub(crate) mod watched;
 
 use watched::{Moved, Watched};
+
+/// Concurrent per-key counter (e.g., per-IP or per-device connection budgets).
+pub(crate) struct KeyLimiter<K: Eq + Hash + Clone> {
+    counts: Arc<std::sync::Mutex<HashMap<K, usize>>>,
+}
+
+impl<K: Eq + Hash + Clone> Clone for KeyLimiter<K> {
+    fn clone(&self) -> Self {
+        Self {
+            counts: self.counts.clone(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> Default for KeyLimiter<K> {
+    fn default() -> Self {
+        Self {
+            counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+pub(crate) struct KeyGuard<K: Eq + Hash + Clone> {
+    counts: Arc<std::sync::Mutex<HashMap<K, usize>>>,
+    key: K,
+}
+
+impl<K: Eq + Hash + Clone> Drop for KeyGuard<K> {
+    fn drop(&mut self) {
+        let mut map = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = map.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> KeyLimiter<K> {
+    pub(crate) fn try_acquire(&self, key: K, limit: usize) -> Option<KeyGuard<K>> {
+        let mut map = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(key.clone()).or_insert(0);
+        if *entry >= limit {
+            return None;
+        }
+        *entry += 1;
+        Some(KeyGuard {
+            counts: self.counts.clone(),
+            key,
+        })
+    }
+}
+
+/// Concurrent pre-auth pairing handshakes accepted at once.
+const MAX_PAIRING_IN_FLIGHT: usize = 16;
+/// Concurrent pre-auth pairing handshakes per client IP address.
+const MAX_PAIRING_PER_IP: usize = 4;
+/// Maximum online SAS challenges issued by a single pairing listener.
+const MAX_PAIRING_CHALLENGES: usize = 8;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,6 +168,14 @@ pub struct PairingListener {
     sink: mpsc::Sender<TcpStream>,
     /// The device whose relay they come through, once [`through`](Self::through).
     through: std::sync::Mutex<Option<crate::MemberEndpoint>>,
+    /// In-flight TLS + Flight 1 handshakes, kept across `next_request` calls
+    /// so rejecting one request never aborts concurrent legitimate joiners.
+    in_flight: Mutex<JoinSet<Result<IncomingJoin>>>,
+    /// Per-source IP cap for direct pairing handshakes.
+    per_ip: KeyLimiter<IpAddr>,
+    /// Number of wire v2 challenges issued on this listener (caps online SAS
+    /// grinding if an invitation code leaks).
+    challenges: Arc<AtomicUsize>,
 }
 
 impl Drop for PairingListener {
@@ -129,6 +214,9 @@ impl PairingListener {
             relayed: Mutex::new(relayed),
             sink,
             through: std::sync::Mutex::new(None),
+            in_flight: Mutex::new(JoinSet::new()),
+            per_ip: KeyLimiter::default(),
+            challenges: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -149,29 +237,55 @@ impl PairingListener {
         Ok(self.listener.local_addr()?)
     }
 
-    /// Waits for the next joiner that completes the handshake and sends a
-    /// request naming the certificate it connected with. Anything else (junk,
-    /// failed handshakes, mismatched certificates) is dropped and the wait
-    /// continues.
+    /// Waits for the next joiner that completes the TLS handshake and sends a
+    /// wire v2 [`JoinCommit`] naming the certificate it connected with.
+    /// Handshakes run concurrently up to [`MAX_PAIRING_IN_FLIGHT`] so a
+    /// single stalled socket never blocks legitimate joiners.
     pub async fn next_request(&self) -> Result<IncomingJoin> {
+        let mut relayed = self.relayed.lock().await;
+        let mut in_flight = self.in_flight.lock().await;
         loop {
-            let tcp = {
-                let mut relayed = self.relayed.lock().await;
-                tokio::select! {
-                    accepted = self.listener.accept() => accepted?.0,
-                    Some(tcp) = relayed.recv() => tcp,
+            let room = in_flight.len() < MAX_PAIRING_IN_FLIGHT;
+            tokio::select! {
+                accepted = self.listener.accept(), if room => {
+                    let (tcp, addr) = accepted?;
+                    let ip = addr.ip().to_canonical();
+                    let Some(ip_guard) = self.per_ip.try_acquire(ip, MAX_PAIRING_PER_IP) else {
+                        continue;
+                    };
+                    let acceptor = self.acceptor.clone();
+                    let challenges = self.challenges.clone();
+                    in_flight.spawn(async move {
+                        let _guard = ip_guard;
+                        receive_commit(acceptor, tcp, challenges).await
+                    });
                 }
-            };
-            if let Ok(incoming) = self.receive(tcp).await {
-                return Ok(incoming);
+                Some(tcp) = relayed.recv(), if room => {
+                    let acceptor = self.acceptor.clone();
+                    let challenges = self.challenges.clone();
+                    in_flight.spawn(async move {
+                        receive_commit(acceptor, tcp, challenges).await
+                    });
+                }
+                Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
+                    if let Ok(Ok(incoming)) = finished {
+                        return Ok(incoming);
+                    }
+                }
             }
         }
     }
+}
 
-    async fn receive(&self, tcp: TcpStream) -> Result<IncomingJoin> {
-        let mut stream = with_timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(tcp))
-            .await?
-            .map_err(handshake_error)?;
+async fn receive_commit(
+    acceptor: TlsAcceptor,
+    tcp: TcpStream,
+    challenges: Arc<AtomicUsize>,
+) -> Result<IncomingJoin> {
+    // One combined deadline covers both TLS and Flight 1 so a slow peer
+    // cannot chain two separate timeouts.
+    let (stream, commit) = with_timeout(HANDSHAKE_TIMEOUT, async {
+        let mut stream = acceptor.accept(tcp).await.map_err(handshake_error)?;
         let client_pin = pin_of(
             stream
                 .get_ref()
@@ -180,40 +294,101 @@ impl PairingListener {
                 .and_then(|chain| chain.first())
                 .ok_or(Error::Handshake)?,
         );
-        // Anyone who can reach the listener gets this far, so the request
-        // has a small bound and little time: it is sent at once and is a
-        // few hundred bytes.
-        let request: JoinRequest = with_timeout(
-            HANDSHAKE_TIMEOUT,
-            read_frame_within(&mut stream, MAX_HANDSHAKE_FRAME_BYTES),
-        )
-        .await??;
-        // The request is signed by the joiner's device key; the certificate
-        // on this connection must be the one it names.
-        if request.joiner_transport_pin() != client_pin {
+        let body = read_body(&mut stream, MAX_HANDSHAKE_FRAME_BYTES).await?;
+        if body.first().copied() != Some(PAIRING_WIRE_VERSION) {
+            return Err(Error::UnsupportedVersion);
+        }
+        let commit: JoinCommit = decode_body(&body)?;
+        if commit.version() != PAIRING_WIRE_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        if commit.joiner_transport_pin() != client_pin {
             return Err(Error::PinMismatch);
         }
-        Ok(IncomingJoin { stream, request })
-    }
+        Ok((stream, commit))
+    })
+    .await??;
+    Ok(IncomingJoin {
+        stream,
+        commit,
+        challenges,
+    })
 }
 
-/// A join request received over TLS, not yet reviewed.
+/// Flight 1 ([`JoinCommit`]) received over TLS, not yet reviewed against the
+/// vault's invitation store.
 pub struct IncomingJoin {
     stream: tokio_rustls::server::TlsStream<TcpStream>,
-    request: JoinRequest,
+    commit: JoinCommit,
+    challenges: Arc<AtomicUsize>,
 }
 
 impl IncomingJoin {
-    /// Validates the request with [`review_join`]. Only a request that passes
-    /// should be shown to the owner.
+    /// Synchronously validates Flight 1 against the vault and invitation store
+    /// (holding no lock across network I/O) and prepares Flight 2
+    /// ([`JoinChallenge`]). Call [`ChallengedJoin::complete`] next to finish
+    /// commit-before-reveal and derive the SAS.
     pub fn review(
         self,
         vault: &Vault,
         invitations: &InvitationStore,
         peers: &mut PeerStore,
+        voting: Voting,
+        relay: Option<&RelayCode>,
         now: u64,
-    ) -> Result<PendingJoin> {
-        let review = review_join(vault, invitations, peers, self.request, now)?;
+    ) -> Result<ChallengedJoin> {
+        let (verified, challenge) =
+            review_commit(vault, invitations, peers, self.commit, voting, relay, now)?;
+        let mut allowed = false;
+        let mut current = self.challenges.load(Ordering::SeqCst);
+        while current < MAX_PAIRING_CHALLENGES {
+            match self.challenges.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    allowed = true;
+                    break;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+        if !allowed {
+            return Err(Error::ProtocolViolation);
+        }
+        Ok(ChallengedJoin {
+            stream: self.stream,
+            verified,
+            challenge,
+        })
+    }
+}
+
+/// A validated Flight 1 ready to exchange Flight 2 ([`JoinChallenge`]) and
+/// Flight 3 ([`JoinReveal`]) without holding any vault lock.
+pub struct ChallengedJoin {
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    verified: VerifiedCommit,
+    challenge: JoinChallenge,
+}
+
+impl ChallengedJoin {
+    /// Sends Flight 2, receives and verifies Flight 3 within
+    /// [`HANDSHAKE_TIMEOUT`], and returns the [`PendingJoin`] with the SAS
+    /// ready to show to the owner.
+    pub async fn complete(mut self) -> Result<PendingJoin> {
+        let reveal: JoinReveal = with_timeout(HANDSHAKE_TIMEOUT, async {
+            write_frame(&mut self.stream, &self.challenge).await?;
+            let body = read_body(&mut self.stream, MAX_HANDSHAKE_FRAME_BYTES).await?;
+            if body.first().copied() != Some(PAIRING_WIRE_VERSION) {
+                return Err(Error::UnsupportedVersion);
+            }
+            decode_body(&body)
+        })
+        .await??;
+        let review = self.verified.complete(reveal)?;
         Ok(PendingJoin {
             stream: self.stream,
             review,
@@ -221,7 +396,7 @@ impl IncomingJoin {
     }
 }
 
-/// A reviewed join request waiting for the owner. Holds no vault borrow.
+/// A reviewed join handshake waiting for the owner. Holds no vault borrow.
 pub struct PendingJoin {
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     review: JoinReview,
@@ -353,11 +528,11 @@ impl PairingConnection {
     }
 }
 
-/// A join request ready to send. Preparing it needs the peer store, and for
+/// A join commit ready to send. Preparing it needs the peer store, and for
 /// a device joining with its vault, the vault; connecting needs neither.
 pub struct PreparedJoin {
-    joiner: Joiner,
-    request: JoinRequest,
+    pending: PendingJoiner,
+    commit: JoinCommit,
     identity: TransportIdentity,
 }
 
@@ -365,10 +540,10 @@ impl PreparedJoin {
     /// The request of a new device, which has no vault yet.
     pub fn new(invitation: Invitation, peers: &mut PeerStore, now: u64) -> Result<Self> {
         let identity = peers.transport_identity()?;
-        let (joiner, request) = Joiner::start(invitation, identity.pin(), now)?;
+        let (pending, commit) = Joiner::start(invitation, identity.pin(), now)?;
         Ok(Self {
-            joiner,
-            request,
+            pending,
+            commit,
             identity,
         })
     }
@@ -383,24 +558,34 @@ impl PreparedJoin {
         now: u64,
     ) -> Result<Self> {
         let identity = peers.transport_identity()?;
-        let (joiner, request) = Joiner::start_with_vault(invitation, vault, identity.pin(), now)?;
+        let (pending, commit) = Joiner::start_with_vault(invitation, vault, identity.pin(), now)?;
         Ok(Self {
-            joiner,
-            request,
+            pending,
+            commit,
             identity,
         })
     }
 
     /// Connects to the inviter named in the invitation, pinning its
-    /// certificate, and sends the request.
+    /// certificate, and completes the 3-flight wire v2 commit-before-reveal
+    /// exchange so both sides hold the same SAS.
     pub async fn connect(self) -> Result<PairingConnection> {
-        let joiner = self.joiner;
         let connector = TlsConnector::from(client_config(
             &self.identity,
-            joiner.inviter_transport_pin(),
+            self.pending.inviter_transport_pin(),
         )?);
-        let (mut stream, relay) = reach_inviter(&joiner, &self.identity, &connector).await?;
-        write_frame(&mut stream, &self.request).await?;
+        let (mut stream, relay) = reach_inviter(&self.pending, &self.identity, &connector).await?;
+        let (joiner, reveal) = with_timeout(HANDSHAKE_TIMEOUT, async {
+            write_frame(&mut stream, &self.commit).await?;
+            let body = read_body(&mut stream, MAX_HANDSHAKE_FRAME_BYTES).await?;
+            if body.first().copied() != Some(PAIRING_WIRE_VERSION) {
+                return Err(Error::UnsupportedVersion);
+            }
+            let challenge: JoinChallenge = decode_body(&body)?;
+            self.pending.accept_challenge(&challenge)
+        })
+        .await??;
+        with_timeout(HANDSHAKE_TIMEOUT, write_frame(&mut stream, &reveal)).await??;
         Ok(PairingConnection {
             joiner,
             stream,
@@ -414,7 +599,7 @@ impl PreparedJoin {
 /// within a second. The relay is kept, with this device registered at it,
 /// for the members that then reach it there.
 async fn reach_inviter(
-    joiner: &Joiner,
+    joiner: &PendingJoiner,
     identity: &TransportIdentity,
     connector: &TlsConnector,
 ) -> Result<(

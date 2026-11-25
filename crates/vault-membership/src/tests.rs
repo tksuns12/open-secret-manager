@@ -1452,7 +1452,7 @@ fn an_unsigned_membership_entry_cannot_swap_recipient_key_or_transport_pin() {
     ));
 
     let (_tx, rx) = tokio::sync::watch::channel(openraft::RaftMetrics::new_initial(1));
-    let directory = crate::Directory::new(Arc::new(std::sync::Mutex::new(state.clone())), rx);
+    let directory = crate::Directory::new(1, Arc::new(std::sync::Mutex::new(state.clone())), rx);
     assert_eq!(directory.device_for_pin(&node(2).transport_pin), Some(2));
     assert_eq!(directory.device_for_pin(&attacker_pin), None);
     assert_eq!(directory.members().get(&2), Some(&node(2).transport_pin));
@@ -1523,6 +1523,181 @@ fn an_unsigned_membership_entry_cannot_swap_recipient_key_or_transport_pin() {
         Outcome::Accepted
     );
     assert_eq!(state.enrolled_node(3), Some(&node(3)));
+}
+
+#[tokio::test]
+async fn bounded_snapshot_data_refuses_large_seeks_and_writes_before_allocating() {
+    use std::io::SeekFrom;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let mut snap = crate::BoundedSnapshotData::new(1024);
+    assert!(snap
+        .seek(SeekFrom::Start(4 * 1024 * 1024 * 1024))
+        .await
+        .is_err());
+    assert!(snap.seek(SeekFrom::Start(1025)).await.is_err());
+    assert!(snap.write_all(&vec![0u8; 1025]).await.is_err());
+    assert!(snap.into_inner().is_empty());
+
+    let mut snap = crate::BoundedSnapshotData::new(1024);
+    snap.seek(SeekFrom::Start(1000)).await.unwrap();
+    assert!(snap.write_all(&[1u8; 25]).await.is_err());
+    snap.write_all(&[2u8; 24]).await.unwrap();
+    assert_eq!(snap.into_inner().len(), 1024);
+}
+
+#[test]
+fn directory_removal_requires_quorum_of_committed_enrolled_voters() {
+    use openraft::{EntryPayload, LogId, Membership};
+
+    let keys: BTreeMap<DeviceId, SigningKey> = (1..=4)
+        .map(|id| (DeviceId::from(id), SigningKey::from_bytes(&[id; 32])))
+        .collect();
+    let node = |id: DeviceId| DeviceNode {
+        public_key: keys[&id].verifying_key().to_bytes(),
+        transport_pin: [id as u8; 32],
+        recipient_key: Cluster::hpke(id).public().as_bytes(),
+    };
+    let mut index = 0u64;
+    let mut apply = |state: &mut crate::ControlState,
+                     payload: EntryPayload<crate::ControlConfig>| {
+        index += 1;
+        state.apply(
+            LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            &payload,
+        )
+    };
+    let sign = |requester: DeviceId, id: u8, req: ControlRequest| {
+        EntryPayload::Normal(crate::ControlEntry::Request(SignedRequest::sign(
+            &VAULT,
+            [id; 16],
+            requester,
+            req,
+            &KeySigner {
+                device: requester,
+                key: keys[&requester].clone(),
+            },
+        )))
+    };
+
+    // 1-voter cluster {1} + non-voter phone {4}: sole voter 1 cannot be
+    // declared removed by phone 4, whereas voter 1 CAN confirm removal of 4.
+    let mut state = crate::ControlState::new(VAULT);
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1])],
+            BTreeMap::from([(1, node(1))]),
+        )),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            sign(
+                1,
+                1,
+                ControlRequest::Genesis {
+                    epoch: 1,
+                    checks: vec![check(1)],
+                    authors: Vec::new(),
+                },
+            ),
+        ),
+        Outcome::Accepted
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            sign(
+                1,
+                2,
+                ControlRequest::ProposeChange(MembershipChange::Enroll {
+                    device: 4,
+                    node: node(4),
+                    votes: false,
+                }),
+            ),
+        ),
+        Outcome::Accepted
+    );
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1])],
+            BTreeMap::from([(1, node(1)), (4, node(4))]),
+        )),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Complete {
+                request_id: [2; 16]
+            }),
+        ),
+        Outcome::Accepted
+    );
+    let (_tx, rx) = tokio::sync::watch::channel(openraft::RaftMetrics::new_initial(1));
+    let dir_voter = crate::Directory::new(
+        1,
+        Arc::new(std::sync::Mutex::new(state.clone())),
+        rx.clone(),
+    );
+    assert!(!dir_voter.removal_confirmed(&BTreeSet::from([4])));
+    assert!(!dir_voter.is_voter(4));
+    assert!(dir_voter.is_voter(1));
+    let dir_phone = crate::Directory::new(
+        4,
+        Arc::new(std::sync::Mutex::new(state.clone())),
+        rx.clone(),
+    );
+    assert!(dir_phone.removal_confirmed(&BTreeSet::from([1])));
+
+    // 3-voter cluster {1, 2, 3}: 1 voter reporting removal of 3 is a minority
+    // (1 < 2), while 2 voters {1, 2} form a strict majority (2 >= 2).
+    for (req_id, dev) in [(3u8, 2u128), (4u8, 3u128)] {
+        assert_eq!(
+            apply(
+                &mut state,
+                sign(
+                    1,
+                    req_id,
+                    ControlRequest::ProposeChange(MembershipChange::Enroll {
+                        device: dev,
+                        node: node(dev),
+                        votes: true,
+                    }),
+                ),
+            ),
+            Outcome::Accepted
+        );
+        let voters: BTreeSet<DeviceId> = if dev == 2 {
+            BTreeSet::from([1, 2])
+        } else {
+            BTreeSet::from([1, 2, 3])
+        };
+        let mut nodes = BTreeMap::from([(1, node(1)), (2, node(2)), (4, node(4))]);
+        if dev == 3 {
+            nodes.insert(3, node(3));
+        }
+        apply(
+            &mut state,
+            EntryPayload::Membership(Membership::new(vec![voters], nodes)),
+        );
+        assert_eq!(
+            apply(
+                &mut state,
+                EntryPayload::Normal(crate::ControlEntry::Complete {
+                    request_id: [req_id; 16]
+                }),
+            ),
+            Outcome::Accepted
+        );
+    }
+    let dir_three = crate::Directory::new(3, Arc::new(std::sync::Mutex::new(state)), rx);
+    assert!(!dir_three.removal_confirmed(&BTreeSet::from([4])));
+    assert!(!dir_three.removal_confirmed(&BTreeSet::from([1])));
+    assert!(!dir_three.removal_confirmed(&BTreeSet::from([1, 4])));
+    assert!(dir_three.removal_confirmed(&BTreeSet::from([1, 2])));
 }
 
 mod fixtures;

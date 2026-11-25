@@ -57,12 +57,19 @@ async fn the_pairing_listener_ignores_junk_and_the_joiner_hears_a_refusal() {
     let mut b_peers = PeerStore::open_in_memory().unwrap();
     let (served, joined) = tokio::join!(
         async {
-            let pending = listener.next_request().await?.review(
-                &a.vault,
-                &a.invitations,
-                &mut a.peers,
-                NOW,
-            )?;
+            let pending = listener
+                .next_request()
+                .await?
+                .review(
+                    &a.vault,
+                    &a.invitations,
+                    &mut a.peers,
+                    Voting::Votes,
+                    None,
+                    NOW,
+                )?
+                .complete()
+                .await?;
             pending.decline().await
         },
         async {
@@ -87,12 +94,19 @@ async fn the_pairing_listener_ignores_junk_and_the_joiner_hears_a_refusal() {
     }];
     let (served, joined) = tokio::join!(
         async {
-            let pending = listener.next_request().await?.review(
-                &a.vault,
-                &a.invitations,
-                &mut a.peers,
-                NOW,
-            )?;
+            let pending = listener
+                .next_request()
+                .await?
+                .review(
+                    &a.vault,
+                    &a.invitations,
+                    &mut a.peers,
+                    Voting::Votes,
+                    None,
+                    NOW,
+                )?
+                .complete()
+                .await?;
             let (_, approved) = pending.approve_enrollment(
                 &a.vault,
                 &mut a.invitations,
@@ -110,6 +124,86 @@ async fn the_pairing_listener_ignores_junk_and_the_joiner_hears_a_refusal() {
     );
     served.unwrap();
     assert!(matches!(joined, Err(Error::EnrollmentRefused)));
+}
+
+#[tokio::test]
+async fn a_slow_socket_does_not_block_a_legitimate_joiner() {
+    let dir = tempdir().unwrap();
+    let mut a = device(&dir.path().join("a.db"));
+    let (listener, address) = pairing_listener(&mut a.peers).await;
+    let invited = invitation(&mut a, &address);
+    let mut b_peers = PeerStore::open_in_memory().unwrap();
+
+    // Hold open a silent TCP socket that never sends TLS bytes.
+    let _stalled = tokio::net::TcpStream::connect(&address).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let (served, joined) = tokio::join!(
+        async {
+            let pending = listener
+                .next_request()
+                .await?
+                .review(
+                    &a.vault,
+                    &a.invitations,
+                    &mut a.peers,
+                    Voting::Votes,
+                    None,
+                    NOW,
+                )?
+                .complete()
+                .await?;
+            let sas = pending.sas();
+            pending.decline().await?;
+            Ok::<_, Error>(sas)
+        },
+        async {
+            let connection = start_pairing(invited, &mut b_peers, NOW).await?;
+            let sas = connection.sas();
+            let _ = connection.receive_enrollment().await;
+            Ok::<_, Error>(sas)
+        }
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(served.unwrap(), joined.unwrap());
+}
+
+#[tokio::test]
+async fn a_v1_join_request_is_refused_on_the_live_wire() {
+    let dir = tempdir().unwrap();
+    let mut a = device(&dir.path().join("a.db"));
+    let (listener, address) = pairing_listener(&mut a.peers).await;
+    let inviter_pin = a.peers.transport_identity().unwrap().pin();
+    let mut b_peers = PeerStore::open_in_memory().unwrap();
+    let b_identity = b_peers.transport_identity().unwrap();
+
+    let frozen: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/pairing.json")).unwrap();
+    let v1_frame = crate::fixture::unhex(frozen["join_request"]["sent"]["frame"].as_str().unwrap());
+
+    let connector = tokio_rustls::TlsConnector::from(crate::transport::client_config_for_tests(
+        &b_identity,
+        inviter_pin,
+    ));
+    let (server, client) = tokio::join!(
+        tokio::time::timeout(Duration::from_millis(500), listener.next_request()),
+        async {
+            let tcp = tokio::net::TcpStream::connect(&address).await.unwrap();
+            let mut stream = connector
+                .connect(crate::transport::server_name_for_tests(), tcp)
+                .await
+                .unwrap();
+            stream.write_all(&v1_frame).await.unwrap();
+            let mut buf = [0u8; 16];
+            // Server must drop the v1 wire request rather than issuing a challenge.
+            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap_or(0);
+            n
+        }
+    );
+    assert!(server.is_err(), "v1 JoinRequest must never be accepted");
+    assert_eq!(client, 0);
 }
 
 #[tokio::test]

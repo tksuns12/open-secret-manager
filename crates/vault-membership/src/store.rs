@@ -10,13 +10,15 @@
 
 use std::{
     fmt::Debug,
-    io::Cursor,
+    io::{Cursor, SeekFrom},
     ops::{Bound, RangeBounds},
     path::Path,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    task::{Context, Poll},
 };
 
 use openraft::{
@@ -26,7 +28,10 @@ use openraft::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::sync::watch;
+use tokio::{
+    io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf},
+    sync::watch,
+};
 
 use crate::{
     ControlConfig, ControlEntry, ControlRequest, ControlState, DeviceId, DeviceNode, Outcome,
@@ -37,8 +42,110 @@ type Result<T> = std::result::Result<T, StorageError<DeviceId>>;
 /// The layout of the control-plane database: the tables below, with every
 /// value but the snapshot's data as JSON text.
 const STORE_VERSION: u32 = 1;
-/// Upper bound on snapshot JSON size accepted by `install_snapshot`.
-const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+/// Upper bound on snapshot JSON size accepted by `install_snapshot` and
+/// buffered while receiving a snapshot.
+pub const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+
+/// A bounded in-memory snapshot buffer that refuses seeks or writes past
+/// `limit` bytes before allocating memory.
+#[derive(Debug)]
+pub struct BoundedSnapshotData {
+    cursor: Cursor<Vec<u8>>,
+    limit: usize,
+}
+
+impl BoundedSnapshotData {
+    /// Creates an empty snapshot buffer capped at `limit` bytes.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            cursor: Cursor::new(Vec::new()),
+            limit,
+        }
+    }
+
+    /// Wraps existing snapshot bytes after verifying they fit within `limit`.
+    pub fn from_vec(data: Vec<u8>, limit: usize) -> std::io::Result<Self> {
+        if data.len() > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control-plane snapshot exceeds size limit",
+            ));
+        }
+        Ok(Self {
+            cursor: Cursor::new(data),
+            limit,
+        })
+    }
+
+    /// Consumes the buffer and returns the accumulated snapshot bytes.
+    pub fn into_inner(self) -> Vec<u8> {
+        self.cursor.into_inner()
+    }
+}
+
+impl AsyncRead for BoundedSnapshotData {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.cursor).poll_read(cx, buf)
+    }
+}
+
+impl AsyncSeek for BoundedSnapshotData {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+        let len = self.cursor.get_ref().len() as i128;
+        let cur = self.cursor.position() as i128;
+        let target: i128 = match position {
+            SeekFrom::Start(pos) => i128::from(pos),
+            SeekFrom::End(delta) => len.saturating_add(i128::from(delta)),
+            SeekFrom::Current(delta) => cur.saturating_add(i128::from(delta)),
+        };
+        if target < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid seek to a negative position",
+            ));
+        }
+        if target > self.limit as i128 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control-plane snapshot exceeds size limit",
+            ));
+        }
+        Pin::new(&mut self.cursor).start_seek(position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        Pin::new(&mut self.cursor).poll_complete(cx)
+    }
+}
+
+impl AsyncWrite for BoundedSnapshotData {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let end = self.cursor.position().checked_add(buf.len() as u64);
+        if end.is_none_or(|end| end > self.limit as u64) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control-plane snapshot exceeds size limit",
+            )));
+        }
+        Pin::new(&mut self.cursor).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.cursor).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.cursor).poll_shutdown(cx)
+    }
+}
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -185,10 +292,7 @@ fn populate_legacy_enrolled(connection: &Connection, state: &mut ControlState) -
     };
     if !has_purged {
         let mut replayed = ControlState::new(state.vault_id);
-        let limit = state
-            .last_applied
-            .map(|id| log_index(id.index))
-            .transpose()?;
+        let limit = state.last_applied.map(|id| id.index);
         let mut statement = connection
             .prepare("SELECT entry FROM raft_log ORDER BY idx")
             .map_err(read_error)?;
@@ -199,7 +303,7 @@ fn populate_legacy_enrolled(connection: &Connection, state: &mut ControlState) -
             .map_err(read_error)?;
         for text in rows {
             let entry: Entry<ControlConfig> = from_json(&text)?;
-            if limit.is_some_and(|max| entry.log_id.index as i64 > max) {
+            if limit.is_some_and(|max| entry.log_id.index > max) {
                 break;
             }
             replayed.apply(entry.log_id, &entry.payload);
@@ -531,7 +635,9 @@ impl RaftSnapshotBuilder<ControlConfig> for SnapshotBuilder {
         }
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(
+                BoundedSnapshotData::from_vec(data, MAX_SNAPSHOT_BYTES).map_err(write_error)?,
+            ),
         })
     }
 }
@@ -599,14 +705,14 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<BoundedSnapshotData>> {
+        Ok(Box::new(BoundedSnapshotData::new(MAX_SNAPSHOT_BYTES)))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<DeviceId, DeviceNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<BoundedSnapshotData>,
     ) -> Result<()> {
         let data = snapshot.into_inner();
         if data.len() > MAX_SNAPSHOT_BYTES {
@@ -710,7 +816,9 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
         row.map(|(meta, data)| {
             Ok(Snapshot {
                 meta: from_json(&meta)?,
-                snapshot: Box::new(Cursor::new(data)),
+                snapshot: Box::new(
+                    BoundedSnapshotData::from_vec(data, MAX_SNAPSHOT_BYTES).map_err(read_error)?,
+                ),
             })
         })
         .transpose()

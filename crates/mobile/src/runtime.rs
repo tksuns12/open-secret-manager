@@ -1405,9 +1405,19 @@ impl Runtime {
             };
             match session.await {
                 Ok(report) => reports.push(report),
-                Err(osm_vault_peer::Error::Removed) => {
+                Err(osm_vault_peer::Error::Removed)
+                    if control.endpoint.told_removed()
+                        || control
+                            .node
+                            .state()
+                            .removed
+                            .contains_key(&control.node.device()) =>
+                {
                     failure = Some(osm_vault_peer::Error::Removed);
                     break;
+                }
+                Err(osm_vault_peer::Error::Removed) => {
+                    failure = Some(osm_vault_peer::Error::NotAMember);
                 }
                 Err(error) => failure = Some(error),
             }

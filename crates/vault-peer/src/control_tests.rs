@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use crate::{
     approve_enrollment,
     control::{self, Reconciled},
-    invite, review_join,
+    invite, review_commit,
     tests::{address, login, over_wire, sync, NOW},
     EnrollmentGrant, Error, Invitation, Joiner, PeerStore, Voting,
 };
@@ -144,8 +144,20 @@ impl Net {
         let code = invitation.encode().unwrap();
         // A certificate identifies one device, so each joiner has its own.
         let pin = [name.as_bytes()[0]; 32];
-        let (joiner, request) =
+        let (pending, commit) =
             Joiner::start(Invitation::decode(&code).unwrap(), pin, NOW + 1).unwrap();
+        let (verified, challenge) = review_commit(
+            &inviter.vault,
+            &inviter.invitations,
+            &mut inviter.peers,
+            over_wire(&commit),
+            Voting::Votes,
+            None,
+            NOW + 2,
+        )
+        .unwrap();
+        let (joiner, reveal) = pending.accept_challenge(&over_wire(&challenge)).unwrap();
+        let review = verified.complete(over_wire(&reveal)).unwrap();
         let node = if online {
             Some(
                 self.node(name, joiner.control_device(), joiner.vault_id())
@@ -154,14 +166,6 @@ impl Net {
         } else {
             None
         };
-        let review = review_join(
-            &inviter.vault,
-            &inviter.invitations,
-            &mut inviter.peers,
-            over_wire(&request),
-            NOW + 2,
-        )
-        .unwrap();
         assert_eq!(review.sas(), joiner.sas());
         let (proposal, grant) = approve_enrollment(
             &inviter.vault,

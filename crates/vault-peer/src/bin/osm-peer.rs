@@ -536,7 +536,7 @@ impl Device {
             let mut peers = self.peers.lock().await;
             PairingListener::bind("127.0.0.1:0", &mut peers).await?
         };
-        let invitation = {
+        let (invitation, relay_code) = {
             let vault = self.vault.lock().await;
             let mut invitations = self.invitations.lock().await;
             let mut peers = self.peers.lock().await;
@@ -544,24 +544,27 @@ impl Device {
                 // For a joiner away from every network this device is on: the
                 // vault's relay, and no address at all.
                 let code = vault.relay()?.ok_or("the vault has no relay")?;
-                invite_through_relay(
+                let relay_code = RelayCode::decode(&code)?;
+                let invitation = invite_through_relay(
                     &vault,
                     &mut invitations,
                     &mut peers,
                     Vec::new(),
-                    &RelayCode::decode(&code)?,
+                    &relay_code,
                     now(),
                     MAX_INVITATION_TTL_SECS,
-                )?
+                )?;
+                (invitation, Some(relay_code))
             } else {
-                invite(
+                let invitation = invite(
                     &vault,
                     &mut invitations,
                     &mut peers,
                     vec![listener.local_addr()?.to_string()],
                     now(),
                     MAX_INVITATION_TTL_SECS,
-                )?
+                )?;
+                (invitation, None)
             }
         };
         if away {
@@ -575,10 +578,23 @@ impl Device {
             )
             .await
             .map_err(|_| "the invitation expired")??;
-            let vault = self.vault.lock().await;
-            let invitations = self.invitations.lock().await;
-            let mut peers = self.peers.lock().await;
-            if let Ok(pending) = incoming.review(&vault, &invitations, &mut peers, now()) {
+            let challenged = {
+                let vault = self.vault.lock().await;
+                let invitations = self.invitations.lock().await;
+                let mut peers = self.peers.lock().await;
+                incoming.review(
+                    &vault,
+                    &invitations,
+                    &mut peers,
+                    voting,
+                    relay_code.as_ref(),
+                    now(),
+                )
+            };
+            let Ok(challenged) = challenged else {
+                continue;
+            };
+            if let Ok(pending) = challenged.complete().await {
                 break pending;
             }
         };

@@ -385,6 +385,7 @@ impl<D: Dialer> Forward for D {
 /// [`Directory::introduce`]. A removed device is never accepted.
 #[derive(Clone)]
 pub struct Directory {
+    self_device: DeviceId,
     state: Arc<Mutex<ControlState>>,
     metrics: watch::Receiver<RaftMetrics<DeviceId, DeviceNode>>,
     introduced: Arc<Mutex<BTreeMap<DeviceId, [u8; 32]>>>,
@@ -392,10 +393,12 @@ pub struct Directory {
 
 impl Directory {
     pub(crate) fn new(
+        self_device: DeviceId,
         state: Arc<Mutex<ControlState>>,
         metrics: watch::Receiver<RaftMetrics<DeviceId, DeviceNode>>,
     ) -> Self {
         Self {
+            self_device,
             state,
             metrics,
             introduced: Arc::default(),
@@ -426,6 +429,58 @@ impl Directory {
     pub fn is_member(&self, device: DeviceId) -> bool {
         self.with_state(|state| state.is_active_member(device))
             .unwrap_or(false)
+    }
+
+    /// Whether this node's committed state lists `device` as an enrolled
+    /// voting member.
+    pub fn is_voter(&self, device: DeviceId) -> bool {
+        self.with_state(|state| state.votes(device))
+            .unwrap_or(false)
+    }
+
+    /// Whether `reporters` constitute quorum-confirmed proof that this device
+    /// was removed from the vault:
+    /// - Never confirmed before genesis or when this device is the sole voter.
+    /// - Only committed enrolled voters (never non-voters, learners, or
+    ///   unregistered peers) are counted.
+    /// - If this device already applied a committed `ProposeChange::Remove`
+    ///   for itself, one remaining enrolled voter suffices; otherwise a
+    ///   strict majority of committed enrolled voters must report removal.
+    pub fn removal_confirmed(&self, reporters: &BTreeSet<DeviceId>) -> bool {
+        self.with_state(|state| {
+            if state.epoch == 0 {
+                return false;
+            }
+            if state.removed.contains_key(&self.self_device) {
+                return true;
+            }
+            let enrolled_voters: BTreeSet<DeviceId> = state
+                .voters()
+                .into_iter()
+                .filter(|device| state.votes(*device))
+                .collect();
+            if enrolled_voters.is_empty()
+                || (enrolled_voters.len() == 1 && enrolled_voters.contains(&self.self_device))
+            {
+                return false;
+            }
+            let confirmed = reporters
+                .iter()
+                .filter(|device| **device != self.self_device && enrolled_voters.contains(device))
+                .count();
+            let pending_self_removal = state.pending.as_ref().is_some_and(|pending| {
+                matches!(
+                    &pending.change,
+                    crate::MembershipChange::Remove { device, .. } if *device == self.self_device
+                )
+            });
+            if pending_self_removal {
+                confirmed >= 1
+            } else {
+                confirmed > enrolled_voters.len() / 2
+            }
+        })
+        .unwrap_or(false)
     }
 
     /// The removed device that had the certificate with this pin, if any.

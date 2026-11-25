@@ -6,10 +6,10 @@ use osm_vault_sync::{InvitationPolicy, InvitationStore};
 use tempfile::tempdir;
 
 use crate::{
-    approve_enrollment, invite, review_join,
+    approve_enrollment, invite, invite_through_relay, review_commit,
     wire::{decode_body, encode_frame, FrameDecoder, MAX_FRAME_BYTES},
-    EnrollmentGrant, Error, Invitation, JoinRequest, Joiner, MemberContact, PeerStore, SyncMessage,
-    SyncReport, SyncSession, Voting,
+    EnrollmentGrant, Error, Invitation, JoinCommit, Joiner, MemberContact, PeerStore, RelayCode,
+    SyncMessage, SyncReport, SyncSession, Voting,
 };
 
 pub(crate) const NOW: u64 = 1_800_000_000;
@@ -411,10 +411,18 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
         Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW + 60),
         Err(Error::InvitationExpired)
     ));
-    let (_, request) =
+    let (_, commit) =
         Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW + 59).unwrap();
     assert!(matches!(
-        review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW + 60),
+        review_commit(
+            &a.vault,
+            &a.invitations,
+            &mut a.peers,
+            commit,
+            Voting::Votes,
+            None,
+            NOW + 60,
+        ),
         Err(Error::Sync(osm_vault_sync::Error::InvitationExpired))
     ));
     assert!(invite(
@@ -428,7 +436,7 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
     .is_err());
     assert!(Invitation::decode("OSM-PAIR1-not-base64!").is_err());
 
-    // A request whose signature does not match the key it names.
+    // A commit whose signature does not match the key it names.
     let invitation = invite(
         &a.vault,
         &mut a.invitations,
@@ -439,19 +447,134 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
     )
     .unwrap();
     let code = invitation.encode().unwrap();
-    let (_, request) = Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
-    let mut forged: JoinRequest = over_wire(&request);
+    let (_, commit) = Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
+    let mut forged: JoinCommit = over_wire(&commit);
     forged.tamper_signature();
     assert!(matches!(
-        review_join(&a.vault, &a.invitations, &mut a.peers, forged, NOW),
+        review_commit(
+            &a.vault,
+            &a.invitations,
+            &mut a.peers,
+            forged,
+            Voting::Votes,
+            None,
+            NOW,
+        ),
         Err(Error::InvalidSignature)
+    ));
+
+    // A tampered relay binding or bad nonce reveal is refused.
+    let (_, commit) = Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
+    let mut bad_relay: JoinCommit = over_wire(&commit);
+    bad_relay.tamper_relay_binding();
+    assert!(matches!(
+        review_commit(
+            &a.vault,
+            &a.invitations,
+            &mut a.peers,
+            bad_relay,
+            Voting::Votes,
+            None,
+            NOW,
+        ),
+        Err(Error::ProtocolViolation)
+    ));
+    let rogue_relay = RelayCode::new("rogue.example.test:47830", [9; 32], [8; 32]).unwrap();
+    let relayed_inv = invite_through_relay(
+        &a.vault,
+        &mut a.invitations,
+        &mut a.peers,
+        address(),
+        &rogue_relay,
+        NOW,
+        300,
+    )
+    .unwrap();
+    let (_, relayed_commit) = Joiner::start(
+        Invitation::decode(&relayed_inv.encode().unwrap()).unwrap(),
+        JOINER_PIN,
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(
+        review_commit(
+            &a.vault,
+            &a.invitations,
+            &mut a.peers,
+            relayed_commit,
+            Voting::Votes,
+            None,
+            NOW,
+        ),
+        Err(Error::ProtocolViolation)
+    ));
+
+    // Bad reveal nonce does not match the earlier commitment.
+    let (pending, commit) =
+        Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
+    let (verified, challenge) = review_commit(
+        &a.vault,
+        &a.invitations,
+        &mut a.peers,
+        over_wire(&commit),
+        Voting::Votes,
+        None,
+        NOW,
+    )
+    .unwrap();
+    let (_, mut reveal) = pending.accept_challenge(&over_wire(&challenge)).unwrap();
+    reveal.tamper_nonce();
+    assert!(matches!(
+        verified.complete(reveal),
+        Err(Error::ProtocolViolation)
+    ));
+
+    // Mismatched voting role at approval is refused.
+    let (pending, commit) =
+        Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
+    let (verified, challenge) = review_commit(
+        &a.vault,
+        &a.invitations,
+        &mut a.peers,
+        over_wire(&commit),
+        Voting::WithoutVote,
+        None,
+        NOW,
+    )
+    .unwrap();
+    let (_, reveal) = pending.accept_challenge(&over_wire(&challenge)).unwrap();
+    let review = verified.complete(over_wire(&reveal)).unwrap();
+    let members = own_contact(&mut a);
+    assert!(matches!(
+        approve_enrollment(
+            &a.vault,
+            &mut a.invitations,
+            review,
+            members,
+            Voting::Votes,
+            Some(47820),
+            NOW,
+        ),
+        Err(Error::ProtocolViolation)
     ));
 
     // The joiner refuses a grant that was altered in transit: it neither
     // accepts the members it names nor creates a vault.
-    let (joiner, request) =
+    let (pending, commit) =
         Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
-    let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
+    let (verified, challenge) = review_commit(
+        &a.vault,
+        &a.invitations,
+        &mut a.peers,
+        over_wire(&commit),
+        Voting::Votes,
+        None,
+        NOW,
+    )
+    .unwrap();
+    let (joiner, reveal) = pending.accept_challenge(&over_wire(&challenge)).unwrap();
+    let review = verified.complete(over_wire(&reveal)).unwrap();
+    assert_eq!(review.sas(), joiner.sas());
     let members = own_contact(&mut a);
     let (_, grant) = approve_enrollment(
         &a.vault,
@@ -482,7 +605,15 @@ fn pairing_rejects_replay_expiry_tampering_and_unconfirmed_codes() {
     // The token was consumed by the approval: it cannot be replayed.
     let (_, replay) = Joiner::start(Invitation::decode(&code).unwrap(), JOINER_PIN, NOW).unwrap();
     assert!(matches!(
-        review_join(&a.vault, &a.invitations, &mut a.peers, replay, NOW),
+        review_commit(
+            &a.vault,
+            &a.invitations,
+            &mut a.peers,
+            replay,
+            Voting::Votes,
+            None,
+            NOW,
+        ),
         Err(Error::Sync(osm_vault_sync::Error::InvitationReplay))
     ));
 
@@ -511,13 +642,24 @@ fn the_joiner_requires_owner_confirmation() {
         300,
     )
     .unwrap();
-    let (joiner, request) = Joiner::start(
+    let (pending, commit) = Joiner::start(
         Invitation::decode(&invitation.encode().unwrap()).unwrap(),
         JOINER_PIN,
         NOW,
     )
     .unwrap();
-    let review = review_join(&a.vault, &a.invitations, &mut a.peers, request, NOW).unwrap();
+    let (verified, challenge) = review_commit(
+        &a.vault,
+        &a.invitations,
+        &mut a.peers,
+        commit,
+        Voting::Votes,
+        None,
+        NOW,
+    )
+    .unwrap();
+    let (joiner, reveal) = pending.accept_challenge(&challenge).unwrap();
+    let review = verified.complete(reveal).unwrap();
     let members = own_contact(&mut a);
     let (_, grant) = approve_enrollment(
         &a.vault,

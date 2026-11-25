@@ -5,7 +5,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use osm_vault_peer::wire::{decode_body, encode_frame, FrameDecoder};
-use osm_vault_peer::{EnrollmentGrant, JoinRequest, SyncMessage};
+use osm_vault_peer::{
+    EnrollmentGrant, JoinChallenge, JoinCommit, JoinRequest, JoinReveal, SyncMessage,
+};
 use serde::{de::DeserializeOwned, Serialize};
 
 fn one_form<T: Serialize + DeserializeOwned>(body: &[u8]) {
@@ -29,6 +31,9 @@ fn bodies(chunks: impl Iterator<Item = Vec<u8>>) -> Result<Vec<Vec<u8>>, ()> {
 fuzz_target!(|data: &[u8]| {
     one_form::<SyncMessage>(data);
     one_form::<JoinRequest>(data);
+    one_form::<JoinCommit>(data);
+    one_form::<JoinChallenge>(data);
+    one_form::<JoinReveal>(data);
     one_form::<EnrollmentGrant>(data);
     // At once, and a byte at a time.
     let whole = bodies(std::iter::once(data.to_vec()));

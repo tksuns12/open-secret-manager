@@ -12,7 +12,8 @@ use tempfile::tempdir;
 use crate::{
     session::inventory::{from_hex, summary, RevisionId},
     wire::{decode_body, encode_frame, FrameDecoder, MAX_FRAME_BYTES},
-    EnrollmentGrant, Invitation, JoinRequest, SyncMessage, SyncSession, PROTOCOL_VERSION,
+    EnrollmentGrant, Invitation, JoinChallenge, JoinCommit, JoinRequest, JoinReveal, SyncMessage,
+    SyncSession, PROTOCOL_VERSION,
 };
 
 /// A number written in more bytes than it needs is another form of the
@@ -63,6 +64,9 @@ proptest! {
         }
         canonical::<SyncMessage>(&body)?;
         canonical::<JoinRequest>(&body)?;
+        canonical::<JoinCommit>(&body)?;
+        canonical::<JoinChallenge>(&body)?;
+        canonical::<JoinReveal>(&body)?;
         canonical::<EnrollmentGrant>(&body)?;
     }
 

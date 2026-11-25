@@ -48,6 +48,9 @@ use crate::{
 const PAIRING_VERSION: u8 = 1;
 /// An invitation that also carries the relay the inviter is reached by.
 const PAIRING_VERSION_WITH_RELAY: u8 = 2;
+/// Version of the live pairing wire handshake (3-flight commit-before-reveal
+/// binding both nonces, `voting`, and the invitation's relay).
+pub const PAIRING_WIRE_VERSION: u8 = 2;
 const INVITATION_PREFIX: &str = "OSM-PAIR1-";
 const MAX_INVITATION_CODE_LEN: usize = 512;
 const MAX_ADDRESSES: usize = 4;
@@ -238,7 +241,8 @@ impl Invitation {
     }
 }
 
-/// Sent by the joiner to the inviter.
+/// Version 1 join request (retained only for decoding frozen v1 fixtures;
+/// live pairing uses [`JoinCommit`] under protocol version 2).
 #[derive(Serialize, Deserialize)]
 pub struct JoinRequest {
     version: u8,
@@ -247,10 +251,9 @@ pub struct JoinRequest {
     joiner_device_id: [u8; 16],
     joiner_public_key: [u8; 32],
     joiner_hpke_key: [u8; 32],
-    /// SHA-256 of the joiner's TLS certificate. The inviter checks it
-    /// against the certificate the connection presented.
+    /// SHA-256 of the joiner's TLS certificate.
     joiner_transport_pin: [u8; 32],
-    /// Joiner's pairing signature over the transcript.
+    /// Joiner's pairing signature over the v1 transcript.
     signature: Vec<u8>,
 }
 
@@ -260,7 +263,47 @@ impl Drop for JoinRequest {
     }
 }
 
-impl JoinRequest {
+impl std::fmt::Debug for JoinRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinRequest")
+            .field("joiner_device_id", &self.joiner_device_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Flight 1 of pairing wire v2: sent by the joiner before seeing the
+/// inviter's nonce, committing to its own secret nonce and to the relay
+/// carried by the invitation.
+#[derive(Serialize, Deserialize)]
+pub struct JoinCommit {
+    version: u8,
+    vault_id: [u8; 32],
+    token: [u8; 32],
+    joiner_device_id: [u8; 16],
+    joiner_public_key: [u8; 32],
+    joiner_hpke_key: [u8; 32],
+    /// SHA-256 of the joiner's TLS certificate. The inviter checks it
+    /// against the certificate the connection presented.
+    joiner_transport_pin: [u8; 32],
+    /// `SHA-256("osm-pairing-commit-v2\0" || joiner_nonce)`.
+    joiner_commit: [u8; 32],
+    /// Commitment to the relay carried by the invitation (or its absence).
+    relay_binding: [u8; 32],
+    /// Joiner's pairing signature over `commit_message(&pre_transcript)`.
+    signature: Vec<u8>,
+}
+
+impl Drop for JoinCommit {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
+impl JoinCommit {
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
     pub fn joiner_transport_pin(&self) -> [u8; 32] {
         self.joiner_transport_pin
     }
@@ -269,13 +312,60 @@ impl JoinRequest {
     pub(crate) fn tamper_signature(&mut self) {
         self.signature[0] ^= 1;
     }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_relay_binding(&mut self) {
+        self.relay_binding[0] ^= 1;
+    }
 }
 
-impl std::fmt::Debug for JoinRequest {
+impl std::fmt::Debug for JoinCommit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JoinRequest")
+        f.debug_struct("JoinCommit")
             .field("joiner_device_id", &self.joiner_device_id)
             .finish_non_exhaustive()
+    }
+}
+
+/// Flight 2 of pairing wire v2: sent by the inviter after verifying
+/// [`JoinCommit`], supplying its fresh nonce and the intended `voting` role.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinChallenge {
+    version: u8,
+    inviter_nonce: [u8; 32],
+    voting: bool,
+}
+
+impl JoinChallenge {
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub fn voting(&self) -> Voting {
+        if self.voting {
+            Voting::Votes
+        } else {
+            Voting::WithoutVote
+        }
+    }
+}
+
+/// Flight 3 of pairing wire v2: the joiner reveals the nonce committed in
+/// [`JoinCommit::joiner_commit`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinReveal {
+    version: u8,
+    joiner_nonce: [u8; 32],
+}
+
+impl JoinReveal {
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_nonce(&mut self) {
+        self.joiner_nonce[0] ^= 1;
     }
 }
 
@@ -349,28 +439,68 @@ impl EnrollmentGrant {
     }
 }
 
-/// A verified join request awaiting the owner's decision on the inviter.
+/// A verified [`JoinCommit`] waiting for the joiner's [`JoinReveal`].
+pub struct VerifiedCommit {
+    commit: JoinCommit,
+    pre_transcript: [u8; 32],
+    inviter_nonce: [u8; 32],
+    voting: Voting,
+}
+
+impl VerifiedCommit {
+    /// Checks the joiner's revealed nonce against its earlier commitment and
+    /// derives the final transcript and short code.
+    pub fn complete(self, reveal: JoinReveal) -> Result<JoinReview> {
+        if reveal.version != PAIRING_WIRE_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        if !same_bytes(
+            &commit_nonce(&reveal.joiner_nonce),
+            &self.commit.joiner_commit,
+        ) {
+            return Err(Error::ProtocolViolation);
+        }
+        let transcript = transcript_v2(
+            &self.pre_transcript,
+            &self.inviter_nonce,
+            &reveal.joiner_nonce,
+            self.voting,
+        );
+        Ok(JoinReview {
+            commit: self.commit,
+            transcript,
+            voting: self.voting,
+        })
+    }
+}
+
+/// A verified join handshake awaiting the owner's decision on the inviter.
 pub struct JoinReview {
-    request: JoinRequest,
+    commit: JoinCommit,
     transcript: [u8; 32],
+    voting: Voting,
 }
 
 impl JoinReview {
     /// The short code to compare with the joiner's screen.
     pub fn sas(&self) -> String {
-        short_code(&self.transcript)
+        short_code_v2(&self.transcript)
     }
 
     pub fn joiner_device_id(&self) -> [u8; 16] {
-        self.request.joiner_device_id
+        self.commit.joiner_device_id
+    }
+
+    pub fn voting(&self) -> Voting {
+        self.voting
     }
 
     /// The joiner as committed membership will record it.
     pub fn joiner_node(&self) -> DeviceNode {
         DeviceNode {
-            public_key: self.request.joiner_public_key,
-            transport_pin: self.request.joiner_transport_pin,
-            recipient_key: self.request.joiner_hpke_key,
+            public_key: self.commit.joiner_public_key,
+            transport_pin: self.commit.joiner_transport_pin,
+            recipient_key: self.commit.joiner_hpke_key,
         }
     }
 }
@@ -437,48 +567,65 @@ pub fn invite_through_relay(
     Ok(invitation)
 }
 
-/// Validates a join request without consuming the invitation. Only a request
-/// that carries a live token and is signed by the key it names reaches the
-/// owner for confirmation.
-pub fn review_join(
+/// Validates Flight 1 ([`JoinCommit`]) without consuming the invitation,
+/// checking the token, relay commitment, and joiner signature, and creates
+/// Flight 2 ([`JoinChallenge`]) with a fresh inviter nonce and the intended
+/// `voting` role.
+pub fn review_commit(
     vault: &Vault,
     invitations: &InvitationStore,
     peers: &mut PeerStore,
-    request: JoinRequest,
+    commit: JoinCommit,
+    voting: Voting,
+    relay: Option<&RelayCode>,
     now: u64,
-) -> Result<JoinReview> {
+) -> Result<(VerifiedCommit, JoinChallenge)> {
     let inviter_pin = peers.transport_identity()?.pin();
-    if request.version != PAIRING_VERSION {
+    if commit.version != PAIRING_WIRE_VERSION {
         return Err(Error::UnsupportedVersion);
     }
-    if request.vault_id != vault.vault_id() {
+    if commit.vault_id != vault.vault_id() {
         return Err(Error::VaultMismatch);
     }
-    let token = InvitationToken::from_bytes(request.token);
+    let token = InvitationToken::from_bytes(commit.token);
     if invitations.check(&token, now)? != VaultId(vault.vault_id()) {
         return Err(Error::VaultMismatch);
     }
+    if !same_bytes(&commit.relay_binding, &relay_binding(relay)) {
+        return Err(Error::ProtocolViolation);
+    }
     let (inviter_id, inviter_key) = own_identity(vault)?;
-    let transcript = transcript(
+    let pre_transcript = pre_transcript_v2(
         &Inviter {
-            vault_id: &request.vault_id,
+            vault_id: &commit.vault_id,
             device_id: &inviter_id,
             public_key: &inviter_key,
             transport_pin: &inviter_pin,
-            token: &request.token,
+            token: &commit.token,
         },
-        &request,
+        &commit,
     );
     verify_pairing_signature(
-        &request.joiner_public_key,
-        &request_message(&transcript),
-        &request.signature,
+        &commit.joiner_public_key,
+        &commit_message(&pre_transcript),
+        &commit.signature,
     )
     .map_err(|_| Error::InvalidSignature)?;
-    Ok(JoinReview {
-        request,
-        transcript,
-    })
+    let inviter_nonce = random_nonce()?;
+    let challenge = JoinChallenge {
+        version: PAIRING_WIRE_VERSION,
+        inviter_nonce,
+        voting: voting == Voting::Votes,
+    };
+    Ok((
+        VerifiedCommit {
+            commit,
+            pre_transcript,
+            inviter_nonce,
+            voting,
+        },
+        challenge,
+    ))
 }
 
 /// Approves a joiner on the inviter by proposing its enrollment. Call only
@@ -490,9 +637,9 @@ pub fn review_join(
 /// new invitation.
 ///
 /// `members` are the vault's members from this device's committed state,
-/// this device included (`MemberEndpoint::roster`), `voting` is whether the
-/// joiner will vote, and `listen_port` is where this device accepts member
-/// connections, if it listens.
+/// this device included (`MemberEndpoint::roster`), `voting` must match the
+/// role committed in the handshake, and `listen_port` is where this device
+/// accepts member connections, if it listens.
 pub fn approve_enrollment(
     vault: &Vault,
     invitations: &mut InvitationStore,
@@ -502,17 +649,20 @@ pub fn approve_enrollment(
     listen_port: Option<u16>,
     now: u64,
 ) -> Result<(SignedRequest, EnrollmentGrant)> {
+    if voting != review.voting {
+        return Err(Error::ProtocolViolation);
+    }
     if !valid_contacts(&members) {
         return Err(Error::InvalidAddress);
     }
     let request = control::enrollment_request(
         vault,
-        review.request.joiner_device_id,
+        review.commit.joiner_device_id,
         review.joiner_node(),
         voting,
     )?;
     let mut grant = EnrollmentGrant {
-        version: PAIRING_VERSION,
+        version: PAIRING_WIRE_VERSION,
         vault_id: vault.vault_id(),
         request_id: request.request_id,
         recovery_check: vault.recovery_check(),
@@ -524,14 +674,73 @@ pub fn approve_enrollment(
         .sign_pairing(&grant.signed_message(&review.transcript))?
         .to_vec();
     invitations.approve(
-        &InvitationToken::from_bytes(review.request.token),
-        DeviceId(review.request.joiner_public_key),
+        &InvitationToken::from_bytes(review.commit.token),
+        DeviceId(review.commit.joiner_public_key),
         now,
     )?;
     Ok((request, grant))
 }
 
-/// The joining device's side of pairing.
+/// The joining device before receiving the inviter's [`JoinChallenge`].
+pub struct PendingJoiner {
+    invitation: Invitation,
+    device_id: [u8; 16],
+    public_key: [u8; 32],
+    recipient_key: [u8; 32],
+    pending: Option<(PendingDevice, HpkeKeyPair)>,
+    transport_pin: [u8; 32],
+    pre_transcript: [u8; 32],
+    joiner_nonce: Zeroizing<[u8; 32]>,
+}
+
+impl PendingJoiner {
+    pub(crate) fn inviter_transport_pin(&self) -> [u8; 32] {
+        self.invitation.body.inviter_transport_pin
+    }
+
+    pub(crate) fn inviter_addresses(&self) -> &[String] {
+        &self.invitation.body.addresses
+    }
+
+    /// The relay the invitation named, if it named one.
+    pub fn invitation_relay(&self) -> Option<&RelayCode> {
+        self.invitation.relay.as_ref()
+    }
+
+    /// Accepts Flight 2 ([`JoinChallenge`]), derives the joint transcript and
+    /// SAS, and returns the live [`Joiner`] alongside Flight 3 ([`JoinReveal`]).
+    pub fn accept_challenge(self, challenge: &JoinChallenge) -> Result<(Joiner, JoinReveal)> {
+        if challenge.version != PAIRING_WIRE_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        let voting = challenge.voting();
+        let transcript = transcript_v2(
+            &self.pre_transcript,
+            &challenge.inviter_nonce,
+            &self.joiner_nonce,
+            voting,
+        );
+        let reveal = JoinReveal {
+            version: PAIRING_WIRE_VERSION,
+            joiner_nonce: *self.joiner_nonce,
+        };
+        Ok((
+            Joiner {
+                invitation: self.invitation,
+                device_id: self.device_id,
+                public_key: self.public_key,
+                recipient_key: self.recipient_key,
+                pending: self.pending,
+                transport_pin: self.transport_pin,
+                transcript,
+                voting,
+            },
+            reveal,
+        ))
+    }
+}
+
+/// The joining device's side of pairing, after completing commit-before-reveal.
 pub struct Joiner {
     invitation: Invitation,
     device_id: [u8; 16],
@@ -544,16 +753,17 @@ pub struct Joiner {
     pending: Option<(PendingDevice, HpkeKeyPair)>,
     transport_pin: [u8; 32],
     transcript: [u8; 32],
+    voting: Voting,
 }
 
 impl Joiner {
-    /// Creates a new device's identity and the request to send.
+    /// Creates a new device's identity and Flight 1 ([`JoinCommit`]) to send.
     /// `transport_pin` is this device's TLS certificate hash.
     pub fn start(
         invitation: Invitation,
         transport_pin: [u8; 32],
         now: u64,
-    ) -> Result<(Self, JoinRequest)> {
+    ) -> Result<(PendingJoiner, JoinCommit)> {
         let device = PendingDevice::generate();
         let hpke = HpkeKeyPair::from_secret(&device.recipient_secret());
         let (device_id, public_key) = (device.device_id(), device.public_key());
@@ -572,15 +782,15 @@ impl Joiner {
         Ok(started)
     }
 
-    /// Creates the request of a device that already holds a copy of the
-    /// invitation's vault and joins its control plane under the identity it
-    /// has. The vault must be unlocked.
+    /// Creates Flight 1 ([`JoinCommit`]) for a device that already holds a copy
+    /// of the invitation's vault and joins its control plane under the identity
+    /// it has. The vault must be unlocked.
     pub fn start_with_vault(
         invitation: Invitation,
         vault: &Vault,
         transport_pin: [u8; 32],
         now: u64,
-    ) -> Result<(Self, JoinRequest)> {
+    ) -> Result<(PendingJoiner, JoinCommit)> {
         if invitation.body.vault_id != vault.vault_id() {
             return Err(Error::VaultMismatch);
         }
@@ -605,22 +815,27 @@ impl Joiner {
         transport_pin: [u8; 32],
         now: u64,
         sign: impl FnOnce(&[u8]) -> Result<[u8; 64]>,
-    ) -> Result<(Self, JoinRequest)> {
+    ) -> Result<(PendingJoiner, JoinCommit)> {
         if now >= invitation.body.expires_at {
             return Err(Error::InvitationExpired);
         }
+        let joiner_nonce = Zeroizing::new(random_nonce()?);
+        let joiner_commit = commit_nonce(&joiner_nonce);
+        let relay_binding = relay_binding(invitation.relay.as_ref());
         let body = &invitation.body;
-        let mut request = JoinRequest {
-            version: PAIRING_VERSION,
+        let mut commit = JoinCommit {
+            version: PAIRING_WIRE_VERSION,
             vault_id: body.vault_id,
             token: body.token,
             joiner_device_id: device_id,
             joiner_public_key: public_key,
             joiner_hpke_key: recipient_key,
             joiner_transport_pin: transport_pin,
+            joiner_commit,
+            relay_binding,
             signature: Vec::new(),
         };
-        let transcript = transcript(
+        let pre_transcript = pre_transcript_v2(
             &Inviter {
                 vault_id: &body.vault_id,
                 device_id: &body.inviter_device_id,
@@ -628,20 +843,21 @@ impl Joiner {
                 transport_pin: &body.inviter_transport_pin,
                 token: &body.token,
             },
-            &request,
+            &commit,
         );
-        request.signature = sign(&request_message(&transcript))?.to_vec();
+        commit.signature = sign(&commit_message(&pre_transcript))?.to_vec();
         Ok((
-            Self {
+            PendingJoiner {
                 invitation,
                 device_id,
                 public_key,
                 recipient_key,
                 pending: None,
                 transport_pin,
-                transcript,
+                pre_transcript,
+                joiner_nonce,
             },
-            request,
+            commit,
         ))
     }
 
@@ -650,8 +866,9 @@ impl Joiner {
         self.pending.is_none()
     }
 
-    pub(crate) fn inviter_transport_pin(&self) -> [u8; 32] {
-        self.invitation.body.inviter_transport_pin
+    /// Whether the inviter committed to enrolling this device as a voter.
+    pub fn voting(&self) -> Voting {
+        self.voting
     }
 
     /// The addresses the invitation named for the inviter, each with the
@@ -677,10 +894,6 @@ impl Joiner {
         self.invitation.relay.as_ref()
     }
 
-    pub(crate) fn inviter_addresses(&self) -> &[String] {
-        &self.invitation.body.addresses
-    }
-
     /// This device's ID in the control plane. Start its control-plane node
     /// with it (and [`Joiner::vault_id`]) before the owner confirms, so the
     /// leader can bring it up to date as a learner.
@@ -693,7 +906,7 @@ impl Joiner {
     }
 
     /// Whether committed control state lists this device as an enrolled
-    /// voter holding every epoch key, so [`Joiner::finish_enrollment`] can
+    /// member holding every epoch key, so [`Joiner::finish_enrollment`] can
     /// proceed.
     pub fn enrolled(&self, state: &ControlState) -> bool {
         let me = self.control_device();
@@ -707,10 +920,10 @@ impl Joiner {
     }
 
     /// Checks that the grant is the invitation's inviter answering this
-    /// pairing.
+    /// pairing under wire version 2.
     fn verify_grant(&self, grant: &EnrollmentGrant) -> Result<()> {
         let body = &self.invitation.body;
-        if grant.version != PAIRING_VERSION {
+        if grant.version != PAIRING_WIRE_VERSION {
             return Err(Error::UnsupportedVersion);
         }
         if grant.vault_id != body.vault_id {
@@ -753,8 +966,8 @@ impl Joiner {
     }
 
     /// Checks the grant, the owner's confirmation, and that committed state
-    /// records this device as an enrolled voter with the keys and
-    /// certificate it sent.
+    /// records this device as an enrolled member with the keys, voting role,
+    /// and certificate agreed in the handshake.
     fn check_enrolled(
         &self,
         grant: &EnrollmentGrant,
@@ -777,6 +990,7 @@ impl Joiner {
             || recorded.recipient_key != self.recipient_key
             || recorded.transport_pin != self.transport_pin
             || state.authors.get(&me) != Some(&self.public_key)
+            || state.votes(me) != (self.voting == Voting::Votes)
         {
             return Err(Error::ProtocolViolation);
         }
@@ -858,7 +1072,7 @@ impl Joiner {
 
     /// The short code to compare with the inviter's screen.
     pub fn sas(&self) -> String {
-        short_code(&self.transcript)
+        short_code_v2(&self.transcript)
     }
 
     pub fn device_id(&self) -> [u8; 16] {
@@ -875,6 +1089,41 @@ fn own_identity(vault: &Vault) -> Result<([u8; 16], [u8; 32])> {
     ))
 }
 
+fn random_nonce() -> Result<[u8; 32]> {
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| Error::Transport("no randomness"))?;
+    Ok(nonce)
+}
+
+fn same_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+fn commit_nonce(joiner_nonce: &[u8; 32]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"osm-pairing-commit-v2\0")
+        .chain_update(joiner_nonce)
+        .finalize()
+        .into()
+}
+
+fn relay_binding(relay: Option<&RelayCode>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"osm-pairing-relay-v2\0");
+    match relay {
+        None => hasher.update([0]),
+        Some(code) => {
+            hasher.update([1]);
+            let address = code.address().as_bytes();
+            hasher.update((address.len() as u64).to_be_bytes());
+            hasher.update(address);
+            hasher.update(code.pin());
+            hasher.update(*code.token());
+        }
+    }
+    hasher.finalize().into()
+}
+
 /// The inviter's half of the transcript, from the invitation.
 struct Inviter<'a> {
     vault_id: &'a [u8; 32],
@@ -884,9 +1133,8 @@ struct Inviter<'a> {
     token: &'a [u8; 32],
 }
 
-/// Hash of everything both sides must agree on, including both TLS pins, so
-/// the short code also confirms the transport identities. Every field is
-/// fixed length.
+/// Version 1 transcript hash (retained only to verify frozen v1 fixtures).
+#[cfg(test)]
 fn transcript(inviter: &Inviter<'_>, request: &JoinRequest) -> [u8; 32] {
     let token_digest = Sha256::new()
         .chain_update(b"osm-pairing-token-v1\0")
@@ -903,6 +1151,48 @@ fn transcript(inviter: &Inviter<'_>, request: &JoinRequest) -> [u8; 32] {
         .chain_update(request.joiner_public_key)
         .chain_update(request.joiner_hpke_key)
         .chain_update(request.joiner_transport_pin)
+        .finalize()
+        .into()
+}
+
+/// Flight 1 pre-transcript binding both identities, the invitation token, the
+/// joiner's nonce commitment, and the invitation's relay.
+fn pre_transcript_v2(inviter: &Inviter<'_>, commit: &JoinCommit) -> [u8; 32] {
+    let token_digest = Sha256::new()
+        .chain_update(b"osm-pairing-token-v2\0")
+        .chain_update(inviter.token)
+        .finalize();
+    Sha256::new()
+        .chain_update(b"osm-pairing-pre-transcript-v2\0")
+        .chain_update(inviter.vault_id)
+        .chain_update(inviter.device_id)
+        .chain_update(inviter.public_key)
+        .chain_update(inviter.transport_pin)
+        .chain_update(token_digest)
+        .chain_update(commit.joiner_device_id)
+        .chain_update(commit.joiner_public_key)
+        .chain_update(commit.joiner_hpke_key)
+        .chain_update(commit.joiner_transport_pin)
+        .chain_update(commit.joiner_commit)
+        .chain_update(commit.relay_binding)
+        .finalize()
+        .into()
+}
+
+/// Final pairing wire v2 transcript binding both nonces and the joiner's
+/// `voting` role after commit-before-reveal.
+fn transcript_v2(
+    pre_transcript: &[u8; 32],
+    inviter_nonce: &[u8; 32],
+    joiner_nonce: &[u8; 32],
+    voting: Voting,
+) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"osm-pairing-transcript-v2\0")
+        .chain_update(pre_transcript)
+        .chain_update(inviter_nonce)
+        .chain_update(joiner_nonce)
+        .chain_update([u8::from(voting == Voting::Votes)])
         .finalize()
         .into()
 }
@@ -927,16 +1217,34 @@ fn valid_addresses(addresses: &[String]) -> bool {
             .all(|address| !address.is_empty() && address.len() <= MAX_ADDRESS_LEN)
 }
 
+#[cfg(test)]
 fn request_message(transcript: &[u8; 32]) -> Vec<u8> {
     let mut message = b"join-request\0".to_vec();
     message.extend_from_slice(transcript);
     message
 }
 
-/// Six decimal digits, shown as `123 456`.
+fn commit_message(pre_transcript: &[u8; 32]) -> Vec<u8> {
+    let mut message = b"join-commit-v2\0".to_vec();
+    message.extend_from_slice(pre_transcript);
+    message
+}
+
+/// Six decimal digits (v1 frozen fixture).
+#[cfg(test)]
 fn short_code(transcript: &[u8; 32]) -> String {
     let digest = Sha256::new()
         .chain_update(b"osm-pairing-sas-v1\0")
+        .chain_update(transcript)
+        .finalize();
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03} {:03}", value / 1000, value % 1000)
+}
+
+/// Six decimal digits derived from the wire v2 commit-before-reveal transcript.
+fn short_code_v2(transcript: &[u8; 32]) -> String {
+    let digest = Sha256::new()
+        .chain_update(b"osm-pairing-sas-v2\0")
         .chain_update(transcript)
         .finalize();
     let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
