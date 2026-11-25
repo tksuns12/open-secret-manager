@@ -37,6 +37,8 @@ type Result<T> = std::result::Result<T, StorageError<DeviceId>>;
 /// The layout of the control-plane database: the tables below, with every
 /// value but the snapshot's data as JSON text.
 const STORE_VERSION: u32 = 1;
+/// Upper bound on snapshot JSON size accepted by `install_snapshot`.
+const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -156,6 +158,70 @@ fn wrong_vault() -> StorageError<DeviceId> {
     ))
 }
 
+fn log_index(index: u64) -> Result<i64> {
+    i64::try_from(index).map_err(|_| write_error(std::io::Error::other("log index out of range")))
+}
+
+/// Reconstructs `legacy_enrolled` in memory when opening a database written
+/// before `ControlState::enrolled_nodes` existed. Replays the persisted
+/// signed log from index 1 when intact, falling back to the persisted
+/// committed membership only if earlier entries were already purged.
+fn populate_legacy_enrolled(connection: &Connection, state: &mut ControlState) -> Result<()> {
+    if state.epoch == 0 || !state.enrolled_nodes.is_empty() {
+        return Ok(());
+    }
+    let purged: Option<String> = connection
+        .query_row(
+            "SELECT purged FROM raft_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(read_error)?
+        .flatten();
+    let has_purged = match purged {
+        Some(text) => from_json::<Option<LogId<DeviceId>>>(&text)?.is_some(),
+        None => false,
+    };
+    if !has_purged {
+        let mut replayed = ControlState::new(state.vault_id);
+        let limit = state
+            .last_applied
+            .map(|id| log_index(id.index))
+            .transpose()?;
+        let mut statement = connection
+            .prepare("SELECT entry FROM raft_log ORDER BY idx")
+            .map_err(read_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(read_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(read_error)?;
+        for text in rows {
+            let entry: Entry<ControlConfig> = from_json(&text)?;
+            if limit.is_some_and(|max| entry.log_id.index as i64 > max) {
+                break;
+            }
+            replayed.apply(entry.log_id, &entry.payload);
+        }
+        if replayed.epoch == state.epoch && !replayed.enrolled_nodes.is_empty() {
+            state.legacy_enrolled = replayed.enrolled_nodes;
+            return Ok(());
+        }
+    }
+    let voters = state.voters();
+    for (device, node) in state.membership.membership().nodes() {
+        let in_membership = voters.contains(device) || state.without_vote.contains(device);
+        if in_membership
+            && !state.removed.contains_key(device)
+            && state.authors.get(device) == Some(&node.public_key)
+        {
+            state.legacy_enrolled.insert(*device, node.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Opens (or creates) a node's control-plane database for `vault_id`.
 pub fn open(
     path: impl AsRef<Path>,
@@ -165,7 +231,7 @@ pub fn open(
     let connection = Connection::open(path).map_err(read_error)?;
     osm_vault_sync::claim_store_version(&connection, STORE_VERSION).map_err(read_error)?;
     connection.execute_batch(SCHEMA).map_err(write_error)?;
-    let state = match connection
+    let mut state = match connection
         .query_row(
             "SELECT state FROM control_state WHERE singleton = 1",
             [],
@@ -180,6 +246,7 @@ pub fn open(
     if state.vault_id != vault_id {
         return Err(wrong_vault());
     }
+    populate_legacy_enrolled(&connection, &mut state)?;
     let (applied, _) = watch::channel(state.last_applied);
     let db = Arc::new(Mutex::new(connection));
     Ok((
@@ -253,6 +320,9 @@ impl RaftLogReader<ControlConfig> for LogStore {
             Bound::Excluded(end) => *end,
             Bound::Unbounded => u64::MAX,
         };
+        if start > i64::MAX as u64 || start >= end {
+            return Ok(Vec::new());
+        }
         let db = lock(&self.db)?;
         let mut statement = db
             .prepare("SELECT entry FROM raft_log WHERE idx >= ?1 AND idx < ?2 ORDER BY idx")
@@ -351,7 +421,7 @@ impl RaftLogStorage<ControlConfig> for LogStore {
                 transaction
                     .execute(
                         "INSERT OR REPLACE INTO raft_log(idx, entry) VALUES (?1, ?2)",
-                        params![entry.log_id.index as i64, to_json(&entry)?],
+                        params![log_index(entry.log_id.index)?, to_json(&entry)?],
                     )
                     .map_err(write_error)?;
             }
@@ -366,25 +436,21 @@ impl RaftLogStorage<ControlConfig> for LogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId<DeviceId>) -> Result<()> {
+        let idx = log_index(log_id.index)?;
         let db = lock(&self.db)?;
-        db.execute(
-            "DELETE FROM raft_log WHERE idx >= ?1",
-            [log_id.index as i64],
-        )
-        .map_err(write_error)?;
+        db.execute("DELETE FROM raft_log WHERE idx >= ?1", [idx])
+            .map_err(write_error)?;
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<DeviceId>) -> Result<()> {
+        let idx = log_index(log_id.index)?;
         // Record the purge point first: a crash between the two steps then
         // leaves entries that are merely redundant, never a hole.
         self.set_meta("purged", &Some(log_id))?;
         let db = lock(&self.db)?;
-        db.execute(
-            "DELETE FROM raft_log WHERE idx <= ?1",
-            [log_id.index as i64],
-        )
-        .map_err(write_error)?;
+        db.execute("DELETE FROM raft_log WHERE idx <= ?1", [idx])
+            .map_err(write_error)?;
         Ok(())
     }
 }
@@ -543,22 +609,85 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<()> {
         let data = snapshot.into_inner();
+        if data.len() > MAX_SNAPSHOT_BYTES {
+            return Err(read_error(std::io::Error::other(
+                "control-plane snapshot exceeds size limit",
+            )));
+        }
         let mut installed: ControlState = serde_json::from_slice(&data).map_err(read_error)?;
         if installed.vault_id != self.vault_id()? {
             return Err(wrong_vault());
         }
+        {
+            let current = self
+                .state
+                .lock()
+                .map_err(|_| read_error(std::io::Error::other("state lock poisoned")))?;
+            let invalid = |msg: &str| read_error(std::io::Error::other(msg));
+            if installed.epoch < current.epoch {
+                return Err(invalid("snapshot moves epoch backward"));
+            }
+            if installed.epoch > 0 {
+                for epoch in 1..=installed.epoch {
+                    if !installed.epoch_checks.contains_key(&epoch) {
+                        return Err(invalid("snapshot is missing an epoch check"));
+                    }
+                }
+                for (epoch, check) in &current.epoch_checks {
+                    if installed.epoch_checks.get(epoch) != Some(check) {
+                        return Err(invalid("snapshot changes an existing epoch check"));
+                    }
+                }
+            }
+            for (device, remover) in &current.removed {
+                if installed.removed.get(device) != Some(remover) {
+                    return Err(invalid("snapshot drops a device removal"));
+                }
+            }
+            for (device, key) in &current.authors {
+                if installed.authors.get(device) != Some(key) {
+                    return Err(invalid("snapshot changes an existing author"));
+                }
+            }
+        }
         installed.last_applied = meta.last_log_id;
         installed.membership = meta.last_membership.clone();
-        {
-            let db = lock(&self.db)?;
-            db.execute(
-                "INSERT INTO control_snapshot(singleton, meta, data) VALUES (1, ?1, ?2)
-                 ON CONFLICT(singleton) DO UPDATE SET meta = excluded.meta, data = excluded.data",
-                params![to_json(meta)?, data],
-            )
-            .map_err(write_error)?;
+        if installed.epoch > 0 && installed.enrolled_nodes.is_empty() {
+            let voters = installed.voters();
+            for (device, node) in installed.membership.membership().nodes() {
+                let in_membership =
+                    voters.contains(device) || installed.without_vote.contains(device);
+                if in_membership
+                    && !installed.removed.contains_key(device)
+                    && installed.authors.get(device) == Some(&node.public_key)
+                {
+                    installed.legacy_enrolled.insert(*device, node.clone());
+                }
+            }
         }
-        self.persist(&installed)?;
+        let state_text = to_json(&installed)?;
+        let meta_text = to_json(meta)?;
+        {
+            let mut db = lock(&self.db)?;
+            let transaction = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(write_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO control_snapshot(singleton, meta, data) VALUES (1, ?1, ?2)
+                     ON CONFLICT(singleton) DO UPDATE SET meta = excluded.meta, data = excluded.data",
+                    params![meta_text, data],
+                )
+                .map_err(write_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO control_state(singleton, state) VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET state = excluded.state",
+                    [state_text],
+                )
+                .map_err(write_error)?;
+            transaction.commit().map_err(write_error)?;
+        }
         let applied = installed.last_applied;
         *self
             .state

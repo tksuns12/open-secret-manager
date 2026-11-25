@@ -56,6 +56,9 @@ fn envelope(device: DeviceId, epoch: u64) -> Vec<u8> {
 enum Step {
     /// A membership entry naming these voters, signed by nobody.
     Voters(Vec<DeviceId>),
+    /// An unsigned membership entry keeping current voters/nodes, but
+    /// swapping one device's recipient_key and transport_pin.
+    TamperNode(usize),
     /// The membership entry that makes a pending change take effect, as a
     /// leader writes it: its target voters, with the members without a vote
     /// that stay as learners.
@@ -101,6 +104,7 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
     let forged = prop::bool::weighted(0.15);
     let step = prop_oneof![
         2 => prop::sample::subsequence(DEVICES.to_vec(), 1..=5).prop_map(Step::Voters),
+        2 => any::<usize>().prop_map(Step::TamperNode),
         4 => Just(Step::Settle),
         1 => (any::<usize>(), forged, 1_u64..3).prop_map(|(by, forged, epoch)| Step::Genesis { by, forged, epoch }),
         3 => (any::<usize>(), forged, any::<usize>(), any::<u8>(), any::<bool>())
@@ -176,6 +180,22 @@ fn entry(state: &ControlState, step: &Step) -> (EntryPayload<ControlConfig>, Opt
             voters.iter().copied().collect(),
             DEVICES.iter().copied().collect(),
         ),
+        Step::TamperNode(target) => {
+            let victim = pick(&state.members(), *target);
+            let voters = state.voters();
+            let mut nodes: BTreeMap<DeviceId, DeviceNode> = DEVICES
+                .iter()
+                .map(|device| (*device, node(*device)))
+                .collect();
+            let mut tampered = node(victim);
+            tampered.recipient_key = [0xEE; 32];
+            tampered.transport_pin = [0xDD; 32];
+            nodes.insert(victim, tampered);
+            (
+                EntryPayload::Membership(Membership::new(vec![voters], nodes)),
+                None,
+            )
+        }
         Step::Settle => {
             let voters = state
                 .pending
@@ -380,6 +400,23 @@ proptest! {
             }
             for held in state.keys_held.values() {
                 prop_assert!(held.iter().all(|epoch| (1..=state.epoch).contains(epoch)));
+            }
+            // Signed enrolled node metadata (recipient_key, transport_pin,
+            // public_key) is never overwritten by unsigned membership entries.
+            for (&device, enrolled) in state.enrolled_node_map() {
+                prop_assert_eq!(
+                    enrolled,
+                    &node(device),
+                    "enrolled node for {} was tampered at {:?}",
+                    device,
+                    step
+                );
+                prop_assert!(
+                    !state.removed.contains_key(&device),
+                    "removed device {} stayed in enrolled_nodes at {:?}",
+                    device,
+                    step
+                );
             }
             // Only a completed, signed enrollment without a vote makes a
             // device a member without one, and only its completed removal

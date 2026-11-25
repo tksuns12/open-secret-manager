@@ -7,7 +7,7 @@ use std::{
 
 use openraft::{
     error::{ClientWriteError, RaftError},
-    ChangeMembers, Config, LogId, Raft,
+    ChangeMembers, Config, LogId, Raft, SnapshotPolicy,
 };
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -32,11 +32,17 @@ pub fn default_config() -> Arc<Config> {
 /// are inconsistent, for example a heartbeat that is not well below the
 /// election timeout.
 pub fn timing(heartbeat: u64, election_min: u64, election_max: u64) -> Option<Arc<Config>> {
+    // Keep the full signed control-plane log and never trigger automatic
+    // unsigned snapshot replication: remote `InstallSnapshot` is refused
+    // until quorum-certified snapshots exist in a future format.
     Config {
         cluster_name: "osm-vault".into(),
         heartbeat_interval: heartbeat,
         election_timeout_min: election_min,
         election_timeout_max: election_max,
+        snapshot_policy: SnapshotPolicy::Never,
+        replication_lag_threshold: u64::MAX,
+        max_in_snapshot_log_to_keep: u64::MAX,
         ..Config::default()
     }
     .validate()
@@ -144,6 +150,10 @@ impl ControlNode {
         &self.raft
     }
 
+    pub(crate) fn state_handle(&self) -> Arc<Mutex<ControlState>> {
+        self.state.clone()
+    }
+
     /// The applied control state on this node.
     pub fn state(&self) -> ControlState {
         self.state
@@ -171,7 +181,14 @@ impl ControlNode {
     /// authenticated as `authenticated`, a device in [`Self::directory`].
     /// An RPC claiming another sender is refused before it reaches Raft.
     pub async fn handle(&self, authenticated: DeviceId, rpc: ControlRpc) -> ControlReply {
-        network::serve(&self.raft, authenticated, rpc, self.write_timeout).await
+        network::serve(
+            &self.raft,
+            &self.state,
+            authenticated,
+            rpc,
+            self.write_timeout,
+        )
+        .await
     }
 
     /// Forms a new cluster with `members` as its voters. Only for a vault's
@@ -278,17 +295,31 @@ async fn advance(raft: &Raft<ControlConfig>, state: &ControlState) -> Result<()>
     if let (MembershipChange::Enroll { device, node, .. }, false) =
         (&pending.change, pending.cancelled)
     {
-        let known = raft
+        let existing = raft
             .metrics()
             .borrow()
             .membership_config
             .membership()
             .get_node(device)
-            .is_some();
-        if !known {
-            raft.add_learner(*device, node.clone(), false)
+            .cloned();
+        match existing {
+            None => {
+                raft.add_learner(*device, node.clone(), false)
+                    .await
+                    .map_err(|error| Error::Raft(error.to_string()))?;
+            }
+            Some(recorded) if recorded != *node => {
+                // An unsigned membership entry may have pre-inserted a learner
+                // with forged keys: overwrite it with the signed `DeviceNode`.
+                raft.change_membership(
+                    ChangeMembers::SetNodes(BTreeMap::from([(*device, node.clone())])),
+                    false,
+                )
                 .await
                 .map_err(|error| Error::Raft(error.to_string()))?;
+                return Ok(());
+            }
+            Some(_) => {}
         }
         let caught_up = {
             let metrics = raft.metrics();

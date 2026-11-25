@@ -96,6 +96,17 @@ pub struct ControlState {
     /// existed.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub without_vote: BTreeSet<DeviceId>,
+    /// The signed node record (signing key, TLS pin, HPKE recipient key) for
+    /// each currently enrolled member, populated only from Genesis (founding
+    /// voters) and completed signed Enroll requests. An unsigned Raft
+    /// `EntryPayload::Membership` cannot alter these keys or pins.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub enrolled_nodes: BTreeMap<DeviceId, DeviceNode>,
+    /// In-memory fallback populated by `store::open` when opening an older
+    /// database whose persisted `ControlState` predated `enrolled_nodes`.
+    /// Omitted from serialization so frozen fixtures round-trip identically.
+    #[serde(skip)]
+    pub(crate) legacy_enrolled: BTreeMap<DeviceId, DeviceNode>,
 }
 
 impl ControlState {
@@ -119,16 +130,39 @@ impl ControlState {
         self.membership.membership().get_node(&device)
     }
 
+    /// The signed node record for an enrolled member (signing key, TLS pin,
+    /// HPKE recipient key). Never altered by an unsigned Raft membership
+    /// entry.
+    pub fn enrolled_node(&self, device: DeviceId) -> Option<&DeviceNode> {
+        self.enrolled_node_map().get(&device)
+    }
+
+    pub(crate) fn enrolled_node_map(&self) -> &BTreeMap<DeviceId, DeviceNode> {
+        if !self.enrolled_nodes.is_empty() {
+            &self.enrolled_nodes
+        } else {
+            &self.legacy_enrolled
+        }
+    }
+
+    fn promote_legacy_enrolled(&mut self) {
+        if self.enrolled_nodes.is_empty() && !self.legacy_enrolled.is_empty() {
+            self.enrolled_nodes = std::mem::take(&mut self.legacy_enrolled);
+        }
+    }
+
     /// Whether `device` is a member whose enrollment the vault's devices
     /// signed for, and whose removal they have not: a voter, or a device in
-    /// the membership that was enrolled without a vote, an author under the
-    /// key membership records for it, and not among the removed devices.
+    /// the membership that was enrolled without a vote, recorded in
+    /// `enrolled_nodes` with the signing key in `authors`, and not among the
+    /// removed devices.
     ///
-    /// Authority and epoch keys follow this, never voting rights alone. A
-    /// Raft membership entry carries no signature, so a device that held
-    /// only a voter's transport identity could add voters, a removed device
-    /// among them; without a standing signed enrollment they can neither
-    /// make requests nor be given keys.
+    /// Authority and epoch keys follow this, never voting rights or unsigned
+    /// Raft membership records alone. A Raft membership entry carries no
+    /// signature, so a device that held only a voter's transport identity
+    /// could add voters, resurrect a removed device, or swap a member's
+    /// `recipient_key`/`transport_pin`; without a standing signed enrollment
+    /// they can neither make requests, substitute keys, nor be given keys.
     pub fn is_enrolled(&self, device: DeviceId) -> bool {
         let in_membership = if self.without_vote.contains(&device) {
             self.node(device).is_some()
@@ -138,7 +172,7 @@ impl ControlState {
         in_membership
             && !self.removed.contains_key(&device)
             && self
-                .node(device)
+                .enrolled_node(device)
                 .is_some_and(|node| self.authors.get(&device) == Some(&node.public_key))
     }
 
@@ -212,8 +246,12 @@ impl ControlState {
                 self.membership = StoredMembership::new(Some(log_id), membership.clone());
                 Outcome::Recorded
             }
-            EntryPayload::Normal(ControlEntry::Request(request)) => self.apply_request(request),
+            EntryPayload::Normal(ControlEntry::Request(request)) => {
+                self.promote_legacy_enrolled();
+                self.apply_request(request)
+            }
             EntryPayload::Normal(ControlEntry::Complete { request_id }) => {
+                self.promote_legacy_enrolled();
                 self.complete(request_id)
             }
         }
@@ -239,8 +277,8 @@ impl ControlState {
         // it; afterwards only an enrolled member, voting or not: genesis and
         // every enrollment since were signed, so authority traces back to
         // the founder rather than to whatever the Raft membership contains.
-        // Either way with its own key as the committed membership records
-        // it.
+        // Either way with its own signed key rather than an unsigned
+        // membership record.
         let may_ask = if self.epoch == 0 {
             self.voters().contains(&signed.requester)
         } else {
@@ -249,10 +287,16 @@ impl ControlState {
         if !may_ask {
             return Outcome::Rejected(Rejection::Unauthorized);
         }
-        let Some(requester) = self.node(signed.requester) else {
+        let requester_key = if self.epoch == 0 {
+            self.node(signed.requester).map(|node| node.public_key)
+        } else {
+            self.enrolled_node(signed.requester)
+                .map(|node| node.public_key)
+        };
+        let Some(requester_key) = requester_key else {
             return Outcome::Rejected(Rejection::Unauthorized);
         };
-        if !signed.verify(&self.vault_id, &requester.public_key) {
+        if !signed.verify(&self.vault_id, &requester_key) {
             return Outcome::Rejected(Rejection::BadSignature);
         }
         let result = match &signed.request {
@@ -296,22 +340,30 @@ impl ControlState {
                 return Err(invalid("invalid author list"));
             }
         }
-        // Every voter is an author, with the key membership records.
+        // Every founding voter is an author and an enrolled node, with the
+        // node record membership held at genesis. Non-voter historical authors
+        // stay in `authors` (so old revisions remain verifiable) and are NOT
+        // added to `enrolled_nodes`.
+        let mut enrolled = BTreeMap::new();
         for voter in self.voters() {
-            let key = self.node(voter).map(|node| node.public_key);
+            let Some(node) = self.node(voter) else {
+                return Err(invalid("a voter has no node record"));
+            };
             match author_keys.get(&voter) {
-                Some(listed) if Some(*listed) != key => {
+                Some(listed) if *listed != node.public_key => {
                     return Err(invalid("an author's key differs from its voter key"))
                 }
                 Some(_) => {}
                 None => {
-                    author_keys.insert(voter, key.unwrap_or_default());
+                    author_keys.insert(voter, node.public_key);
                 }
             }
+            enrolled.insert(voter, node.clone());
         }
         self.epoch = epoch;
         self.epoch_checks = (1..=epoch).zip(checks.iter().copied()).collect();
         self.authors = author_keys;
+        self.enrolled_nodes = enrolled;
         self.keys_held.insert(founder, (1..=epoch).collect());
         Ok(())
     }
@@ -354,7 +406,9 @@ impl ControlState {
                 }
                 // A transport certificate identifies one device: peers map
                 // a connection's certificate back to a device ID.
-                if self
+                if self.enrolled_node_map().iter().any(|(known, recorded)| {
+                    known != device && recorded.transport_pin == node.transport_pin
+                }) || self
                     .membership
                     .membership()
                     .nodes()
@@ -393,9 +447,10 @@ impl ControlState {
             }
         }
         let removed_pin = match change {
-            MembershipChange::Remove { device, .. } => {
-                self.node(*device).map(|node| node.transport_pin)
-            }
+            MembershipChange::Remove { device, .. } => self
+                .enrolled_node(*device)
+                .or_else(|| self.node(*device))
+                .map(|node| node.transport_pin),
             MembershipChange::Enroll { .. } => None,
         };
         self.pending = Some(PendingChange {
@@ -436,7 +491,7 @@ impl ControlState {
     }
 
     /// The envelope is for this vault and `epoch`, and is sealed to
-    /// `device`'s keys as membership records them.
+    /// `device`'s signed enrollment keys (never an unsigned membership entry).
     fn check_envelope(
         &self,
         device: DeviceId,
@@ -444,7 +499,7 @@ impl ControlState {
         envelope: &[u8],
     ) -> Result<(), Rejection> {
         let node = self
-            .node(device)
+            .enrolled_node(device)
             .ok_or_else(|| invalid("envelope for an unknown device"))?;
         let envelope =
             EpochKeyEnvelope::from_bytes(envelope).map_err(|_| invalid("malformed envelope"))?;
@@ -533,6 +588,7 @@ impl ControlState {
             } => {
                 if !pending.cancelled {
                     self.authors.insert(device, node.public_key);
+                    self.enrolled_nodes.insert(device, node);
                     if !votes {
                         self.without_vote.insert(device);
                     }
@@ -540,6 +596,7 @@ impl ControlState {
             }
             MembershipChange::Remove { device, rotation } => {
                 self.without_vote.remove(&device);
+                self.enrolled_nodes.remove(&device);
                 self.epoch = rotation.epoch;
                 self.epoch_checks.insert(rotation.epoch, rotation.check);
                 for (recipient, envelope) in rotation.envelopes {
@@ -562,19 +619,17 @@ impl ControlState {
 
 impl ControlState {
     /// Whether the committed membership is what the pending change leads
-    /// to: uniform, with its target voters, and, for a member without a
-    /// vote, with that device present when it joins and gone when it is
-    /// removed.
+    /// to: uniform, with its target voters, with the signed `DeviceNode`
+    /// recorded for a joining device, and, for a member without a vote, with
+    /// that device present when it joins and gone when it is removed.
     pub fn in_effect(&self, pending: &PendingChange) -> bool {
         if !(self.is_uniform() && self.voters() == pending.target_voters) {
             return false;
         }
         match &pending.change {
-            MembershipChange::Enroll {
-                device,
-                votes: false,
-                ..
-            } if !pending.cancelled => self.node(*device).is_some(),
+            MembershipChange::Enroll { device, node, .. } if !pending.cancelled => {
+                self.node(*device) == Some(node)
+            }
             MembershipChange::Remove { device, .. } if self.without_vote.contains(device) => {
                 self.node(*device).is_none()
             }

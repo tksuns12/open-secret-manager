@@ -359,9 +359,11 @@ pub fn reconcile(vault: &mut Vault, state: &ControlState) -> Result<Reconciled> 
     Ok(report)
 }
 
-/// Seals `key` for `epoch` to `device`'s keys as membership records them.
+/// Seals `key` for `epoch` to `device`'s signed enrollment keys.
 fn seal(state: &ControlState, device: DeviceId, epoch: u64, key: &[u8; 32]) -> Result<Vec<u8>> {
-    let node = state.node(device).ok_or(Error::ProtocolViolation)?;
+    let node = state
+        .enrolled_node(device)
+        .ok_or(Error::ProtocolViolation)?;
     Ok(seal_epoch_key(
         VaultId(state.vault_id),
         epoch,

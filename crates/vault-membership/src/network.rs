@@ -142,34 +142,70 @@ fn fatal(error: RaftError<DeviceId>) -> Fatal<DeviceId> {
     }
 }
 
+/// Whether `authenticated` is permitted to send `Vote` or `AppendEntries`
+/// against the local node's committed control state.
+///
+/// While `epoch == 0` (bootstrapping or joining before genesis is replicated),
+/// any peer accepted by the directory may replicate the initial signed log.
+/// Whether `authenticated` is allowed to drive Raft replication (`AppendEntries`
+/// or `Vote`) against this node.
+///
+/// Once founded, removed devices, non-voting members, and pending non-voting
+/// or cancelled learners are refused.
+fn may_replicate(state: &Arc<Mutex<ControlState>>, authenticated: DeviceId) -> bool {
+    let Ok(state) = state.lock() else {
+        return false;
+    };
+    if state.epoch == 0 {
+        return true;
+    }
+    if state.removed.contains_key(&authenticated) || state.without_vote.contains(&authenticated) {
+        return false;
+    }
+    if let Some(pending) = &state.pending {
+        if matches!(
+            &pending.change,
+            crate::MembershipChange::Enroll { device, votes, .. }
+                if *device == authenticated && (!*votes || pending.cancelled)
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Handles an RPC received over a connection authenticated as
 /// `authenticated`. A forwarded request waits up to `submit_timeout` for a
 /// quorum.
+///
+/// Remote `InstallSnapshot` RPCs are refused because v1 `ControlState`
+/// snapshots carry no quorum signatures; nodes catch up by replaying the
+/// signed log from genesis instead.
 pub(crate) async fn serve(
     raft: &Raft<ControlConfig>,
+    state: &Arc<Mutex<ControlState>>,
     authenticated: DeviceId,
     rpc: ControlRpc,
     submit_timeout: Duration,
 ) -> ControlReply {
     match rpc {
         ControlRpc::AppendEntries(rpc) => {
-            if verify_rpc_sender(&rpc.vote, authenticated).is_err() {
+            if verify_rpc_sender(&rpc.vote, authenticated).is_err()
+                || !may_replicate(state, authenticated)
+            {
                 return ControlReply::Refused;
             }
             ControlReply::AppendEntries(raft.append_entries(rpc).await.map_err(fatal))
         }
         ControlRpc::Vote(rpc) => {
-            if verify_rpc_sender(&rpc.vote, authenticated).is_err() {
+            if verify_rpc_sender(&rpc.vote, authenticated).is_err()
+                || !may_replicate(state, authenticated)
+            {
                 return ControlReply::Refused;
             }
             ControlReply::Vote(raft.vote(rpc).await.map_err(fatal))
         }
-        ControlRpc::InstallSnapshot(rpc) => {
-            if verify_rpc_sender(&rpc.vote, authenticated).is_err() {
-                return ControlReply::Refused;
-            }
-            ControlReply::InstallSnapshot(raft.install_snapshot(rpc).await)
-        }
+        ControlRpc::InstallSnapshot(_) => ControlReply::Refused,
         ControlRpc::Submit(request) => {
             // The state machine checks the signature; here a device may only
             // pass on what it signed itself.
@@ -371,13 +407,14 @@ impl Directory {
     }
 
     /// The pins of the vault's enrolled members in this node's committed
-    /// state. This is what a node may introduce to another.
+    /// state, from their signed enrollment records. This is what a node may
+    /// introduce to another.
     pub fn members(&self) -> BTreeMap<DeviceId, [u8; 32]> {
         self.with_state(|state| {
             state
                 .members()
                 .into_iter()
-                .filter_map(|device| Some((device, state.node(device)?.transport_pin)))
+                .filter_map(|device| Some((device, state.enrolled_node(device)?.transport_pin)))
                 .collect()
         })
         .unwrap_or_default()
@@ -408,24 +445,41 @@ impl Directory {
     /// Every device this node accepts, with its pin.
     pub fn pins(&self) -> BTreeMap<DeviceId, [u8; 32]> {
         let effective = self.metrics.borrow().membership_config.clone();
-        let mut pins: BTreeMap<DeviceId, [u8; 32]> = effective
-            .membership()
-            .nodes()
-            .map(|(device, node)| (*device, node.transport_pin))
-            .collect();
         let introduced = self
             .introduced
             .lock()
             .map(|introduced| introduced.clone())
             .unwrap_or_default();
+        let mut pins = BTreeMap::new();
         let read = self.with_state(|state| {
-            pins.extend(
-                state
-                    .membership
-                    .membership()
-                    .nodes()
-                    .map(|(device, node)| (*device, node.transport_pin)),
-            );
+            if state.epoch == 0 {
+                // Before genesis is applied (initial bootstrap or brand-new
+                // joiner), accept nodes from membership alongside pending and
+                // introduced peers.
+                pins.extend(
+                    effective
+                        .membership()
+                        .nodes()
+                        .map(|(device, node)| (*device, node.transport_pin)),
+                );
+                pins.extend(
+                    state
+                        .membership
+                        .membership()
+                        .nodes()
+                        .map(|(device, node)| (*device, node.transport_pin)),
+                );
+            } else {
+                // Once founded, transport pins for enrolled members follow
+                // signed enrollment records exclusively, never unsigned Raft
+                // membership entries.
+                pins.extend(
+                    state
+                        .enrolled_node_map()
+                        .iter()
+                        .map(|(device, node)| (*device, node.transport_pin)),
+                );
+            }
             if let Some(pending) = state.pending.as_ref().filter(|pending| !pending.cancelled) {
                 if let crate::MembershipChange::Enroll { device, node, .. } = &pending.change {
                     pins.insert(*device, node.transport_pin);
@@ -478,7 +532,7 @@ impl Directory {
 
 #[derive(Default)]
 struct RouterState {
-    nodes: BTreeMap<DeviceId, Raft<ControlConfig>>,
+    nodes: BTreeMap<DeviceId, (Raft<ControlConfig>, Arc<Mutex<ControlState>>)>,
     isolated: BTreeSet<DeviceId>,
 }
 
@@ -489,9 +543,11 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn register(&self, device: DeviceId, raft: Raft<ControlConfig>) {
+    pub fn register(&self, node: &crate::ControlNode) {
         if let Ok(mut state) = self.state.lock() {
-            state.nodes.insert(device, raft);
+            state
+                .nodes
+                .insert(node.device(), (node.raft().clone(), node.state_handle()));
         }
     }
 
@@ -523,7 +579,11 @@ impl Router {
         }
     }
 
-    fn target(&self, from: DeviceId, to: DeviceId) -> Result<Raft<ControlConfig>, LinkError> {
+    fn target(
+        &self,
+        from: DeviceId,
+        to: DeviceId,
+    ) -> Result<(Raft<ControlConfig>, Arc<Mutex<ControlState>>), LinkError> {
         let disconnected = || LinkError::Unreachable(format!("device {to} is disconnected"));
         let state = self.state.lock().map_err(|_| disconnected())?;
         if state.isolated.contains(&from) || state.isolated.contains(&to) {
@@ -558,7 +618,7 @@ pub struct RouterLink {
 
 impl Link for RouterLink {
     async fn call(&mut self, rpc: ControlRpc, ttl: Duration) -> Result<ControlReply, LinkError> {
-        let raft = self.router.target(self.from, self.to)?;
-        Ok(serve(&raft, self.from, rpc, ttl).await)
+        let (raft, state) = self.router.target(self.from, self.to)?;
+        Ok(serve(&raft, &state, self.from, rpc, ttl).await)
     }
 }

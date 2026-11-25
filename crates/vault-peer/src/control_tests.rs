@@ -103,7 +103,7 @@ impl Net {
         )
         .await
         .unwrap();
-        self.router.register(device, node.raft().clone());
+        self.router.register(&node);
         node
     }
 

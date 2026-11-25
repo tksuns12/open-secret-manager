@@ -6,8 +6,8 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 use ed25519_dalek::SigningKey;
 use openraft::{
-    raft::{AppendEntriesRequest, VoteRequest},
-    Config, ServerState, Vote,
+    raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest},
+    Config, ServerState, SnapshotMeta, Vote,
 };
 use osm_vault_core::{PendingDevice, Vault};
 use osm_vault_membership::{
@@ -40,17 +40,7 @@ const PASSWORD: &str = "member password";
 /// Slower than the in-process tests use: a connection takes a TLS
 /// handshake, and debug builds are slow.
 fn tls_config() -> Arc<Config> {
-    Arc::new(
-        Config {
-            cluster_name: "test".into(),
-            heartbeat_interval: 100,
-            election_timeout_min: 600,
-            election_timeout_max: 1200,
-            ..Config::default()
-        }
-        .validate()
-        .unwrap(),
-    )
+    osm_vault_membership::timing(100, 600, 1200).unwrap()
 }
 
 fn options() -> NodeOptions {
@@ -486,40 +476,43 @@ async fn the_control_plane_runs_between_devices_over_pinned_tls() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_joining_device_installs_a_snapshot_over_tls() {
+async fn a_joining_device_catches_up_over_tls_and_remote_snapshots_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let a = Bare::start(&dir, 1).await;
     let b = Bare::start(&dir, 2).await;
     a.found().await;
     a.enroll(1, &b, &[&a]).await;
 
-    // The leader keeps a snapshot and drops the log it covers, so a new
-    // device cannot be sent those entries.
-    let raft = a.node.raft();
-    raft.trigger().snapshot().await.unwrap();
-    let mut metrics = raft.metrics();
-    let snapshot = loop {
-        if let Some(snapshot) = metrics.borrow().snapshot {
-            break snapshot;
-        }
-        metrics.changed().await.unwrap();
-    };
-    raft.trigger().purge_log(snapshot.index).await.unwrap();
-    loop {
-        if metrics.borrow().purged == Some(snapshot) {
-            break;
-        }
-        metrics.changed().await.unwrap();
-    }
+    // Even over an authenticated member's pinned TLS link, remote
+    // InstallSnapshot RPCs are refused because v1 snapshots carry no quorum
+    // signatures.
+    let mut link = a.endpoint.link(b.id, &b.info());
+    let snapshot_rpc = ControlRpc::InstallSnapshot(InstallSnapshotRequest {
+        vote: Vote::new_committed(99, a.id),
+        meta: SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "remote".into(),
+        },
+        offset: 0,
+        data: serde_json::to_vec(&a.state()).unwrap(),
+        done: true,
+    });
+    assert!(matches!(
+        link.call(snapshot_rpc, Duration::from_secs(5)).await,
+        Ok(ControlReply::Refused)
+    ));
 
+    // A joining device catches up over TLS by replaying the retained signed
+    // log from genesis and ends up with the same enrolled state.
     let c = Bare::start(&dir, 3).await;
     a.enroll(2, &c, &[&a, &b]).await;
-    assert!(c.node.raft().metrics().borrow().snapshot >= Some(snapshot));
     let state = c.state();
     assert_eq!(state.members(), BTreeSet::from([1, 2, 3]));
     assert_eq!(state.epoch, 1);
     assert_eq!(state.vault_id, VAULT);
     assert_eq!(state.authors, a.state().authors);
+    assert_eq!(state.enrolled_node(3), Some(&c.info()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -21,17 +21,7 @@ use crate::{
 const VAULT: [u8; 32] = [42; 32];
 
 fn fast_config() -> Arc<Config> {
-    Arc::new(
-        Config {
-            cluster_name: "test".into(),
-            heartbeat_interval: 50,
-            election_timeout_min: 300,
-            election_timeout_max: 600,
-            ..Config::default()
-        }
-        .validate()
-        .unwrap(),
-    )
+    crate::timing(50, 300, 600).unwrap()
 }
 
 /// The epoch key a test vault uses for `epoch`, and its check.
@@ -97,7 +87,7 @@ impl Cluster {
         )
         .await
         .unwrap();
-        self.router.register(device, node.raft().clone());
+        self.router.register(&node);
         self.running.insert(device, node);
     }
 
@@ -1135,7 +1125,7 @@ async fn connections_are_accepted_from_recorded_and_introduced_devices_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_far_behind_catches_up_from_a_snapshot() {
+async fn a_device_far_behind_catches_up_from_the_signed_log_and_refuses_remote_snapshots() {
     let mut cluster = Cluster::new(4);
     for device in [1, 2, 3] {
         cluster.start(device, CrashPlan::default()).await;
@@ -1154,27 +1144,35 @@ async fn a_device_far_behind_catches_up_from_a_snapshot() {
         .collect();
     cluster.settle(&remaining, &remaining).await;
 
-    // The leader keeps a snapshot and drops the log it covers.
+    // Even a remote snapshot sent by the current leader is refused: v1
+    // snapshots carry no quorum signatures, so nodes must catch up by
+    // replaying the full signed log instead.
     let leader = cluster.leader_among(&remaining).await;
-    let raft = cluster.running[&leader].raft();
-    raft.trigger().snapshot().await.unwrap();
-    let mut metrics = raft.metrics();
-    let snapshot = loop {
-        if let Some(snapshot) = metrics.borrow().snapshot {
-            break snapshot;
-        }
-        metrics.changed().await.unwrap();
-    };
-    raft.trigger().purge_log(snapshot.index).await.unwrap();
-    loop {
-        if metrics.borrow().purged == Some(snapshot) {
-            break;
-        }
-        metrics.changed().await.unwrap();
-    }
+    let follower = remaining
+        .iter()
+        .copied()
+        .find(|device| *device != leader)
+        .unwrap();
+    let snapshot_rpc = ControlRpc::InstallSnapshot(InstallSnapshotRequest {
+        vote: Vote::new_committed(99, leader),
+        meta: SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "remote".into(),
+        },
+        offset: 0,
+        data: serde_json::to_vec(&cluster.running[&leader].state()).unwrap(),
+        done: true,
+    });
+    assert!(matches!(
+        cluster.running[&follower]
+            .handle(leader, snapshot_rpc)
+            .await,
+        ControlReply::Refused
+    ));
 
-    // A new device cannot be sent those entries; it installs the snapshot
-    // and ends up with the same state.
+    // A new device catches up from index 1 over the retained signed log and
+    // ends up with the same state, surviving crash and restart.
     let enrollment = cluster.enroll(leader, 2, 4);
     assert_eq!(
         cluster.running[&leader].submit(enrollment).await.unwrap(),
@@ -1185,17 +1183,346 @@ async fn a_device_far_behind_catches_up_from_a_snapshot() {
     voters.push(4);
     cluster.settle(&voters, &voters).await;
     let joined = &cluster.running[&4];
-    assert!(joined.raft().metrics().borrow().snapshot >= Some(snapshot));
     let state = joined.state();
     assert_eq!(state.epoch, 2);
     assert_eq!(state.removed, cluster.running[&leader].state().removed);
     assert_eq!(state.vault_id, VAULT);
+    assert_eq!(state.enrolled_node(4), Some(&cluster.node_info(4)));
 
-    // It restarts from the installed snapshot.
     cluster.crash(4).await;
     cluster.start(4, CrashPlan::default()).await;
     assert_eq!(cluster.running[&4].state().epoch, 2);
     cluster.settle(&voters, &voters).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unauthenticated_install_snapshot_cannot_inject_authors_or_steal_keys() {
+    let mut cluster = Cluster::new(3);
+    cluster.start_all(CrashPlan::default()).await;
+    cluster.bootstrap(&[1, 2, 3]).await;
+    let leader = cluster.leader().await;
+    let victim = [1, 2, 3]
+        .into_iter()
+        .find(|device| *device != leader)
+        .unwrap();
+
+    // Craft a poisoned snapshot claiming epoch 2, adding attacker device 99
+    // as an enrolled author and clearing keys_held to harvest key grants.
+    let mut forged = cluster.running[&victim].state();
+    let attacker: DeviceId = 99;
+    let attacker_key = SigningKey::from_bytes(&[99; 32]);
+    let attacker_node = DeviceNode {
+        public_key: attacker_key.verifying_key().to_bytes(),
+        transport_pin: [99; 32],
+        recipient_key: HpkeKeyPair::from_secret(&[149; 32]).public().as_bytes(),
+    };
+    forged.epoch = 2;
+    forged.epoch_checks.insert(2, check(2));
+    forged.authors.insert(attacker, attacker_node.public_key);
+    forged
+        .enrolled_nodes
+        .insert(attacker, attacker_node.clone());
+    forged.keys_held.clear();
+    let forged_bytes = serde_json::to_vec(&forged).unwrap();
+
+    let make_rpc = |sender: DeviceId| {
+        ControlRpc::InstallSnapshot(InstallSnapshotRequest {
+            vote: Vote::new_committed(50, sender),
+            meta: SnapshotMeta {
+                last_log_id: Some(openraft::LogId::new(
+                    openraft::CommittedLeaderId::new(50, sender),
+                    100,
+                )),
+                last_membership: Default::default(),
+                snapshot_id: "poisoned".into(),
+            },
+            offset: 0,
+            data: forged_bytes.clone(),
+            done: true,
+        })
+    };
+
+    // Refused whether sent by a compromised voter or an outside device.
+    assert!(matches!(
+        cluster.running[&victim]
+            .handle(leader, make_rpc(leader))
+            .await,
+        ControlReply::Refused
+    ));
+    assert!(matches!(
+        cluster.running[&victim]
+            .handle(attacker, make_rpc(attacker))
+            .await,
+        ControlReply::Refused
+    ));
+
+    let state = cluster.running[&victim].state();
+    assert_eq!(state.epoch, 1);
+    assert!(!state.authors.contains_key(&attacker));
+    assert!(!state.is_enrolled(attacker));
+    assert!(state.enrolled_node(attacker).is_none());
+}
+
+#[test]
+fn an_unsigned_membership_entry_cannot_swap_recipient_key_or_transport_pin() {
+    use openraft::{CommittedLeaderId, EntryPayload, LogId, Membership};
+
+    let mut state = crate::ControlState::new(VAULT);
+    let mut index = 0_u64;
+    let mut apply = |state: &mut crate::ControlState,
+                     payload: EntryPayload<crate::ControlConfig>| {
+        index += 1;
+        state.apply(LogId::new(CommittedLeaderId::new(1, 1), index), &payload)
+    };
+    let key = |device: DeviceId| SigningKey::from_bytes(&[device as u8; 32]);
+    let hpke = |device: DeviceId| HpkeKeyPair::from_secret(&[device as u8 + 50; 32]);
+    let node = |device: DeviceId| DeviceNode {
+        public_key: key(device).verifying_key().to_bytes(),
+        transport_pin: [device as u8; 32],
+        recipient_key: hpke(device).public().as_bytes(),
+    };
+    let request = |by: DeviceId, id: u8, req: ControlRequest| {
+        EntryPayload::Normal(crate::ControlEntry::Request(SignedRequest::sign(
+            &VAULT,
+            [id; 16],
+            by,
+            req,
+            &KeySigner {
+                device: by,
+                key: key(by),
+            },
+        )))
+    };
+
+    // Device 1 founds the vault at epoch 1 with historical non-voter author 9.
+    let initial = BTreeMap::from([(1, node(1))]);
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(vec![BTreeSet::from([1])], initial)),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            request(
+                1,
+                0,
+                ControlRequest::Genesis {
+                    epoch: 1,
+                    checks: vec![check(1)],
+                    authors: vec![(9, key(9).verifying_key().to_bytes())],
+                },
+            ),
+        ),
+        Outcome::Accepted
+    );
+
+    // Promoting non-founder historical author 9 via unsigned membership does
+    // not enroll it, grant it keys, or let it sign requests.
+    let with_author_9 = BTreeMap::from([(1, node(1)), (9, node(9))]);
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(vec![BTreeSet::from([1, 9])], with_author_9)),
+    );
+    assert!(!state.is_enrolled(9));
+    assert!(state.enrolled_node(9).is_none());
+    let author_9_envelope = seal_epoch_key(
+        VaultId(VAULT),
+        1,
+        osm_vault_sync::DeviceId(node(9).public_key),
+        hpke(9).public(),
+        &epoch_key(1),
+    )
+    .unwrap()
+    .to_bytes()
+    .to_vec();
+    assert!(matches!(
+        apply(
+            &mut state,
+            request(
+                1,
+                1,
+                ControlRequest::GrantKeys {
+                    device: 9,
+                    envelopes: vec![author_9_envelope],
+                },
+            ),
+        ),
+        Outcome::Rejected(_)
+    ));
+    assert!(matches!(
+        apply(
+            &mut state,
+            request(
+                9,
+                2,
+                ControlRequest::ProposeChange(MembershipChange::Enroll {
+                    device: 3,
+                    node: node(3),
+                    votes: true,
+                }),
+            ),
+        ),
+        Outcome::Rejected(_)
+    ));
+
+    // Restore membership to [1] and properly enroll device 2.
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1])],
+            BTreeMap::from([(1, node(1))]),
+        )),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            request(
+                1,
+                3,
+                ControlRequest::ProposeChange(MembershipChange::Enroll {
+                    device: 2,
+                    node: node(2),
+                    votes: true,
+                }),
+            ),
+        ),
+        Outcome::Accepted
+    );
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1, 2])],
+            BTreeMap::from([(1, node(1)), (2, node(2))]),
+        )),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Complete {
+                request_id: [3; 16]
+            }),
+        ),
+        Outcome::Accepted
+    );
+    assert_eq!(state.enrolled_node(2), Some(&node(2)));
+
+    // An unsigned membership entry swaps device 2's recipient_key and
+    // transport_pin to an attacker's keys while keeping its public_key.
+    let attacker_hpke = HpkeKeyPair::from_secret(&[0xEE; 32]);
+    let attacker_pin = [0xDD; 32];
+    let tampered_node_2 = DeviceNode {
+        public_key: node(2).public_key,
+        transport_pin: attacker_pin,
+        recipient_key: attacker_hpke.public().as_bytes(),
+    };
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1, 2])],
+            BTreeMap::from([(1, node(1)), (2, tampered_node_2.clone())]),
+        )),
+    );
+
+    // State keeps the signed enrolled node, rejects envelopes sealed to the
+    // attacker's HPKE key, and Directory refuses the attacker's transport pin.
+    assert_eq!(state.enrolled_node(2), Some(&node(2)));
+    let forged_envelope = seal_epoch_key(
+        VaultId(VAULT),
+        1,
+        osm_vault_sync::DeviceId(node(2).public_key),
+        attacker_hpke.public(),
+        &epoch_key(1),
+    )
+    .unwrap()
+    .to_bytes()
+    .to_vec();
+    assert!(matches!(
+        apply(
+            &mut state,
+            request(
+                1,
+                4,
+                ControlRequest::GrantKeys {
+                    device: 2,
+                    envelopes: vec![forged_envelope],
+                },
+            ),
+        ),
+        Outcome::Rejected(_)
+    ));
+
+    let (_tx, rx) = tokio::sync::watch::channel(openraft::RaftMetrics::new_initial(1));
+    let directory = crate::Directory::new(Arc::new(std::sync::Mutex::new(state.clone())), rx);
+    assert_eq!(directory.device_for_pin(&node(2).transport_pin), Some(2));
+    assert_eq!(directory.device_for_pin(&attacker_pin), None);
+    assert_eq!(directory.members().get(&2), Some(&node(2).transport_pin));
+
+    // Honest-leader learner-reuse defense: pre-seeding device 3 as a learner
+    // with a forged DeviceNode must NOT allow a signed Enroll for device 3 to
+    // complete until the node entry matches the signed Enroll node.
+    let forged_node_3 = DeviceNode {
+        public_key: node(3).public_key,
+        transport_pin: [0xCC; 32],
+        recipient_key: attacker_hpke.public().as_bytes(),
+    };
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1, 2])],
+            BTreeMap::from([(1, node(1)), (2, node(2)), (3, forged_node_3.clone())]),
+        )),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            request(
+                1,
+                5,
+                ControlRequest::ProposeChange(MembershipChange::Enroll {
+                    device: 3,
+                    node: node(3),
+                    votes: true,
+                }),
+            ),
+        ),
+        Outcome::Accepted
+    );
+    // Promoting device 3 with the pre-seeded forged node does not satisfy
+    // `in_effect`, so Complete is rejected.
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1, 2, 3])],
+            BTreeMap::from([(1, node(1)), (2, node(2)), (3, forged_node_3)]),
+        )),
+    );
+    assert!(matches!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Complete {
+                request_id: [5; 16]
+            }),
+        ),
+        Outcome::Rejected(_)
+    ));
+    // Replacing device 3's entry with the signed node lets Complete succeed.
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1, 2, 3])],
+            BTreeMap::from([(1, node(1)), (2, node(2)), (3, node(3))]),
+        )),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Complete {
+                request_id: [5; 16]
+            }),
+        ),
+        Outcome::Accepted
+    );
+    assert_eq!(state.enrolled_node(3), Some(&node(3)));
 }
 
 mod fixtures;
