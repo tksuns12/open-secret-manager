@@ -50,6 +50,16 @@ pub(crate) fn random_array<const N: usize>() -> [u8; N] {
     value
 }
 
+#[cfg(test)]
+const MIN_KDF_MEMORY_KIB: u32 = 8 * 1024;
+#[cfg(not(test))]
+const MIN_KDF_MEMORY_KIB: u32 = 65_536;
+
+#[cfg(test)]
+const MIN_KDF_ITERATIONS: u32 = 1;
+#[cfg(not(test))]
+const MIN_KDF_ITERATIONS: u32 = 3;
+
 pub(crate) fn derive_password_key(
     password: &str,
     salt: &[u8],
@@ -58,8 +68,9 @@ pub(crate) fn derive_password_key(
     if password.is_empty() {
         return Err(Error::InvalidCredentials);
     }
-    if !(8 * 1024..=256 * 1024).contains(&config.memory_kib)
-        || !(1..=10).contains(&config.iterations)
+    if salt.len() < SALT_LEN
+        || !(MIN_KDF_MEMORY_KIB..=256 * 1024).contains(&config.memory_kib)
+        || !(MIN_KDF_ITERATIONS..=10).contains(&config.iterations)
         || !(1..=16).contains(&config.parallelism)
     {
         return Err(Error::Crypto);

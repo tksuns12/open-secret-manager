@@ -7,7 +7,9 @@ use std::{
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    config::DbConfig, params, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -113,9 +115,6 @@ pub const RELAY_ID: &str = "osm-relay";
 
 /// The item IDs the vault keeps notes of its own under.
 pub(crate) const RESERVED_IDS: [&str; 2] = [BACKUPS_ID, RELAY_ID];
-
-/// A note of the vault's own, opened, and the device that wrote it.
-type Note = (Zeroizing<Vec<u8>>, [u8; DEVICE_ID_LEN]);
 
 /// Longest relay code the vault keeps.
 const MAX_RELAY_CODE: usize = 1024;
@@ -486,6 +485,10 @@ pub struct Vault {
     recipient_secret: Option<SecretKey>,
     /// Names this unlock, while unlocked.
     session: Option<UnlockSession>,
+    /// Highest `key_epoch` observed across verified accepted revisions,
+    /// guarding against unauthenticated `vault_meta.current_epoch` /
+    /// `write_fence` rollbacks.
+    max_accepted_epoch: u64,
 }
 
 /// Seals revisions for one author. Borrowing the keys separately from the
@@ -657,12 +660,14 @@ impl Vault {
             revoked: BTreeSet::new(),
             recipient_secret: None,
             session: None,
+            max_accepted_epoch: FIRST_EPOCH,
         }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let connection = open_connection(path)?;
+        validate_schema(&connection)?;
         let header = read_header(&connection)?;
         let mut vault = Self::from_parts(path, connection, header);
         // Adding the ingress queue needs no key, so a locked vault can
@@ -768,6 +773,7 @@ impl Vault {
         self.revoked.clear();
         self.recipient_secret = None;
         self.session = None;
+        self.max_accepted_epoch = FIRST_EPOCH;
     }
 
     /// Names this unlock: `None` while locked, and different after every
@@ -784,6 +790,9 @@ impl Vault {
     /// in format 6, the shared vault key in older formats. Re-rooting an
     /// older vault needs `password_key` to rewrap the new root.
     fn activate(&mut self, unlocked: SecretKey, password_key: Option<&SecretKey>) -> Result<()> {
+        if self.header.format_version <= SHARED_KEY_FORMAT_VERSION && password_key.is_none() {
+            return Err(Error::UpgradeRequiresPassword);
+        }
         let mut root_key = unlocked;
         let master_key = root_key.clone();
         if self.header.format_version == LEGACY_FORMAT_VERSION {
@@ -834,6 +843,7 @@ impl Vault {
         if !epoch_keys.contains_key(&self.header.current_epoch) {
             return Err(Error::Crypto);
         }
+        let max_accepted_epoch = self.check_epoch_rollback(device.device_id, &devices)?;
         let revoked = load_revocations(&self.connection, &root_key, &self.header.vault_id)?;
         let recipient_secret = self.recipient_secret_or_create(&root_key)?;
         self.check_seal(&root_key)?;
@@ -844,7 +854,50 @@ impl Vault {
         self.revoked = revoked;
         self.recipient_secret = Some(recipient_secret);
         self.session = Some(UnlockSession::new(random_array()));
+        self.max_accepted_epoch = max_accepted_epoch.max(self.header.current_epoch);
         Ok(())
+    }
+
+    /// Detects unauthenticated `vault_meta.current_epoch` rollback against
+    /// cryptographically verified revisions in `revisions`: if this device
+    /// itself signed a revision at a higher epoch than `current_epoch`, fail
+    /// closed; otherwise return the highest verified epoch authored by any
+    /// authorized device so `signer()` refuses writes under stale epochs.
+    fn check_epoch_rollback(
+        &self,
+        own_device_id: [u8; DEVICE_ID_LEN],
+        devices: &BTreeMap<[u8; DEVICE_ID_LEN], VerifyingKey>,
+    ) -> Result<u64> {
+        let mut max_epoch = self.header.current_epoch;
+        let current = i64::try_from(self.header.current_epoch).map_err(|_| Error::Crypto)?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {REVISION_COLUMNS} FROM revisions r WHERE r.key_epoch > ?"
+        ))?;
+        let mut rows = statement.query([current])?;
+        while let Some(row) = rows.next()? {
+            let revision = row_to_revision(row)?;
+            let Some(author) = devices.get(&revision.author_device_id) else {
+                continue;
+            };
+            let Ok(signature) = Signature::from_slice(&revision.signature) else {
+                continue;
+            };
+            let aad = revision.aad();
+            if author
+                .verify_strict(
+                    &revision_signature_message(&aad, &revision.nonce, &revision.ciphertext),
+                    &signature,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if revision.author_device_id == own_device_id {
+                return Err(Error::Crypto);
+            }
+            max_epoch = max_epoch.max(revision.key_epoch);
+        }
+        Ok(max_epoch)
     }
 
     /// Seals a format 7 vault in one transaction: adds the format 8 columns,
@@ -913,6 +966,7 @@ impl Vault {
     /// devices at the next sync, as anything this device lacks does.
     fn check_seal(&mut self, root_key: &SecretKey) -> Result<()> {
         let vault_id = self.header.vault_id;
+        validate_schema(&self.connection)?;
         self.connection.execute_batch(SEAL_TRACKING)?;
         let transaction = self
             .connection
@@ -966,14 +1020,16 @@ impl Vault {
             }
         }
         if !(sealed && revisions_intact && heads_intact) {
-            transaction.execute("UPDATE vault_meta SET rows_changed=1 WHERE singleton=1", [])?;
+            // Do NOT reseal a tampered database under the victim's root key:
+            // leaving `row_seal = NULL` ensures clearing `rows_changed = 0` on
+            // disk cannot erase an unconfirmed tamper warning before
+            // `confirm_rows_changed()` explicitly reseals.
+            transaction.execute(
+                "UPDATE vault_meta SET rows_changed=1, row_seal=NULL WHERE singleton=1",
+                [],
+            )?;
         }
-        if sealed {
-            forget_added_rows(&transaction)?;
-        } else {
-            store_row_seal(&transaction, root_key, &vault_id, &marks)?;
-            forget_added_rows(&transaction)?;
-        }
+        forget_added_rows(&transaction)?;
         transaction.commit()?;
         self.header = read_header(&self.connection)?;
         Ok(())
@@ -989,11 +1045,18 @@ impl Vault {
         self.header.rows_changed
     }
 
-    /// The owner has seen that rows were taken out: stop saying so.
+    /// The owner has seen that rows were taken out: reseal the current rows
+    /// and stop saying so.
     pub fn confirm_rows_changed(&mut self) -> Result<()> {
-        self.key()?;
-        self.connection
-            .execute("UPDATE vault_meta SET rows_changed=0 WHERE singleton=1", [])?;
+        let root_key = self.key()?.clone();
+        let vault_id = self.header.vault_id;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_schema(&transaction)?;
+        seal_rows(&transaction, &root_key, &vault_id)?;
+        transaction.execute("UPDATE vault_meta SET rows_changed=0 WHERE singleton=1", [])?;
+        transaction.commit()?;
         self.header = read_header(&self.connection)?;
         Ok(())
     }
@@ -1022,8 +1085,10 @@ impl Vault {
         if self.sealed_rows()? >= seen {
             return Ok(false);
         }
-        self.connection
-            .execute("UPDATE vault_meta SET rows_changed=1 WHERE singleton=1", [])?;
+        self.connection.execute(
+            "UPDATE vault_meta SET rows_changed=1, row_seal=NULL WHERE singleton=1",
+            [],
+        )?;
         self.header = read_header(&self.connection)?;
         Ok(true)
     }
@@ -1074,7 +1139,30 @@ impl Vault {
             |row| row.get(0),
         )?;
         if version == LEGACY_FORMAT_VERSION {
+            // Reject hybrid/downgraded files that claim format 1 while already
+            // holding format 2+ tables or columns.
+            let extra_tables: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                 AND name NOT IN ('vault_meta', 'revisions', 'heads')",
+                [],
+                |row| row.get(0),
+            )?;
+            let extra_columns: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('vault_meta') \
+                 WHERE name IN ('device_id', 'row_seal', 'current_epoch', 'write_fence')",
+                [],
+                |row| row.get(0),
+            )?;
+            if extra_tables > 0 || extra_columns > 0 {
+                return Err(Error::Crypto);
+            }
             let legacy = legacy_revisions(&transaction, &vault_id)?;
+            // Require at least one authenticated Format 1 revision so an
+            // attacker cannot replace a Format 8 vault with an empty Format 1
+            // database reusing only `password_wrapped_key`.
+            if legacy.is_empty() {
+                return Err(Error::Crypto);
+            }
             let heads = {
                 let mut statement =
                     transaction.prepare("SELECT item_id,revision,tombstone FROM heads")?;
@@ -1089,6 +1177,22 @@ impl Vault {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 rows
             };
+            let mut expected_heads: BTreeMap<String, (String, bool)> = legacy
+                .iter()
+                .map(|rev| (rev.revision.clone(), (rev.item_id.clone(), rev.tombstone)))
+                .collect();
+            for rev in &legacy {
+                if let Some(parent) = &rev.parent_revision {
+                    expected_heads.remove(parent);
+                }
+            }
+            let actual_heads: BTreeMap<String, (String, bool)> = heads
+                .iter()
+                .map(|(item_id, rev, tombstone)| (rev.clone(), (item_id.clone(), *tombstone)))
+                .collect();
+            if actual_heads.len() != heads.len() || actual_heads != expected_heads {
+                return Err(Error::Crypto);
+            }
             let (device, signing_key) =
                 generate_device(master_key, &vault_id, SHARED_KEY_FORMAT_VERSION)?;
             let mut header = self.header.clone();
@@ -1261,9 +1365,9 @@ impl Vault {
     fn signer(&self) -> Result<RevisionSigner<'_>> {
         self.key()?;
         let epoch = self.header.current_epoch;
-        // Committed membership has moved on: writing under this epoch could
-        // reach a removed device.
-        if epoch < self.header.write_fence {
+        // Committed membership or verified accepted revisions have moved on:
+        // writing under an obsolete epoch could reach a removed device.
+        if epoch < self.header.write_fence.max(self.max_accepted_epoch) {
             return Err(Error::EpochPending);
         }
         Ok(RevisionSigner {
@@ -1348,8 +1452,11 @@ impl Vault {
                 public_key,
             },
         )?;
-        reseal(&transaction, &key, &self.header.vault_id)?;
+        let broken = reseal(&transaction, &key, &self.header.vault_id)?;
         transaction.commit()?;
+        if broken {
+            self.header.rows_changed = true;
+        }
         self.devices.insert(device_id, verifying);
         Ok(())
     }
@@ -1385,11 +1492,15 @@ impl Vault {
         Ok(())
     }
 
-    /// Wraps the root key with a new password, under a new salt.
+    /// Wraps the root key with a new password, under a fresh salt and the
+    /// current build's default KDF parameters so tampered header parameters
+    /// cannot downgrade password protection across `change_password` or
+    /// `reset_password`.
     fn store_password(&mut self, new_password: &str, root_key: &[u8; KEY_LEN]) -> Result<()> {
         let salt = random_array::<SALT_LEN>();
         let nonce = random_array::<NONCE_LEN>();
-        let wrapping_key = derive_password_key(new_password, &salt, self.header.kdf)?;
+        let kdf = KdfConfig::default();
+        let wrapping_key = derive_password_key(new_password, &salt, kdf)?;
         let wrapped = encrypt(
             &wrapping_key,
             &nonce,
@@ -1397,9 +1508,18 @@ impl Vault {
             root_key.as_ref(),
         )?;
         self.connection.execute(
-            "UPDATE vault_meta SET password_salt=?, password_nonce=?, password_wrapped_key=? WHERE singleton=1",
-            params![salt.as_slice(), nonce.as_slice(), wrapped],
+            "UPDATE vault_meta SET kdf_memory_kib=?, kdf_iterations=?, kdf_parallelism=?, \
+             password_salt=?, password_nonce=?, password_wrapped_key=? WHERE singleton=1",
+            params![
+                kdf.memory_kib,
+                kdf.iterations,
+                kdf.parallelism,
+                salt.as_slice(),
+                nonce.as_slice(),
+                wrapped
+            ],
         )?;
+        self.header.kdf = kdf;
         self.header.password_salt = salt;
         self.header.password_nonce = nonce;
         self.header.password_wrapped_key = wrapped;
@@ -1602,6 +1722,9 @@ impl Vault {
         heads: &[String],
     ) -> Result<RevisionInfo> {
         self.key()?;
+        if RESERVED_IDS.contains(&item_id) {
+            return Err(Error::InvalidItem("that item id is reserved".into()));
+        }
         let stored = revision_by_id(&self.connection, revision)?.ok_or(Error::NotFound)?;
         if stored.item_id != item_id {
             return Err(Error::InvalidItem("that version is of another item".into()));
@@ -1660,15 +1783,15 @@ impl Vault {
     }
 
     /// When a device of this vault last saved a backup, by that device's
-    /// clock, and which device: the latest the vault has noted.
+    /// clock, and which device: the latest active note in the backup head set.
     pub fn last_backup(&self) -> Result<Option<(u64, [u8; DEVICE_ID_LEN])>> {
         let mut latest = None;
-        for (plaintext, author) in self.notes(BACKUPS_ID)? {
-            if let Some(at) = saved_at(&plaintext) {
-                // Of two noted in one second, the one stored last.
-                if latest.is_none_or(|(last, _)| at >= last) {
-                    latest = Some((at, author));
-                }
+        for ((at, author), _) in self.active_notes(BACKUPS_ID, |plaintext, author| {
+            Some((saved_at(plaintext)?, author))
+        })? {
+            // Of two noted in one second, the one stored last.
+            if latest.is_none_or(|(last, _)| at >= last) {
+                latest = Some((at, author));
             }
         }
         Ok(latest)
@@ -1692,20 +1815,20 @@ impl Vault {
     /// none. A vault that has not synced says nothing, which is not the same
     /// as saying it has none.
     pub fn has_relay_setting(&self) -> Result<bool> {
-        Ok(self
-            .notes(RELAY_ID)?
-            .iter()
-            .any(|(plaintext, _)| serde_json::from_slice::<RelaySetting>(plaintext).is_ok()))
+        Ok(!self
+            .active_notes(RELAY_ID, |plaintext, _| {
+                serde_json::from_slice::<RelaySetting>(plaintext).ok()
+            })?
+            .is_empty())
     }
 
-    /// The code of the relay the vault's devices use, as last set on any of
-    /// them by its clock; `None` if none was set, or it was taken away.
+    /// The code of the relay the vault's devices use, as last set in the
+    /// active head set; `None` if none was set, or it was taken away.
     pub fn relay(&self) -> Result<Option<Zeroizing<String>>> {
         let mut latest: Option<RelaySetting> = None;
-        for (plaintext, _) in self.notes(RELAY_ID)? {
-            let Ok(setting) = serde_json::from_slice::<RelaySetting>(&plaintext) else {
-                continue;
-            };
+        for (setting, _) in self.active_notes(RELAY_ID, |plaintext, _| {
+            serde_json::from_slice::<RelaySetting>(plaintext).ok()
+        })? {
             // Of two set in one second, the one stored last.
             if latest
                 .as_ref()
@@ -1732,21 +1855,46 @@ impl Vault {
         self.commit_revision(revision, Some(kind), None)
     }
 
-    /// Every note under the reserved `id`, verified and opened, in the order
-    /// this device stored them, each with its author.
-    fn notes(&self, id: &str) -> Result<Vec<Note>> {
+    /// Resolves active notes under reserved `id` starting from current DAG
+    /// `heads`. Once a head parses as a valid note, its superseded ancestors
+    /// are ignored (so discarded or overwritten `u64::MAX` timestamps cannot
+    /// poison the vault). Only unrecognized non-empty notes from non-revoked
+    /// authors fall back to their parents for forward compatibility.
+    fn active_notes<T>(
+        &self,
+        id: &str,
+        mut parse: impl FnMut(&[u8], [u8; DEVICE_ID_LEN]) -> Option<T>,
+    ) -> Result<Vec<(T, i64)>> {
         self.key()?;
-        let mut statement = self.connection.prepare(&format!(
-            "SELECT {REVISION_COLUMNS} FROM revisions r WHERE r.item_id=? AND r.tombstone=1 \
-             ORDER BY r.rowid"
-        ))?;
-        let noted = statement
-            .query_map([id], row_to_revision)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        noted
-            .iter()
-            .map(|revision| Ok((self.open_revision(revision)?, revision.author_device_id)))
-            .collect()
+        let mut queue = head_ids(&self.connection, id)?;
+        let mut visited = BTreeSet::new();
+        let mut found = Vec::new();
+        while let Some(rev_id) = queue.pop() {
+            if !visited.insert(rev_id.clone()) {
+                continue;
+            }
+            let Some((revision, rowid)) = revision_with_rowid(&self.connection, &rev_id)? else {
+                continue;
+            };
+            if revision.item_id != id || !revision.tombstone {
+                continue;
+            }
+            let plaintext = self.open_revision(&revision)?;
+            if let Some(parsed) = parse(&plaintext, revision.author_device_id) {
+                found.push((parsed, rowid));
+                continue;
+            }
+            if plaintext.is_empty() || self.revoked.contains(&revision.author_device_id) {
+                continue;
+            }
+            for parent in revision.parents {
+                if !visited.contains(&parent) {
+                    queue.push(parent);
+                }
+            }
+        }
+        found.sort_by_key(|(_, rowid)| *rowid);
+        Ok(found)
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<ItemSummary>> {
@@ -1846,8 +1994,11 @@ impl Vault {
                 parents: Vec::new(),
             });
         }
-        reseal(&transaction, &seal_key, &seal_vault)?;
+        let broken = reseal(&transaction, &seal_key, &seal_vault)?;
         transaction.commit()?;
+        if broken {
+            self.header.rows_changed = true;
+        }
         Ok(revisions)
     }
 
@@ -1940,8 +2091,11 @@ impl Vault {
                 params![revision_id, revision.item_id],
             )?;
         }
-        reseal(&transaction, &seal_key, &seal_vault)?;
+        let broken = reseal(&transaction, &seal_key, &seal_vault)?;
         transaction.commit()?;
+        if broken {
+            self.header.rows_changed = true;
+        }
         Ok(())
     }
 
@@ -1965,6 +2119,9 @@ impl Vault {
     pub fn delete(&mut self, item_id: &str, expected_revision: &str) -> Result<RevisionInfo> {
         if item_id.is_empty() {
             return Err(Error::InvalidItem("id must not be empty".into()));
+        }
+        if RESERVED_IDS.contains(&item_id) {
+            return Err(Error::InvalidItem("that item id is reserved".into()));
         }
         let mut item = Item::new("deleted");
         item.id = item_id.to_owned();
@@ -2002,6 +2159,9 @@ impl Vault {
         heads: &[String],
         mut read: Vec<Item>,
     ) -> Result<RevisionInfo> {
+        if RESERVED_IDS.contains(&item_id) {
+            return Err(Error::InvalidItem("that item id is reserved".into()));
+        }
         let mut parents = heads.to_vec();
         parents.sort();
         parents.dedup();
@@ -2320,7 +2480,7 @@ impl Vault {
             current_epoch: payload.current_epoch,
             device: Some(device),
             recipient: Some(recipient),
-            write_fence: FIRST_EPOCH,
+            write_fence: payload.current_epoch,
             rows_changed: false,
         };
         insert_header(&connection, &header)?;
@@ -2571,23 +2731,47 @@ impl Vault {
                 .execute("DELETE FROM quarantine WHERE revision=?", [revision_id])?;
             return Ok(None);
         }
-        let mut heads = item_heads(&self.connection, &held.item_id)?;
-        if heads.len() > 1 {
+        let heads = item_heads(&self.connection, &held.item_id)?;
+        let is_reserved = RESERVED_IDS.contains(&held.item_id.as_str());
+        if heads.len() > 1 && !is_reserved {
             return Err(Error::Unresolved);
         }
-        let current = heads.pop();
-        let (tombstone, plaintext) = match &current {
-            Some(head) => (head.tombstone, self.open_revision(head)?),
-            None => (true, Zeroizing::new(Vec::new())),
+        let (tombstone, plaintext) = if is_reserved {
+            // Preserve the current active reserved-note payload (if any), or
+            // write an empty clearing tombstone when none exists so the
+            // discarded revision is superseded without being resurrected.
+            let mut best: Option<(u64, Zeroizing<Vec<u8>>)> = None;
+            for head in &heads {
+                if !head.tombstone {
+                    continue;
+                }
+                let opened = self.open_revision(head)?;
+                if let Some(at) = saved_at(&opened) {
+                    if best.as_ref().is_none_or(|(last, _)| at >= *last) {
+                        best = Some((at, opened));
+                    }
+                }
+            }
+            match best {
+                Some((_, bytes)) => (true, bytes),
+                None => (true, Zeroizing::new(Vec::new())),
+            }
+        } else {
+            match heads.first() {
+                Some(head) => (head.tombstone, self.open_revision(head)?),
+                None => (true, Zeroizing::new(Vec::new())),
+            }
         };
         // A head the held revision already names is superseded by it.
-        let mut parents: Vec<String> = current
-            .map(|head| head.revision_id())
+        let mut parents: Vec<String> = heads
             .into_iter()
+            .map(|head| head.revision_id())
             .filter(|head| !held.parents.contains(head))
+            .take(MAX_PARENTS - 1)
             .chain([revision_id.to_owned()])
             .collect();
         parents.sort();
+        parents.dedup();
         let revision = self
             .signer()?
             .seal(&held.item_id, parents, tombstone, &plaintext)?;
@@ -2660,8 +2844,12 @@ impl Vault {
         // A staged copy is consumed by the same transaction that accepts it.
         transaction.execute("DELETE FROM ingress WHERE revision=?", [&id])?;
         replace_heads(&transaction, &revision, &id)?;
-        reseal(&transaction, &seal_key, &seal_vault)?;
+        let broken = reseal(&transaction, &seal_key, &seal_vault)?;
         transaction.commit()?;
+        if broken {
+            self.header.rows_changed = true;
+        }
+        self.max_accepted_epoch = self.max_accepted_epoch.max(revision.key_epoch);
         Ok(info)
     }
 
@@ -3068,10 +3256,175 @@ fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
 
 fn open_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     connection.execute_batch(
-        "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;"
+        "PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; \
+         PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;",
     )?;
     Ok(connection)
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Validates `sqlite_master` against the exact tables, indexes, and triggers
+/// that vault formats 1..8 can legitimately contain, rejecting injected
+/// triggers, views, virtual tables, or unexpected objects before any query or
+/// write runs.
+fn validate_schema(connection: &Connection) -> Result<()> {
+    const ALLOWED_TABLES: &[&str] = &[
+        "vault_meta",
+        "revisions",
+        "heads",
+        "devices",
+        "quarantine",
+        "ingress",
+        "epoch_keys",
+        "revoked_devices",
+        "unconfirmed_recovery",
+    ];
+    const ALLOWED_AUTOINDEXES: &[(&str, &str)] = &[
+        ("sqlite_autoindex_revisions_1", "revisions"),
+        ("sqlite_autoindex_heads_1", "heads"),
+        ("sqlite_autoindex_devices_1", "devices"),
+        ("sqlite_autoindex_devices_2", "devices"),
+        ("sqlite_autoindex_quarantine_1", "quarantine"),
+        ("sqlite_autoindex_ingress_1", "ingress"),
+        ("sqlite_autoindex_revoked_devices_1", "revoked_devices"),
+    ];
+    const ALLOWED_INDEXES: &[(&str, &str, &str)] = &[
+        (
+            "revisions_item_id",
+            "revisions",
+            "CREATE INDEX revisions_item_id ON revisions(item_id)",
+        ),
+        (
+            "heads_item_id",
+            "heads",
+            "CREATE INDEX heads_item_id ON heads(item_id)",
+        ),
+    ];
+    const ALLOWED_TRIGGERS: &[(&str, &str, &str)] = &[
+        (
+            "revisions_no_update",
+            "revisions",
+            "CREATE TRIGGER revisions_no_update BEFORE UPDATE ON revisions BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END",
+        ),
+        (
+            "revisions_no_delete",
+            "revisions",
+            "CREATE TRIGGER revisions_no_delete BEFORE DELETE ON revisions BEGIN SELECT RAISE(ABORT, 'revisions are immutable'); END",
+        ),
+        (
+            "devices_no_update",
+            "devices",
+            "CREATE TRIGGER devices_no_update BEFORE UPDATE ON devices BEGIN SELECT RAISE(ABORT, 'device authorizations are immutable'); END",
+        ),
+        (
+            "quarantine_no_update",
+            "quarantine",
+            "CREATE TRIGGER quarantine_no_update BEFORE UPDATE ON quarantine BEGIN SELECT RAISE(ABORT, 'quarantined revisions are immutable'); END",
+        ),
+        (
+            "ingress_no_update",
+            "ingress",
+            "CREATE TRIGGER ingress_no_update BEFORE UPDATE ON ingress BEGIN SELECT RAISE(ABORT, 'staged revisions are immutable'); END",
+        ),
+        (
+            "epoch_keys_no_update",
+            "epoch_keys",
+            "CREATE TRIGGER epoch_keys_no_update BEFORE UPDATE ON epoch_keys BEGIN SELECT RAISE(ABORT, 'epoch keys are immutable'); END",
+        ),
+        (
+            "epoch_keys_no_delete",
+            "epoch_keys",
+            "CREATE TRIGGER epoch_keys_no_delete BEFORE DELETE ON epoch_keys BEGIN SELECT RAISE(ABORT, 'epoch keys are immutable'); END",
+        ),
+        (
+            "revoked_devices_no_update",
+            "revoked_devices",
+            "CREATE TRIGGER revoked_devices_no_update BEFORE UPDATE ON revoked_devices BEGIN SELECT RAISE(ABORT, 'revocations are immutable'); END",
+        ),
+        (
+            "revoked_devices_no_delete",
+            "revoked_devices",
+            "CREATE TRIGGER revoked_devices_no_delete BEFORE DELETE ON revoked_devices BEGIN SELECT RAISE(ABORT, 'revocations are immutable'); END",
+        ),
+    ];
+
+    let mut statement =
+        connection.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let table: String = row.get(2)?;
+        let sql: Option<String> = row.get(3)?;
+        match kind.as_str() {
+            "table" => {
+                if !ALLOWED_TABLES.contains(&name.as_str()) || name != table {
+                    return Err(Error::Crypto);
+                }
+                let Some(sql) = sql else {
+                    return Err(Error::Crypto);
+                };
+                let normalized = normalize_sql(&sql);
+                let upper = normalized.to_ascii_uppercase();
+                if !upper.starts_with("CREATE TABLE ") || upper.contains("VIRTUAL TABLE") {
+                    return Err(Error::Crypto);
+                }
+            }
+            "index" => match sql {
+                None => {
+                    if !ALLOWED_AUTOINDEXES.contains(&(name.as_str(), table.as_str())) {
+                        return Err(Error::Crypto);
+                    }
+                }
+                Some(sql) => {
+                    let normalized = normalize_sql(&sql).replace(" (", "(");
+                    if !ALLOWED_INDEXES.iter().any(|(n, t, expected)| {
+                        *n == name && *t == table && *expected == normalized
+                    }) {
+                        return Err(Error::Crypto);
+                    }
+                }
+            },
+            "trigger" => {
+                let Some(sql) = sql else {
+                    return Err(Error::Crypto);
+                };
+                let normalized = normalize_sql(&sql);
+                if !ALLOWED_TRIGGERS
+                    .iter()
+                    .any(|(n, t, expected)| *n == name && *t == table && *expected == normalized)
+                {
+                    return Err(Error::Crypto);
+                }
+            }
+            _ => return Err(Error::Crypto),
+        }
+    }
+    Ok(())
+}
+
+fn revision_with_rowid(
+    connection: &Connection,
+    revision_id: &str,
+) -> Result<Option<(EncryptedRevision, i64)>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT r.rowid,{REVISION_COLUMNS} FROM revisions r WHERE r.revision=?"
+    ))?;
+    statement
+        .query_row([revision_id], |row| {
+            Ok((row_to_revision_at(row, 1)?, row.get::<_, i64>(0)?))
+        })
+        .optional()
+        .map_err(Into::into)
 }
 
 fn read_header(connection: &Connection) -> Result<Header> {
@@ -3428,19 +3781,34 @@ fn seal_rows(connection: &Connection, root_key: &SecretKey, vault_id: &[u8; 32])
 /// Adds to the seal the rows added since it was last written, which the
 /// connection's own triggers listed (`SEAL_TRACKING`). Called in the
 /// transaction that adds them, so the seal always matches what that
-/// transaction leaves, and costs the same however many rows there are. A
-/// seal that no longer opens was broken since the unlock: the owner is told
-/// at the next one, and the rows are sealed from all of them.
-fn reseal(connection: &Connection, root_key: &SecretKey, vault_id: &[u8; 32]) -> Result<()> {
-    let stored: Option<Vec<u8>> = connection.query_row(
-        "SELECT row_seal FROM vault_meta WHERE singleton=1",
+/// transaction leaves, and costs the same however many rows there are.
+///
+/// If the seal is missing, fails to open, or `rows_changed` is already set,
+/// leaves `row_seal = NULL` and `rows_changed = 1` (returning `Ok(true)`) so
+/// a tampered database is never silently resealed before `confirm_rows_changed`.
+fn reseal(connection: &Connection, root_key: &SecretKey, vault_id: &[u8; 32]) -> Result<bool> {
+    validate_schema(connection)?;
+    let (stored, flagged): (Option<Vec<u8>>, i64) = connection.query_row(
+        "SELECT row_seal, rows_changed FROM vault_meta WHERE singleton=1",
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    if flagged != 0 {
+        connection.execute(
+            "UPDATE vault_meta SET rows_changed=1, row_seal=NULL WHERE singleton=1",
+            [],
+        )?;
+        forget_added_rows(connection)?;
+        return Ok(true);
+    }
     let Some(mut marks) = stored.and_then(|stored| open_row_seal(root_key, vault_id, &stored))
     else {
-        connection.execute("UPDATE vault_meta SET rows_changed=1 WHERE singleton=1", [])?;
-        return seal_rows(connection, root_key, vault_id);
+        connection.execute(
+            "UPDATE vault_meta SET rows_changed=1, row_seal=NULL WHERE singleton=1",
+            [],
+        )?;
+        forget_added_rows(connection)?;
+        return Ok(true);
     };
     let seal_key = row_seal_key(root_key)?;
     let mut statement =
@@ -3459,7 +3827,8 @@ fn reseal(connection: &Connection, root_key: &SecretKey, vault_id: &[u8; 32]) ->
     drop(rows);
     drop(statement);
     store_row_seal(connection, root_key, vault_id, &marks)?;
-    forget_added_rows(connection)
+    forget_added_rows(connection)?;
+    Ok(false)
 }
 
 fn store_row_seal(
@@ -3989,8 +4358,11 @@ impl Vault {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_revocation(&transaction, &root_key, &self.header.vault_id, &device_id)?;
-        reseal(&transaction, &root_key, &self.header.vault_id)?;
+        let broken = reseal(&transaction, &root_key, &self.header.vault_id)?;
         transaction.commit()?;
+        if broken {
+            self.header.rows_changed = true;
+        }
         self.revoked.insert(device_id);
         Ok(true)
     }
@@ -4156,8 +4528,11 @@ impl Vault {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         store_epoch_key(&transaction, &root_key, &self.header.vault_id, epoch, key)?;
-        reseal(&transaction, &root_key, &self.header.vault_id)?;
+        let broken = reseal(&transaction, &root_key, &self.header.vault_id)?;
         transaction.commit()?;
+        if broken {
+            self.header.rows_changed = true;
+        }
         self.epoch_keys.insert(epoch, Zeroizing::new(*key));
         Ok(())
     }
@@ -4188,11 +4563,14 @@ impl Vault {
         if !self.epoch_keys.contains_key(&epoch) {
             return Err(Error::MissingEpochKey);
         }
+        let epoch_i64 = i64::try_from(epoch).map_err(|_| Error::Crypto)?;
         self.connection.execute(
-            "UPDATE vault_meta SET current_epoch=? WHERE singleton=1",
-            [i64::try_from(epoch).map_err(|_| Error::Crypto)?],
+            "UPDATE vault_meta SET current_epoch=?, write_fence=MAX(write_fence, ?) WHERE singleton=1",
+            params![epoch_i64, epoch_i64],
         )?;
         self.header.current_epoch = epoch;
+        self.header.write_fence = self.header.write_fence.max(epoch);
+        self.max_accepted_epoch = self.max_accepted_epoch.max(epoch);
         Ok(())
     }
 

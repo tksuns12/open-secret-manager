@@ -3349,3 +3349,266 @@ fn password_health_judges_the_live_logins_and_not_the_deleted_ones() {
     vault.lock();
     assert!(vault.password_health().is_err());
 }
+
+#[test]
+fn epoch_rollback_in_vault_meta_is_detected_and_stale_writes_are_blocked() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    let (epoch, _) = vault.generate_epoch_key().unwrap();
+    assert_eq!(epoch, 2);
+    vault.activate_epoch(2).unwrap();
+    assert_eq!(vault.write_fence(), 2);
+    vault.put(login("Under epoch two")).unwrap();
+    drop(vault);
+
+    // An attacker rolls current_epoch and write_fence back to 1 on disk.
+    let raw = Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE vault_meta SET current_epoch=1, write_fence=1 WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    // Unlock must fail closed because this device already signed an epoch-2 revision.
+    let mut reopened = Vault::open(&path).unwrap();
+    assert!(matches!(reopened.unlock("password"), Err(Error::Crypto)));
+}
+
+#[test]
+fn empty_format_1_downgrade_cannot_silently_wipe_a_format_8_vault() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    vault.put(login("Secret")).unwrap();
+    drop(vault);
+
+    // Extract the Format 8 password wrapper and plant it into an empty Format 1 schema.
+    let src = Connection::open(&path).unwrap();
+    struct MetaRow {
+        vault_id: Vec<u8>,
+        mem: u32,
+        iters: u32,
+        par: u32,
+        salt: Vec<u8>,
+        nonce: Vec<u8>,
+        wrapped: Vec<u8>,
+        rec_nonce: Option<Vec<u8>>,
+        rec_wrapped: Option<Vec<u8>>,
+    }
+    let meta = src
+        .query_row(
+            "SELECT vault_id,kdf_memory_kib,kdf_iterations,kdf_parallelism,password_salt,\
+             password_nonce,password_wrapped_key,recovery_nonce,recovery_wrapped_key \
+             FROM vault_meta WHERE singleton=1",
+            [],
+            |r| {
+                Ok(MetaRow {
+                    vault_id: r.get(0)?,
+                    mem: r.get(1)?,
+                    iters: r.get(2)?,
+                    par: r.get(3)?,
+                    salt: r.get(4)?,
+                    nonce: r.get(5)?,
+                    wrapped: r.get(6)?,
+                    rec_nonce: r.get(7)?,
+                    rec_wrapped: r.get(8)?,
+                })
+            },
+        )
+        .unwrap();
+    drop(src);
+
+    let downgraded = dir.path().join("downgraded.db");
+    let dst = Connection::open(&downgraded).unwrap();
+    dst.execute_batch(
+        "CREATE TABLE vault_meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            format_version INTEGER NOT NULL,
+            vault_id BLOB NOT NULL,
+            kdf_memory_kib INTEGER NOT NULL,
+            kdf_iterations INTEGER NOT NULL,
+            kdf_parallelism INTEGER NOT NULL,
+            password_salt BLOB NOT NULL,
+            password_nonce BLOB NOT NULL,
+            password_wrapped_key BLOB NOT NULL,
+            recovery_nonce BLOB NOT NULL,
+            recovery_wrapped_key BLOB NOT NULL
+        );
+        CREATE TABLE revisions (
+            revision TEXT PRIMARY KEY,
+            format_version INTEGER NOT NULL,
+            vault_id BLOB NOT NULL,
+            item_id TEXT NOT NULL,
+            parent_revision TEXT,
+            key_epoch INTEGER NOT NULL,
+            nonce BLOB NOT NULL,
+            ciphertext BLOB NOT NULL,
+            tombstone INTEGER NOT NULL
+        );
+        CREATE TABLE heads (
+            item_id TEXT PRIMARY KEY,
+            revision TEXT NOT NULL,
+            tombstone INTEGER NOT NULL
+        );",
+    )
+    .unwrap();
+    dst.execute(
+        "INSERT INTO vault_meta VALUES (1,1,?,?,?,?,?,?,?,?,?)",
+        rusqlite::params![
+            meta.vault_id,
+            meta.mem,
+            meta.iters,
+            meta.par,
+            meta.salt,
+            meta.nonce,
+            meta.wrapped,
+            meta.rec_nonce.unwrap(),
+            meta.rec_wrapped.unwrap()
+        ],
+    )
+    .unwrap();
+    drop(dst);
+
+    let mut opened = Vault::open(&downgraded).unwrap();
+    assert!(matches!(opened.unlock("password"), Err(Error::Crypto)));
+}
+
+#[test]
+fn sqlite_trigger_injection_and_row_seal_laundering_are_blocked() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (mut vault, _) = Vault::create(&path, "password").unwrap();
+    vault.put(login("Alpha")).unwrap();
+    vault.put(login("Beta")).unwrap();
+    drop(vault);
+
+    // 1. Injecting a trigger into vault_meta is rejected immediately on open.
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER hide_tamper AFTER UPDATE OF rows_changed ON vault_meta \
+         BEGIN UPDATE vault_meta SET rows_changed=0 WHERE singleton=1; END;",
+    )
+    .unwrap();
+    drop(raw);
+    assert!(matches!(Vault::open(&path), Err(Error::Crypto)));
+
+    // Remove the injected trigger, then delete a revision row.
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "DROP TRIGGER hide_tamper; \
+         DROP TRIGGER revisions_no_delete; \
+         DELETE FROM heads WHERE revision = (SELECT revision FROM revisions ORDER BY rowid DESC LIMIT 1); \
+         DELETE FROM revisions WHERE rowid = (SELECT MAX(rowid) FROM revisions);",
+    )
+    .unwrap();
+    drop(raw);
+
+    // 2. First unlock detects tampering and refuses to reseal before confirmation.
+    let mut reopened = Vault::open(&path).unwrap();
+    reopened.unlock("password").unwrap();
+    assert!(reopened.rows_changed());
+    drop(reopened);
+
+    // 3. Clearing rows_changed=0 on disk cannot launder the unconfirmed tamper.
+    let raw = Connection::open(&path).unwrap();
+    raw.execute("UPDATE vault_meta SET rows_changed=0 WHERE singleton=1", [])
+        .unwrap();
+    drop(raw);
+
+    let mut again = Vault::open(&path).unwrap();
+    again.unlock("password").unwrap();
+    assert!(again.rows_changed());
+
+    // 4. Explicit confirmation reseals the vault cleanly.
+    again.confirm_rows_changed().unwrap();
+    assert!(!again.rows_changed());
+    drop(again);
+
+    let mut clean = Vault::open(&path).unwrap();
+    clean.unlock("password").unwrap();
+    assert!(!clean.rows_changed());
+}
+
+#[test]
+fn discarding_a_quarantined_u64_max_relay_note_never_activates_it() {
+    let dir = tempdir().unwrap();
+    let (mut a, _) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let b = join(dir.path(), "b.db", &a);
+    a.authorize_device(b.device_id().unwrap(), b.device_public_key().unwrap())
+        .unwrap();
+
+    // Device a sets a legitimate relay; b is then revoked before writing a
+    // malicious u64::MAX relay revision.
+    let relay_info = a.set_relay(Some("OSM-RELAY1-legit")).unwrap();
+    a.revoke_device(b.device_id().unwrap()).unwrap();
+
+    // Craft a signed u64::MAX relay tombstone from revoked device b.
+    let evil_plaintext = br#"{"saved_at":18446744073709551615,"relay":"OSM-RELAY1-evil"}"#;
+    let evil = b
+        .seal_plaintext_for_test("osm-relay", Vec::new(), true, evil_plaintext)
+        .unwrap();
+    assert!(matches!(
+        a.apply_encrypted_revision(evil.clone()),
+        Err(Error::Quarantined)
+    ));
+
+    // Discarding the quarantined relay revision must NOT activate the evil relay.
+    a.discard_quarantined(&evil.revision_id()).unwrap();
+    assert_eq!(
+        a.relay().unwrap().as_deref().map(String::as_str),
+        Some("OSM-RELAY1-legit")
+    );
+
+    // Reserved IDs cannot be mutated through delete() or resolve().
+    assert!(matches!(
+        a.delete("osm-relay", &relay_info.revision),
+        Err(Error::InvalidItem(_))
+    ));
+    assert!(matches!(
+        a.resolve("osm-relay", None, &[relay_info.revision]),
+        Err(Error::InvalidItem(_))
+    ));
+}
+
+#[test]
+fn reset_password_restores_default_kdf_parameters() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.db");
+    let (vault, recovery) = Vault::create(&path, "initial password").unwrap();
+    drop(vault);
+
+    // Attacker modifies KDF columns on disk (e.g., to inflate or downgrade cost).
+    let raw = Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE vault_meta SET kdf_memory_kib=16384, kdf_iterations=4, kdf_parallelism=2 WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    let mut reopened = Vault::open(&path).unwrap();
+    reopened
+        .reset_password(&recovery, "brand new password")
+        .unwrap();
+    drop(reopened);
+
+    let raw = Connection::open(&path).unwrap();
+    let (mem, iters, par): (u32, u32, u32) = raw
+        .query_row(
+            "SELECT kdf_memory_kib, kdf_iterations, kdf_parallelism FROM vault_meta WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let expected = crate::crypto::KdfConfig::default();
+    assert_eq!(
+        (mem, iters, par),
+        (
+            expected.memory_kib,
+            expected.iterations,
+            expected.parallelism
+        )
+    );
+}
