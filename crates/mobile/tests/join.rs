@@ -67,7 +67,7 @@ impl Desktop {
         let endpoint = MemberEndpoint::new(
             vault.vault_id(),
             &mut peers,
-            AddressBook::open(&peers_path).unwrap(),
+            AddressBook::open_allowing_loopback(&peers_path).unwrap(),
         )
         .unwrap();
         let device = device_id_from_bytes(vault.device_id().unwrap());
@@ -299,6 +299,7 @@ fn a_phone_joins_without_a_vote_reads_copies_stays_in_sync_and_learns_its_remova
 
     let folder = dir.path().join("phone");
     let phone = Device::open_listening_on(folder.clone(), 0).unwrap();
+    phone.allow_loopback_for_tests();
     assert_eq!(phone.state(), DeviceState::NoVault);
     assert!(matches!(phone.items(), Err(MobileError::NoVault)));
     assert!(matches!(
@@ -387,6 +388,7 @@ fn a_phone_joins_without_a_vote_reads_copies_stays_in_sync_and_learns_its_remova
     // Closed and opened again, it is the same device of the same vault.
     drop(phone);
     let phone = Device::open_listening_on(folder.clone(), 0).unwrap();
+    phone.allow_loopback_for_tests();
     assert_eq!(phone.state(), DeviceState::Locked);
     phone.unlock(PHONE_PASSWORD.into()).unwrap();
     phone.go_online().unwrap();
@@ -436,6 +438,7 @@ fn joined_phone_with(
     keystore: Arc<dyn Keystore>,
 ) -> Device {
     let phone = Device::open_with_keystore(folder, 0, keystore).unwrap();
+    phone.allow_loopback_for_tests();
     let (code, codes, answer) = desktop_runtime.block_on(desktop.invite());
     let shown = phone.join_start(code).unwrap();
     assert_eq!(codes.recv_timeout(Duration::from_secs(30)).unwrap(), shown);
@@ -669,6 +672,7 @@ fn a_locked_phone_away_from_the_screen_syncs_both_ways_and_stays_locked() {
     drop(phone);
     desktop_runtime.block_on(desktop.put(login("Written while the phone slept", "p")));
     let phone = Device::open_with_keystore(folder.clone(), 0, keystore.clone()).unwrap();
+    phone.allow_loopback_for_tests();
     assert_eq!(phone.state(), DeviceState::Locked);
     let status = phone.sync_in_background().unwrap();
     assert!(status.pending > 0, "{status:?}");
@@ -760,6 +764,7 @@ fn a_phone_takes_the_vaults_relay_and_syncs_through_it_while_locked() {
     // Woken only to sync, locked, it cannot read the vault, and reaches the
     // desktop through the relay it kept: both ways.
     let phone = Device::open_listening_on(folder, 0).unwrap();
+    phone.allow_loopback_for_tests();
     assert_eq!(phone.state(), DeviceState::Locked);
     let status = phone.sync_in_background().unwrap();
     assert!(status.pending > 0, "{status:?}");
@@ -807,6 +812,7 @@ fn a_phone_away_from_every_network_joins_through_the_relay() {
 
     let phone =
         Device::open_with_keystore(dir.path().join("phone"), 0, Arc::new(NoKeystore)).unwrap();
+    phone.allow_loopback_for_tests();
     let (invitation, codes, answer) = desktop_runtime.block_on(desktop.invite_away(&code));
     assert!(invitation.starts_with("OSM-PAIR1-"));
     let shown = phone.join_start(invitation).unwrap();
@@ -819,6 +825,7 @@ fn a_phone_away_from_every_network_joins_through_the_relay() {
     drop(phone);
     let folder = dir.path().join("phone");
     let phone = Device::open_with_keystore(folder.clone(), 0, Arc::new(NoKeystore)).unwrap();
+    phone.allow_loopback_for_tests();
     assert!(
         PeerStore::open(folder.join("peers.sqlite3"), Arc::new(NoKeystore))
             .unwrap()
@@ -867,6 +874,7 @@ fn a_join_through_the_relay_that_is_quit_midway_leaves_no_relay_in_the_phones_fi
 
     let folder = dir.path().join("phone");
     let phone = Device::open_with_keystore(folder.clone(), 0, Arc::new(NoKeystore)).unwrap();
+    phone.allow_loopback_for_tests();
     let (invitation, codes, _answer) = desktop_runtime.block_on(desktop.invite_away(&code));
     let shown = phone.join_start(invitation).unwrap();
     assert_eq!(codes.recv_timeout(Duration::from_secs(60)).unwrap(), shown);

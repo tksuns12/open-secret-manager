@@ -156,12 +156,21 @@ pub struct Network {
 
 struct InviteState {
     decision: Option<oneshot::Sender<bool>>,
+    token_digest: [u8; 32],
     task: JoinHandle<()>,
 }
 
 struct JoinState {
     connection: PairingConnection,
     control: Arc<Control>,
+}
+
+fn open_address_book(peers_path: &Path) -> Result<AddressBook, CommandError> {
+    #[cfg(test)]
+    let opened = AddressBook::open_allowing_loopback(peers_path);
+    #[cfg(not(test))]
+    let opened = AddressBook::open(peers_path);
+    opened.map_err(|error| store_error("peers.sqlite3", error))
 }
 
 impl Network {
@@ -174,8 +183,7 @@ impl Network {
         let peers_path = directory.join("peers.sqlite3");
         let peers = PeerStore::open(&peers_path, keystore.clone())
             .map_err(|error| store_error("peers.sqlite3", error))?;
-        let addresses =
-            AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error))?;
+        let addresses = open_address_book(&peers_path)?;
         // One-use invitation tokens are recorded durably so a restart
         // cannot make a used token valid again.
         let invitations = InvitationStore::open(
@@ -484,8 +492,7 @@ fn with_stores_closed<T>(
     let peers_path = net.directory.join("peers.sqlite3");
     // The address book first, and whatever else fails, so that it is not
     // left empty by a store that did not open.
-    let addresses =
-        AddressBook::open(&peers_path).map_err(|error| store_error("peers.sqlite3", error));
+    let addresses = open_address_book(&peers_path);
     let opened_peers = PeerStore::open(&peers_path, net.keystore.clone())
         .map_err(|error| store_error("peers.sqlite3", error));
     let mut address_error = None;
@@ -1972,6 +1979,11 @@ pub async fn start_invite<R: Runtime>(
     let mut invite_slot = net.invite.lock().await;
     if let Some(previous) = invite_slot.take() {
         previous.task.abort();
+        let _ = net
+            .invitations
+            .lock()
+            .await
+            .revoke_by_digest(&previous.token_digest, now());
     }
     let (listener, invitation) = {
         // Take every guard before borrowing the vault: a shared `&Vault`
@@ -1985,6 +1997,7 @@ pub async fn start_invite<R: Runtime>(
             .as_ref()
             .filter(|vault| vault.is_unlocked())
             .ok_or_else(locked)?;
+        let _ = invitations.revoke_all_unused(osm_vault_sync::VaultId(vault.vault_id()), now());
         let invitation = match &relay_code {
             Some(relay) => invite_through_relay(
                 vault,
@@ -2005,6 +2018,7 @@ pub async fn start_invite<R: Runtime>(
             ),
         }
         .map_err(network_error)?;
+        listener.expect_token(invitation.token_digest());
         if relay_code.is_some() {
             // A joiner that comes through the relay reaches this
             // invitation, as long as it is open.
@@ -2012,6 +2026,7 @@ pub async fn start_invite<R: Runtime>(
         }
         (listener, invitation)
     };
+    let token_digest = invitation.token_digest();
     let code = invitation.encode().map_err(network_error)?.to_string();
     let info = InviteInfo {
         qr: qr_of(&code)?,
@@ -2023,12 +2038,14 @@ pub async fn start_invite<R: Runtime>(
         app.clone(),
         control,
         listener,
+        token_digest,
         voting,
         relay_code,
         decided,
     ));
     *invite_slot = Some(InviteState {
         decision: Some(decision),
+        token_digest,
         task,
     });
     Ok(info)
@@ -2038,6 +2055,7 @@ async fn wait_for_joiner<R: Runtime>(
     app: AppHandle<R>,
     control: Arc<Control>,
     listener: PairingListener,
+    token_digest: [u8; 32],
     voting: Voting,
     relay_code: Option<RelayCode>,
     decided: oneshot::Receiver<bool>,
@@ -2060,6 +2078,12 @@ async fn wait_for_joiner<R: Runtime>(
             message: "the invitation expired".into(),
         })
     });
+    // Ensure any unapproved/declined/expired token is permanently consumed.
+    let _ = network(&app)
+        .invitations
+        .lock()
+        .await
+        .revoke_by_digest(&token_digest, now());
     let _ = app.emit(
         "pairing-finished",
         PairingFinished {
@@ -2167,6 +2191,12 @@ pub async fn confirm_invite(
 pub async fn cancel_invite(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
     if let Some(invite) = state.network.invite.lock().await.take() {
         invite.task.abort();
+        let _ = state
+            .network
+            .invitations
+            .lock()
+            .await
+            .revoke_by_digest(&invite.token_digest, now());
     }
     Ok(())
 }

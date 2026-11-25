@@ -232,6 +232,12 @@ impl Invitation {
         self.body.expires_at
     }
 
+    /// SHA-256 digest of the invitation's pairing token (non-secret handle for
+    /// binding a [`crate::PairingListener`] and revoking unused invitations).
+    pub fn token_digest(&self) -> [u8; 32] {
+        InvitationToken::from_bytes(self.body.token).digest()
+    }
+
     pub fn inviter_transport_pin(&self) -> [u8; 32] {
         self.body.inviter_transport_pin
     }
@@ -306,6 +312,10 @@ impl JoinCommit {
 
     pub fn joiner_transport_pin(&self) -> [u8; 32] {
         self.joiner_transport_pin
+    }
+
+    pub(crate) fn token_digest(&self) -> [u8; 32] {
+        InvitationToken::from_bytes(self.token).digest()
     }
 
     #[cfg(test)]
@@ -655,11 +665,12 @@ pub fn approve_enrollment(
     if !valid_contacts(&members) {
         return Err(Error::InvalidAddress);
     }
-    let request = control::enrollment_request(
+    let request = control::enrollment_request_for_pairing(
         vault,
         review.commit.joiner_device_id,
         review.joiner_node(),
         voting,
+        &review.transcript,
     )?;
     let mut grant = EnrollmentGrant {
         version: PAIRING_WIRE_VERSION,
@@ -1095,7 +1106,7 @@ fn random_nonce() -> Result<[u8; 32]> {
     Ok(nonce)
 }
 
-fn same_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub(crate) fn same_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 

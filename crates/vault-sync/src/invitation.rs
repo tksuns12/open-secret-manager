@@ -22,7 +22,9 @@ impl InvitationToken {
         &self.0
     }
 
-    pub(crate) fn digest(&self) -> [u8; 32] {
+    /// SHA-256 digest of the token (non-secret identifier for revoking or
+    /// binding a listener without re-exposing the bearer bytes).
+    pub fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(INVITATION_HASH_DOMAIN);
         hasher.update(self.0);
@@ -288,6 +290,29 @@ impl InvitationStore {
             vault_id,
             recipient,
         })
+    }
+
+    /// Marks the unused invitation with `digest` as revoked so a cancelled or
+    /// declined invitation cannot be replayed on a later listener.
+    pub fn revoke_by_digest(&mut self, digest: &[u8; 32], now: u64) -> Result<bool> {
+        let now = sql_time(now)?;
+        let changed = self.connection.execute(
+            "UPDATE invitations SET used_at = ?1
+             WHERE token_hash = ?2 AND used_at IS NULL",
+            params![now, digest.as_slice()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Marks every currently unused invitation for `vault_id` as revoked.
+    pub fn revoke_all_unused(&mut self, vault_id: VaultId, now: u64) -> Result<usize> {
+        let now = sql_time(now)?;
+        let changed = self.connection.execute(
+            "UPDATE invitations SET used_at = ?1
+             WHERE vault_id = ?2 AND used_at IS NULL",
+            params![now, vault_id.0.as_slice()],
+        )?;
+        Ok(changed)
     }
 }
 

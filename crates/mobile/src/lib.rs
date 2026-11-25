@@ -1349,6 +1349,12 @@ impl Device {
             inner: Arc::new(inner),
         })
     }
+    /// Enables loopback peer addresses on this device's address book for
+    /// local integration tests.
+    #[doc(hidden)]
+    pub fn allow_loopback_for_tests(&self) {
+        self.inner.allow_loopback();
+    }
 }
 
 impl Drop for Device {

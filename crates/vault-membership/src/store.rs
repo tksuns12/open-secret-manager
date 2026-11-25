@@ -267,12 +267,17 @@ fn log_index(index: u64) -> Result<i64> {
     i64::try_from(index).map_err(|_| write_error(std::io::Error::other("log index out of range")))
 }
 
-/// Reconstructs `legacy_enrolled` in memory when opening a database written
-/// before `ControlState::enrolled_nodes` existed. Replays the persisted
-/// signed log from index 1 when intact, falling back to the persisted
-/// committed membership only if earlier entries were already purged.
+/// Reconstructs `legacy_enrolled` and `legacy_cancelled` in memory when opening
+/// a database written before those persisted fields existed. Replays the
+/// persisted signed log from index 1 when intact, falling back to the persisted
+/// committed membership for `legacy_enrolled` only if earlier entries were purged.
 fn populate_legacy_enrolled(connection: &Connection, state: &mut ControlState) -> Result<()> {
-    if state.epoch == 0 || !state.enrolled_nodes.is_empty() {
+    if state.epoch == 0 {
+        return Ok(());
+    }
+    let need_enrolled = state.enrolled_nodes.is_empty();
+    let need_cancelled = state.cancelled_enrollments.is_empty();
+    if !need_enrolled && !need_cancelled {
         return Ok(());
     }
     let purged: Option<String> = connection
@@ -306,19 +311,29 @@ fn populate_legacy_enrolled(connection: &Connection, state: &mut ControlState) -
             }
             replayed.apply(entry.log_id, &entry.payload);
         }
-        if replayed.epoch == state.epoch && !replayed.enrolled_nodes.is_empty() {
-            state.legacy_enrolled = replayed.enrolled_nodes;
-            return Ok(());
+        if replayed.epoch == state.epoch {
+            if need_cancelled && !replayed.cancelled_enrollments.is_empty() {
+                state.legacy_cancelled = replayed.cancelled_enrollments;
+            }
+            if need_enrolled && !replayed.enrolled_nodes.is_empty() {
+                state.legacy_enrolled = replayed.enrolled_nodes;
+                return Ok(());
+            }
+            if !need_enrolled {
+                return Ok(());
+            }
         }
     }
-    let voters = state.voters();
-    for (device, node) in state.membership.membership().nodes() {
-        let in_membership = voters.contains(device) || state.without_vote.contains(device);
-        if in_membership
-            && !state.removed.contains_key(device)
-            && state.authors.get(device) == Some(&node.public_key)
-        {
-            state.legacy_enrolled.insert(*device, node.clone());
+    if need_enrolled {
+        let voters = state.voters();
+        for (device, node) in state.membership.membership().nodes() {
+            let in_membership = voters.contains(device) || state.without_vote.contains(device);
+            if in_membership
+                && !state.removed.contains_key(device)
+                && state.authors.get(device) == Some(&node.public_key)
+            {
+                state.legacy_enrolled.insert(*device, node.clone());
+            }
         }
     }
     Ok(())
@@ -801,6 +816,15 @@ impl RaftStateMachine<ControlConfig> for StateMachineStore {
             for (device, key) in &current.authors {
                 if installed.authors.get(device) != Some(key) {
                     return Err(invalid("snapshot changes an existing author"));
+                }
+            }
+            for cancelled in current
+                .cancelled_enrollments
+                .iter()
+                .chain(current.legacy_cancelled.iter())
+            {
+                if !installed.cancelled_enrollments.contains(cancelled) {
+                    return Err(invalid("snapshot drops a cancelled enrollment"));
                 }
             }
         }

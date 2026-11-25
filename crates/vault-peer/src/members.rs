@@ -117,6 +117,24 @@ fn valid_address(address: &str) -> bool {
     !address.is_empty() && address.len() <= MAX_ADDRESS_LEN
 }
 
+/// Strict peer address check for [`AddressBook`]: only literal IP:port socket
+/// addresses on reachable non-zero ports are accepted (no DNS hostnames, no
+/// link-local/metadata/multicast/unspecified/broadcast/IPv4-mapped IPv6).
+/// Loopback is rejected by default and opted into only for local tests.
+fn valid_peer_address(address: &str, allow_loopback: bool) -> bool {
+    if !valid_address(address) {
+        return false;
+    }
+    let Ok(socket) = address.parse::<SocketAddr>() else {
+        return false;
+    };
+    if socket.port() == 0 {
+        return false;
+    }
+    let ip = socket.ip();
+    crate::local::reachable(ip) || (allow_loopback && ip.is_loopback())
+}
+
 pub(crate) fn valid_contacts(contacts: &[MemberContact]) -> bool {
     contacts.len() <= MAX_CONTACTS
         && contacts
@@ -186,6 +204,9 @@ struct Book {
     known: BTreeMap<DeviceId, Vec<KnownAddress>>,
     /// Where addresses are kept across restarts, if anywhere.
     store: Option<Connection>,
+    /// Whether loopback peer addresses (`127.0.0.1`, `[::1]`) are accepted.
+    /// Off in production; opted into by local multi-process tests.
+    allow_loopback: bool,
 }
 
 impl Book {
@@ -337,6 +358,49 @@ impl AddressBook {
     /// second layout, which kept one address for each device, has it moved
     /// over.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_loopback(path, false)
+    }
+
+    /// As [`AddressBook::open`], additionally accepting loopback addresses
+    /// (`127.0.0.1`, `[::1]`) for local integration tests and `osm-peer`.
+    #[doc(hidden)]
+    pub fn open_allowing_loopback(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_loopback(path, true)
+    }
+
+    /// In-memory address book accepting loopback addresses, for local tests.
+    #[doc(hidden)]
+    pub fn with_loopback() -> Self {
+        Self {
+            book: Arc::new(Mutex::new(Book {
+                allow_loopback: true,
+                ..Book::default()
+            })),
+        }
+    }
+
+    /// Enables loopback peer addresses on this address book, for local tests.
+    /// If backed by a SQLite store, reloads persisted loopback entries too.
+    #[doc(hidden)]
+    pub fn allow_loopback(&self) {
+        if let Ok(mut book) = self.book.lock() {
+            book.allow_loopback = true;
+            if let Some(store) = &book.store {
+                if let Ok(reloaded) = load_addresses(store, true) {
+                    book.known = reloaded;
+                }
+            }
+        }
+    }
+
+    fn allows_loopback(&self) -> bool {
+        self.book
+            .lock()
+            .map(|book| book.allow_loopback)
+            .unwrap_or(false)
+    }
+
+    fn open_with_loopback(path: impl AsRef<Path>, allow_loopback: bool) -> Result<Self> {
         let mut store = Connection::open(path)?;
         store.busy_timeout(Duration::from_secs(5))?;
         let found = osm_vault_sync::check_store_version(&store, crate::peers::STORE_VERSION)?;
@@ -368,33 +432,12 @@ impl AddressBook {
             osm_vault_sync::set_store_version(&transaction, crate::peers::STORE_VERSION)?;
         }
         transaction.commit()?;
-        let mut known: BTreeMap<DeviceId, Vec<KnownAddress>> = BTreeMap::new();
-        {
-            let mut statement = store.prepare(
-                "SELECT device_id, address FROM device_addresses ORDER BY device_id, position",
-            )?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for (device, address) in rows {
-                let Ok(device) = <[u8; 16]>::try_from(device) else {
-                    continue;
-                };
-                known
-                    .entry(device_id_from_bytes(device))
-                    .or_default()
-                    .push(KnownAddress {
-                        address,
-                        failed: false,
-                    });
-            }
-        }
+        let known = load_addresses(&store, allow_loopback)?;
         Ok(Self {
             book: Arc::new(Mutex::new(Book {
                 known,
                 store: Some(store),
+                allow_loopback,
             })),
         })
     }
@@ -425,10 +468,10 @@ impl AddressBook {
     /// authenticated connection came from, or where one was made. It is
     /// tried first.
     pub fn observe(&self, device: DeviceId, address: &str) {
-        if !valid_address(address) {
-            return;
-        }
         if let Ok(mut book) = self.book.lock() {
+            if !valid_peer_address(address, book.allow_loopback) {
+                return;
+            }
             book.reached(device, address);
         }
     }
@@ -436,34 +479,34 @@ impl AddressBook {
     /// Records an address another member reported, or an invitation named.
     /// It is tried after those this device reached, and pushes none out.
     pub fn suggest(&self, device: DeviceId, address: &str) {
-        if !valid_address(address) {
-            return;
-        }
         if let Ok(mut book) = self.book.lock() {
+            if !valid_peer_address(address, book.allow_loopback) {
+                return;
+            }
             book.add(device, address);
         }
     }
 
     /// Records the addresses `device` named for itself, best first, over a
     /// connection authenticated as that device: they are tried right after
-    /// where it was last reached, and push older ones out. Only an IP
-    /// address with a port is taken, at most [`MAX_OWN_ADDRESSES`], so that
-    /// a member cannot have names looked up.
+    /// where it was last reached, and push older ones out. Only a reachable
+    /// literal IP address with a non-zero port is taken, at most
+    /// [`MAX_OWN_ADDRESSES`], so that a member cannot trigger DNS lookups or
+    /// SSRF probes against local/link-local services.
     pub(crate) fn claim(&self, device: DeviceId, addresses: &[String]) {
-        let mut named: Vec<&str> = Vec::new();
-        for address in addresses {
-            if valid_address(address)
-                && address.parse::<SocketAddr>().is_ok()
-                && !named.contains(&address.as_str())
-            {
-                named.push(address);
-            }
-        }
-        named.truncate(MAX_OWN_ADDRESSES);
-        if named.is_empty() {
-            return;
-        }
         if let Ok(mut book) = self.book.lock() {
+            let allow_loopback = book.allow_loopback;
+            let mut named: Vec<&str> = Vec::new();
+            for address in addresses {
+                if valid_peer_address(address, allow_loopback) && !named.contains(&address.as_str())
+                {
+                    named.push(address);
+                }
+            }
+            named.truncate(MAX_OWN_ADDRESSES);
+            if named.is_empty() {
+                return;
+            }
             book.claimed(device, &named);
         }
     }
@@ -481,6 +524,38 @@ impl AddressBook {
             book.forget(device);
         }
     }
+}
+
+/// Loads persisted peer addresses from `store`, dropping any entry that is not
+/// a valid reachable socket address under `allow_loopback`.
+fn load_addresses(
+    store: &Connection,
+    allow_loopback: bool,
+) -> Result<BTreeMap<DeviceId, Vec<KnownAddress>>> {
+    let mut known: BTreeMap<DeviceId, Vec<KnownAddress>> = BTreeMap::new();
+    let mut statement = store
+        .prepare("SELECT device_id, address FROM device_addresses ORDER BY device_id, position")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (device, address) in rows {
+        let Ok(device) = <[u8; 16]>::try_from(device) else {
+            continue;
+        };
+        if !valid_peer_address(&address, allow_loopback) {
+            continue;
+        }
+        known
+            .entry(device_id_from_bytes(device))
+            .or_default()
+            .push(KnownAddress {
+                address,
+                failed: false,
+            });
+    }
+    Ok(known)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,7 +816,8 @@ impl MemberEndpoint {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let mut own = set.unwrap_or_else(|| crate::local_addresses(port));
-        own.retain(|address| valid_address(address));
+        let allow_loopback = self.inner.addresses.allows_loopback();
+        own.retain(|address| valid_peer_address(address, allow_loopback));
         own.truncate(MAX_OWN_ADDRESSES);
         own
     }
@@ -860,12 +936,15 @@ impl MemberEndpoint {
             return Err(Error::ProtocolViolation);
         }
         let directory = self.directory()?;
-        directory.introduce(contacts.iter().map(|contact| {
-            (
-                device_id_from_bytes(contact.device_id),
-                contact.transport_pin,
-            )
-        }));
+        directory.introduce_from(
+            sender.map(|(device, _)| device),
+            contacts.iter().map(|contact| {
+                (
+                    device_id_from_bytes(contact.device_id),
+                    contact.transport_pin,
+                )
+            }),
+        );
         let own = self.pin();
         let mut claimed = Vec::new();
         for contact in contacts {

@@ -146,6 +146,31 @@ pub fn enrollment_request(
     )
 }
 
+/// Proposes enrolling a device from a specific pairing transcript so an
+/// in-place re-pairing after a cancelled enrollment gets a fresh `request_id`
+/// instead of colliding with the cancelled proposal.
+pub fn enrollment_request_for_pairing(
+    vault: &Vault,
+    device: [u8; 16],
+    node: DeviceNode,
+    voting: Voting,
+    transcript: &[u8; 32],
+) -> Result<SignedRequest> {
+    let vault_id = vault.vault_id();
+    let mut subject = [0u8; 48];
+    subject[..16].copy_from_slice(&device);
+    subject[16..].copy_from_slice(transcript);
+    sign(
+        vault,
+        request_id(&vault_id, b"enroll", &subject),
+        ControlRequest::ProposeChange(MembershipChange::Enroll {
+            device: device_id_from_bytes(device),
+            node,
+            votes: voting == Voting::Votes,
+        }),
+    )
+}
+
 /// Proposes removing `device`, with a new epoch key sealed to every other
 /// enrolled member in `state`. The key is not kept here: this device, like every
 /// remaining one, recovers it from its own envelope once the removal

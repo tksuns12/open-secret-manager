@@ -72,7 +72,7 @@ struct Host {
 impl Host {
     async fn start(dir: &TempDir, id: DeviceId, vault_id: [u8; 32]) -> Self {
         let mut peers = PeerStore::open_in_memory().unwrap();
-        let addresses = AddressBook::default();
+        let addresses = AddressBook::with_loopback();
         let database = dir.path().join(format!("{id}.raft"));
         let (endpoint, node) = Self::node(&mut peers, &addresses, &database, id, vault_id).await;
         let mut host = Self {
@@ -900,7 +900,7 @@ async fn a_device_known_by_its_home_address_alone_is_reached_away_at_one_it_name
     // B forgets every address it has for A but the home one.
     let (home, network) = forward_to(a_port).await;
     b.host.stop().await;
-    b.host.addresses = AddressBook::default();
+    b.host.addresses = AddressBook::with_loopback();
     b.host.restart(b.vault.vault_id()).await;
     b.host.listen().await;
     b.host.addresses.observe(a_id, &home);
@@ -1871,4 +1871,40 @@ async fn a_single_peer_claiming_removed_cannot_wipe_a_member_without_quorum() {
     // B is still healthy and reachable.
     let _ = b.endpoint.announce(a.id, a.pin()).await;
     let _ = rogue.await;
+}
+
+#[test]
+fn address_book_rejects_hostnames_link_local_and_loopback_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("peers.db");
+    let book = AddressBook::open(&path).unwrap();
+    for rejected in [
+        "attacker.example:47820",
+        "169.254.169.254:80",
+        "127.0.0.1:47820",
+        "[::1]:47820",
+        "0.0.0.0:47820",
+        "255.255.255.255:47820",
+        "[fe80::1]:47820",
+        "[::ffff:192.168.1.2]:47820",
+        "192.0.2.10:0",
+    ] {
+        book.observe(1, rejected);
+        book.suggest(1, rejected);
+        book.claim(1, &[rejected.to_owned()]);
+    }
+    assert!(book.all(1).is_empty());
+
+    // Reachable literal IP:port addresses are still accepted.
+    book.observe(1, "192.0.2.10:47820");
+    book.suggest(1, "[2001:db8::10]:47820");
+    assert_eq!(book.all(1), ["192.0.2.10:47820", "[2001:db8::10]:47820"]);
+
+    // Loopback opt-in accepts 127.0.0.1 / [::1] while still refusing metadata & hostnames.
+    let local = AddressBook::with_loopback();
+    local.observe(2, "127.0.0.1:47820");
+    local.suggest(2, "[::1]:47820");
+    local.suggest(2, "169.254.169.254:80");
+    local.suggest(2, "metadata.internal:80");
+    assert_eq!(local.all(2), ["127.0.0.1:47820", "[::1]:47820"]);
 }

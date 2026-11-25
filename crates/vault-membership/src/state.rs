@@ -107,6 +107,15 @@ pub struct ControlState {
     /// Omitted from serialization so frozen fixtures round-trip identically.
     #[serde(skip)]
     pub(crate) legacy_enrolled: BTreeMap<DeviceId, DeviceNode>,
+    /// Enrollment request IDs that were explicitly cancelled, persisted
+    /// permanently so FIFO eviction from `applied_requests` can never allow
+    /// replaying an old cancelled `Enroll` proposal.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub cancelled_enrollments: BTreeSet<[u8; 16]>,
+    /// In-memory fallback populated by `store::open` when opening a pre-existing
+    /// database whose persisted `ControlState` predated `cancelled_enrollments`.
+    #[serde(skip)]
+    pub(crate) legacy_cancelled: BTreeSet<[u8; 16]>,
 }
 
 impl ControlState {
@@ -145,10 +154,19 @@ impl ControlState {
         }
     }
 
-    fn promote_legacy_enrolled(&mut self) {
+    fn promote_legacy(&mut self) {
         if self.enrolled_nodes.is_empty() && !self.legacy_enrolled.is_empty() {
             self.enrolled_nodes = std::mem::take(&mut self.legacy_enrolled);
         }
+        if !self.legacy_cancelled.is_empty() {
+            self.cancelled_enrollments
+                .extend(std::mem::take(&mut self.legacy_cancelled));
+        }
+    }
+
+    pub(crate) fn is_cancelled_enrollment(&self, request_id: &[u8; 16]) -> bool {
+        self.cancelled_enrollments.contains(request_id)
+            || self.legacy_cancelled.contains(request_id)
     }
 
     /// Whether `device` is a member whose enrollment the vault's devices
@@ -247,17 +265,24 @@ impl ControlState {
                 Outcome::Recorded
             }
             EntryPayload::Normal(ControlEntry::Request(request)) => {
-                self.promote_legacy_enrolled();
+                self.promote_legacy();
                 self.apply_request(request)
             }
             EntryPayload::Normal(ControlEntry::Complete { request_id }) => {
-                self.promote_legacy_enrolled();
+                self.promote_legacy();
                 self.complete(request_id)
             }
         }
     }
 
     fn apply_request(&mut self, signed: &SignedRequest) -> Outcome {
+        if matches!(
+            signed.request,
+            ControlRequest::ProposeChange(MembershipChange::Enroll { .. })
+        ) && self.is_cancelled_enrollment(&signed.request_id)
+        {
+            return Outcome::Rejected(Rejection::InvalidChange("enrollment was cancelled".into()));
+        }
         if let Some(earlier) = self.outcome_of(&signed.request_id) {
             return Outcome::AlreadyApplied(Box::new(earlier.clone()));
         }
@@ -525,9 +550,11 @@ impl ControlState {
         }
         // The device never received keys: grants wait until its enrollment
         // completes. The leader now steers back to the membership without
-        // it.
+        // it, and the request ID is permanently remembered as cancelled so
+        // FIFO eviction from `applied_requests` cannot re-enable replay.
         pending.target_voters.remove(device);
         pending.cancelled = true;
+        self.cancelled_enrollments.insert(*request_id);
         Ok(())
     }
 

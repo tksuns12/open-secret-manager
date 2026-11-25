@@ -1700,6 +1700,226 @@ fn directory_removal_requires_quorum_of_committed_enrolled_voters() {
     assert!(dir_three.removal_confirmed(&BTreeSet::from([1, 2])));
 }
 
+#[test]
+fn cancelled_enrollment_request_cannot_be_replayed_after_request_window_eviction() {
+    use openraft::{CommittedLeaderId, EntryPayload, LogId, Membership};
+
+    let key = SigningKey::from_bytes(&[1u8; 32]);
+    let node1 = DeviceNode {
+        public_key: key.verifying_key().to_bytes(),
+        transport_pin: [1; 32],
+        recipient_key: Cluster::hpke(1).public().as_bytes(),
+    };
+    let node2 = DeviceNode {
+        public_key: SigningKey::from_bytes(&[2u8; 32])
+            .verifying_key()
+            .to_bytes(),
+        transport_pin: [2; 32],
+        recipient_key: Cluster::hpke(2).public().as_bytes(),
+    };
+    let mut state = crate::ControlState::new(VAULT);
+    let mut index = 0u64;
+    let mut apply = |state: &mut crate::ControlState,
+                     payload: EntryPayload<crate::ControlConfig>| {
+        index += 1;
+        state.apply(LogId::new(CommittedLeaderId::new(1, 1), index), &payload)
+    };
+    let sign = |req_id: [u8; 16], req: ControlRequest| {
+        SignedRequest::sign(
+            &VAULT,
+            req_id,
+            1,
+            req,
+            &KeySigner {
+                device: 1,
+                key: key.clone(),
+            },
+        )
+    };
+
+    apply(
+        &mut state,
+        EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1])],
+            BTreeMap::from([(1, node1.clone())]),
+        )),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Request(sign(
+                [0; 16],
+                ControlRequest::Genesis {
+                    epoch: 1,
+                    checks: vec![check(1)],
+                    authors: Vec::new(),
+                },
+            ))),
+        ),
+        Outcome::Accepted
+    );
+
+    // Propose enrollment of device 2, then cancel it.
+    let cancelled_id = [0xAA; 16];
+    let enroll = sign(
+        cancelled_id,
+        ControlRequest::ProposeChange(MembershipChange::Enroll {
+            device: 2,
+            node: node2.clone(),
+            votes: true,
+        }),
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Request(enroll.clone())),
+        ),
+        Outcome::Accepted
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Request(sign(
+                [0xAB; 16],
+                ControlRequest::CancelEnrollment {
+                    request_id: cancelled_id,
+                },
+            ))),
+        ),
+        Outcome::Accepted
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Complete {
+                request_id: cancelled_id,
+            }),
+        ),
+        Outcome::Accepted
+    );
+    assert!(state.is_cancelled_enrollment(&cancelled_id));
+
+    // Fill well past the 4,096 FIFO request dedup window with accepted
+    // enroll+cancel+complete cycles so `cancelled_id` is evicted from `applied_requests`.
+    for i in 1u32..=2100 {
+        let mut enroll_id = [0u8; 16];
+        enroll_id[..4].copy_from_slice(&i.to_be_bytes());
+        enroll_id[15] = 1;
+        let mut cancel_id = [0u8; 16];
+        cancel_id[..4].copy_from_slice(&i.to_be_bytes());
+        cancel_id[15] = 2;
+        assert_eq!(
+            apply(
+                &mut state,
+                EntryPayload::Normal(crate::ControlEntry::Request(sign(
+                    enroll_id,
+                    ControlRequest::ProposeChange(MembershipChange::Enroll {
+                        device: 3 + u128::from(i),
+                        node: node2.clone(),
+                        votes: false,
+                    }),
+                ))),
+            ),
+            Outcome::Accepted
+        );
+        assert_eq!(
+            apply(
+                &mut state,
+                EntryPayload::Normal(crate::ControlEntry::Request(sign(
+                    cancel_id,
+                    ControlRequest::CancelEnrollment {
+                        request_id: enroll_id,
+                    },
+                ))),
+            ),
+            Outcome::Accepted
+        );
+        assert_eq!(
+            apply(
+                &mut state,
+                EntryPayload::Normal(crate::ControlEntry::Complete {
+                    request_id: enroll_id,
+                }),
+            ),
+            Outcome::Accepted
+        );
+    }
+    assert!(state.outcome_of(&cancelled_id).is_none());
+
+    // Replaying the exact signed Enroll request MUST still be permanently rejected.
+    assert!(matches!(
+        apply(
+            &mut state,
+            EntryPayload::Normal(crate::ControlEntry::Request(enroll)),
+        ),
+        Outcome::Rejected(crate::Rejection::InvalidChange(_))
+    ));
+    assert!(state.pending.is_none());
+}
+
+#[test]
+fn directory_introduced_is_pruned_and_capped_per_source() {
+    use openraft::{CommittedLeaderId, EntryPayload, LogId, Membership};
+
+    let key = |id: u8| SigningKey::from_bytes(&[id; 32]);
+    let node = |id: u8| DeviceNode {
+        public_key: key(id).verifying_key().to_bytes(),
+        transport_pin: [id; 32],
+        recipient_key: Cluster::hpke(u128::from(id)).public().as_bytes(),
+    };
+    let mut state = crate::ControlState::new(VAULT);
+    state.apply(
+        LogId::new(CommittedLeaderId::new(1, 1), 1),
+        &EntryPayload::Membership(Membership::new(
+            vec![BTreeSet::from([1, 2])],
+            BTreeMap::from([(1, node(1)), (2, node(2))]),
+        )),
+    );
+    state.apply(
+        LogId::new(CommittedLeaderId::new(1, 1), 2),
+        &EntryPayload::Normal(crate::ControlEntry::Request(SignedRequest::sign(
+            &VAULT,
+            [1; 16],
+            1,
+            ControlRequest::Genesis {
+                epoch: 1,
+                checks: vec![check(1)],
+                authors: Vec::new(),
+            },
+            &KeySigner {
+                device: 1,
+                key: key(1),
+            },
+        ))),
+    );
+    let (_tx, rx) = tokio::sync::watch::channel(openraft::RaftMetrics::new_initial(1));
+    let dir = crate::Directory::new(1, Arc::new(std::sync::Mutex::new(state)), rx);
+
+    // Enrollment grant introduces device 10; honest peer 2 introduces device 11.
+    let pin10 = [10u8; 32];
+    let pin11 = [11u8; 32];
+    dir.introduce([(10, pin10)]);
+    dir.introduce_from(Some(2), [(11, pin11)]);
+    assert_eq!(dir.device_for_pin(&pin10), Some(10));
+    assert_eq!(dir.device_for_pin(&pin11), Some(11));
+
+    // A rogue peer 3 floods 400 bogus devices; its quota caps at 64 and it
+    // cannot evict either the enrollment grant (10) or honest peer 2's entry (11).
+    for i in 100u128..500u128 {
+        let mut p = [0u8; 32];
+        p[..16].copy_from_slice(&i.to_be_bytes());
+        dir.introduce_from(Some(3), [(i, p)]);
+    }
+    assert_eq!(dir.device_for_pin(&pin10), Some(10));
+    assert_eq!(dir.device_for_pin(&pin11), Some(11));
+    // Rogue peer 3 also cannot overwrite device 11's pin.
+    dir.introduce_from(Some(3), [(11, [0xFE; 32])]);
+    assert_eq!(dir.device_for_pin(&pin11), Some(11));
+    assert_eq!(dir.device_for_pin(&[0xFE; 32]), None);
+    // Total pins = 2 committed + 1 grant + 1 honest + 64 rogue = 68.
+    assert_eq!(dir.pins().len(), 68);
+}
+
 mod fixtures;
 mod properties;
 mod without_vote;

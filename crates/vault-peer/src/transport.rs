@@ -176,6 +176,9 @@ pub struct PairingListener {
     /// Number of wire v2 challenges issued on this listener (caps online SAS
     /// grinding if an invitation code leaks).
     challenges: Arc<AtomicUsize>,
+    /// Optional token digest this listener is bound to: when set via
+    /// [`Self::expect_token`], commits presenting any other token are refused.
+    expected_token: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
 }
 
 impl Drop for PairingListener {
@@ -217,7 +220,18 @@ impl PairingListener {
             in_flight: Mutex::new(JoinSet::new()),
             per_ip: KeyLimiter::default(),
             challenges: Arc::new(AtomicUsize::new(0)),
+            expected_token: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Binds this listener to the invitation whose token has SHA-256 `digest`
+    /// ([`Invitation::token_digest`]). Any commit presenting a different token
+    /// is refused before a challenge is issued.
+    pub fn expect_token(&self, digest: [u8; 32]) {
+        *self
+            .expected_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(digest);
     }
 
     /// Also takes the joiners that reach `endpoint`'s device through its
@@ -255,16 +269,18 @@ impl PairingListener {
                     };
                     let acceptor = self.acceptor.clone();
                     let challenges = self.challenges.clone();
+                    let expected_token = self.expected_token.clone();
                     in_flight.spawn(async move {
                         let _guard = ip_guard;
-                        receive_commit(acceptor, tcp, challenges).await
+                        receive_commit(acceptor, tcp, challenges, expected_token).await
                     });
                 }
                 Some(tcp) = relayed.recv(), if room => {
                     let acceptor = self.acceptor.clone();
                     let challenges = self.challenges.clone();
+                    let expected_token = self.expected_token.clone();
                     in_flight.spawn(async move {
-                        receive_commit(acceptor, tcp, challenges).await
+                        receive_commit(acceptor, tcp, challenges, expected_token).await
                     });
                 }
                 Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
@@ -281,6 +297,7 @@ async fn receive_commit(
     acceptor: TlsAcceptor,
     tcp: TcpStream,
     challenges: Arc<AtomicUsize>,
+    expected_token: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
 ) -> Result<IncomingJoin> {
     // One combined deadline covers both TLS and Flight 1 so a slow peer
     // cannot chain two separate timeouts.
@@ -312,6 +329,7 @@ async fn receive_commit(
         stream,
         commit,
         challenges,
+        expected_token,
     })
 }
 
@@ -321,6 +339,7 @@ pub struct IncomingJoin {
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     commit: JoinCommit,
     challenges: Arc<AtomicUsize>,
+    expected_token: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
 }
 
 impl IncomingJoin {
@@ -337,6 +356,15 @@ impl IncomingJoin {
         relay: Option<&RelayCode>,
         now: u64,
     ) -> Result<ChallengedJoin> {
+        let expected = *self
+            .expected_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(expected) = expected {
+            if !crate::pairing::same_bytes(&self.commit.token_digest(), &expected) {
+                return Err(Error::InvalidInvitation);
+            }
+        }
         let (verified, challenge) =
             review_commit(vault, invitations, peers, self.commit, voting, relay, now)?;
         let mut allowed = false;
@@ -1023,13 +1051,16 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(ring::default_provider())
 }
 
-fn certificate(
-    identity: &TransportIdentity,
-) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    (
+fn cert_resolver(identity: &TransportIdentity) -> Result<Arc<rustls::sign::SingleCertAndKey>> {
+    let key = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::Pkcs8(
+        PrivatePkcs8KeyDer::from(identity.private_key.as_slice()),
+    ))
+    .map_err(|_| Error::Transport("invalid transport certificate"))?;
+    let certified = Arc::new(rustls::sign::CertifiedKey::new(
         vec![CertificateDer::from(identity.certificate.clone())],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.to_vec())),
-    )
+        key,
+    ));
+    Ok(Arc::new(rustls::sign::SingleCertAndKey::from(certified)))
 }
 
 /// Decides at each handshake whether a client certificate is accepted.
@@ -1052,7 +1083,7 @@ pub(crate) fn server_config(
     clients: ClientPolicy,
 ) -> Result<Arc<ServerConfig>> {
     let provider = provider();
-    let (chain, key) = certificate(identity);
+    let resolver = cert_resolver(identity)?;
     let mut config = ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| Error::Transport("TLS 1.3 is unavailable"))?
@@ -1060,8 +1091,7 @@ pub(crate) fn server_config(
             policy: clients,
             provider,
         }))
-        .with_single_cert(chain, key)
-        .map_err(|_| Error::Transport("invalid transport certificate"))?;
+        .with_cert_resolver(resolver);
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
     Ok(Arc::new(config))
@@ -1072,7 +1102,7 @@ pub(crate) fn client_config(
     server_pin: [u8; 32],
 ) -> Result<Arc<ClientConfig>> {
     let provider = provider();
-    let (chain, key) = certificate(identity);
+    let resolver = cert_resolver(identity)?;
     let mut config = ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| Error::Transport("TLS 1.3 is unavailable"))?
@@ -1081,8 +1111,7 @@ pub(crate) fn client_config(
             pin: server_pin,
             provider,
         }))
-        .with_client_auth_cert(chain, key)
-        .map_err(|_| Error::Transport("invalid transport certificate"))?;
+        .with_client_cert_resolver(resolver);
     config.resumption = Resumption::disabled();
     Ok(Arc::new(config))
 }

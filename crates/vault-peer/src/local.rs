@@ -73,13 +73,14 @@ fn route_source(destination: SocketAddr) -> Option<IpAddr> {
 /// aside for protocols (RFC 6890). A phone on a mobile network with IPv6
 /// alone has 192.0.0.2 or 192.0.0.4 for its IPv4 through 464XLAT (RFC 7335),
 /// as the owner's did, which only that phone answers.
-fn reachable(ip: IpAddr) -> bool {
+pub(crate) fn reachable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_link_local()
                 || ip.is_multicast()
+                || ip.is_broadcast()
                 || ip.octets()[..3] == [192, 0, 0])
         }
         IpAddr::V6(ip) => {

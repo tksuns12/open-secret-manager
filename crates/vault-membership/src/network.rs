@@ -374,6 +374,16 @@ impl<D: Dialer> Forward for D {
     }
 }
 
+/// Per-source cap on peer-introduced entries so a single compromised member
+/// cannot evict entries introduced by honest peers or an enrollment grant.
+const MAX_INTRODUCED_PER_SOURCE: usize = 64;
+
+#[derive(Default)]
+struct Introduced {
+    entries: BTreeMap<DeviceId, ([u8; 32], Option<DeviceId>)>,
+    order: std::collections::VecDeque<DeviceId>,
+}
+
 /// Which devices this node accepts control connections from, by TLS
 /// certificate pin.
 ///
@@ -388,7 +398,7 @@ pub struct Directory {
     self_device: DeviceId,
     state: Arc<Mutex<ControlState>>,
     metrics: watch::Receiver<RaftMetrics<DeviceId, DeviceNode>>,
-    introduced: Arc<Mutex<BTreeMap<DeviceId, [u8; 32]>>>,
+    introduced: Arc<Mutex<Introduced>>,
 }
 
 impl Directory {
@@ -500,10 +510,16 @@ impl Directory {
     /// Every device this node accepts, with its pin.
     pub fn pins(&self) -> BTreeMap<DeviceId, [u8; 32]> {
         let effective = self.metrics.borrow().membership_config.clone();
-        let introduced = self
+        let introduced: Vec<(DeviceId, [u8; 32])> = self
             .introduced
             .lock()
-            .map(|introduced| introduced.clone())
+            .map(|introduced| {
+                introduced
+                    .entries
+                    .iter()
+                    .map(|(&device, &(pin, _))| (device, pin))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut pins = BTreeMap::new();
         let read = self.with_state(|state| {
@@ -573,14 +589,123 @@ impl Directory {
     /// records wins: an introduction neither replaces a recorded device's
     /// pin nor claims a recorded pin for another device.
     pub fn introduce(&self, devices: impl IntoIterator<Item = (DeviceId, [u8; 32])>) {
+        self.introduce_from(None, devices);
+    }
+
+    /// As [`Directory::introduce`], attributed to `source` (`None` for a
+    /// signed enrollment grant, `Some(member)` for a peer's opening roster).
+    ///
+    /// Stale introductions for devices already recorded or removed in
+    /// committed state are pruned first, and each peer `source` is capped at
+    /// [`MAX_INTRODUCED_PER_SOURCE`] entries with FIFO eviction within its
+    /// own quota so one compromised member cannot evict honest introductions.
+    pub fn introduce_from(
+        &self,
+        source: Option<DeviceId>,
+        devices: impl IntoIterator<Item = (DeviceId, [u8; 32])>,
+    ) {
+        let (known_devices, removed_devices, recorded_pins) = self
+            .with_state(|state| {
+                let mut known = BTreeSet::new();
+                let mut pins = BTreeSet::new();
+                if state.epoch == 0 {
+                    for (device, node) in state.membership.membership().nodes() {
+                        known.insert(*device);
+                        pins.insert(node.transport_pin);
+                    }
+                } else {
+                    for (device, node) in state.enrolled_node_map() {
+                        known.insert(*device);
+                        pins.insert(node.transport_pin);
+                    }
+                }
+                if let Some(pending) = state.pending.as_ref().filter(|pending| !pending.cancelled) {
+                    if let crate::MembershipChange::Enroll { device, node, .. } = &pending.change {
+                        known.insert(*device);
+                        pins.insert(node.transport_pin);
+                    }
+                }
+                let removed: BTreeSet<DeviceId> = state.removed.keys().copied().collect();
+                pins.extend(state.removed_pins.values().copied());
+                (known, removed, pins)
+            })
+            .unwrap_or_default();
+
         let Ok(mut introduced) = self.introduced.lock() else {
             return;
         };
-        for (device, pin) in devices {
-            if introduced.len() >= MAX_INTRODUCED && !introduced.contains_key(&device) {
-                break;
+
+        let Introduced { entries, order } = &mut *introduced;
+        // Prune entries already recorded or removed in committed state.
+        let mut pruned = false;
+        entries.retain(|device, (pin, _)| {
+            let keep = !known_devices.contains(device)
+                && !removed_devices.contains(device)
+                && !recorded_pins.contains(pin);
+            if !keep {
+                pruned = true;
             }
-            introduced.insert(device, pin);
+            keep
+        });
+        if pruned {
+            order.retain(|device| entries.contains_key(device));
+        }
+
+        for (device, pin) in devices {
+            if known_devices.contains(&device)
+                || removed_devices.contains(&device)
+                || recorded_pins.contains(&pin)
+            {
+                continue;
+            }
+            if let Some((existing_pin, existing_source)) = entries.get_mut(&device) {
+                if source.is_none() || *existing_source == source {
+                    *existing_pin = pin;
+                    *existing_source = source;
+                }
+                continue;
+            }
+            if source.is_some() {
+                let count = entries
+                    .values()
+                    .filter(|(_, owner)| *owner == source)
+                    .count();
+                if count >= MAX_INTRODUCED_PER_SOURCE {
+                    if let Some(pos) = order
+                        .iter()
+                        .position(|id| entries.get(id).is_some_and(|(_, owner)| *owner == source))
+                    {
+                        if let Some(evicted) = order.remove(pos) {
+                            entries.remove(&evicted);
+                        }
+                    }
+                }
+            }
+            if entries.len() >= MAX_INTRODUCED {
+                let evict_pos = if source.is_some() {
+                    order
+                        .iter()
+                        .position(|id| entries.get(id).is_some_and(|(_, owner)| *owner == source))
+                        .or_else(|| {
+                            order.iter().position(|id| {
+                                entries.get(id).is_some_and(|(_, owner)| owner.is_some())
+                            })
+                        })
+                } else {
+                    order
+                        .iter()
+                        .position(|id| entries.get(id).is_some_and(|(_, owner)| owner.is_some()))
+                        .or(Some(0))
+                };
+                let Some(pos) = evict_pos else {
+                    continue;
+                };
+                if let Some(evicted) = order.remove(pos) {
+                    entries.remove(&evicted);
+                }
+            }
+            entries.insert(device, (pin, source));
+            order.push_back(device);
         }
     }
 }

@@ -238,3 +238,67 @@ async fn a_port_in_use_is_not_shared() {
     let other = crate::listen(0).unwrap();
     assert_ne!(other.local_addr().unwrap().port(), port);
 }
+
+#[tokio::test]
+async fn pairing_listener_rejects_mismatched_and_revoked_tokens() {
+    let dir = tempdir().unwrap();
+    let mut a = device(&dir.path().join("a.db"));
+    let (listener, address) = pairing_listener(&mut a.peers).await;
+
+    // Issue two invitations; bind the listener strictly to the second token
+    // and revoke the first.
+    let first = invitation(&mut a, &address);
+    let second = invitation(&mut a, &address);
+    listener.expect_token(second.token_digest());
+    let mut b_peers = PeerStore::open_in_memory().unwrap();
+
+    // Presenting `first` to a listener bound to `second` must be refused even
+    // before `first` is revoked in the invitation store.
+    let (review_err, join_res) = tokio::join!(
+        async {
+            listener
+                .next_request()
+                .await
+                .unwrap()
+                .review(
+                    &a.vault,
+                    &a.invitations,
+                    &mut a.peers,
+                    Voting::Votes,
+                    None,
+                    NOW,
+                )
+                .err()
+        },
+        start_pairing(first, &mut b_peers, NOW)
+    );
+    assert!(matches!(review_err, Some(Error::InvalidInvitation)));
+    assert!(join_res.is_err());
+
+    // Revoking `second` via its digest prevents it from ever being accepted on
+    // any listener.
+    assert!(a
+        .invitations
+        .revoke_by_digest(&second.token_digest(), NOW)
+        .unwrap());
+    let (review_err, join_res) = tokio::join!(
+        async {
+            listener
+                .next_request()
+                .await
+                .unwrap()
+                .review(
+                    &a.vault,
+                    &a.invitations,
+                    &mut a.peers,
+                    Voting::Votes,
+                    None,
+                    NOW,
+                )
+                .err()
+        },
+        start_pairing(second, &mut b_peers, NOW)
+    );
+    assert!(review_err.is_some());
+    assert!(join_res.is_err());
+}

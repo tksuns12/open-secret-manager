@@ -218,7 +218,11 @@ async fn start_control(
     peers_path: &str,
     control: &str,
 ) -> Result<(MemberEndpoint, Arc<ControlNode>), Box<dyn std::error::Error>> {
-    let endpoint = MemberEndpoint::new(vault_id, peers, AddressBook::open(peers_path)?)?;
+    let endpoint = MemberEndpoint::new(
+        vault_id,
+        peers,
+        AddressBook::open_allowing_loopback(peers_path)?,
+    )?;
     let options = NodeOptions {
         write_timeout: Duration::from_secs(5),
         ..NodeOptions::default()
@@ -567,17 +571,37 @@ impl Device {
                 (invitation, None)
             }
         };
+        let token_digest = invitation.token_digest();
+        listener.expect_token(token_digest);
         if away {
             listener.through(&self.endpoint);
         }
         println!("INVITE {}", invitation.encode()?.as_str());
         let pending = loop {
-            let incoming = tokio::time::timeout(
+            let incoming = match tokio::time::timeout(
                 Duration::from_secs(MAX_INVITATION_TTL_SECS),
                 listener.next_request(),
             )
             .await
-            .map_err(|_| "the invitation expired")??;
+            {
+                Ok(Ok(incoming)) => incoming,
+                Ok(Err(error)) => {
+                    let _ = self
+                        .invitations
+                        .lock()
+                        .await
+                        .revoke_by_digest(&token_digest, now());
+                    return Err(error.into());
+                }
+                Err(_) => {
+                    let _ = self
+                        .invitations
+                        .lock()
+                        .await
+                        .revoke_by_digest(&token_digest, now());
+                    return Err("the invitation expired".into());
+                }
+            };
             let challenged = {
                 let vault = self.vault.lock().await;
                 let invitations = self.invitations.lock().await;
@@ -600,6 +624,11 @@ impl Device {
         };
         println!("SAS {}", pending.sas());
         if lines.recv().await.as_deref() != Some("y") {
+            let _ = self
+                .invitations
+                .lock()
+                .await
+                .revoke_by_digest(&token_digest, now());
             pending.decline().await?;
             return Err("pairing was declined".into());
         }

@@ -265,6 +265,10 @@ impl Runtime {
         })
     }
 
+    pub(crate) fn allow_loopback(&self) {
+        self.addresses.allow_loopback();
+    }
+
     pub(crate) async fn state(&self) -> DeviceState {
         if self.removed.load(Ordering::SeqCst) {
             return DeviceState::Removed;
