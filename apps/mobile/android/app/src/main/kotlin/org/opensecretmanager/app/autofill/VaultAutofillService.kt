@@ -233,7 +233,11 @@ class VaultAutofillService : AutofillService() {
     private fun earlierUsername(contexts: List<FillContext>, form: Form): Pair<AssistStructure, AutofillId>? =
         contexts.dropLast(1).asReversed().firstNotNullOfOrNull { context ->
             Form.usernameScreen(context.structure)
-                ?.takeIf { it.packageName == form.packageName && it.webDomain == form.webDomain }
+                ?.takeIf {
+                    it.packageName == form.packageName &&
+                        it.webDomain == form.webDomain &&
+                        it.webScheme == form.webScheme
+                }
                 ?.username?.let { context.structure to it }
         }
 
@@ -265,9 +269,18 @@ class VaultAutofillService : AutofillService() {
             callback.onSuccess()
             return
         }
-        val sent = form.newPasswords.firstOrNull() ?: form.password
-        val values = Form.values(structure, setOfNotNull(form.username, sent))
-        val password = sent?.let(values::get).orEmpty()
+        // Validate the requester before storing any submitted password in PendingSave
+        // so untrusted/unknown requesters or HTTP browser pages cannot enqueue saves.
+        val requester = Requester.of(this, form)
+        if (requester == null) {
+            callback.onSuccess()
+            return
+        }
+        val passwordIds = form.newPasswords.ifEmpty { listOfNotNull(form.password) }
+        val values = Form.values(structure, (passwordIds + listOfNotNull(form.password, form.username)).toSet())
+        val password = passwordIds.firstNotNullOfOrNull { id -> values[id]?.takeIf { it.isNotEmpty() } }
+            ?: form.password?.let(values::get)?.takeIf { it.isNotEmpty() }
+            ?: ""
         // A screen that asked for the password alone: the username, if an
         // earlier screen of the same sign-in asked for it.
         val username = form.username?.let(values::get)
@@ -279,10 +292,9 @@ class VaultAutofillService : AutofillService() {
         }
         // Named as the save screen names it, for the app to offer it by if
         // Android does not start that screen.
-        val from = when (val requester = Requester.of(this, form)) {
+        val from = when (requester) {
             is Requester.Web -> requester.origin.removePrefix("https://")
             is Requester.App -> requester.label
-            null -> form.packageName
         }
         val id = PendingSave.put(PendingSave.Save(form, username, password), from)
         val intent = Intent(this, SaveActivity::class.java).putExtra(SaveActivity.SAVE, id)

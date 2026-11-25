@@ -1,6 +1,7 @@
 package org.opensecretmanager.app.autofill
 
 import android.app.assist.AssistStructure
+import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
@@ -59,6 +60,15 @@ data class Form(
         putInt(NEW_PASSWORD_MAX_LENGTH, newPasswordMaxLength)
     }
 
+    /** A normalized web origin inherited from a view node or its ancestors. */
+    internal data class WebOrigin(val domain: String, val scheme: String?)
+
+    /** Result of resolving a node's web origin against its inherited ancestor origin. */
+    internal sealed interface OriginStep {
+        data class Same(val origin: WebOrigin?) : OriginStep
+        data object Conflict : OriginStep
+    }
+
     companion object {
         private const val PACKAGE = "form.package"
         private const val WEB_DOMAIN = "form.webDomain"
@@ -99,36 +109,123 @@ data class Form(
             return found
         }
 
-        /** A text field on the screen, and the window it is in. */
-        private class Field(val node: AssistStructure.ViewNode, val window: Int)
+        internal const val MIN_VISIBLE_ALPHA = 0.1f
+        internal const val MIN_FIELD_SIZE = 4f
 
-        /** The text fields shown, and the page's domain and scheme. */
-        private class Fields(val all: List<Field>, val webDomain: String?, val webScheme: String?)
+        internal fun nodeWebOrigin(node: AssistStructure.ViewNode): WebOrigin? {
+            val domain = node.webDomain?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+            val scheme = if (Build.VERSION.SDK_INT >= 28) {
+                node.webScheme?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            } else {
+                null
+            }
+            return WebOrigin(domain, scheme)
+        }
 
         /**
-         * The text fields shown, in the order of the screen's tree. A page's
+         * Resolves [node]'s effective web origin against [inherited].
+         *
+         * A child subtree that introduces a different domain or a different
+         * scheme (such as a cross-origin or HTTP iframe nested inside an HTTPS
+         * page) returns [OriginStep.Conflict] so the entire subtree is pruned
+         * and can never receive credentials meant for the outer origin.
+         */
+        internal fun resolveOrigin(inherited: WebOrigin?, node: AssistStructure.ViewNode): OriginStep {
+            val own = nodeWebOrigin(node) ?: return OriginStep.Same(inherited)
+            if (inherited == null) return OriginStep.Same(own)
+            if (own.domain != inherited.domain) return OriginStep.Conflict
+            if (Build.VERSION.SDK_INT >= 28 && inherited.scheme != null && own.scheme != null && own.scheme != inherited.scheme) {
+                return OriginStep.Conflict
+            }
+            return OriginStep.Same(WebOrigin(inherited.domain, inherited.scheme ?: own.scheme))
+        }
+
+        /**
+         * Whether [node] (and therefore its entire subtree) is hidden from the
+         * owner: invisible/gone, near-transparent, or marked `hidden` /
+         * `aria-hidden="true"` in HTML.
+         */
+        internal fun isHiddenNode(node: AssistStructure.ViewNode): Boolean {
+            if (node.visibility != View.VISIBLE || node.alpha < MIN_VISIBLE_ALPHA) return true
+            val attrs = node.htmlInfo?.attributes.orEmpty()
+            return attrs.any { attr ->
+                attr.first.equals("hidden", ignoreCase = true) ||
+                    (attr.first.equals("aria-hidden", ignoreCase = true) && attr.second.equals("true", ignoreCase = true))
+            }
+        }
+
+        /** Bounds of [node] in window coordinates, applying any matrix transform. */
+        internal fun nodeBounds(node: AssistStructure.ViewNode, parentLeft: Float, parentTop: Float): RectF {
+            val matrix = node.transformation
+            return if (matrix == null) {
+                val left = parentLeft + node.left
+                val top = parentTop + node.top
+                RectF(left, top, left + node.width, top + node.height)
+            } else {
+                val rect = RectF(0f, 0f, node.width.toFloat(), node.height.toFloat())
+                matrix.mapRect(rect)
+                rect.offset(parentLeft + node.left, parentTop + node.top)
+                rect
+            }
+        }
+
+        /**
+         * Whether [bounds] are large enough and positioned on-screen (horizontally
+         * and not pushed above the top edge) so the owner can see the field.
+         */
+        internal fun isVisibleBounds(bounds: RectF, windowWidth: Int): Boolean {
+            if (bounds.width() < MIN_FIELD_SIZE || bounds.height() < MIN_FIELD_SIZE) return false
+            if (bounds.right <= 0f || bounds.bottom <= 0f) return false
+            if (windowWidth > 0 && bounds.left >= windowWidth.toFloat()) return false
+            return true
+        }
+
+        /** A visible text field on the screen, scoped to its window and inherited web origin. */
+        private class Field(val node: AssistStructure.ViewNode, val window: Int, val origin: WebOrigin?) {
+            fun sameScope(other: Field): Boolean = window == other.window && origin == other.origin
+        }
+
+        /**
+         * The visible, on-screen text fields in the order of the screen's tree,
+         * pruning hidden subtrees and cross-origin nested frames. A page's
          * input that takes no text is none, though a browser may say it is a
          * text field: Firefox reports a box to tick so, and may report it
          * between a page's password and its ID.
          */
-        private fun fields(structure: AssistStructure): Fields {
+        private fun fields(structure: AssistStructure): List<Field> {
             val fields = mutableListOf<Field>()
-            var webDomain: String? = null
-            var webScheme: String? = null
-            fun visit(node: AssistStructure.ViewNode, window: Int) {
-                if (webDomain == null && !node.webDomain.isNullOrBlank()) {
-                    webDomain = node.webDomain
-                    if (Build.VERSION.SDK_INT >= 28) webScheme = node.webScheme
+            fun visit(
+                node: AssistStructure.ViewNode,
+                window: Int,
+                windowWidth: Int,
+                inherited: WebOrigin?,
+                parentLeft: Float,
+                parentTop: Float,
+            ) {
+                if (isHiddenNode(node)) return
+                val origin = when (val step = resolveOrigin(inherited, node)) {
+                    is OriginStep.Same -> step.origin
+                    OriginStep.Conflict -> return
                 }
-                if (node.autofillType == View.AUTOFILL_TYPE_TEXT && node.autofillId != null && node.visibility == View.VISIBLE &&
+                val bounds = nodeBounds(node, parentLeft, parentTop)
+                if (node.autofillType == View.AUTOFILL_TYPE_TEXT &&
+                    node.autofillId != null &&
+                    isVisibleBounds(bounds, windowWidth) &&
                     htmlType(node) !in NOT_TEXT_TYPES
                 ) {
-                    fields += Field(node, window)
+                    fields += Field(node, window, origin)
                 }
-                for (index in 0 until node.childCount) visit(node.getChildAt(index), window)
+                val childLeft = bounds.left - node.scrollX
+                val childTop = bounds.top - node.scrollY
+                for (index in 0 until node.childCount) {
+                    visit(node.getChildAt(index), window, windowWidth, origin, childLeft, childTop)
+                }
             }
-            for (index in 0 until structure.windowNodeCount) visit(structure.getWindowNodeAt(index).rootViewNode, index)
-            return Fields(fields, webDomain, webScheme)
+            for (index in 0 until structure.windowNodeCount) {
+                val windowNode = structure.getWindowNodeAt(index)
+                visit(windowNode.rootViewNode, index, windowNode.width, null, 0f, 0f)
+            }
+            return fields
         }
 
         /**
@@ -137,15 +234,17 @@ data class Form(
          * password field nor a one-time code field. Null for any other screen.
          */
         fun usernameScreen(structure: AssistStructure): Form? {
-            val fields = fields(structure)
-            if (fields.all.any { isPasswordField(it.node) || isOneTimeCode(it.node) }) return null
-            val username = fields.all.firstOrNull { isUsername(it.node) && saysUsername(it.node) }
-                ?: fields.all.firstOrNull { isUsername(it.node) }
+            val all = fields(structure)
+            if (all.any { isPasswordField(it.node) || isOneTimeCode(it.node) }) return null
+            val focused = all.firstOrNull { it.node.isFocused }
+            val candidates = focused?.let { f -> all.filter { it.sameScope(f) } } ?: all
+            val username = candidates.firstOrNull { isUsername(it.node) && saysUsername(it.node) }
+                ?: candidates.firstOrNull { isUsername(it.node) }
                 ?: return null
             return Form(
                 packageName = structure.activityComponent.packageName,
-                webDomain = fields.webDomain,
-                webScheme = fields.webScheme,
+                webDomain = username.origin?.domain,
+                webScheme = username.origin?.scheme,
                 username = username.node.autofillId,
                 password = null,
                 oneTimeCode = null,
@@ -155,21 +254,34 @@ data class Form(
 
         /** Finds the login fields, or null if the screen has neither a password field nor a one-time code field. */
         fun parse(structure: AssistStructure): Form? {
-            val fields = fields(structure)
-            val code = fields.all.firstOrNull { isOneTimeCode(it.node) }
+            val all = fields(structure)
+            val focused = all.firstOrNull { it.node.isFocused }
+            val focusedScope = focused?.let { f -> all.filter { it.sameScope(f) } }
+            val pool = if (focusedScope != null && focusedScope.any { isPasswordField(it.node) || isOneTimeCode(it.node) }) {
+                focusedScope
+            } else {
+                all
+            }
             // Many apps type their ID field as a password shown as typed, to
             // keep the keyboard from suggesting words: a password field that
             // hides what is typed is the password, if there is one.
-            val passwords = fields.all.filter { isPasswordField(it.node) }
+            val passwords = pool.filter { isPasswordField(it.node) }
             val password = passwords.firstOrNull { !typedAsShownPassword(it.node) } ?: passwords.firstOrNull()
-            if (password == null && code == null) return null
+            val code = if (password != null) {
+                pool.firstOrNull { it.sameScope(password) && isOneTimeCode(it.node) }
+            } else {
+                pool.firstOrNull { isOneTimeCode(it.node) }
+            }
+            val anchor = password ?: code ?: return null
+            val scoped = pool.filter { it.sameScope(anchor) }
+            val scopedPasswords = passwords.filter { it.sameScope(anchor) }
             // A screen that asks only for a code has no username.
-            val username = password?.let { usernameFor(fields.all, it) }
-            val new = password?.let { newPasswords(passwords, it) }.orEmpty()
+            val username = password?.let { usernameFor(scoped, it) }
+            val new = password?.let { newPasswords(scopedPasswords, it) }.orEmpty()
             return Form(
                 packageName = structure.activityComponent.packageName,
-                webDomain = fields.webDomain,
-                webScheme = fields.webScheme,
+                webDomain = anchor.origin?.domain,
+                webScheme = anchor.origin?.scheme,
                 username = username?.node?.autofillId,
                 password = password?.node?.autofillId,
                 oneTimeCode = code?.node?.autofillId,
@@ -245,7 +357,8 @@ data class Form(
             node.autofillHints.orEmpty().map { it.lowercase() } +
                 node.htmlInfo?.attributes.orEmpty()
                     .filter { it.first.equals("autocomplete", ignoreCase = true) }
-                    .flatMap { it.second.lowercase().split(' ') }
+                    .flatMap { it.second.trim().lowercase().split(WHITESPACE) }
+                    .filter { it.isNotEmpty() }
 
         private fun htmlType(node: AssistStructure.ViewNode): String? =
             node.htmlInfo?.attributes.orEmpty()
@@ -343,6 +456,7 @@ data class Form(
         fun namesOtherThanUsername(names: List<String>): Boolean = named(names, NOT_USERNAME_PARTS, emptySet())
 
         private val NAME_ATTRIBUTES = setOf("name", "id", "label", "aria-label", "placeholder")
+        private val WHITESPACE = Regex("\\s+")
         /** A page's `type`s of input that take no text. */
         private val NOT_TEXT_TYPES = setOf("checkbox", "radio", "submit", "button", "reset", "image", "file", "hidden", "range", "color")
         private val WORD_BREAK = Regex("[^\\p{L}\\p{N}]+|(?<=\\p{Ll})(?=\\p{Lu})|(?<=\\p{Lu})(?=\\p{Lu}\\p{Ll})|(?<=\\p{L})(?=\\p{N})|(?<=\\p{N})(?=\\p{L})")

@@ -230,7 +230,14 @@ internal fun SaveChoices(
                     },
                     enabled = idle,
                     modifier = Modifier.fillMaxWidth().testTag("update:${candidate.title}"),
-                ) { Text("Update the password of ${candidate.title}") }
+                ) {
+                    val label = if (candidate.username.isNotBlank()) {
+                        "Update the password of ${candidate.title} (${candidate.username})"
+                    } else {
+                        "Update the password of ${candidate.title}"
+                    }
+                    Text(label)
+                }
             }
         }
         HorizontalDivider()

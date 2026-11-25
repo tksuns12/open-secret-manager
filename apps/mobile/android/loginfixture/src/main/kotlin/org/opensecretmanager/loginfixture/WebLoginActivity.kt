@@ -48,6 +48,7 @@ class WebLoginActivity : Activity() {
             "split" -> SPLIT_PAGE
             "reordered" -> REORDERED_PAGE
             "card" -> CARD_PAGE
+            "card-hidden" -> CARD_HIDDEN_PAGE
             "signup" -> SIGNUP_PAGE
             "signup-plain" -> PLAIN_SIGNUP_PAGE
             "change" -> CHANGE_PAGE
@@ -152,6 +153,32 @@ class WebLoginActivity : Activity() {
             </form>
             <script>
               setInterval(() => fixture.reportCard([holder.value, n1.value + n2.value + n3.value + n4.value, month.value, year.value, code.value, hidden.value].join("|")), 200);
+            </script>
+        """.trimIndent()
+
+        /**
+         * A card form containing decoy CVC fields hidden via low opacity,
+         * sub-4px sizing, and negative off-screen positioning.
+         */
+        val CARD_HIDDEN_PAGE = """
+            <!doctype html>
+            <meta name="viewport" content="width=device-width">
+            <style>input, select { display: block; width: 90%; font-size: 22px; margin: 12px 0; } .part { display: inline-block; width: 20%; }
+              #tiny { width: 1px; height: 1px; padding: 0; border: 0; margin: 0; }
+              #offscreen { position: absolute; left: -9999px; top: 0; width: 100px; height: 40px; }
+              #faint { opacity: 0.01; }</style>
+            <form id="pay">
+              <input id="holder" autocomplete="cc-name" placeholder="Name on card">
+              <div><input class="part" id="n1" autocomplete="cc-number" maxlength="4" inputmode="numeric"><input class="part" id="n2" autocomplete="cc-number" maxlength="4" inputmode="numeric"><input class="part" id="n3" autocomplete="cc-number" maxlength="4" inputmode="numeric"><input class="part" id="n4" autocomplete="cc-number" maxlength="4" inputmode="numeric"></div>
+              <select id="month" autocomplete="cc-exp-month"><option value="">MM</option><option>01</option><option>02</option><option>03</option><option>04</option><option>05</option><option>06</option><option>07</option><option>08</option><option>09</option><option>10</option><option>11</option><option>12</option></select>
+              <select id="year" autocomplete="cc-exp-year"><option value="">YYYY</option><option>2026</option><option>2027</option><option>2028</option><option>2029</option><option>2030</option><option>2031</option><option>2032</option></select>
+              <input id="code" autocomplete="cc-csc" inputmode="numeric" placeholder="CVC">
+              <input id="tiny" autocomplete="cc-csc">
+              <input id="offscreen" autocomplete="cc-csc">
+              <input id="faint" autocomplete="cc-csc">
+            </form>
+            <script>
+              setInterval(() => fixture.reportCard([holder.value, n1.value + n2.value + n3.value + n4.value, month.value, year.value, code.value, tiny.value, offscreen.value, faint.value].join("|")), 200);
             </script>
         """.trimIndent()
 

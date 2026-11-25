@@ -1151,6 +1151,19 @@ class AutofillTest {
     }
 
     @Test
+    fun aPasswordIsNotGeneratedForAFieldCappedBelowMinimumLength() {
+        openAndFind(MAKE, "SignUpActivity", field = "email", extras = " --ei maxLength 4").click()
+        find(mine("password"), 60_000).text = password
+        find(mine("unlock")).click()
+        find(mine("asker"))
+        find(mine("generated-too-short"))
+        assertNull(device.findObject(mine("generated-password")))
+        assertNull(device.findObject(mine("save-new")))
+        find(mine("cancel")).click()
+        assertLockedAgain()
+    }
+
+    @Test
     fun aTrustedBrowsersSignUpGetsAPasswordSavedForItsOrigin() {
         Requester.trustedForTests += FIXTURE
         val made = makeAPassword(openAndFind(MAKE, "WebLoginActivity", "https://new.example.test", extras = " --es page signup"))
@@ -1333,6 +1346,15 @@ class AutofillTest {
         visa.click()
         assertFilled("Owner|4111111111111111|12|2030|123|")
         assertNull(device.findObject(mine("asker")))
+    }
+
+    @Test
+    fun aPagesCardFormIgnoresSubMinimalOffScreenAndLowOpacityFields() {
+        withTheCardsVault()
+        askToFill("WebLoginActivity", "https://shop.example.test", extras = " --es page card-hidden", entry = CARD_OFFER)
+        find(mine("fill:Visa")).click()
+        assertFilled("Owner|4111111111111111|12|2030|123|||")
+        assertLockedAgain()
     }
 
     private companion object {

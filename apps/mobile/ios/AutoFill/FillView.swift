@@ -165,7 +165,10 @@ private struct SaveChoices: View {
                     Divider()
                     Text("Update a login").font(.headline)
                     ForEach(model.candidates, id: \.id) { candidate in
-                        Button("Update the password of \(candidate.title)") { model.update(candidate) }
+                        let label = candidate.username.isEmpty
+                            ? "Update the password of \(candidate.title)"
+                            : "Update the password of \(candidate.title) (\(candidate.username))"
+                        Button(label) { model.update(candidate) }
                             .buttonStyle(.bordered)
                             .disabled(model.busy != nil)
                             .accessibilityIdentifier("update:\(candidate.title)")

@@ -1,7 +1,6 @@
 package org.opensecretmanager.app.autofill
 
 import android.app.assist.AssistStructure
-import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.autofill.AutofillId
@@ -167,30 +166,66 @@ data class CardForm(
             return CardForm(packageName, extras.getString(WEB_DOMAIN), extras.getString(WEB_SCHEME), fields)
         }
 
-        /** Finds a card form's fields, or null if the screen has no field for a card's number. */
+        private data class Scope(val window: Int, val origin: Form.WebOrigin?)
+
+        private data class Matched(val field: CardField, val scope: Scope, val focused: Boolean)
+
+        /**
+         * Finds a card form's fields, or null if the screen has no field for a
+         * card's number. Prunes hidden/off-screen/cross-origin subtrees and
+         * scopes all filled fields to a single window and web origin.
+         */
         fun parse(structure: AssistStructure): CardForm? {
-            val fields = mutableListOf<CardField>()
-            var focused = false
-            var webDomain: String? = null
-            var webScheme: String? = null
-            fun visit(node: AssistStructure.ViewNode) {
-                if (webDomain == null && !node.webDomain.isNullOrBlank()) {
-                    webDomain = node.webDomain
-                    if (Build.VERSION.SDK_INT >= 28) webScheme = node.webScheme
+            val matched = mutableListOf<Matched>()
+            fun visit(
+                node: AssistStructure.ViewNode,
+                window: Int,
+                windowWidth: Int,
+                inherited: Form.WebOrigin?,
+                parentLeft: Float,
+                parentTop: Float,
+            ) {
+                if (Form.isHiddenNode(node)) return
+                val origin = when (val step = Form.resolveOrigin(inherited, node)) {
+                    is Form.OriginStep.Same -> step.origin
+                    Form.OriginStep.Conflict -> return
                 }
-                // Nothing in a view that is not shown.
-                if (node.visibility != View.VISIBLE || node.alpha == 0f) return
+                val bounds = Form.nodeBounds(node, parentLeft, parentTop)
                 val id = node.autofillId
                 val part = partOf(node)
-                if (id != null && part != null && node.width > 0 && node.height > 0 && node.autofillType in TYPES_TAKEN) {
-                    fields += CardField(id, part, node.autofillType, node.autofillOptions.orEmpty().map { it.toString() }, Form.maxLength(node))
-                    if (node.isFocused) focused = true
+                if (id != null &&
+                    part != null &&
+                    Form.isVisibleBounds(bounds, windowWidth) &&
+                    node.autofillType in TYPES_TAKEN
+                ) {
+                    matched += Matched(
+                        CardField(id, part, node.autofillType, node.autofillOptions.orEmpty().map { it.toString() }, Form.maxLength(node)),
+                        Scope(window, origin),
+                        node.isFocused,
+                    )
                 }
-                for (index in 0 until node.childCount) visit(node.getChildAt(index))
+                val childLeft = bounds.left - node.scrollX
+                val childTop = bounds.top - node.scrollY
+                for (index in 0 until node.childCount) {
+                    visit(node.getChildAt(index), window, windowWidth, origin, childLeft, childTop)
+                }
             }
-            for (index in 0 until structure.windowNodeCount) visit(structure.getWindowNodeAt(index).rootViewNode)
-            if (fields.none { it.part == CardPart.NUMBER }) return null
-            return CardForm(structure.activityComponent.packageName, webDomain, webScheme, fields, focused)
+            for (index in 0 until structure.windowNodeCount) {
+                val windowNode = structure.getWindowNodeAt(index)
+                visit(windowNode.rootViewNode, index, windowNode.width, null, 0f, 0f)
+            }
+            val groups = matched.groupBy { it.scope }.values.filter { group ->
+                group.any { it.field.part == CardPart.NUMBER }
+            }
+            val chosen = groups.firstOrNull { group -> group.any { it.focused } } ?: groups.firstOrNull() ?: return null
+            val scope = chosen.first().scope
+            return CardForm(
+                structure.activityComponent.packageName,
+                scope.origin?.domain,
+                scope.origin?.scheme,
+                chosen.map { it.field },
+                chosen.any { it.focused },
+            )
         }
 
         private val TYPES_TAKEN = setOf(View.AUTOFILL_TYPE_TEXT, View.AUTOFILL_TYPE_LIST, View.AUTOFILL_TYPE_DATE)

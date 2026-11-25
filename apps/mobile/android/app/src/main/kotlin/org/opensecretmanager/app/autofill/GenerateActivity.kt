@@ -181,11 +181,15 @@ private fun GenerateScreen(
     }
 }
 
+private const val MIN_GENERATED_LENGTH = 8
+
 /**
  * The username and the password made, which the owner can make again or
  * with another choice, and where they go. A field that takes fewer
- * characters than chosen gets a password of its length, since the form
- * would cut a longer one and the vault keep what the site never got.
+ * characters than chosen gets a password of its length (down to
+ * [MIN_GENERATED_LENGTH]), since the form would cut a longer one and the
+ * vault keep what the site never got. Fields capped below
+ * [MIN_GENERATED_LENGTH] are refused rather than generating a weak password.
  */
 @Composable
 private fun Made(
@@ -199,9 +203,30 @@ private fun Made(
     val context = LocalContext.current
     var options by remember { mutableStateOf(Generator.options(context)) }
     val cap = form.newPasswordMaxLength
+    if (cap in 1 until MIN_GENERATED_LENGTH) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                "This field takes at most $cap characters",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.testTag("generated-too-short"),
+            )
+            Text(
+                "Open Secret Manager will not generate a password shorter than $MIN_GENERATED_LENGTH characters because it would be too weak to protect this account.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+        return
+    }
     fun capped(choice: PasswordOptions): PasswordOptions {
         val kinds = listOf(choice.lowercase, choice.uppercase, choice.digits, choice.symbols).count { it }
-        return if (cap > 0 && choice.length.toInt() > cap) choice.copy(length = maxOf(cap, kinds).toUInt()) else choice
+        return if (cap >= MIN_GENERATED_LENGTH && choice.length.toInt() > cap) {
+            choice.copy(length = maxOf(cap, kinds).toUInt())
+        } else {
+            choice
+        }
     }
     fun make(choice: PasswordOptions) = runCatching { generatePassword(capped(choice)) }.getOrDefault("")
     var password by remember { mutableStateOf(make(options)) }
