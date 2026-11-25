@@ -23,6 +23,12 @@ serde_json = "1"
 [workspace]
 members = ["."]
 
+# `libfuzzer_sys::fuzz_target!` expands to `#[no_mangle] pub extern "C" fn ...`,
+# so `unsafe_code = "forbid"` cannot be enabled on the fuzz crate itself; require
+# explicit unsafe blocks inside any unsafe fn instead.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
 [profile.release]
 debug = 1
 

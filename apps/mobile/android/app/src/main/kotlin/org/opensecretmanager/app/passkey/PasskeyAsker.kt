@@ -53,12 +53,17 @@ internal class PasskeyAsker(
             }
             val signing = info.signingInfoCompat
             // The origin is the current certificate's, as Android's guide has
-            // it; the app is remembered by its original one, as for logins.
+            // it; the app is remembered by its canonical signing identity
+            // (original signer for single-signer, combined digest for multi-signer).
             val current = signing.apkContentsSigners.firstOrNull() ?: return null
-            val original = if (signing.hasMultipleSigners) current else signing.signingCertificateHistory.firstOrNull() ?: current
+            val appCertificate = Requester.canonicalCertificateId(
+                hasMultipleSigners = signing.hasMultipleSigners,
+                apkContentsSigners = signing.apkContentsSigners.map { it.toByteArray() },
+                signingCertificateHistory = signing.signingCertificateHistory.map { it.toByteArray() },
+            ) ?: return null
             val sha256 = { bytes: ByteArray -> MessageDigest.getInstance("SHA-256").digest(bytes) }
             return PasskeyAsker(
-                Requester.App(info.packageName, label, sha256(original.toByteArray()).joinToString("") { "%02X".format(it) }, null),
+                Requester.App(info.packageName, label, appCertificate, null),
                 PasskeyCaller.App(sha256(current.toByteArray())),
                 LinkedSites.exactOf(context, info.packageName),
             )

@@ -36,3 +36,6 @@ rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 tempfile = "3.24.0"
+
+[lints]
+workspace = true

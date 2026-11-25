@@ -5,12 +5,11 @@ import Security
 /// The iOS Keychain, which seals this device's network (TLS) key so that
 /// the app's files alone do not give it away. Each sealing makes a 256-bit
 /// key of its own, kept in the Keychain under a random name, on this phone
-/// only and readable after the phone's first unlock, so that a sync in the
-/// background can open the network key while the phone is locked. The
-/// network key is sealed under it with AES-GCM. What is stored in the
-/// device's folder is the name, the nonce, and the sealed key. The app and
-/// its AutoFill extension share the Keychain's items through their app
-/// group, as they share the folder.
+/// only and readable only while the phone is unlocked. The network key is
+/// sealed under it with AES-GCM. What is stored in the device's folder is
+/// the name, the nonce, and the sealed key. The app and its AutoFill
+/// extension share the Keychain's items through their app group, as they
+/// share the folder.
 final class KeychainKeystore: PhoneKeystore {
     static let shared = KeychainKeystore()
 
@@ -49,7 +48,7 @@ final class KeychainKeystore: PhoneKeystore {
         else { throw KeystoreFailure.Unavailable }
         var item = query(name)
         item[kSecValueData as String] = wrapping.withUnsafeBytes { Data($0) }
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else {
             throw KeystoreFailure.Unavailable
         }
@@ -79,6 +78,11 @@ final class KeychainKeystore: PhoneKeystore {
               let box = try? AES.GCM.SealedBox(combined: body),
               let key = try? AES.GCM.open(box, using: SymmetricKey(data: wrapping), authenticating: bound(name))
         else { throw KeystoreFailure.Lost }
+        // Migrate pre-existing items to WhenUnlockedThisDeviceOnly on read.
+        let update: [String: Any] = [
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        _ = SecItemUpdate(query(name) as CFDictionary, update as CFDictionary)
         return key
     }
 

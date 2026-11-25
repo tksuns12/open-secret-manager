@@ -4,7 +4,7 @@
 #
 # Ubuntu 22.04, so that the package needs no newer system libraries than
 # 22.04 has (glibc 2.35, WebKitGTK 4.1).
-FROM ubuntu:22.04
+FROM ubuntu:22.04@sha256:b000e69a50ff940390233025e7a337fb8469b509e2334fa4d018ac30f3e18cdb
 
 ARG RUST_VERSION=1.95.0
 ARG NODE_VERSION=24.21.0

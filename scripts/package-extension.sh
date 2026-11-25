@@ -34,15 +34,24 @@ mkdir -p "$out"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-(cd apps/browser-extension && npm ci --no-audit --no-fund >/dev/null && npm run -s build)
+if [ "${OSM_ALLOW_CHANGES:-}" = 1 ]; then
+    build_dir="$root/apps/browser-extension"
+else
+    # Export a clean commit snapshot so untracked files or stale dist artifacts
+    # in the working tree cannot leak into release store archives.
+    mkdir -p "$work/src"
+    git archive "$commit" apps/browser-extension | tar -x -C "$work/src"
+    build_dir="$work/src/apps/browser-extension"
+fi
+(cd "$build_dir" && npm ci --no-audit --no-fund >/dev/null && npm run -s build)
 
 # One file, its entries in a fixed order and without the Mac's metadata.
 pack() {
     (cd "$1" && find . -type f ! -name .DS_Store | LC_ALL=C sort | sed 's|^\./||' |
         COPYFILE_DISABLE=1 zip -q -X -@ "$2")
 }
-pack apps/browser-extension/dist/firefox "$out/open-secret-manager-firefox-$version.zip"
-cp -R apps/browser-extension/dist/chromium "$work/chromium"
+pack "$build_dir/dist/firefox" "$out/open-secret-manager-firefox-$version.zip"
+cp -R "$build_dir/dist/chromium" "$work/chromium"
 node -e '
 const fs = require("fs");
 const path = process.argv[1];

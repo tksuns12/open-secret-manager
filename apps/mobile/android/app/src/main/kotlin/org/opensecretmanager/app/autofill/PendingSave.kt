@@ -25,7 +25,7 @@ object PendingSave {
     data class Waiting(val id: Int, val from: String)
 
     /** How long a save is kept: its password is in memory meanwhile. */
-    const val KEPT_MILLIS = 10 * 60 * 1000L
+    const val KEPT_MILLIS = 2 * 60 * 1000L
 
     /** The time a save's age is read by; tests set it. */
     internal var clock: () -> Long = SystemClock::elapsedRealtime
@@ -70,6 +70,13 @@ object PendingSave {
     fun forget(id: Int) {
         if (latest?.id == id) latest = null
         settledIds += id
+    }
+
+    /** Clears any pending save immediately (e.g., on vault lock or screen off). */
+    @Synchronized
+    fun clear() {
+        latest = null
+        handler.removeCallbacks(expire)
     }
 
     /** Whether the save [id] names was saved or discarded. */

@@ -218,7 +218,7 @@ fun VaultScreen(
     ) { padding ->
         // The keyboard's own room: edge to edge, the window no longer shrinks for it.
         Column(Modifier.padding(padding).consumeWindowInsets(padding).imePadding().fillMaxSize()) {
-            if (fields == null && (state.screen == Screen.LOCKED || state.screen == Screen.UNLOCKED)) WaitingSave()
+            if (fields == null && state.screen == Screen.UNLOCKED) WaitingSave()
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when (state.screen) {
                     Screen.OPENING -> Message("Opening…")

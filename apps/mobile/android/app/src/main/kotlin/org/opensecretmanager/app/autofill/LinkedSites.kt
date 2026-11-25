@@ -16,14 +16,14 @@ import android.os.Build
  * and nothing is suggested.
  */
 object LinkedSites {
-    /** The domains, without `*.` or `www.`, each of two labels or more. */
+    /** The domains, without `*.`, preserving `www.`, each of two labels or more. */
     fun of(context: Context, packageName: String): Set<String> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptySet()
         val manager = context.getSystemService(DomainVerificationManager::class.java) ?: return emptySet()
         val state = runCatching { manager.getDomainVerificationUserState(packageName) }.getOrNull() ?: return emptySet()
         return state.hostToStateMap
             .filterValues { it == DomainVerificationUserState.DOMAIN_STATE_VERIFIED }
-            .keys.map { it.lowercase().removePrefix("*.").removePrefix("www.") }
+            .keys.map { it.lowercase().removePrefix("*.") }
             .filter { '.' in it }
             .toSet()
     }

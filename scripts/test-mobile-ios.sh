@@ -39,7 +39,7 @@ if [ "${OSM_IOS_OPTIMIZED:-}" = 1 ]; then
     profile=release
     optimized=SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG
 fi
-apps/mobile/ios/prepare.sh "$work/prepare" "$profile"
+OSM_IOS_TEST_FIXTURES=1 apps/mobile/ios/prepare.sh "$work/prepare" "$profile"
 # Without the app icon if this Mac lacks the simulator runtime Xcode's asset
 # compiler needs (see icon-flags.sh); the tests do not need it.
 # shellcheck disable=SC2046

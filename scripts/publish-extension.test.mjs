@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, beforeEach, describe, test } from "node:test";
-import { amoToken, credentials, isNewer, main, PublishError, readPackage, REVIEWER_NOTES } from "./publish-extension.mjs";
+import { amoToken, credentials, isNewer, main, PublishError, readPackage, redact, REVIEWER_NOTES, saveSecret } from "./publish-extension.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "publish-extension.mjs");
 const SECRETS = {
@@ -68,7 +68,7 @@ function stand(routes) {
       const record = { method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks) };
       seen.push(record);
       const route = routes(record, seen);
-      res.writeHead(route.status ?? 200, { "Content-Type": "application/json" });
+      res.writeHead(route.status ?? 200, { "Content-Type": "application/json", ...(route.headers ?? {}) });
       res.end(JSON.stringify(route.json ?? {}));
     });
   });
@@ -380,6 +380,58 @@ describe("secrets", () => {
       amo.server.close();
     }
     assert.equal(amo.seen.filter((r) => r.method === "POST").length, 0);
+  });
+
+  test("check and status warn when endpoint override environment variables are set", async () => {
+    const amo = stand(() => ({ json: { status: "public", current_version: { version: "0.1.0" } } }));
+    process.env.OSM_AMO_BASE = await listen(amo.server);
+    try {
+      await main(["check", "firefox"]);
+    } finally {
+      amo.server.close();
+    }
+    assert.match(output.join("\n"), /NOTE: OSM_AMO_BASE is set/);
+  });
+
+  test("store errors redact runtime bearer access tokens and AMO JWTs", async () => {
+    const token = amoToken(SECRETS.OSM_AMO_JWT_ISSUER, SECRETS.OSM_AMO_JWT_SECRET);
+    assert.ok(!redact(`leaked ${token}`).includes(token));
+    const cws = stand((req) => {
+      if (req.url === "/token") return { json: { access_token: "live-bearer-secret-999" } };
+      return { status: 401, json: { error: `rejected ${req.headers.authorization}` } };
+    });
+    process.env.OSM_CWS_BASE = await listen(cws.server);
+    process.env.OSM_OAUTH_URL = `${process.env.OSM_CWS_BASE}/token`;
+    try {
+      let message = "";
+      await main(["check", "chromium"]).catch((e) => { message = e.message; });
+      assert.match(message, /answered 401/);
+      assert.ok(!message.includes("live-bearer-secret-999"), message);
+    } finally {
+      cws.server.close();
+    }
+  });
+
+  test("HTTP redirects are refused instead of forwarding credentials", async () => {
+    const amo = stand(() => ({ status: 302, headers: { Location: "https://evil.example/" }, json: {} }));
+    process.env.OSM_AMO_BASE = await listen(amo.server);
+    try {
+      await assert.rejects(main(["check", "firefox"]), PublishError);
+    } finally {
+      amo.server.close();
+    }
+  });
+
+  test("saveSecret rejects unknown secret names and unsafe OSM_KEYCHAIN paths", { skip: process.platform !== "darwin" }, () => {
+    delete process.env.OSM_NO_KEYCHAIN;
+    try {
+      assert.throws(() => saveSecret("EVIL_NAME", "valid-token"), /Unknown keychain secret name/);
+      process.env.OSM_KEYCHAIN = "/tmp/bad path\ndelete-keychain";
+      assert.throws(() => saveSecret("OSM_CWS_REFRESH_TOKEN", "valid-token"), /cannot be passed safely/);
+    } finally {
+      delete process.env.OSM_KEYCHAIN;
+      process.env.OSM_NO_KEYCHAIN = "1";
+    }
   });
 });
 

@@ -21,8 +21,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
-      - run: rustc --version && cargo --version
+          node-version: '24.21.0'
+      - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0 && rustc --version && cargo --version
       - run: npm ci --no-audit --no-fund
         working-directory: apps/desktop
       # NSIS: an installer for the signed-in user alone, which needs no

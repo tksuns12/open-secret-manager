@@ -71,7 +71,6 @@ sealed interface Requester {
         fun of(context: Context, form: CardForm): Requester? = of(context, form.packageName, form.webDomain, form.webScheme)
 
         internal fun of(context: Context, packageName: String, webDomain: String?, webScheme: String?): Requester? {
-            val certificates = certificates(context, packageName)
             val domain = webDomain?.takeIf { it.isNotBlank() }
             val label = runCatching {
                 val manager = context.packageManager
@@ -80,13 +79,13 @@ sealed interface Requester {
             // Branch on trusted browsers FIRST: a trusted browser without a
             // valid https webDomain (chrome://, about:blank, file://, http://,
             // or a missing webDomain) must NEVER fall through to Requester.App.
-            if (trusts(context, packageName, certificates)) {
+            if (trusts(context, packageName)) {
                 if (domain == null || !webScheme.equals("https", ignoreCase = true)) return null
                 return Web("https://${domain.lowercase()}", packageName, label)
             }
-            // The original certificate, which stays first in its history when
-            // the app moves to a new one: the app keeps its identity here.
-            val certificate = certificates.firstOrNull() ?: return null
+            // The original certificate for single-signer apps, or a canonical
+            // digest over all signers for multi-signer APKs.
+            val certificate = appCertificateId(context, packageName) ?: return null
             return App(packageName, label, certificate, domain?.lowercase())
         }
 
@@ -106,10 +105,64 @@ sealed interface Requester {
                 }
             }
 
-        private fun trusts(context: Context, packageName: String, certificates: Set<String>): Boolean {
+        private fun hexToBytes(hex: String): ByteArray? {
+            if (hex.length != 64) return null
+            val out = ByteArray(32)
+            for (i in 0 until 32) {
+                val hi = Character.digit(hex[i * 2], 16)
+                val lo = Character.digit(hex[i * 2 + 1], 16)
+                if (hi < 0 || lo < 0) return null
+                out[i] = ((hi shl 4) or lo).toByte()
+            }
+            return out
+        }
+
+        private fun trusts(context: Context, packageName: String): Boolean {
             if (packageName in trustedForTests) return true
             val trusted = trustedMap(context)[packageName] ?: return false
-            return certificates.any { it in trusted }
+            val manager = context.packageManager
+            return trusted.any { hex ->
+                val digest = hexToBytes(hex) ?: return@any false
+                runCatching {
+                    manager.hasSigningCertificate(packageName, digest, PackageManager.CERT_INPUT_SHA256)
+                }.getOrDefault(false)
+            }
+        }
+
+        /**
+         * Canonical signing identity for a non-browser app: the original
+         * signing certificate SHA-256 for single-signer apps (preserving
+         * existing app keys), or a SHA-256 over all sorted signer digests for
+         * multi-signer APKs.
+         */
+        fun appCertificateId(context: Context, packageName: String): String? {
+            val info = runCatching {
+                context.packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+            }.getOrNull() ?: return null
+            val signing = info.signingInfo ?: return null
+            return canonicalCertificateId(
+                hasMultipleSigners = signing.hasMultipleSigners(),
+                apkContentsSigners = signing.apkContentsSigners.orEmpty().map { it.toByteArray() },
+                signingCertificateHistory = signing.signingCertificateHistory.orEmpty().map { it.toByteArray() },
+            )
+        }
+
+        internal fun canonicalCertificateId(
+            hasMultipleSigners: Boolean,
+            apkContentsSigners: List<ByteArray>,
+            signingCertificateHistory: List<ByteArray>,
+        ): String? {
+            val sha256Hex = { bytes: ByteArray ->
+                MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02X".format(it) }
+            }
+            if (hasMultipleSigners) {
+                val sorted = apkContentsSigners.map(sha256Hex).sorted()
+                if (sorted.isEmpty()) return null
+                if (sorted.size == 1) return sorted.first()
+                return sha256Hex(sorted.joinToString(":").toByteArray(Charsets.UTF_8))
+            }
+            val original = signingCertificateHistory.firstOrNull() ?: apkContentsSigners.firstOrNull() ?: return null
+            return sha256Hex(original)
         }
 
         /**

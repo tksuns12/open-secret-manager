@@ -67,6 +67,18 @@ const NAMES = {
   login: ["OSM_CWS_CLIENT_ID", "OSM_CWS_CLIENT_SECRET"],
 };
 
+const ALL_SECRET_NAMES = new Set(Object.values(NAMES).flat());
+const SAFE_KEYCHAIN_PATH = /^[A-Za-z0-9._/@:+-]+$/;
+
+function validatedKeychainArgs() {
+  const custom = process.env.OSM_KEYCHAIN;
+  if (!custom) return [];
+  if (!SAFE_KEYCHAIN_PATH.test(custom)) {
+    throw new PublishError("OSM_KEYCHAIN contains characters that cannot be passed safely to the keychain tool.");
+  }
+  return [custom];
+}
+
 // What must never be printed: every credential this run has read.
 const known = new Set();
 export function redact(text) {
@@ -77,8 +89,9 @@ export function redact(text) {
 
 function keychain(name) {
   if (process.platform !== "darwin" || process.env.OSM_NO_KEYCHAIN === "1") return undefined;
+  if (!ALL_SECRET_NAMES.has(name)) return undefined;
   try {
-    const file = process.env.OSM_KEYCHAIN ? [process.env.OSM_KEYCHAIN] : [];
+    const file = validatedKeychainArgs();
     return execFileSync("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name, "-w", ...file], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
@@ -96,10 +109,13 @@ export function saveSecret(name, value) {
   if (process.platform !== "darwin" || process.env.OSM_NO_KEYCHAIN === "1") {
     throw new PublishError("There is no keychain here: run login with --print and keep the token where the environment can read it.");
   }
+  if (!ALL_SECRET_NAMES.has(name)) {
+    throw new PublishError(`Unknown keychain secret name: ${name}`);
+  }
   if (!/^[A-Za-z0-9._~+/-]+$/.test(value)) {
     throw new PublishError("The token has characters the keychain command cannot take safely: run login with --print.");
   }
-  const file = process.env.OSM_KEYCHAIN ? [process.env.OSM_KEYCHAIN] : [];
+  const file = validatedKeychainArgs();
   const line = ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", name, "-w", value, ...file].join(" ");
   spawnSync("security", ["-i"], { input: `${line}\n`, stdio: ["pipe", "ignore", "ignore"] });
   if (keychain(name) !== value) throw new PublishError("The keychain did not take the token.");
@@ -135,7 +151,9 @@ export function amoToken(issuer, secret, now = Math.floor(Date.now() / 1000)) {
   const head = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const body = b64url(JSON.stringify({ iss: issuer, jti: randomUUID(), iat: now, exp: now + 240 }));
   const signature = createHmac("sha256", secret).update(`${head}.${body}`).digest("base64url");
-  return `${head}.${body}.${signature}`;
+  const token = `${head}.${body}.${signature}`;
+  known.add(token);
+  return token;
 }
 
 // ------------------------------------------------------------------- the HTTP
@@ -143,7 +161,7 @@ export function amoToken(issuer, secret, now = Math.floor(Date.now() / 1000)) {
 async function call(method, url, { headers = {}, body } = {}) {
   let response;
   try {
-    response = await fetch(url, { method, headers, body, signal: AbortSignal.timeout(120_000) });
+    response = await fetch(url, { method, headers, body, redirect: "error", signal: AbortSignal.timeout(120_000) });
   } catch (error) {
     throw new PublishError(redact(`${method} ${new URL(url).pathname}: ${error.cause?.code ?? error.message}`));
   }
@@ -350,6 +368,7 @@ class Cws {
         body,
       });
       if (!answer.access_token) throw new PublishError("Google gave no access token for the refresh token.");
+      known.add(answer.access_token);
       this.token = answer.access_token;
     }
     return { Authorization: `Bearer ${this.token}` };
@@ -495,6 +514,7 @@ export async function login({ print = false } = {}) {
     }),
   });
   const token = answer.refresh_token;
+  if (answer.access_token) known.add(answer.access_token);
   if (!token) throw new PublishError("Google gave no refresh token: allow the request again, and say yes to the offline access it asks for.");
   known.add(token);
 
@@ -574,6 +594,10 @@ export async function main(argv) {
     return 0;
   }
 
+  for (const name of ["OSM_AMO_BASE", "OSM_CWS_BASE", "OSM_OAUTH_URL", "OSM_AUTH_URL"]) {
+    if (process.env[name]) console.error(`NOTE: ${name} is set (${process.env[name]}): the keys go there, not to the store.`);
+  }
+
   if (options.command === "check" || options.command === "status") {
     for (const store of stores) {
       if (store === "firefox") {
@@ -589,9 +613,6 @@ export async function main(argv) {
     return;
   }
 
-  for (const name of ["OSM_AMO_BASE", "OSM_CWS_BASE", "OSM_OAUTH_URL", "OSM_AUTH_URL"]) {
-    if (process.env[name]) console.error(`NOTE: ${name} is set (${process.env[name]}): the keys go there, not to the store.`);
-  }
   const pack = readPackage(resolve(options.dir ?? defaultDir()));
   const have = stores.filter((store) => pack.files[store]);
   if (have.length !== stores.length) {

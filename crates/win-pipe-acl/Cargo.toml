@@ -14,3 +14,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Authorization",
     "Win32_System_Threading",
 ] }
+
+# Isolated Win32 FFI crate for owner-only Named Pipe DACLs; intentionally omits
+# `unsafe_code = "forbid"` while requiring explicit `unsafe {}` blocks inside
+# every `unsafe fn`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

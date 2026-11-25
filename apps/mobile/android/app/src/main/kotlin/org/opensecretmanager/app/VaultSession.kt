@@ -28,6 +28,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.opensecretmanager.app.autofill.EarlierAppLogins
 import org.opensecretmanager.app.autofill.OtherFieldService
+import org.opensecretmanager.app.autofill.PendingSave
 import org.opensecretmanager.vault.Asks
 import org.opensecretmanager.vault.CardFill
 import org.opensecretmanager.vault.DeletedEntry
@@ -427,6 +428,8 @@ class VaultSession(private val context: Context, private val folder: File) {
     /** The owner's own Lock, which asks for no fingerprint until the app leaves the screen. */
     fun lock(): Job {
         OtherFieldService.cancel()
+        PendingSave.clear()
+        SecretClipboard.clearNow(context)
         askAtOnce.set(false)
         locksAsked.incrementAndGet()
         lockLater?.cancel()
@@ -458,6 +461,7 @@ class VaultSession(private val context: Context, private val folder: File) {
 
     /** Locks the vault, and lets go of what the screens held of it. Under [calls]. */
     private fun lockVault(device: Device) {
+        PendingSave.clear()
         device.lock()
         synchronized(stateLock) {
             unlockedNow = false
@@ -920,6 +924,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      */
     fun onForeground() {
         inFront = true
+        SecretClipboard.clearIfDue(context)
         showLockedIfDue()
         lockLater?.cancel()
         lockLater = null
@@ -1015,6 +1020,8 @@ class VaultSession(private val context: Context, private val folder: File) {
         OtherFieldService.cancel()
         askAtOnce.set(true)
         if (StayUnlocked.throughScreenOff(context)) return
+        PendingSave.clear()
+        SecretClipboard.clearNow(context)
         locksAsked.incrementAndGet()
         lockLater?.cancel()
         lockLater = null
@@ -1041,6 +1048,7 @@ class VaultSession(private val context: Context, private val folder: File) {
      * screen can be passed.
      */
     fun onScreenOn() {
+        SecretClipboard.clearIfDue(context)
         if (lockAt == null) return
         showLockedIfDue()
         run(null) { refresh() }

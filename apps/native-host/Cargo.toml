@@ -19,3 +19,6 @@ osm-vault-browser = { path = "../../crates/vault-browser" }
 osm-vault-core = { path = "../../crates/vault-core" }
 tempfile = "3.24.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

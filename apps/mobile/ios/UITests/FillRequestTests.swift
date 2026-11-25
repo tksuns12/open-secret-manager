@@ -21,6 +21,10 @@ final class FillRequestTests: XCTestCase {
         )
         XCTAssertEqual(requester(("http://mail.example.test/", .URL)), .notHTTPS("http://mail.example.test/"))
         XCTAssertEqual(requester(("http://mail.example.test/", .URL), ("mail.example.test", .domain)), .origins(["https://mail.example.test"]))
+        XCTAssertEqual(requester(("https://[::1]:8443/login", .URL)), .origins(["https://[::1]:8443"]))
+        XCTAssertEqual(requester(("https://bücher.example/login", .URL)), .origins(["https://xn--bcher-kva.example"]))
+        XCTAssertEqual(requester(("https://user:pass@evil.test/", .URL)), .unnamed)
+        XCTAssertEqual(requester(("*.example.test", .domain)), .unnamed)
         XCTAssertEqual(requester(), .unnamed)
         XCTAssertEqual(requester(("not a url", .URL)), .unnamed)
         // As the vault is told: an http address is told nothing.

@@ -34,10 +34,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     fill::{self, AppChoices, Asks, Filled, Offer, Requester},
-    CardDetail, CardFill, DeletedEntry, DeviceState, HistoryEntry, ItemDetail, ItemDraft,
-    ItemSummary, MobileError, PasskeyCaller, PasskeyChoice, PasskeyCreation, PasskeyRefusal,
-    PasskeySignIn, PasswordHealth, RebasedEdit, ReusedPassword, SaveCandidate, SyncState,
-    SyncStatus, WeakPassword, Weakness,
+    CardDetail, CardFill, DeletedEntry, DeviceState, DraftGuard, HistoryEntry, ItemDetail,
+    ItemDraft, ItemSummary, MobileError, PasskeyCaller, PasskeyChoice, PasskeyCreation,
+    PasskeyRefusal, PasskeySignIn, PasswordHealth, RebasedEdit, ReusedPassword, SaveCandidate,
+    SyncState, SyncStatus, WeakPassword, Weakness,
 };
 
 /// The first eight hex digits of a device's ID, as the screens name it.
@@ -287,7 +287,9 @@ impl Runtime {
         {
             let mut vault = self.vault.lock().await;
             let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
-            if !vault.is_unlocked() {
+            if vault.is_unlocked() {
+                vault.check_password(password)?;
+            } else {
                 vault.unlock(password)?;
             }
         }
@@ -411,19 +413,20 @@ impl Runtime {
         self: &Arc<Self>,
         draft: ItemDraft,
     ) -> Result<String, MobileError> {
-        if !draft.kind.editable_here() {
+        let draft = DraftGuard::new(draft);
+        if !draft.as_ref().kind.editable_here() {
             return Err(MobileError::NotEditableHere);
         }
         let id = {
             let mut vault = self.vault.lock().await;
             let vault = vault.as_mut().ok_or(MobileError::NoVault)?;
             let mut item = Item::default();
-            draft.apply_to(&mut item);
+            draft.take().apply_to(&mut item);
             let id = item.id.clone();
             vault.put(item)?;
             id
         };
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(id)
     }
 
@@ -433,7 +436,8 @@ impl Runtime {
         revision: &str,
         draft: ItemDraft,
     ) -> Result<(), MobileError> {
-        if !draft.kind.editable_here() {
+        let draft = DraftGuard::new(draft);
+        if !draft.as_ref().kind.editable_here() {
             return Err(MobileError::NotEditableHere);
         }
         {
@@ -450,10 +454,10 @@ impl Runtime {
             if !crate::ItemKind::from(item.kind).editable_here() {
                 return Err(MobileError::NotEditableHere);
             }
-            draft.apply_to(&mut item);
+            draft.take().apply_to(&mut item);
             vault.update(item, revision)?;
         }
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(())
     }
 
@@ -463,6 +467,7 @@ impl Runtime {
         revision: &str,
         draft: ItemDraft,
     ) -> Result<RebasedEdit, MobileError> {
+        let draft = DraftGuard::new(draft);
         let vault = self.vault.lock().await;
         let vault = vault.as_ref().ok_or(MobileError::NoVault)?;
         let VaultItem {
@@ -485,7 +490,7 @@ impl Runtime {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-            draft: draft.rebased(&read, &now),
+            draft: draft.take().rebased(&read, &now),
             revision: current,
         })
     }
@@ -507,7 +512,7 @@ impl Runtime {
             }
             vault.delete(id, revision)?;
         }
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(())
     }
 
@@ -525,7 +530,7 @@ impl Runtime {
             }
             vault.remove_passkey(id, revision, credential_id)?;
         }
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(())
     }
 
@@ -621,17 +626,16 @@ impl Runtime {
             }
             vault.restore(id, revision, heads)?;
         }
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(())
     }
 
     /// After a change here, online: syncs at once rather than at the next
-    /// interval, without making the caller wait.
-    fn sync_soon(self: &Arc<Self>) {
-        let runtime = Arc::clone(self);
-        tokio::spawn(async move {
-            let _ = runtime.sync_with_members().await;
-        });
+    /// interval, tracked on the control plane so going offline aborts it.
+    async fn sync_soon(self: &Arc<Self>) {
+        if let Some(control) = self.control.lock().await.clone() {
+            self.sync_once(&control);
+        }
     }
 
     pub(crate) async fn password(&self, id: &str) -> Result<String, MobileError> {
@@ -703,10 +707,7 @@ impl Runtime {
             if vault.holds_passkey(&request.rp_id, &request.exclude)? {
                 return Err(MobileError::PasskeyExists);
             }
-            let created = request.create(verified, now())?;
-            let (client_data, _) = asking.client_data(Ceremony::Create, &request.challenge);
-            let response = created.registration.response_json(&client_data);
-            match into {
+            let target_revision = match into {
                 Some(id) => {
                     let found = vault.get(id)?;
                     if found.conflict {
@@ -715,15 +716,29 @@ impl Runtime {
                     if found.item.kind != ItemKind::Login {
                         return Err(MobileError::NotALogin);
                     }
-                    vault.add_passkey(id, &found.revision, created.passkey)?;
+                    if !Origin::of_url(&found.item.url)
+                        .is_some_and(|origin| passkey::rp_id_allowed(&request.rp_id, &origin))
+                    {
+                        return Err(MobileError::NotForThisPage);
+                    }
+                    Some(found.revision)
                 }
-                None => {
+                None => None,
+            };
+            let created = request.create(verified, now())?;
+            let (client_data, _) = asking.client_data(Ceremony::Create, &request.challenge);
+            let response = created.registration.response_json(&client_data);
+            match (into, target_revision) {
+                (Some(id), Some(revision)) => {
+                    vault.add_passkey(id, &revision, created.passkey)?;
+                }
+                _ => {
                     vault.save_passkey_as_login(created.passkey, &request.rp_id)?;
                 }
             }
             response
         };
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(response)
     }
 
@@ -873,7 +888,7 @@ impl Runtime {
                 password,
             )?;
         }
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(())
     }
 
@@ -896,7 +911,7 @@ impl Runtime {
                 password,
             )?
         };
-        self.sync_soon();
+        self.sync_soon().await;
         Ok(id)
     }
 
@@ -1086,11 +1101,12 @@ impl Runtime {
         let sync = tokio::spawn(async move {
             let _ = runtime.sync_with_members().await;
         });
-        control
+        let mut tasks = control
             .tasks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(sync);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(sync);
     }
 
     pub(crate) async fn go_offline(&self) {
@@ -1208,9 +1224,14 @@ impl Runtime {
         // Tell the members it knows where it listens now: a phone's
         // address changes from one network to the next.
         let announcer = control.clone();
-        tokio::spawn(async move {
+        let announce = tokio::spawn(async move {
             announcer.endpoint.announce_all().await;
         });
+        control
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(announce);
         Ok(control)
     }
 

@@ -12,7 +12,15 @@ enum DeviceFolder {
             throw Unavailable()
         }
         var folder = container.appendingPathComponent("vault", isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let protection: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.complete]
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: protection)
+        try? FileManager.default.setAttributes(protection, ofItemAtPath: folder.path)
+        // Upgrade any pre-existing vault files to complete file protection.
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: folder.path) {
+            for name in entries {
+                try? FileManager.default.setAttributes(protection, ofItemAtPath: folder.appendingPathComponent(name).path)
+            }
+        }
         // Not in backups: the vault and the device's keys stay on this
         // phone. A copy elsewhere would be a second device under this one's
         // identity.

@@ -15,6 +15,21 @@ enum FillRequester: Equatable {
     /// Nothing named: the owner chooses a login, warned.
     case unnamed
 
+    private static func normalizedHost(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let host = raw.lowercased()
+        if host.contains("*") || host.contains("/") || host.contains("@") || host.contains("%")
+            || host.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+            return nil
+        }
+        if host.hasPrefix("[") || host.hasSuffix("]") {
+            guard host.hasPrefix("[") && host.hasSuffix("]") && host.count > 2 else { return nil }
+            return host
+        }
+        if host.contains(":") { return nil }
+        return host
+    }
+
     init(_ identifiers: [ASCredentialServiceIdentifier]) {
         var origins: [String] = []
         var app: (id: String, name: String)?
@@ -22,15 +37,26 @@ enum FillRequester: Equatable {
         for identifier in identifiers {
             switch identifier.type {
             case .domain:
-                let host = identifier.identifier.lowercased()
-                if !host.isEmpty, !host.contains("/") { origins.append("https://\(host)") }
+                let raw = identifier.identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !raw.isEmpty,
+                      !raw.contains("*"), !raw.contains("/"), !raw.contains("@"),
+                      !raw.contains(":"), !raw.contains("?"), !raw.contains("#"),
+                      raw.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+                      let components = URLComponents(string: "https://\(raw)"),
+                      components.user == nil, components.password == nil,
+                      let host = Self.normalizedHost(components.encodedHost)
+                else { continue }
+                origins.append("https://\(host)")
             case .URL:
-                guard let url = URL(string: identifier.identifier), let host = url.host?.lowercased(), !host.isEmpty else { continue }
-                guard url.scheme?.lowercased() == "https" else {
+                guard let components = URLComponents(string: identifier.identifier),
+                      components.user == nil, components.password == nil,
+                      let host = Self.normalizedHost(components.encodedHost)
+                else { continue }
+                guard components.scheme?.lowercased() == "https" else {
                     refused = refused ?? identifier.identifier
                     continue
                 }
-                if let port = url.port, port != 443 {
+                if let port = components.port, port != 443 {
                     origins.append("https://\(host):\(port)")
                 } else {
                     origins.append("https://\(host)")

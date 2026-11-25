@@ -991,15 +991,17 @@ class AutofillTest {
         find(By.res("android", "autofill_save_yes")).click()
         if (device.wait(Until.hasObject(mine("password")), 10_000) == true) fail("Android opened the save screen after all")
 
-        // Opened, the app offers it, named as the save screen names it.
+        // Opened while locked, the app hides the pending save until unlocked.
         shell("am start -W -n ${context.packageName}/.MainActivity")
+        find(mine("password"), 60_000)
+        assertNull(device.findObject(mine("waiting-save")))
+        find(mine("password")).text = password
+        find(mine("unlock")).click()
         find(mine("waiting-save"), 30_000)
         find(By.text("A login from Login fixture is waiting to be saved"))
         capture("waiting-save")
         find(mine("waiting-save-open")).click()
-        find(mine("password"), 60_000).text = password
-        find(mine("unlock")).click()
-        find(mine("asker"))
+        find(mine("asker"), 30_000)
         find(mine("save-new")).click()
         // Saved, from the app's own screen: the app is in front, unlocked,
         // and offers it no more.
@@ -1057,6 +1059,10 @@ class AutofillTest {
         val form = Form(FIXTURE, null, null, null, null, null)
         PendingSave.put(PendingSave.Save(form, "someone", "a password"), "Login fixture")
         shell("am start -W -n ${context.packageName}/.MainActivity")
+        find(mine("password"), 60_000)
+        assertNull(device.findObject(mine("waiting-save")))
+        find(mine("password")).text = password
+        find(mine("unlock")).click()
         find(mine("waiting-save-discard"), 30_000).click()
         if (device.wait(Until.gone(mine("waiting-save")), 15_000) != true) fail("the save is still offered")
         assertNull(PendingSave.waiting())

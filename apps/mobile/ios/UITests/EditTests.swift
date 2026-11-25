@@ -61,9 +61,10 @@ final class EditTests: UITestCase {
         type("Forum", into: "edit-title", in: app)
         type("me@forum.example.test", into: "edit-username", in: app)
         type("https://forum.example.test", into: "edit-url", in: app)
-        // It comes with a password made for it, which the owner replaces.
+        // It comes with a password made for it (masked by default), which the owner replaces.
         XCTAssert(app.staticTexts["password-made"].exists)
-        replace("edit-password", with: "forum password", in: app)
+        app.buttons["clear-password"].tap()
+        type("forum password", into: "edit-password", in: app)
         app.buttons["save"].tap()
         // The new item opens.
         XCTAssert(app.staticTexts["detail-username"].waitForLabel("me@forum.example.test"))
@@ -100,7 +101,8 @@ final class EditTests: UITestCase {
         XCTAssert(field("edit-title", in: app).waitForExistence(timeout: 10))
         type(title, into: "edit-title", in: app)
         type(username, into: "edit-username", in: app)
-        replace("edit-password", with: password, in: app)
+        app.buttons["clear-password"].tap()
+        type(password, into: "edit-password", in: app)
         app.buttons["save"].tap()
         XCTAssert(app.staticTexts["detail-username"].waitForLabel(username))
     }
@@ -187,10 +189,11 @@ final class EditTests: UITestCase {
         let app = unlocked()
         app.buttons["new-item"].tap()
         type("Router", into: "edit-title", in: app)
-        // A new login comes with a password made for it, shown.
+        // A new login comes with a password made for it, masked until revealed.
+        XCTAssert(app.staticTexts["password-made"].exists)
+        app.buttons["show-password"].waitAndTap()
         let made = (field("edit-password", in: app).value as? String) ?? ""
         XCTAssertNotNil(made.wholeMatch(of: #/[^lIO01]{20}/#), made)
-        XCTAssert(app.staticTexts["password-made"].exists)
         app.buttons["generate"].waitAndTap()
         let generated = (field("edit-password", in: app).value as? String) ?? ""
         XCTAssertEqual(generated.count, 20)
@@ -229,6 +232,7 @@ final class EditTests: UITestCase {
         }
         // The last kind cannot be turned off.
         XCTAssertFalse(app.switches["generator-kind:0–9"].isEnabled)
+        app.buttons["show-password"].waitAndTap()
         let password = { (self.field("edit-password", in: app).value as? String) ?? "" }
         XCTAssertNotNil(password().wholeMatch(of: #/[0-9]{20}/#), password())
         app.sliders["generator-length"].adjust(toNormalizedSliderPosition: 0)
@@ -239,6 +243,7 @@ final class EditTests: UITestCase {
         app.buttons["cancel-edit"].tap()
         app.buttons["new-item"].waitAndTap()
         XCTAssert(field("edit-title", in: app).waitForExistence(timeout: 10))
+        app.buttons["show-password"].waitAndTap()
         XCTAssertNotNil(password().wholeMatch(of: #/[0-9]{8}/#), password())
         app.buttons["clear-password"].tap()
         XCTAssertEqual(password(), "")

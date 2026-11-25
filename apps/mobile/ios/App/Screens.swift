@@ -825,7 +825,7 @@ private struct ItemEditor: View {
         _password = State(initialValue: draft?.password ?? editor.generated ?? "")
         let made = draft == nil ? editor.generated : nil
         _made = State(initialValue: made)
-        _showPassword = State(initialValue: made != nil)
+        _showPassword = State(initialValue: false)
         _code = State(initialValue: draft?.oneTimeCodeSecret ?? "")
         _removeCode = State(initialValue: draft?.oneTimeCodeSecret == "")
         _notes = State(initialValue: draft?.notes ?? detail?.notes ?? "")
@@ -842,7 +842,6 @@ private struct ItemEditor: View {
     private func generate() {
         password = model.generatePassword()
         made = password
-        showPassword = true
     }
 
     private var draft: ItemDraft {

@@ -52,7 +52,12 @@ fuzz=fuzz/Cargo.toml
 step() { printf '\n== %s\n' "$*"; }
 
 step "Formatting"
-for script in scripts/*.sh; do sh -n "$script"; done
+for script in scripts/*.sh apps/mobile/*/*.sh; do sh -n "$script"; done
+if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck scripts/*.sh apps/mobile/*/*.sh
+else
+    echo "shellcheck not installed; skipped."
+fi
 cargo fmt --all -- --check
 cargo fmt --manifest-path "$desktop" --all -- --check
 cargo fmt --manifest-path "$fuzz" --all -- --check

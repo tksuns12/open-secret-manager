@@ -162,9 +162,12 @@ final class FillModel: ObservableObject {
 
     private func listOffered() async {
         if inserting {
-            // Any item's field, for the field the owner chose.
+            // Any item's field, for the field the owner chose; cards in
+            // conflict are omitted until settled on a computer.
             offered = await call { device in
-                try device.items().sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+                try device.items()
+                    .filter { !($0.kind == .card && $0.conflict) }
+                    .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
             } ?? []
             stage = .unlocked
             return
@@ -238,8 +241,16 @@ final class FillModel: ObservableObject {
 
     /// What of `item` can be inserted, once the owner chose it.
     func chooseToInsert(_ item: ItemSummary) {
+        if item.kind == .card && item.conflict {
+            notice = "Two devices changed this card at once · choose a version on your computer"
+            return
+        }
         Task {
             guard let detail = await call(nil, { try $0.item(id: item.id) }) else { return }
+            if detail.kind == .card && detail.conflict {
+                notice = "Two devices changed this card at once · choose a version on your computer"
+                return
+            }
             insertingFrom = (item, InsertField.of(detail))
         }
     }
@@ -338,6 +349,8 @@ struct InsertField: Identifiable, Equatable {
         case shown(String)
         case password
         case oneTimeCode
+        case cardNumber
+        case cardSecurityCode
         case field(String)
     }
 
@@ -347,12 +360,14 @@ struct InsertField: Identifiable, Equatable {
 
     /// What of `detail` can be inserted: for a login its username, password,
     /// code, and website; for a card its number, security code, cardholder,
-    /// and expiry; then any other field, and the notes.
+    /// and expiry; then any other field, and the notes. Cards in conflict
+    /// yield nothing until settled on a computer.
     static func of(_ detail: ItemDetail) -> [InsertField] {
+        if detail.kind == .card && detail.conflict { return [] }
         var fields: [InsertField] = []
         if let card = detail.card {
-            if card.hasNumber { fields.append(InsertField(label: "Number", source: .field("Number"))) }
-            if card.hasSecurityCode { fields.append(InsertField(label: "Security code", source: .field("Security code"))) }
+            if card.hasNumber { fields.append(InsertField(label: "Number", source: .cardNumber)) }
+            if card.hasSecurityCode { fields.append(InsertField(label: "Security code", source: .cardSecurityCode)) }
             if !card.cardholder.isEmpty { fields.append(InsertField(label: "Cardholder name", source: .shown(card.cardholder))) }
             if !card.expiryMonth.isEmpty && !card.expiryYear.isEmpty {
                 let year = card.expiryYear.count == 4 ? String(card.expiryYear.suffix(2)) : card.expiryYear
@@ -381,6 +396,8 @@ struct InsertField: Identifiable, Equatable {
         case let .shown(text): text
         case .password: try device.password(id: id)
         case .oneTimeCode: try device.oneTimeCode(id: id)
+        case .cardNumber: try device.fillCard(id: id).number
+        case .cardSecurityCode: try device.fillCard(id: id).securityCode
         case let .field(name): try device.field(id: id, name: name)
         }
     }

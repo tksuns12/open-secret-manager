@@ -47,8 +47,14 @@ function acceptable(expression) {
 }
 
 function checkLicense(where, name, version, license) {
-  const exception = policy.exceptions[`${name}@${version}`] ?? policy.exceptions[name];
-  if (exception) return exception.license;
+  const exception = policy.exceptions[`${name}@${version}`];
+  if (exception) {
+    if (!Array.isArray(exception.workspaces) || !exception.workspaces.includes(where)) {
+      problems.push(`${where}: ${name} ${version} is outside its allowed exception workspaces`);
+      return "(disallowed exception)";
+    }
+    return exception.license;
+  }
   if (!license) {
     problems.push(`${where}: ${name} ${version} names no license`);
     return "(none)";
@@ -66,7 +72,12 @@ function rust(workspace, manifest) {
   for (const crate of metadata.packages.filter((crate) => used.has(crate.id))) {
     count += 1;
     if (crate.source === null) {
-      // One of this repository's own crates.
+      // Must be one of this repository's own crates, never a path outside the repo.
+      const manifestPath = path.resolve(crate.manifest_path);
+      if (!manifestPath.startsWith(root + path.sep)) {
+        problems.push(`${workspace}: local crate ${crate.name} lies outside the repository (${crate.manifest_path})`);
+        continue;
+      }
       if (crate.license !== policy.own_license) problems.push(`${workspace}: own crate ${crate.name} is under ${crate.license}`);
       continue;
     }
@@ -80,14 +91,22 @@ function rust(workspace, manifest) {
 }
 
 /** What a package says its license is: in the lockfile, or in its own
- * package.json where it is installed, or else in the registry, for a
- * package made for another system that is not installed here. */
-function npmLicense(folder, where, name, entry) {
+ * package.json where it is installed, or in the integrity-pinned offline map
+ * in dependency-policy.json, or else in the registry when online. */
+function npmLicense(workspace, folder, where, name, entry) {
   if (entry.license) return entry.license;
   try {
     const own = JSON.parse(readFileSync(path.join(root, folder, where, "package.json"), "utf8"));
     if (typeof own.license === "string") return own.license;
   } catch { /* not installed here */ }
+  const pinned = policy.offline_npm_licenses?.[`${name}@${entry.version}`];
+  if (pinned) {
+    if (pinned.integrity !== entry.integrity) {
+      problems.push(`${workspace}: ${name} ${entry.version} integrity does not match offline_npm_licenses`);
+      return "(integrity mismatch)";
+    }
+    return pinned.license;
+  }
   if (offline) return undefined;
   try {
     return JSON.parse(execFileSync("npm", ["view", `${name}@${entry.version}`, "license", "--json"], { encoding: "utf8" }));
@@ -107,9 +126,8 @@ function npm(workspace, folder) {
     if (!entry.resolved?.startsWith(policy.npm_registry) || !entry.integrity) {
       problems.push(`${workspace}: ${name} ${entry.version} comes from ${entry.resolved ?? "nowhere recorded"} ${entry.integrity ? "" : "without a checksum"}`);
     }
-    const found = npmLicense(folder, where, name, entry);
+    const found = npmLicense(workspace, folder, where, name, entry);
     if (found === undefined) {
-      // Made for another system and not installed here.
       unchecked.push(`${workspace}: ${name} ${entry.version}`);
       continue;
     }
@@ -132,7 +150,9 @@ for (const report of reports) {
   if (report.twice.length > 0) console.log(`  in more than one version: ${report.twice.join("; ")}`);
 }
 if (unchecked.length > 0) {
-  console.log(`\nNot checked offline: ${unchecked.length} packages made for other systems, not installed here.`);
+  for (const item of unchecked) {
+    problems.push(`${item} has no verified offline license entry in dependency-policy.json`);
+  }
 }
 if (problems.length > 0) {
   console.log(`\n${problems.length} against the policy:`);

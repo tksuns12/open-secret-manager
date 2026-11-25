@@ -16,10 +16,17 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use osm_vault_core::{Item, ItemKind, Origin, Vault};
 use zeroize::Zeroizing;
@@ -147,13 +154,14 @@ impl Asker {
 }
 
 /// A verified domain of an app's links, as the system lists it: lower case,
-/// without `*.`, `www.`, or a trailing dot, and of two labels or more.
+/// without `*.` or a trailing dot, and a valid registrable domain (not a
+/// public suffix). Preserves `www.` so a `www.` link never widens to apex.
 fn domain(listed: &str) -> Option<String> {
     let listed = listed.trim().to_ascii_lowercase();
     let listed = listed.strip_prefix("*.").unwrap_or(&listed);
-    let listed = listed.strip_prefix("www.").unwrap_or(listed);
     let listed = listed.trim_end_matches('.');
-    (listed.contains('.') && !listed.starts_with('.')).then(|| listed.to_owned())
+    (listed.contains('.') && osm_vault_core::passkey::rp_id_valid(listed))
+        .then(|| listed.to_owned())
 }
 
 /// Whether a login saved at `url` is for a site on one of an app's verified
@@ -443,6 +451,7 @@ pub(crate) fn save_new(
     username: String,
     password: String,
 ) -> Result<String, MobileError> {
+    let mut password = Zeroizing::new(password);
     let asker = Asker::of(requester)?;
     let url = match &asker {
         Asker::Page(origins) => origins[0].to_string(),
@@ -455,7 +464,7 @@ pub(crate) fn save_new(
         url,
         notes: String::new(),
         favorite: false,
-        password: Some(password),
+        password: Some(std::mem::take(&mut *password)),
         one_time_code_secret: None,
         card: None,
     };
@@ -521,13 +530,30 @@ impl AppChoices {
         if !change(&mut all) {
             return Ok(());
         }
-        // Written whole, then put in place: a stop part-way leaves the file
-        // as it was.
-        let partial = self.path.with_extension("json.partial");
-        let mut file = std::fs::File::create(&partial)?;
-        file.write_all(&serde_json::to_vec(&all).map_err(std::io::Error::other)?)?;
-        file.sync_all()?;
-        std::fs::rename(&partial, &self.path)
+        // Written whole to a unique sibling with owner-only permissions, then
+        // put in place: a stop part-way leaves the file as it was.
+        static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let partial = self.path.with_file_name(format!(
+            "{}.{}-{seq}.partial",
+            Self::FILE,
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&partial)?;
+            file.write_all(&serde_json::to_vec(&all).map_err(std::io::Error::other)?)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&partial, &self.path)
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        write_result
     }
 
     pub(crate) fn remember(&self, key: &str, id: &str) -> std::io::Result<()> {
@@ -559,13 +585,25 @@ mod tests {
     #[test]
     fn an_apps_listed_domains_are_read_as_android_lists_them() {
         assert_eq!(domain("*.Example.com").as_deref(), Some("example.com"));
-        assert_eq!(domain("www.example.com.").as_deref(), Some("example.com"));
+        assert_eq!(
+            domain("www.example.com.").as_deref(),
+            Some("www.example.com")
+        );
         assert_eq!(
             domain(" shop.example.com ").as_deref(),
             Some("shop.example.com")
         );
-        for one_label in ["localhost", "www.", "*.", "", ".com"] {
-            assert_eq!(domain(one_label), None, "{one_label}");
+        for invalid in [
+            "localhost",
+            "www.",
+            "*.",
+            "",
+            ".com",
+            "com",
+            "co.uk",
+            "github.io",
+        ] {
+            assert_eq!(domain(invalid), None, "{invalid}");
         }
     }
 

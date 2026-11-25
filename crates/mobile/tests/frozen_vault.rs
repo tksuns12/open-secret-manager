@@ -1176,6 +1176,29 @@ fn a_passkey_is_made_and_signed_with_for_an_app_and_for_a_page_of_a_trusted_brow
             ..
         })
     ));
+    // Saving a passkey into an existing login for another RP is refused before creation.
+    let other_site = device
+        .create_item(ItemDraft {
+            title: "Other".into(),
+            kind: ItemKind::Login,
+            username: "someone".into(),
+            url: "https://other.test".into(),
+            notes: String::new(),
+            favorite: false,
+            password: Some("pw".into()),
+            one_time_code_secret: None,
+            card: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        device.create_passkey(
+            creation("example.test", &[]),
+            page(None),
+            true,
+            Some(other_site),
+        ),
+        Err(MobileError::NotForThisPage)
+    ));
 }
 
 #[test]
@@ -1187,6 +1210,12 @@ fn the_password_changes_given_the_current_one_and_a_long_enough_new_one() {
     assert!(matches!(
         device.change_password(PASSWORD.into(), new.into()),
         Err(MobileError::Locked)
+    ));
+    device.unlock(PASSWORD.into()).unwrap();
+    // Re-calling unlock while already unlocked verifies the password.
+    assert!(matches!(
+        device.unlock("not the password".into()),
+        Err(MobileError::InvalidCredentials)
     ));
     device.unlock(PASSWORD.into()).unwrap();
     assert!(matches!(

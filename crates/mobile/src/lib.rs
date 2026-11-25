@@ -630,6 +630,34 @@ impl std::fmt::Debug for ItemDraft {
 }
 
 impl ItemDraft {
+    fn wipe(&mut self) {
+        use zeroize::Zeroize;
+        self.title.zeroize();
+        self.username.zeroize();
+        self.url.zeroize();
+        self.notes.zeroize();
+        if let Some(password) = self.password.as_mut() {
+            password.zeroize();
+        }
+        if let Some(secret) = self.one_time_code_secret.as_mut() {
+            secret.zeroize();
+        }
+        if let Some(card) = self.card.as_mut() {
+            card.cardholder.zeroize();
+            card.expiry_month.zeroize();
+            card.expiry_year.zeroize();
+            if let Some(brand) = card.brand.as_mut() {
+                brand.zeroize();
+            }
+            if let Some(number) = card.number.as_mut() {
+                number.zeroize();
+            }
+            if let Some(code) = card.security_code.as_mut() {
+                code.zeroize();
+            }
+        }
+    }
+
     /// Writes the draft over `item`, keeping what the draft leaves alone.
     /// Its values move into the item, which wipes them when it goes; what
     /// is left over is wiped here. (A record cannot wipe itself: the
@@ -686,6 +714,33 @@ impl ItemDraft {
             if item.kind == osm_vault_core::ItemKind::Card {
                 change.apply_to(item);
             }
+        }
+    }
+}
+
+/// Wipes an [`ItemDraft`]'s secret fields on drop unless taken by the caller.
+/// Keeps `ItemDraft` itself free of `Drop` so UniFFI record bindings can still
+/// move fields out of it without ABI changes.
+pub(crate) struct DraftGuard(Option<ItemDraft>);
+
+impl DraftGuard {
+    pub(crate) fn new(draft: ItemDraft) -> Self {
+        Self(Some(draft))
+    }
+
+    pub(crate) fn as_ref(&self) -> &ItemDraft {
+        self.0.as_ref().expect("draft not yet taken")
+    }
+
+    pub(crate) fn take(mut self) -> ItemDraft {
+        self.0.take().expect("draft not yet taken")
+    }
+}
+
+impl Drop for DraftGuard {
+    fn drop(&mut self) {
+        if let Some(mut draft) = self.0.take() {
+            draft.wipe();
         }
     }
 }
