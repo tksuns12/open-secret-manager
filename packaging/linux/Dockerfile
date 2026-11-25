@@ -17,20 +17,35 @@ RUN apt-get update \
       libssl-dev libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# Node from its official release, checked against the published sums.
-RUN case "$TARGETARCH" in amd64) arch=x64 ;; arm64) arch=arm64 ;; *) echo "unknown $TARGETARCH" >&2; exit 1 ;; esac \
+# Node from its official release, verified against pinned per-arch SHA-256 sums.
+RUN case "$TARGETARCH" in \
+      amd64) arch=x64;   sum=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6 ;; \
+      arm64) arch=arm64; sum=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2 ;; \
+      *) echo "unknown $TARGETARCH" >&2; exit 1 ;; \
+    esac \
  && name="node-v$NODE_VERSION-linux-$arch.tar.xz" \
  && curl -fsSLO "https://nodejs.org/dist/v$NODE_VERSION/$name" \
- && curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt" | grep " $name\$" | sha256sum -c - \
+ && echo "$sum  $name" | sha256sum -c - \
  && tar -xJf "$name" -C /usr/local --strip-components=1 \
  && rm "$name"
 
-# The same Rust as the project's other builds.
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+# The same Rust as the project's other builds, installed via pinned rustup-init
+# verified against its published SHA-256 sum rather than piping curl to sh.
+RUN case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-gnu;  sum=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;; \
+      arm64) triple=aarch64-unknown-linux-gnu; sum=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;; \
+      *) echo "unknown $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+ && cd /tmp \
+ && curl -fsSLo rustup-init "https://static.rust-lang.org/rustup/archive/1.29.3/$triple/rustup-init" \
+ && echo "$sum  rustup-init" | sha256sum -c - \
+ && chmod +x rustup-init \
+ && ./rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUST_VERSION" \
+ && rm rustup-init
 ENV PATH=/root/.cargo/bin:$PATH \
     CARGO_INCREMENTAL=0
 
 WORKDIR /src
 # The source arrives as an archive of one commit; the package is built from
 # it with the lockfiles as they are.
-CMD ["sh", "-c", "cd apps/desktop && npm ci --no-audit --no-fund && npm run tauri:build -- --bundles deb"]
+CMD ["sh", "-c", "cd apps/desktop && npm ci --no-audit --no-fund && npm run tauri:build -- --bundles deb -- --locked"]

@@ -33,18 +33,23 @@ out="$root/dist/ios/$short"
 rm -rf "$out"
 mkdir -p "$out"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+index=""
+trap '[ -z "$index" ] || rm -f "$index"; rm -rf "$work"' EXIT
 
-# From an export of the commit at one fixed path, as the other releases.
-build=/private/tmp/open-secret-manager-ios-release
-rm -rf "$build"
-mkdir -p "$build"
-git archive --format=tar "$commit" | tar -x -C "$build"
-if [ "${OSM_ALLOW_CHANGES:-}" = 1 ]; then
-    git diff --binary HEAD | (cd "$build" && git apply --allow-empty)
-    git ls-files --others --exclude-standard -z |
-        xargs -0 -I{} sh -c 'mkdir -p "$(dirname "$1/{}")" && cp -p "{}" "$1/{}"' _ "$build"
+# Export the commit (or working tree with OSM_ALLOW_CHANGES=1) inside the
+# private temporary directory so no predictable /private/tmp path is shared.
+build="$work/src"
+mkdir -m 0700 "$build"
+tree=$commit
+if [ "${OSM_ALLOW_CHANGES:-}" = 1 ] && [ -n "$(git status --porcelain)" ]; then
+    index=$(mktemp)
+    cp "$(git rev-parse --git-path index)" "$index"
+    GIT_INDEX_FILE=$index git add -A
+    tree=$(GIT_INDEX_FILE=$index git write-tree)
+    rm -f "$index"
+    index=""
 fi
+git archive --format=tar "$tree" | tar -x -C "$build"
 
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 export SOURCE_DATE_EPOCH

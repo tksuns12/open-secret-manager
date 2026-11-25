@@ -36,16 +36,19 @@ rm -rf "$out"
 mkdir -p "$out"
 work=$(mktemp -d)
 container=""
-trap '[ -z "$container" ] || docker rm -f "$container" >/dev/null 2>&1; rm -rf "$work"' EXIT
+index=""
+trap '[ -z "$container" ] || docker rm -f "$container" >/dev/null 2>&1; [ -z "$index" ] || rm -f "$index"; rm -rf "$work"' EXIT
 
-# What the commit holds, and with OSM_ALLOW_CHANGES the working tree's
-# changes too.
-mkdir "$work/src"
-git archive --format=tar "$commit" | tar -x -C "$work/src"
-if [ "${OSM_ALLOW_CHANGES:-}" = 1 ]; then
-    git diff --binary HEAD | (cd "$work/src" && git apply --allow-empty)
-    git ls-files --others --exclude-standard -z |
-        xargs -0 -I{} sh -c 'mkdir -p "$(dirname "$1/{}")" && cp -p "{}" "$1/{}"' _ "$work/src"
+# Export the commit (or working tree via a temporary index with
+# OSM_ALLOW_CHANGES=1), avoiding any shell interpolation of filenames.
+tree=$commit
+if [ "${OSM_ALLOW_CHANGES:-}" = 1 ] && [ -n "$(git status --porcelain)" ]; then
+    index=$(mktemp)
+    cp "$(git rev-parse --git-path index)" "$index"
+    GIT_INDEX_FILE=$index git add -A
+    tree=$(GIT_INDEX_FILE=$index git write-tree)
+    rm -f "$index"
+    index=""
 fi
 
 # The Rust and the NDK that prepare-release.sh names, which refuses others.
@@ -53,12 +56,17 @@ rust=$(sed -n 's/^rust=//p' apps/mobile/android/prepare-release.sh)
 ndk=$(sed -n 's/^ndk=//p' apps/mobile/android/prepare-release.sh)
 docker build --platform linux/amd64 --build-arg RUST_VERSION="$rust" --build-arg NDK_VERSION="$ndk" \
     -t osm-android-build packaging/android
-# What Gradle and Cargo download is kept between builds; it changes nothing
-# they build.
-container=$(docker create --platform linux/amd64 -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$commit")" \
-    -v osm-android-gradle:/root/.gradle -v osm-android-cargo:/root/.cargo/registry osm-android-build)
-# Without the Mac's extended attributes, which the container cannot take.
-COPYFILE_DISABLE=1 tar --no-xattrs -C "$work/src" -c . | docker cp - "$container:/src"
+# Unless OSM_ANDROID_FRESH_CACHE=1 (used by scripts/reproduce-android.sh),
+# Gradle and Cargo downloads are cached in named volumes between builds.
+if [ "${OSM_ANDROID_FRESH_CACHE:-0}" = 1 ]; then
+    container=$(docker create --platform linux/amd64 -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$commit")" \
+        osm-android-build)
+else
+    container=$(docker create --platform linux/amd64 -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$commit")" \
+        -v osm-android-gradle:/root/.gradle -v osm-android-cargo:/root/.cargo/registry osm-android-build)
+fi
+# Stream the git archive directly into the container with no macOS xattrs.
+git archive --format=tar "$tree" | docker cp - "$container:/src"
 docker start --attach "$container"
 docker cp "$container:/src/apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk" "$work/unsigned.apk"
 

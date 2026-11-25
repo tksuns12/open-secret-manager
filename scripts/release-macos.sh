@@ -38,16 +38,41 @@ mkdir -p "$out"
 # The commit is built from an export of it at one fixed path. Cargo puts the
 # absolute path of the crates the desktop app takes from outside its own
 # workspace into the app's symbols, so the same commit built at another path
-# makes another program.
-build=/private/tmp/open-secret-manager-release
-rm -rf "$build"
-mkdir -p "$build"
-git archive --format=tar "$commit" | tar -x -C "$build"
-if [ "${OSM_ALLOW_CHANGES:-}" = 1 ]; then
-    git diff --binary HEAD | (cd "$build" && git apply --allow-empty)
-    git ls-files --others --exclude-standard -z |
-        xargs -0 -I{} sh -c 'mkdir -p "$(dirname "$1/{}")" && cp -p "{}" "$1/{}"' _ "$build"
+# makes another program. Refuse symlinks or foreign-owned directories and
+# always clean up on exit.
+build=${OSM_BUILD_DIR:-/private/tmp/open-secret-manager-release}
+stage=""
+index=""
+cleanup() {
+    [ -z "$index" ] || rm -f "$index"
+    [ -z "$stage" ] || rm -rf "$stage"
+    if [ -n "$build" ] && [ ! -L "$build" ] && [ -O "$build" ]; then
+        rm -rf "$build"
+    fi
+}
+trap cleanup EXIT
+if [ -L "$build" ]; then
+    echo "Refusing symlink build path: $build" >&2
+    exit 1
 fi
+if [ -e "$build" ]; then
+    if [ ! -O "$build" ] || [ ! -d "$build" ]; then
+        echo "Refusing pre-existing build path not owned by current user: $build" >&2
+        exit 1
+    fi
+    rm -rf "$build"
+fi
+mkdir -m 0700 "$build"
+tree=$commit
+if [ "${OSM_ALLOW_CHANGES:-}" = 1 ] && [ -n "$(git status --porcelain)" ]; then
+    index=$(mktemp)
+    cp "$(git rev-parse --git-path index)" "$index"
+    GIT_INDEX_FILE=$index git add -A
+    tree=$(GIT_INDEX_FILE=$index git write-tree)
+    rm -f "$index"
+    index=""
+fi
+git archive --format=tar "$tree" | tar -x -C "$build"
 
 # No clock and no home folder in what is built. Paths are also taken out of
 # the symbol table the linker computes the program's UUID from (strip
@@ -66,7 +91,7 @@ if [ -n "${OSM_SIGNING_IDENTITY:-}" ]; then
     # Tauri signs the app and the host inside it, with the hardened runtime.
     export APPLE_SIGNING_IDENTITY="$OSM_SIGNING_IDENTITY"
 fi
-(cd "$build/apps/desktop" && npm ci --no-audit --no-fund && npm run tauri:build -- --bundles app)
+(cd "$build/apps/desktop" && npm ci --no-audit --no-fund && npm run tauri:build -- --bundles app -- --locked)
 
 app="$build/apps/desktop/src-tauri/target/release/bundle/macos/Open Secret Manager.app"
 scripts/app-contents.sh "$app" > "$out/app-contents.sha256"
@@ -78,7 +103,6 @@ codesign --verify --deep --strict "$app"
 
 # The disk image: the app and a link to the Applications folder.
 stage=$(mktemp -d)
-trap 'rm -rf "$stage"' EXIT
 ditto "$app" "$stage/Open Secret Manager.app"
 ln -s /Applications "$stage/Applications"
 dmg="$out/Open-Secret-Manager-$version-macos-$arch.dmg"

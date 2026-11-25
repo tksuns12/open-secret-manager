@@ -32,4 +32,8 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    # chrono 0.4.x is marked unmaintained. It is pulled in solely by
+    # openraft 0.9.25 (and openraft-macros) in vault-membership; nothing in
+    # Open Secret Manager calls chrono directly, and no 0.4.x replacement exists.
+    "RUSTSEC-2026-0543",
 ]

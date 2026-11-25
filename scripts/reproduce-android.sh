@@ -13,7 +13,7 @@ kept=$(mktemp -d)
 trap 'rm -rf "$kept"' EXIT
 
 for build in 1 2; do
-    scripts/release-android.sh
+    OSM_ANDROID_FRESH_CACHE=1 scripts/release-android.sh
     cp "dist/android/$short/apk-contents.sha256" "$kept/$build"
 done
 if diff -u "$kept/1" "$kept/2"; then

@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-url = "2.5.8"
+url = "2.5.9"
 
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }

@@ -47,4 +47,4 @@ ENV PATH=/root/.cargo/bin:$PATH
 
 WORKDIR /src
 # The source arrives as an archive of one commit.
-CMD ["sh", "-c", "apps/mobile/android/prepare-release.sh && cd apps/mobile/android && ./gradlew --no-daemon --no-watch-fs --quiet --no-build-cache :app:assembleRelease"]
+CMD ["sh", "-c", "apps/mobile/android/prepare-release.sh && cd apps/mobile/android && ./gradlew --no-daemon --no-watch-fs --quiet --no-build-cache --dependency-verification=strict :app:assembleRelease"]

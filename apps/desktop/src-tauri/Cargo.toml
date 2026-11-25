@@ -66,6 +66,13 @@ custom-protocol = ["tauri/custom-protocol"]
 [lints.rust]
 unsafe_code = "forbid"
 
+# Match the root workspace's release profile: strip debug/local symbols and
+# enable LTO with a single codegen unit for deterministic, hardened binaries.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
 # Tauri bundles platform-specific dependencies and is checked separately from
 # the UI-independent Rust workspace. The session crate holds what the app
 # needs from macOS directly, and the one `unsafe` call that takes.
