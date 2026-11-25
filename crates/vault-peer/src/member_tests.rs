@@ -453,11 +453,12 @@ async fn the_control_plane_runs_between_devices_over_pinned_tls() {
     a.listen().await;
     assert!(!a.endpoint.told_removed());
     for device in [&b, &c] {
-        // It is told why, which is how it learns: the entry completing its
-        // removal was never sent to it.
+        // Each remaining voter answers Removed; quorum confirmation settles
+        // once both surviving voters have refused A (the first alone returns
+        // NotAMember until the second confirms removal).
         assert!(matches!(
             a.endpoint.announce(device.id, device.pin()).await,
-            Err(Error::Removed)
+            Err(Error::Removed | Error::NotAMember)
         ));
         assert_eq!(
             device.node.directory().device_for_pin(&a.pin()),
@@ -467,6 +468,12 @@ async fn the_control_plane_runs_between_devices_over_pinned_tls() {
         assert_eq!(device.addresses.all(a.id), Vec::<String>::new());
     }
     assert!(a.endpoint.told_removed());
+    for device in [&b, &c] {
+        assert!(matches!(
+            a.endpoint.announce(device.id, device.pin()).await,
+            Err(Error::Removed)
+        ));
+    }
     tokio::time::sleep(Duration::from_secs(3)).await;
     let term = b.node.raft().metrics().borrow().current_term;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -677,8 +684,14 @@ async fn the_sync_channel_is_open_to_members_only() {
     b.listen().await;
     b.endpoint.announce_all().await;
     settle(&[&a, &b], &BTreeSet::from([1, 2])).await;
+    // Both remaining voters confirm C's removal (quorum of {1, 2, 3}); the
+    // first answer alone may return NotAMember until the second confirms.
     assert!(matches!(
         c.endpoint.connect_sync(a.id).await,
+        Err(Error::Removed | Error::NotAMember)
+    ));
+    assert!(matches!(
+        c.endpoint.connect_sync(b.id).await,
         Err(Error::Removed)
     ));
     assert!(c.endpoint.told_removed());
