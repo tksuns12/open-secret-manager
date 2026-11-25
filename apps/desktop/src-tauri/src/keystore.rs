@@ -26,11 +26,39 @@ const NONCE: usize = 24;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemKeystore;
 
+/// Whether a Linux `dbus-secret-service` error message indicates that no D-Bus
+/// session bus or `org.freedesktop.secrets` service exists on the host (as
+/// opposed to a present keyring that is locked, denied, or failed).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn secret_service_absent_message(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("no dbus session or secret service provider found")
+        || text.contains("unable to autolaunch a dbus-daemon")
+        || text.contains("cannot spawn a message bus")
+        || text.contains("failed to execute dbus-launch")
+        || text.contains("using x11 for dbus-daemon autolaunch was disabled")
+        || text.contains("not provided by any .service files")
+        || text.contains("serviceunknown")
+        || (text.contains("failed to connect to socket")
+            && text.contains("no such file or directory"))
+}
+
+/// Returns `true` only on Linux when `keyring::Error::PlatformFailure` reports
+/// that neither a D-Bus session bus nor a Secret Service provider is installed.
+/// Locked keyrings and dismissed prompts surface as `NoStorageAccess` and stay
+/// fail-closed (`Unavailable`).
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_secret_service_absent(error: &keyring::Error) -> bool {
+    matches!(error, keyring::Error::PlatformFailure(inner) if secret_service_absent_message(&inner.to_string()))
+}
+
 fn map_keyring_error(error: keyring::Error) -> KeystoreError {
+    #[cfg(target_os = "linux")]
+    if linux_secret_service_absent(&error) {
+        return KeystoreError::Absent;
+    }
     match error {
         keyring::Error::NoEntry => KeystoreError::Lost,
-        #[cfg(target_os = "linux")]
-        keyring::Error::NoStorageAccess(_) => KeystoreError::Absent,
         _ => KeystoreError::Unavailable,
     }
 }
@@ -146,5 +174,31 @@ mod tests {
         for sealed in [&[][..], &[FORM], &[2; 64], &[FORM; NAME + NONCE - 1]] {
             assert_eq!(SystemKeystore.open(sealed), Err(KeystoreError::Lost));
         }
+    }
+
+    #[test]
+    fn secret_service_absence_classifier_distinguishes_absent_from_locked_or_denied() {
+        assert!(secret_service_absent_message(
+            "DBus error: Unable to autolaunch a dbus-daemon without a $DISPLAY for X11"
+        ));
+        assert!(secret_service_absent_message(
+            "DBus error: The name org.freedesktop.secrets was not provided by any .service files"
+        ));
+        assert!(secret_service_absent_message(
+            "No DBus session or Secret Service provider found"
+        ));
+        assert!(!secret_service_absent_message(
+            "Secret Service: object locked"
+        ));
+        assert!(!secret_service_absent_message(
+            "Secret Service: unlock prompt was dismissed"
+        ));
+        assert!(!secret_service_absent_message("DBus error: AccessDenied"));
+        assert_eq!(
+            map_keyring_error(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("Secret Service: object locked")
+            ))),
+            KeystoreError::Unavailable
+        );
     }
 }

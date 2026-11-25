@@ -44,11 +44,12 @@ pub trait RowsSeen: Send + Sync {
 }
 
 fn map_keyring_error(error: keyring::Error) -> RowsSeenError {
-    match error {
-        #[cfg(target_os = "linux")]
-        keyring::Error::NoStorageAccess(_) => RowsSeenError::Absent,
-        _ => RowsSeenError::Unavailable,
+    #[cfg(target_os = "linux")]
+    if crate::keystore::linux_secret_service_absent(&error) {
+        return RowsSeenError::Absent;
     }
+    let _ = error;
+    RowsSeenError::Unavailable
 }
 
 /// The login Keychain on macOS, the Secret Service on Linux, the Credential
