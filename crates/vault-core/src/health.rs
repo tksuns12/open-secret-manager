@@ -9,6 +9,8 @@
 
 use std::collections::BTreeMap;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
@@ -22,6 +24,11 @@ pub const MIN_LENGTH_OF_ONE_KIND: usize = 12;
 /// A word of the item's own (its username, title or site) is only looked
 /// for in a password when it is this long: a shorter one is found by chance.
 const MIN_OWN_WORD: usize = 4;
+/// Bound on the prefix of an item's title or username checked by
+/// [`holds_own_name`], and on the number of title words checked, so an
+/// oversized metadata field cannot be used as a substring-matching oracle.
+const MAX_OWN_NAME_CHARS: usize = 128;
+const MAX_TITLE_WORDS: usize = 8;
 
 /// Why a password is called weak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,21 +87,32 @@ impl std::fmt::Debug for WeakPassword {
     }
 }
 
-/// A login as reuse needs it: its password, kept only until the check ends,
-/// and where it is for. Nothing else of the item is kept.
+/// A login as reuse needs it: a keyed digest of its password under the
+/// check's ephemeral key, and where it is for. Plaintext passwords are not
+/// retained across items.
 struct Held {
     id: String,
-    password: Zeroizing<String>,
+    password_digest: [u8; 32],
     place: (String, String),
 }
 
 /// Judges the logins it is given one at a time, so that of an item only
-/// what the check needs is held at once, and the passwords are wiped when it
-/// is done.
-#[derive(Default)]
+/// what the check needs is held at once, and the ephemeral key is wiped when
+/// it is done.
 pub struct Check {
+    key: Zeroizing<[u8; 32]>,
     weak: Vec<WeakPassword>,
     held: Vec<Held>,
+}
+
+impl Default for Check {
+    fn default() -> Self {
+        Self {
+            key: Zeroizing::new(crate::crypto::random_array()),
+            weak: Vec::new(),
+            held: Vec::new(),
+        }
+    }
 }
 
 impl Check {
@@ -111,9 +129,13 @@ impl Check {
                 reasons,
             });
         }
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.key.as_ref())
+            .expect("HMAC-SHA256 accepts a 32-byte key");
+        mac.update(item.password.as_bytes());
+        let password_digest: [u8; 32] = mac.finalize().into_bytes().into();
         self.held.push(Held {
             id: item.id.clone(),
-            password: Zeroizing::new(item.password.clone()),
+            password_digest,
             place: (
                 item.username.trim().to_lowercase(),
                 site(&item.url).unwrap_or_default(),
@@ -123,10 +145,13 @@ impl Check {
 
     pub fn finish(mut self) -> PasswordHealth {
         self.weak.sort_by(|a, b| a.id.cmp(&b.id));
-        // By password, as a borrowed key; the places of each.
-        let mut by_password: BTreeMap<&str, Vec<&Held>> = BTreeMap::new();
+        // By keyed password digest; the places of each.
+        let mut by_password: BTreeMap<&[u8; 32], Vec<&Held>> = BTreeMap::new();
         for held in &self.held {
-            by_password.entry(&held.password).or_default().push(held);
+            by_password
+                .entry(&held.password_digest)
+                .or_default()
+                .push(held);
         }
         let mut reused: Vec<Vec<String>> = by_password
             .into_values()
@@ -275,20 +300,30 @@ fn kinds(password: &str) -> usize {
 /// site's registrable domain (`example` for `https://www.example.com`).
 fn holds_own_name(item: &Item) -> bool {
     let password = Zeroizing::new(item.password.to_lowercase());
-    let title = item.title.to_lowercase();
-    let mut words = vec![item.username.trim().to_lowercase(), title.clone()];
+    let title_prefix: String = item.title.chars().take(MAX_OWN_NAME_CHARS).collect();
+    let username_prefix: String = item
+        .username
+        .trim()
+        .chars()
+        .take(MAX_OWN_NAME_CHARS)
+        .collect();
+    let title = title_prefix.to_lowercase();
+    let username = username_prefix.to_lowercase();
+    let mut words = vec![username.clone(), title.clone()];
     words.extend(
         title
             .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.chars().count() >= MIN_OWN_WORD)
+            .take(MAX_TITLE_WORDS)
             .map(str::to_owned),
     );
     words.push(title.chars().filter(|c| c.is_alphanumeric()).collect());
-    if let Some((name, _)) = item.username.split_once('@') {
-        words.push(name.trim().to_lowercase());
+    if let Some((name, _)) = username.split_once('@') {
+        words.push(name.trim().to_owned());
     }
     if let Some((site, true)) = site_of(&item.url) {
         if let Some(label) = site.split('.').next() {
-            words.push(label.to_owned());
+            words.push(label.chars().take(MAX_OWN_NAME_CHARS).collect());
         }
     }
     words
@@ -748,5 +783,23 @@ mod tests {
             .unwrap();
             assert!(reasons_of_the_password_alone(&password).contains(&Weakness::OneKind));
         }
+    }
+
+    #[test]
+    fn holds_own_name_bounds_title_words_and_length() {
+        // More than MAX_TITLE_WORDS words: the 9th word is ignored so a huge
+        // title cannot batch-probe candidate substrings of the password.
+        let many_words = "alpha bravo charlie delta echo foxtrot golf hotel targetword";
+        let item = login("a", many_words, "user", "", "Zq7!targetword-x9");
+        assert!(password_health([&item]).weak.is_empty());
+
+        // Characters past MAX_OWN_NAME_CHARS in title or username are ignored.
+        let long_title = format!("{} targetword", "a".repeat(MAX_OWN_NAME_CHARS));
+        let item_long_title = login("b", &long_title, "user", "", "Zq7!targetword-x9");
+        assert!(password_health([&item_long_title]).weak.is_empty());
+
+        let long_username = format!("{}@example.test", "b".repeat(MAX_OWN_NAME_CHARS));
+        let item_long_user = login("c", "Shop", &long_username, "", "Zq7!example-x9");
+        assert!(password_health([&item_long_user]).weak.is_empty());
     }
 }

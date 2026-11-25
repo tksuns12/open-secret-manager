@@ -44,6 +44,7 @@ pub(crate) fn shell_keeping(
             chosen_backup: std::sync::Mutex::new(None),
             import: Mutex::new(None),
             rows_seen: crate::rows_seen::Checkpoint::new(rows),
+            health_budget: std::sync::Mutex::new(crate::HealthBudget::default()),
         })
         .build(mock_context(noop_assets()))
         .unwrap()

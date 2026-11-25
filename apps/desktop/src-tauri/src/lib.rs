@@ -53,6 +53,57 @@ struct AppState {
     /// What this computer last saw the vault's file hold, kept where the
     /// file cannot set it back.
     rows_seen: rows_seen::Checkpoint,
+    /// Rate limit on `password_health` calls from the window, preventing
+    /// automated oracle probing of stored passwords across the bridge.
+    health_budget: std::sync::Mutex<HealthBudget>,
+}
+
+/// Token bucket limiting how fast the window can query `password_health`.
+struct HealthBudget {
+    tokens: u32,
+    last_refill: std::time::Instant,
+}
+
+impl HealthBudget {
+    const CAPACITY: u32 = 10;
+    const REFILL_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            tokens: Self::CAPACITY,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    fn take_at(&mut self, now: std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let step = Self::REFILL_EVERY.as_secs();
+        let gained = elapsed.as_secs() / step;
+        if gained > 0 {
+            let added = gained.min(u64::from(Self::CAPACITY)) as u32;
+            self.tokens = self.tokens.saturating_add(added).min(Self::CAPACITY);
+            self.last_refill = if self.tokens == Self::CAPACITY {
+                now
+            } else {
+                self.last_refill + std::time::Duration::from_secs(gained.saturating_mul(step))
+            };
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    fn take(&mut self) -> bool {
+        self.take_at(std::time::Instant::now())
+    }
+}
+
+impl Default for HealthBudget {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -202,13 +253,28 @@ async fn password_health(
 ) -> Result<PasswordHealth, CommandError> {
     use osm_vault_core::health::Weakness;
     let vault = state.vault.lock().await;
-    let health = vault
-        .as_ref()
-        .ok_or_else(|| CommandError {
+    let vault = vault.as_ref().ok_or_else(|| CommandError {
+        code: "locked",
+        message: "vault is locked".into(),
+    })?;
+    if !vault.is_unlocked() {
+        return Err(CommandError {
             code: "locked",
             message: "vault is locked".into(),
-        })?
-        .password_health()?;
+        });
+    }
+    let allowed = state
+        .health_budget
+        .lock()
+        .map(|mut budget| budget.take())
+        .unwrap_or(false);
+    if !allowed {
+        return Err(CommandError {
+            code: "rate_limited",
+            message: "too many password health checks; try again in a moment".into(),
+        });
+    }
+    let health = vault.password_health()?;
     Ok(PasswordHealth {
         weak: health
             .weak
@@ -459,7 +525,36 @@ impl From<CardInput> for card::CardChange {
     }
 }
 
+/// Character bounds on metadata fields submitted across the bridge so an
+/// untrusted WebView cannot pack megabytes of candidate words into `title` or
+/// `username` to probe `password_health`.
+const MAX_TITLE_CHARS: usize = 256;
+const MAX_USERNAME_CHARS: usize = 512;
+const MAX_URL_CHARS: usize = 2048;
+
 impl EntryInput {
+    fn validate_bounds(&self) -> Result<(), CommandError> {
+        if self.title.chars().count() > MAX_TITLE_CHARS {
+            return Err(CommandError {
+                code: "invalid_item",
+                message: format!("title must be at most {MAX_TITLE_CHARS} characters"),
+            });
+        }
+        if self.username.chars().count() > MAX_USERNAME_CHARS {
+            return Err(CommandError {
+                code: "invalid_item",
+                message: format!("username must be at most {MAX_USERNAME_CHARS} characters"),
+            });
+        }
+        if self.url.chars().count() > MAX_URL_CHARS {
+            return Err(CommandError {
+                code: "invalid_item",
+                message: format!("website address must be at most {MAX_URL_CHARS} characters"),
+            });
+        }
+        Ok(())
+    }
+
     fn apply_to(&mut self, item: &mut Item) {
         item.title = std::mem::take(&mut self.title);
         item.kind = self.kind;
@@ -531,6 +626,7 @@ async fn create_entry(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<ItemSummary, CommandError> {
+    input.validate_bounds()?;
     let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
         code: "locked",
@@ -552,6 +648,7 @@ async fn update_entry<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle<R>,
 ) -> Result<ItemSummary, CommandError> {
+    input.validate_bounds()?;
     let mut vault = state.vault.lock().await;
     let vault = vault.as_mut().ok_or_else(|| CommandError {
         code: "locked",
@@ -1028,6 +1125,7 @@ pub fn run() {
             rows_seen: rows_seen::Checkpoint::new(std::sync::Arc::new(
                 rows_seen::KeychainRowsSeen::default(),
             )),
+            health_budget: std::sync::Mutex::new(HealthBudget::default()),
         })
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -1343,5 +1441,46 @@ mod tests {
         ] {
             assert!(bridge.contains(&format!("\"{set}\"")), "{set}");
         }
+    }
+
+    #[test]
+    fn entry_input_rejects_oversized_metadata_and_allows_normal_values() {
+        let mut ok = input(None, None);
+        ok.title = "a".repeat(MAX_TITLE_CHARS);
+        ok.username = "u".repeat(MAX_USERNAME_CHARS);
+        ok.url = format!("https://example.test/{}", "p".repeat(MAX_URL_CHARS - 21));
+        ok.notes = "n".repeat(10_000);
+        assert!(ok.validate_bounds().is_ok());
+
+        let mut bad_title = input(None, None);
+        bad_title.title = "a".repeat(MAX_TITLE_CHARS + 1);
+        assert_eq!(
+            bad_title.validate_bounds().unwrap_err().code,
+            "invalid_item"
+        );
+
+        let mut bad_username = input(None, None);
+        bad_username.username = "u".repeat(MAX_USERNAME_CHARS + 1);
+        assert_eq!(
+            bad_username.validate_bounds().unwrap_err().code,
+            "invalid_item"
+        );
+
+        let mut bad_url = input(None, None);
+        bad_url.url = "x".repeat(MAX_URL_CHARS + 1);
+        assert_eq!(bad_url.validate_bounds().unwrap_err().code, "invalid_item");
+    }
+
+    #[test]
+    fn health_budget_limits_burst_and_refills_over_time() {
+        let mut budget = HealthBudget::new();
+        let start = budget.last_refill;
+        for _ in 0..HealthBudget::CAPACITY {
+            assert!(budget.take_at(start));
+        }
+        assert!(!budget.take_at(start));
+        assert!(!budget.take_at(start + std::time::Duration::from_secs(4)));
+        assert!(budget.take_at(start + HealthBudget::REFILL_EVERY));
+        assert!(!budget.take_at(start + HealthBudget::REFILL_EVERY));
     }
 }

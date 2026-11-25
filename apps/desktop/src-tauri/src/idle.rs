@@ -83,6 +83,7 @@ mod tests {
                 rows_seen: crate::rows_seen::Checkpoint::new(std::sync::Arc::new(
                     crate::rows_seen::MemoryRowsSeen::default(),
                 )),
+                health_budget: std::sync::Mutex::new(crate::HealthBudget::default()),
             })
             .build(mock_context(noop_assets()))
             .unwrap();
