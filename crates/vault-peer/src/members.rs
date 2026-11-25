@@ -337,10 +337,13 @@ impl AddressBook {
     /// second layout, which kept one address for each device, has it moved
     /// over.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let store = Connection::open(path)?;
+        let mut store = Connection::open(path)?;
         store.busy_timeout(Duration::from_secs(5))?;
-        osm_vault_sync::claim_store_version(&store, crate::peers::STORE_VERSION)?;
-        let transaction = store.unchecked_transaction()?;
+        let found = osm_vault_sync::check_store_version(&store, crate::peers::STORE_VERSION)?;
+        let transaction =
+            store.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let found = osm_vault_sync::check_store_version(&transaction, crate::peers::STORE_VERSION)?
+            .max(found);
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS device_addresses (
                  device_id BLOB NOT NULL CHECK(length(device_id) = 16),
@@ -360,6 +363,9 @@ impl AddressBook {
                      SELECT device_id, 0, address FROM member_addresses;
                  DROP TABLE member_addresses;",
             )?;
+        }
+        if found < crate::peers::STORE_VERSION {
+            osm_vault_sync::set_store_version(&transaction, crate::peers::STORE_VERSION)?;
         }
         transaction.commit()?;
         let mut known: BTreeMap<DeviceId, Vec<KnownAddress>> = BTreeMap::new();

@@ -2,7 +2,7 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, seq::SliceRandom};
 use sha1::Sha1;
 use url::Url;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{Error, PasswordPolicy, Result};
 
@@ -61,14 +61,19 @@ pub fn generate_password(policy: &PasswordPolicy) -> Result<String> {
         .flat_map(|group| group.iter().copied())
         .collect::<Vec<_>>();
     let mut bytes = Zeroizing::new(Vec::with_capacity(policy.length));
-    for group in &groups {
-        bytes.push(*group.choose(&mut OsRng).ok_or(Error::Crypto)?);
+    loop {
+        bytes.clear();
+        for _ in 0..policy.length {
+            bytes.push(*alphabet.choose(&mut OsRng).ok_or(Error::Crypto)?);
+        }
+        if groups
+            .iter()
+            .all(|group| bytes.iter().any(|byte| group.contains(byte)))
+        {
+            break;
+        }
     }
-    while bytes.len() < policy.length {
-        bytes.push(*alphabet.choose(&mut OsRng).ok_or(Error::Crypto)?);
-    }
-    bytes.shuffle(&mut OsRng);
-    String::from_utf8(bytes.to_vec()).map_err(|_| Error::Crypto)
+    String::from_utf8(std::mem::take(&mut *bytes)).map_err(|_| Error::Crypto)
 }
 
 pub fn totp_code(secret_or_uri: &str, unix_time: u64) -> Result<String> {
@@ -79,7 +84,7 @@ pub fn totp_code(secret_or_uri: &str, unix_time: u64) -> Result<String> {
     if config.period == 0 {
         return Err(Error::InvalidItem("TOTP period must be positive".into()));
     }
-    let secret = Zeroizing::new(decode_base32(&config.secret)?);
+    let secret = decode_base32(&config.secret)?;
     if secret.len() < 10 {
         return Err(Error::InvalidItem("TOTP secret is too short".into()));
     }
@@ -106,6 +111,12 @@ struct TotpConfig {
     period: u64,
 }
 
+impl Drop for TotpConfig {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
 fn parse_totp(value: &str) -> Result<TotpConfig> {
     if !value.starts_with("otpauth://") {
         return Ok(TotpConfig {
@@ -120,12 +131,12 @@ fn parse_totp(value: &str) -> Result<TotpConfig> {
             "only TOTP otpauth URIs are supported".into(),
         ));
     }
-    let mut secret = None;
+    let mut secret: Option<Zeroizing<String>> = None;
     let mut digits = 6;
     let mut period = 30;
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
-            "secret" => secret = Some(value.into_owned()),
+            "secret" => secret = Some(Zeroizing::new(value.into_owned())),
             "digits" => {
                 digits = value
                     .parse()
@@ -142,17 +153,18 @@ fn parse_totp(value: &str) -> Result<TotpConfig> {
             _ => {}
         }
     }
+    let mut secret = secret.ok_or_else(|| Error::InvalidItem("missing TOTP secret".into()))?;
     Ok(TotpConfig {
-        secret: secret.ok_or_else(|| Error::InvalidItem("missing TOTP secret".into()))?,
+        secret: std::mem::take(&mut *secret),
         digits,
         period,
     })
 }
 
-fn decode_base32(value: &str) -> Result<Vec<u8>> {
+fn decode_base32(value: &str) -> Result<Zeroizing<Vec<u8>>> {
     let mut bits = 0_u32;
     let mut bit_count = 0_u8;
-    let mut output = Vec::with_capacity(value.len() * 5 / 8);
+    let mut output = Zeroizing::new(Vec::with_capacity(value.len() * 5 / 8));
     for byte in value
         .bytes()
         .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'-' && *byte != b'=')

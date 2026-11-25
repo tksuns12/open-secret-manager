@@ -38,10 +38,104 @@ pub fn preview_import(format: ImportFormat, bytes: &[u8]) -> Result<ImportPrevie
     })
 }
 
-#[derive(Deserialize)]
 struct BitwardenExport {
-    #[serde(default)]
     items: Vec<BitwardenItem>,
+}
+
+struct BoundedItemsSeed<'a> {
+    too_many: &'a mut bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedItemsSeed<'_> {
+    type Value = Vec<BitwardenItem>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct ItemsVisitor<'a> {
+            too_many: &'a mut bool,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ItemsVisitor<'_> {
+            type Value = Vec<BitwardenItem>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of Bitwarden items")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut items =
+                    Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_IMPORT_ITEMS));
+                while let Some(item) = seq.next_element::<BitwardenItem>()? {
+                    if items.len() >= MAX_IMPORT_ITEMS {
+                        *self.too_many = true;
+                        return Err(serde::de::Error::custom("too many items"));
+                    }
+                    items.push(item);
+                }
+                Ok(items)
+            }
+        }
+
+        deserializer.deserialize_seq(ItemsVisitor {
+            too_many: self.too_many,
+        })
+    }
+}
+
+struct BoundedExportSeed<'a> {
+    too_many: &'a mut bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedExportSeed<'_> {
+    type Value = BitwardenExport;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct ExportVisitor<'a> {
+            too_many: &'a mut bool,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ExportVisitor<'_> {
+            type Value = BitwardenExport;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Bitwarden JSON export object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut items: Option<Vec<BitwardenItem>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "items" {
+                        if items.is_some() {
+                            return Err(serde::de::Error::duplicate_field("items"));
+                        }
+                        items = Some(map.next_value_seed(BoundedItemsSeed {
+                            too_many: self.too_many,
+                        })?);
+                    } else {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(BitwardenExport {
+                    items: items.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ExportVisitor {
+            too_many: self.too_many,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -191,21 +285,37 @@ fn seconds_of(time: &str) -> Option<u64> {
     };
     let [year, month, day] = numbers(date, '-')?;
     let [hour, minute, second] = numbers(clock.split('.').next()?, ':')?;
-    if !(1..=12).contains(&month)
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
     {
         return None;
     }
     // Days since 1970 of a date in the Gregorian calendar.
-    let year = if month <= 2 { year - 1 } else { year };
+    let year = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
     let era = year.div_euclid(400);
-    let of_era = year - era * 400;
-    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
-    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+    let of_era = year.checked_sub(era.checked_mul(400)?)?;
+    let of_year = (153_i64.checked_mul((month + 9) % 12)? + 2) / 5 + day - 1;
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(of_era.checked_mul(365)?)?
+        .checked_add(of_era / 4)?
+        .checked_sub(of_era / 100)?
+        .checked_add(of_year)?
+        .checked_sub(719_468)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    u64::try_from(seconds).ok()
 }
 
 #[derive(Deserialize)]
@@ -269,19 +379,34 @@ fn parse_bitwarden(bytes: &[u8]) -> Result<(Vec<Item>, Vec<ImportWarning>)> {
     // Where the file stops being a Bitwarden export, and nothing of what it
     // says there: the parser's own message quotes the value it met, which
     // can be a password.
-    let export: BitwardenExport = serde_json::from_slice(bytes).map_err(|error| {
-        Error::InvalidImport(format!(
-            "not a Bitwarden JSON export (line {}, column {})",
-            error.line(),
-            error.column()
-        ))
-    })?;
+    let mut too_many_flag = false;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let parsed = serde::de::DeserializeSeed::deserialize(
+        BoundedExportSeed {
+            too_many: &mut too_many_flag,
+        },
+        &mut deserializer,
+    )
+    .and_then(|value| {
+        deserializer.end()?;
+        Ok(value)
+    });
+    let mut export = match parsed {
+        Ok(export) => export,
+        Err(_) if too_many_flag => return Err(too_many()),
+        Err(error) => {
+            return Err(Error::InvalidImport(format!(
+                "not a Bitwarden JSON export (line {}, column {})",
+                error.line(),
+                error.column()
+            )));
+        }
+    };
     if export.items.len() > MAX_IMPORT_ITEMS {
         return Err(too_many());
     }
     let mut items = Vec::with_capacity(export.items.len());
     let mut warnings = Vec::new();
-    let mut export = export;
     for (index, mut source) in std::mem::take(&mut export.items).into_iter().enumerate() {
         let row = index + 1;
         let kind = match source.item_type {

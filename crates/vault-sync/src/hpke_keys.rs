@@ -15,11 +15,62 @@ const SEALED_EPOCH_KEY_LEN: usize = 48;
 const ENCODED_ENVELOPE_LEN: usize =
     4 + 32 + 8 + 32 + KEY_LEN + ENCAPSULATED_KEY_LEN + SEALED_EPOCH_KEY_LEN;
 
+/// Low-order and non-canonical Curve25519 Montgomery u-coordinates (with bit
+/// 255 cleared), matching `curve25519-dalek`'s `X25519_LOW_ORDER_POINTS`.
+/// Rejecting them prevents enrolling a recipient key that later DoSes HPKE
+/// key rotation (`setup_sender` fails with `EncapError`).
+const X25519_LOW_ORDER_POINTS: [[u8; KEY_LEN]; 7] = [
+    [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ],
+    [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ],
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+];
+
+fn is_low_order_x25519(bytes: &[u8; KEY_LEN]) -> bool {
+    let mut masked = *bytes;
+    masked[31] &= 0x7f;
+    X25519_LOW_ORDER_POINTS.contains(&masked)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HpkePublicKey([u8; KEY_LEN]);
 
 impl HpkePublicKey {
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Result<Self> {
+        if is_low_order_x25519(&bytes) {
+            return Err(Error::InvalidPublicKey);
+        }
         <Kem as KemTrait>::PublicKey::from_bytes(&bytes).map_err(|_| Error::InvalidPublicKey)?;
         Ok(Self(bytes))
     }
@@ -61,11 +112,12 @@ impl HpkeKeyPair {
     /// without storing the X25519 key itself.
     pub fn from_secret(secret: &[u8; KEY_LEN]) -> Self {
         let (private, public) = Kem::derive_keypair(secret);
-        let private_bytes: [u8; KEY_LEN] = private
-            .to_bytes()
+        let mut raw_private = private.to_bytes();
+        let private_bytes: [u8; KEY_LEN] = raw_private
             .as_slice()
             .try_into()
             .expect("X25519 private key size");
+        raw_private.zeroize();
         let public_bytes: [u8; KEY_LEN] = public
             .to_bytes()
             .as_slice()
@@ -136,10 +188,17 @@ impl EpochKeyEnvelope {
         }
         let vault_id = VaultId(bytes[4..36].try_into().expect("fixed range"));
         let epoch = u64::from_be_bytes(bytes[36..44].try_into().expect("fixed range"));
+        if epoch == 0 {
+            return Err(Error::InvalidFrame);
+        }
         let recipient = DeviceId(bytes[44..76].try_into().expect("fixed range"));
         let recipient_key =
             HpkePublicKey::from_bytes(bytes[76..108].try_into().expect("fixed range"))?;
-        let encapsulated_key = bytes[108..140].try_into().expect("fixed range");
+        let encapsulated_key: [u8; ENCAPSULATED_KEY_LEN] =
+            bytes[108..140].try_into().expect("fixed range");
+        if is_low_order_x25519(&encapsulated_key) {
+            return Err(Error::InvalidFrame);
+        }
         let ciphertext = bytes[140..188].try_into().expect("fixed range");
         Ok(Self {
             vault_id,
@@ -159,6 +218,12 @@ pub fn seal_epoch_key(
     recipient_key: HpkePublicKey,
     epoch_key: &[u8; KEY_LEN],
 ) -> Result<EpochKeyEnvelope> {
+    if epoch == 0 {
+        return Err(Error::InvalidRotationEpoch);
+    }
+    if is_low_order_x25519(&recipient_key.0) {
+        return Err(Error::InvalidPublicKey);
+    }
     let public = <Kem as KemTrait>::PublicKey::from_bytes(&recipient_key.0)
         .map_err(|_| Error::InvalidPublicKey)?;
     let aad = associated_data(vault_id, epoch, recipient, recipient_key);
@@ -187,7 +252,9 @@ pub fn open_epoch_key(
     expected_recipient: DeviceId,
     private_key: &HpkePrivateKey,
 ) -> Result<Zeroizing<[u8; KEY_LEN]>> {
-    if envelope.vault_id != expected_vault
+    if expected_epoch == 0
+        || envelope.epoch == 0
+        || envelope.vault_id != expected_vault
         || envelope.epoch != expected_epoch
         || envelope.recipient != expected_recipient
     {
@@ -210,12 +277,17 @@ pub fn open_epoch_key(
     let mut context =
         setup_receiver::<AesGcm256, HkdfSha256, Kem>(&OpModeR::Base, &private, &encapsulated, INFO)
             .map_err(|_| Error::Hpke)?;
-    let mut opened = context
-        .open(&envelope.ciphertext, &aad)
-        .map_err(|_| Error::Hpke)?;
-    let key: [u8; KEY_LEN] = opened.as_slice().try_into().map_err(|_| Error::Hpke)?;
-    opened.zeroize();
-    Ok(Zeroizing::new(key))
+    let opened = Zeroizing::new(
+        context
+            .open(&envelope.ciphertext, &aad)
+            .map_err(|_| Error::Hpke)?,
+    );
+    if opened.len() != KEY_LEN {
+        return Err(Error::Hpke);
+    }
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    key.copy_from_slice(&opened);
+    Ok(key)
 }
 
 fn associated_data(
@@ -319,5 +391,46 @@ mod tests {
             pair.private()
         )
         .is_err());
+    }
+
+    #[test]
+    fn low_order_x25519_points_and_epoch_zero_are_refused() {
+        for point in X25519_LOW_ORDER_POINTS {
+            assert!(matches!(
+                HpkePublicKey::from_bytes(point),
+                Err(Error::InvalidPublicKey)
+            ));
+            let mut high_bit = point;
+            high_bit[31] |= 0x80;
+            assert!(matches!(
+                HpkePublicKey::from_bytes(high_bit),
+                Err(Error::InvalidPublicKey)
+            ));
+        }
+        let pair = HpkeKeyPair::generate().unwrap();
+        assert!(matches!(
+            seal_epoch_key(
+                VaultId([1; 32]),
+                0,
+                DeviceId([2; 32]),
+                pair.public(),
+                &[7; 32]
+            ),
+            Err(Error::InvalidRotationEpoch)
+        ));
+        let mut bytes = seal_epoch_key(
+            VaultId([1; 32]),
+            1,
+            DeviceId([2; 32]),
+            pair.public(),
+            &[7; 32],
+        )
+        .unwrap()
+        .to_bytes();
+        bytes[36..44].copy_from_slice(&0_u64.to_be_bytes());
+        assert!(matches!(
+            EpochKeyEnvelope::from_bytes(&bytes),
+            Err(Error::InvalidFrame)
+        ));
     }
 }

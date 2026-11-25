@@ -113,6 +113,9 @@ impl MembershipStore {
         epoch: u64,
         members: BTreeSet<DeviceId>,
     ) -> Result<()> {
+        if epoch == 0 {
+            return Err(Error::InvalidRotationEpoch);
+        }
         if members.is_empty() {
             return Err(Error::InvalidMembershipTransition);
         }
@@ -215,6 +218,38 @@ impl MembershipStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Aborts a rotation that was staged locally before consensus committed
+    /// its joint configuration. Committed (`JointCommitted`) and `Activated`
+    /// rotations cannot be aborted.
+    pub fn abort_staged_rotation(&mut self, vault_id: VaultId) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_state = transaction
+            .query_row(
+                "SELECT state FROM rotation_plan WHERE vault_id = ?1",
+                [vault_id.0.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match existing_state {
+            None => Ok(false),
+            Some(ROTATION_STAGED) => {
+                transaction.execute(
+                    "DELETE FROM rotation_recipient_keys WHERE vault_id = ?1",
+                    [vault_id.0.as_slice()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM rotation_plan WHERE vault_id = ?1",
+                    [vault_id.0.as_slice()],
+                )?;
+                transaction.commit()?;
+                Ok(true)
+            }
+            Some(_) => Err(Error::InvalidMembershipTransition),
+        }
     }
 
     /// Applies an already committed membership entry in monotonically increasing log order.
@@ -541,5 +576,62 @@ mod tests {
             phase: MembershipPhase::Uniform { members, epoch: 2 },
         });
         assert!(matches!(result, Err(Error::InvalidMembershipTransition)));
+    }
+
+    #[test]
+    fn staged_rotation_can_be_aborted_but_committed_cannot_and_epoch_zero_refused() {
+        let vault = VaultId([9; 32]);
+        let owner = DeviceId([1; 32]);
+        let pair = HpkeKeyPair::generate().unwrap();
+        let members = set(&[owner.0]);
+        let mut store = MembershipStore::open_in_memory().unwrap();
+        assert!(matches!(
+            store.initialize(vault, 0, members.clone()),
+            Err(Error::InvalidRotationEpoch)
+        ));
+        store.initialize(vault, 1, members.clone()).unwrap();
+        assert!(!store.abort_staged_rotation(vault).unwrap());
+        let env = seal_epoch_key(vault, 2, owner, pair.public(), &[5; 32]).unwrap();
+        store
+            .stage_rotation(
+                vault,
+                2,
+                members.clone(),
+                vec![StagedRecipientKey {
+                    recipient: owner,
+                    envelope: env.clone(),
+                }],
+            )
+            .unwrap();
+        // Aborting unblocks re-staging epoch 2.
+        assert!(store.abort_staged_rotation(vault).unwrap());
+        assert!(store.rotation_plan(vault).unwrap().is_none());
+        store
+            .stage_rotation(
+                vault,
+                2,
+                members.clone(),
+                vec![StagedRecipientKey {
+                    recipient: owner,
+                    envelope: env,
+                }],
+            )
+            .unwrap();
+        store
+            .apply_committed(CommittedMembership {
+                vault_id: vault,
+                position: ConsensusPosition { term: 1, index: 1 },
+                phase: MembershipPhase::Joint {
+                    old_members: members.clone(),
+                    new_members: members,
+                    new_epoch: 2,
+                },
+            })
+            .unwrap();
+        // Once joint-committed, aborting is refused.
+        assert!(matches!(
+            store.abort_staged_rotation(vault),
+            Err(Error::InvalidMembershipTransition)
+        ));
     }
 }

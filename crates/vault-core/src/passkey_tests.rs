@@ -535,7 +535,12 @@ fn the_passkey_encodings_are_the_frozen_ones() {
 
 #[test]
 fn a_passkey_made_signs_in_and_each_has_its_own_key_and_id() {
-    let request = vector_request();
+    let mut request = vector_request();
+    assert!(matches!(
+        request.create(false, NOW),
+        Err(Error::UserVerificationRequired)
+    ));
+    request.user_verification = UserVerification::Preferred;
     let one = request.create(false, NOW).unwrap();
     let other = request.create(false, NOW).unwrap();
     assert_ne!(
@@ -668,17 +673,46 @@ fn a_passkey_saved_as_a_login_is_found_signs_in_and_is_removed() {
             &credential,
             "example.test",
             &hash,
+            UserVerification::Required,
             true,
             NOW,
         )
         .unwrap();
     assert!(verifies(&created, &assertion, &hash));
     assert!(matches!(
-        vault.sign_with_passkey(&saved.item_id, &credential, "other.test", &hash, true, NOW),
+        vault.sign_with_passkey(
+            &saved.item_id,
+            &credential,
+            "example.test",
+            &hash,
+            UserVerification::Required,
+            false,
+            NOW,
+        ),
+        Err(Error::UserVerificationRequired)
+    ));
+    assert!(matches!(
+        vault.sign_with_passkey(
+            &saved.item_id,
+            &credential,
+            "other.test",
+            &hash,
+            UserVerification::Preferred,
+            true,
+            NOW
+        ),
         Err(Error::OriginMismatch)
     ));
     assert!(matches!(
-        vault.sign_with_passkey(&saved.item_id, "AQ", "example.test", &hash, true, NOW),
+        vault.sign_with_passkey(
+            &saved.item_id,
+            "AQ",
+            "example.test",
+            &hash,
+            UserVerification::Preferred,
+            true,
+            NOW
+        ),
         Err(Error::NotFound)
     ));
 
@@ -822,7 +856,15 @@ fn a_passkey_written_here_is_checked_and_one_a_later_build_wrote_is_kept_as_it_i
         .unwrap()
         .is_empty());
     assert!(matches!(
-        vault.sign_with_passkey("later", "AQID", "example.test", &[0; 32], true, NOW),
+        vault.sign_with_passkey(
+            "later",
+            "AQID",
+            "example.test",
+            &[0; 32],
+            UserVerification::Preferred,
+            true,
+            NOW
+        ),
         Err(Error::InvalidItem(_))
     ));
     vault
@@ -920,6 +962,7 @@ fn settling_a_conflict_or_restoring_a_version_keeps_every_passkey() {
             &on_b.passkey.credential_id,
             "example.test",
             &hash,
+            UserVerification::Preferred,
             false,
             NOW,
         )
@@ -1069,6 +1112,7 @@ fn a_bitwarden_logins_passkeys_come_in_and_one_this_app_cannot_use_is_named() {
             &credential,
             "example.test",
             &hash,
+            UserVerification::Preferred,
             true,
             NOW,
         )
@@ -1113,4 +1157,186 @@ fn a_passkeys_key_and_account_are_never_printed() {
             );
         }
     }
+}
+
+#[test]
+fn check_written_rejects_duplicate_existing_passkey_and_strips_bidi_controls() {
+    let (_dir, mut vault) = vault();
+    let created = made_for("example.test", "owner");
+    let saved = vault
+        .save_passkey_as_login(created.passkey.clone(), "Example")
+        .unwrap();
+    // Re-writing [P, P] where P was already on the followed revision must be rejected.
+    let mut dup = vault.get(&saved.item_id).unwrap().item;
+    dup.passkeys.push(created.passkey.clone());
+    assert!(matches!(
+        vault.update(dup, &saved.revision),
+        Err(Error::InvalidItem(_))
+    ));
+
+    // Bidi RLO and control chars are stripped on options parse and rejected by check().
+    let options = json!({
+        "rp": { "id": "example.test", "name": "Ex\u{202E}ample\n" },
+        "user": { "id": b64(&[1, 2, 3]), "name": "alice\u{202E}\u{0007}", "displayName": "Alice\u{2066}!" },
+        "challenge": b64(&[9; 16]),
+        "pubKeyCredParams": [{ "type": "public-key", "alg": ES256 }]
+    })
+    .to_string();
+    let req = Registering::from_options(&options, None).unwrap();
+    assert_eq!(req.rp_name, "Example");
+    assert_eq!(req.user_name, "alice");
+    assert_eq!(req.user_display_name, "Alice!");
+
+    let mut bad = created.passkey.clone();
+    bad.user_name = "alice\u{202E}".into();
+    assert!(matches!(
+        vault.save_passkey_as_login(bad, "Bad"),
+        Err(Error::InvalidItem(_))
+    ));
+}
+
+#[test]
+fn resolving_delete_vs_edit_does_not_resurrect_deleted_passkey_and_caps_at_max() {
+    let dir = tempdir().unwrap();
+    let (mut a, mut b, item, base) = two_devices(dir.path());
+    let shared = made_for("example.test", "shared");
+    let with_shared = a
+        .add_passkey(&item.id, &base, shared.passkey.clone())
+        .unwrap();
+    b.apply_encrypted_revision(sent(&a, &with_shared.revision))
+        .unwrap();
+
+    // Branch A intentionally deletes `shared`; Branch B edits the title.
+    let deleted = a
+        .remove_passkey(
+            &item.id,
+            &with_shared.revision,
+            &shared.passkey.credential_id,
+        )
+        .unwrap();
+    let mut edited_b = b.get(&item.id).unwrap().item;
+    edited_b.title = "Renamed on B".into();
+    let from_b = b.update(edited_b, &with_shared.revision).unwrap();
+    a.apply_encrypted_revision(sent(&b, &from_b.revision))
+        .unwrap();
+    assert!(a.get(&item.id).unwrap().conflict);
+
+    let versions = a.versions(&item.id).unwrap();
+    let heads = versions
+        .iter()
+        .map(|v| v.revision.clone())
+        .collect::<Vec<_>>();
+    let kept_a = versions
+        .into_iter()
+        .filter_map(|v| v.item)
+        .find(|v| v.passkeys.is_empty())
+        .unwrap();
+    let resolved = a.resolve(&item.id, Some(kept_a), &heads).unwrap();
+    assert!(
+        a.get(&item.id).unwrap().item.passkeys.is_empty(),
+        "deleted passkey must not be resurrected by conflict resolution"
+    );
+
+    // Concurrent additions totaling > MAX_PASSKEYS resolve cleanly capped at MAX_PASSKEYS.
+    b.apply_encrypted_revision(sent(&a, &deleted.revision))
+        .unwrap();
+    b.apply_encrypted_revision(sent(&a, &resolved.revision))
+        .unwrap();
+    let mut a_item = a.get(&item.id).unwrap().item;
+    for i in 0..20 {
+        a_item
+            .passkeys
+            .push(made_for("example.test", &format!("a-{i}")).passkey);
+    }
+    a.update(a_item, &resolved.revision).unwrap();
+    let mut b_item = b.get(&item.id).unwrap().item;
+    for i in 0..20 {
+        b_item
+            .passkeys
+            .push(made_for("example.test", &format!("b-{i}")).passkey);
+    }
+    let b_rev = b.update(b_item, &resolved.revision).unwrap();
+    a.apply_encrypted_revision(sent(&b, &b_rev.revision))
+        .unwrap();
+    let versions = a.versions(&item.id).unwrap();
+    let heads = versions
+        .iter()
+        .map(|v| v.revision.clone())
+        .collect::<Vec<_>>();
+    let kept = versions.into_iter().find_map(|v| v.item).unwrap();
+    a.resolve(&item.id, Some(kept), &heads).unwrap();
+    assert_eq!(a.get(&item.id).unwrap().item.passkeys.len(), MAX_PASSKEYS);
+}
+
+#[test]
+fn same_credential_id_across_rps_matches_and_removes_by_rp_id_and_counter_advances() {
+    let (_dir, mut vault) = vault();
+    let mut pk_a = made_for("a.example.test", "alice").passkey;
+    let mut pk_b = made_for("b.example.test", "bob").passkey;
+    pk_b.credential_id = pk_a.credential_id.clone();
+    pk_a.sign_count = 100;
+    let cred = pk_a.credential_id.clone();
+
+    let mut item = Item::new("Multi-RP");
+    item.passkeys = vec![pk_a, pk_b];
+    let saved = vault.put(item).unwrap();
+
+    let hash = client_data_hash(b"challenge");
+    // Signing for the second RP succeeds even though the first RP appears earlier.
+    let assert_b = vault
+        .sign_with_passkey(
+            &saved.item_id,
+            &cred,
+            "b.example.test",
+            &hash,
+            UserVerification::Preferred,
+            true,
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(assert_b.authenticator_data[33..37], 0_u32.to_be_bytes());
+
+    // Imported sign_count > 0 advances monotonically even on repeated same-second sign-ins
+    // or clocks behind `imported`.
+    let first = vault
+        .sign_with_passkey(
+            &saved.item_id,
+            &cred,
+            "a.example.test",
+            &hash,
+            UserVerification::Preferred,
+            true,
+            50, // behind imported 100 -> emits 101
+        )
+        .unwrap();
+    assert_eq!(first.authenticator_data[33..37], 101_u32.to_be_bytes());
+    let second = vault
+        .sign_with_passkey(
+            &saved.item_id,
+            &cred,
+            "a.example.test",
+            &hash,
+            UserVerification::Preferred,
+            true,
+            50, // same second -> emits 102
+        )
+        .unwrap();
+    assert_eq!(second.authenticator_data[33..37], 102_u32.to_be_bytes());
+
+    // Ambiguous remove_passkey without rp_id refuses rather than deleting both.
+    assert!(matches!(
+        vault.remove_passkey(&saved.item_id, &saved.revision, &cred),
+        Err(Error::InvalidItem(_))
+    ));
+    let after = vault
+        .remove_passkey_for_rp(&saved.item_id, &saved.revision, "a.example.test", &cred)
+        .unwrap();
+    let remaining = vault.get(&saved.item_id).unwrap().item.passkeys.clone();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].rp_id, "b.example.test");
+    // Now unambiguous, remove_passkey succeeds.
+    vault
+        .remove_passkey(&saved.item_id, &after.revision, &cred)
+        .unwrap();
+    assert!(vault.get(&saved.item_id).unwrap().item.passkeys.is_empty());
 }

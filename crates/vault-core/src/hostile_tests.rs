@@ -610,3 +610,110 @@ fn the_revisions_held_for_review_are_full_at_their_bound() {
     assert_eq!(rows(&sound.path, "ingress"), 0);
     assert_eq!(rows(&sound.path, "quarantine"), 10_000);
 }
+
+#[test]
+fn forged_revoked_author_is_rejected_and_reverse_chain_applies_in_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, recovery) = Vault::create(dir.path().join("a.db"), "password").unwrap();
+    let item = Item::new("Chain");
+    let first = a.put(item.clone()).unwrap();
+    a.export_backup(dir.path().join("a.osmbak")).unwrap();
+    let mut b = Vault::restore_backup(
+        dir.path().join("a.osmbak"),
+        dir.path().join("b.db"),
+        &recovery,
+        "password",
+    )
+    .unwrap();
+    let b_id = b.device_id().unwrap();
+    a.authorize_device(b_id, b.device_public_key().unwrap())
+        .unwrap();
+
+    // Build a 10-revision chain on B and stage it on A in reverse order.
+    let mut rev = first.revision.clone();
+    let mut chain = Vec::new();
+    for step in 0..10 {
+        let mut edited = b.get(&item.id).unwrap().item;
+        edited.title = format!("Step {step}");
+        rev = b.update(edited, &rev).unwrap().revision;
+        chain.push(
+            b.encrypted_revisions()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.revision_id() == rev)
+                .unwrap(),
+        );
+    }
+    for r in chain.iter().rev().cloned() {
+        a.stage_revision(r).unwrap();
+    }
+    let report = a.process_staged().unwrap();
+    assert_eq!(report.applied, 10);
+    assert_eq!(report.pending, 0);
+    assert_eq!(a.get(&item.id).unwrap().item.title, "Step 9");
+
+    // Revoke B, then craft a revision with B's author_device_id but corrupted signature.
+    a.revoke_device(b_id).unwrap();
+    let mut edited = b.get(&item.id).unwrap().item;
+    edited.title = "Forged".into();
+    let forged_rev = b.update(edited, &rev).unwrap().revision;
+    let mut forged = b
+        .encrypted_revisions()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.revision_id() == forged_rev)
+        .unwrap();
+    forged.signature[0] ^= 0xff;
+    a.stage_revision(forged).unwrap();
+    let report = a.process_staged().unwrap();
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.quarantined, 0);
+    assert!(a.quarantined().unwrap().is_empty());
+}
+
+#[test]
+fn bitwarden_import_handles_extreme_year_and_restore_preserves_write_fence() {
+    // Extreme year must not panic or wrap in seconds_of().
+    let export = serde_json::json!({
+        "items": [{
+            "type": 1,
+            "name": "Example",
+            "login": {
+                "username": "u",
+                "password": "p",
+                "fido2Credentials": [{
+                    "credentialId": "b64.AAECAw",
+                    "keyType": "public-key",
+                    "keyAlgorithm": "ECDSA",
+                    "keyCurve": "P-256",
+                    "keyValue": "AAAA",
+                    "rpId": "example.test",
+                    "userHandle": "AA",
+                    "creationDate": "999999999999999999-01-01T00:00:00Z"
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let preview =
+        crate::preview_import(crate::ImportFormat::BitwardenJson, export.as_bytes()).unwrap();
+    assert_eq!(preview.valid_count(), 1);
+
+    // Backup/restore preserves write_fence ahead of current_epoch.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut source, recovery) = Vault::create(dir.path().join("src.db"), "password").unwrap();
+    source.put(Item::new("Before fence")).unwrap();
+    source.raise_write_fence(3).unwrap();
+    assert!(matches!(
+        source.put(Item::new("Blocked")),
+        Err(Error::EpochPending)
+    ));
+    let bak = dir.path().join("src.osmbak");
+    source.export_backup(&bak).unwrap();
+    let mut restored =
+        Vault::restore_backup(&bak, dir.path().join("dst.db"), &recovery, "password").unwrap();
+    assert!(matches!(
+        restored.put(Item::new("Still blocked")),
+        Err(Error::EpochPending)
+    ));
+}

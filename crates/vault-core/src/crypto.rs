@@ -513,11 +513,11 @@ impl RecoveryKey {
 
 impl std::fmt::Display for RecoveryKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "OSM-RK1-{}",
-            Base64UrlUnpadded::encode_string(self.0.as_ref())
-        )
+        let mut buf = Zeroizing::new([0_u8; 43]);
+        let encoded = Base64UrlUnpadded::encode(self.0.as_ref(), buf.as_mut())
+            .map_err(|_| std::fmt::Error)?;
+        f.write_str("OSM-RK1-")?;
+        f.write_str(encoded)
     }
 }
 

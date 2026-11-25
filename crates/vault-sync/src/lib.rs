@@ -31,7 +31,7 @@ pub use protocol::{
     DeviceId, MessageId, ProtocolLimits, RevisionId, SignedRevision, VaultId, WireRevision,
     MAX_CIPHERTEXT_BYTES,
 };
-pub use store_version::claim_store_version;
+pub use store_version::{check_store_version, claim_store_version, set_store_version};
 
 #[cfg(test)]
 mod fixture_tests;

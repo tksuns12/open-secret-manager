@@ -160,6 +160,7 @@ impl From<osm_vault_core::Error> for MobileError {
             Error::InvalidCredentials => Self::InvalidCredentials,
             Error::NotFound => Self::NotFound,
             Error::OriginMismatch => Self::NotForThisPage,
+            Error::UserVerificationRequired => Self::NotVerified,
             Error::InvalidItem(reason) => Self::InvalidItem { reason },
             Error::Conflict { .. } => Self::ChangedElsewhere,
             Error::Unresolved => Self::InConflict,

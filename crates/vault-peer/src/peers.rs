@@ -101,66 +101,66 @@ impl PeerStore {
         Self::from_connection(Connection::open_in_memory()?, Arc::new(NoKeystore))
     }
 
-    fn from_connection(connection: Connection, keystore: Arc<dyn Keystore>) -> Result<Self> {
-        osm_vault_sync::claim_store_version(&connection, STORE_VERSION)?;
+    fn from_connection(mut connection: Connection, keystore: Arc<dyn Keystore>) -> Result<Self> {
+        let found = osm_vault_sync::check_store_version(&connection, STORE_VERSION)?;
         // Pages a key was on are overwritten when they are freed, so that
         // sealing a key leaves no copy of it in the file.
         connection.execute_batch(
             "PRAGMA secure_delete = ON;
              PRAGMA journal_mode = DELETE;
-             PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS transport_key (
-                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                 certificate BLOB NOT NULL,
-                 private_key BLOB,
-                 sealed_key BLOB,
-                 CHECK((private_key IS NULL) <> (sealed_key IS NULL))
-             ) STRICT;
-             CREATE TABLE IF NOT EXISTS peers (
-                 device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
-                 public_key BLOB NOT NULL UNIQUE CHECK(length(public_key) = 32),
-                 transport_pin BLOB NOT NULL UNIQUE CHECK(length(transport_pin) = 32),
-                 address TEXT CHECK(address IS NULL OR length(address) <= 128),
-                 paired_at INTEGER NOT NULL
-             ) STRICT;
-             CREATE TABLE IF NOT EXISTS relay (
-                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                 code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 1024)
-             ) STRICT;",
+             PRAGMA synchronous = FULL;",
         )?;
+        {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let found =
+                osm_vault_sync::check_store_version(&transaction, STORE_VERSION)?.max(found);
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS transport_key (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     certificate BLOB NOT NULL,
+                     private_key BLOB,
+                     sealed_key BLOB,
+                     CHECK((private_key IS NULL) <> (sealed_key IS NULL))
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS peers (
+                     device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
+                     public_key BLOB NOT NULL UNIQUE CHECK(length(public_key) = 32),
+                     transport_pin BLOB NOT NULL UNIQUE CHECK(length(transport_pin) = 32),
+                     address TEXT CHECK(address IS NULL OR length(address) <= 128),
+                     paired_at INTEGER NOT NULL
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS relay (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 1024)
+                 ) STRICT;",
+            )?;
+            let old: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                               WHERE type = 'table' AND name = 'transport_identity')",
+                [],
+                |row| row.get(0),
+            )?;
+            if old {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO transport_key(singleton, certificate, private_key)
+                     SELECT singleton, certificate, private_key FROM transport_identity",
+                    [],
+                )?;
+                transaction.execute("DROP TABLE transport_identity", [])?;
+            }
+            if found < STORE_VERSION {
+                osm_vault_sync::set_store_version(&transaction, STORE_VERSION)?;
+            }
+            transaction.commit()?;
+        }
         let mut store = Self {
             connection,
             keystore,
             identity: None,
         };
-        store.move_version_1_key()?;
         store.seal_kept_key()?;
         Ok(store)
-    }
-
-    /// Moves the key a version 1 store kept into `transport_key`, unsealed
-    /// for now. This goes by what is in the file, not by its version
-    /// number, which the address book may have raised first.
-    fn move_version_1_key(&mut self) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let old: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-                           WHERE type = 'table' AND name = 'transport_identity')",
-            [],
-            |row| row.get(0),
-        )?;
-        if old {
-            transaction.execute(
-                "INSERT OR IGNORE INTO transport_key(singleton, certificate, private_key)
-                 SELECT singleton, certificate, private_key FROM transport_identity",
-                [],
-            )?;
-            transaction.execute("DROP TABLE transport_identity", [])?;
-        }
-        transaction.commit()?;
-        Ok(())
     }
 
     /// Seals a key kept unsealed, if the keystore does it now. The sealed

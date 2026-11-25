@@ -181,6 +181,11 @@ impl Passkey {
         {
             return invalid("account name is too long");
         }
+        if self.user_name.chars().any(is_disallowed_name_char)
+            || self.user_display_name.chars().any(is_disallowed_name_char)
+        {
+            return invalid("account name contains disallowed control characters");
+        }
         if self.algorithm != ES256 || self.signing_key().is_err() {
             return invalid("key is not an ES256 key");
         }
@@ -226,7 +231,9 @@ impl Passkey {
             .ok_or_else(|| Error::InvalidItem("a passkey's user handle is not valid".into()))?;
         let counter = match self.sign_count {
             0 => 0,
-            imported => u32::try_from(now).unwrap_or(u32::MAX).max(imported),
+            imported => u32::try_from(now)
+                .unwrap_or(u32::MAX)
+                .max(imported.saturating_add(1)),
         };
         let authenticator_data = authenticator_data(&self.rp_id, flags(verified), counter, None);
         let mut signed = authenticator_data.clone();
@@ -597,9 +604,21 @@ fn challenge_of(text: &str) -> std::result::Result<Vec<u8>, Refusal> {
         .ok_or(Refusal::Malformed("the challenge"))
 }
 
-/// A site's name for an account, cut to what is kept.
+/// Disallowed control and Unicode Bidi spoofing characters in RP/account names.
+fn is_disallowed_name_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// A site's name for an account, stripped of control/Bidi chars and cut to what is kept.
 fn name_of(name: &str) -> String {
-    name.chars().take(MAX_NAME).collect()
+    name.chars()
+        .filter(|c| !is_disallowed_name_char(*c))
+        .take(MAX_NAME)
+        .collect()
 }
 
 impl Registering {
@@ -641,6 +660,9 @@ impl Registering {
     /// Makes a passkey for this request, with a new key and credential ID.
     /// `verified` says the owner was verified in this request.
     pub fn create(&self, verified: bool, now: u64) -> Result<Created> {
+        if self.user_verification == UserVerification::Required && !verified {
+            return Err(Error::UserVerificationRequired);
+        }
         let mut credential_id = [0_u8; CREDENTIAL_ID_LEN];
         OsRng.fill_bytes(&mut credential_id);
         // From the system's random source, as OsRng is.
@@ -655,6 +677,9 @@ impl Registering {
         verified: bool,
         now: u64,
     ) -> Result<Created> {
+        if self.user_verification == UserVerification::Required && !verified {
+            return Err(Error::UserVerificationRequired);
+        }
         let point = key.verifying_key().to_sec1_point(false);
         let (Some(x), Some(y)) = (point.x(), point.y()) else {
             return Err(Error::Crypto);
@@ -892,6 +917,21 @@ pub(crate) fn check_written(item: &Item, followed: &[Item]) -> Result<()> {
             "only a login keeps passkeys: remove them first".into(),
         ));
     }
+    if item.passkeys.len() > MAX_PASSKEYS {
+        return Err(Error::InvalidItem(format!(
+            "a login keeps at most {MAX_PASSKEYS} passkeys"
+        )));
+    }
+    for (index, passkey) in item.passkeys.iter().enumerate() {
+        if item.passkeys[index + 1..]
+            .iter()
+            .any(|other| same_credential(passkey, other))
+        {
+            return Err(Error::InvalidItem(
+                "the login has that passkey already".into(),
+            ));
+        }
+    }
     let added = item
         .passkeys
         .iter()
@@ -901,34 +941,28 @@ pub(crate) fn check_written(item: &Item, followed: &[Item]) -> Result<()> {
                 .any(|before| before.passkeys.contains(passkey))
         })
         .collect::<Vec<_>>();
-    if !added.is_empty() && item.passkeys.len() > MAX_PASSKEYS {
-        return Err(Error::InvalidItem(format!(
-            "a login keeps at most {MAX_PASSKEYS} passkeys"
-        )));
-    }
     for passkey in added {
         passkey.check()?;
-        if item
-            .passkeys
-            .iter()
-            .filter(|other| same_credential(passkey, other))
-            .count()
-            > 1
-        {
-            return Err(Error::InvalidItem(
-                "the login has that passkey already".into(),
-            ));
-        }
     }
     Ok(())
 }
 
-/// Adds to a version that settles others the passkeys of theirs it lacks:
-/// keeping one version whole, in a conflict or a restore, then loses no
-/// passkey of another. The owner removes one afterwards if that was meant.
-pub(crate) fn keep_all(item: &mut Item, followed: &[Item]) {
+/// Adds to a version that settles others the passkeys of theirs it lacks,
+/// skipping passkeys present in a common ancestor (which the kept branch
+/// intentionally deleted) and respecting [`MAX_PASSKEYS`].
+pub(crate) fn keep_all(
+    item: &mut Item,
+    followed: &[Item],
+    ancestor_creds: &std::collections::BTreeSet<(String, String)>,
+) {
     for before in followed {
         for passkey in &before.passkeys {
+            if item.passkeys.len() >= MAX_PASSKEYS {
+                return;
+            }
+            if ancestor_creds.contains(&(passkey.rp_id.clone(), passkey.credential_id.clone())) {
+                continue;
+            }
             if !item
                 .passkeys
                 .iter()
@@ -1067,8 +1101,10 @@ impl Vault {
         self.update(item, expected_revision)
     }
 
-    /// Removes a login's passkey, as read at `expected_revision`. Its key
-    /// stays in the login's earlier versions, and in backups.
+    /// Removes a login's passkey, as read at `expected_revision`. Refuses if
+    /// multiple passkeys on the login share `credential_id` across different
+    /// sites (use [`Vault::remove_passkey_for_rp`]). Its key stays in the
+    /// login's earlier versions, and in backups.
     pub fn remove_passkey(
         &mut self,
         item_id: &str,
@@ -1076,9 +1112,37 @@ impl Vault {
         credential_id: &str,
     ) -> Result<RevisionInfo> {
         let mut item = self.get(item_id)?.item;
-        let before = item.passkeys.len();
+        let matches = item
+            .passkeys
+            .iter()
+            .filter(|passkey| passkey.credential_id == credential_id)
+            .count();
+        if matches == 0 {
+            return Err(Error::NotFound);
+        }
+        if matches > 1 {
+            return Err(Error::InvalidItem(
+                "multiple passkeys share that credential ID; specify the site".into(),
+            ));
+        }
         item.passkeys
             .retain(|passkey| passkey.credential_id != credential_id);
+        self.update(item, expected_revision)
+    }
+
+    /// Removes a login's passkey for a specific `(rp_id, credential_id)`, as
+    /// read at `expected_revision`. Its key stays in earlier versions and backups.
+    pub fn remove_passkey_for_rp(
+        &mut self,
+        item_id: &str,
+        expected_revision: &str,
+        rp_id: &str,
+        credential_id: &str,
+    ) -> Result<RevisionInfo> {
+        let mut item = self.get(item_id)?.item;
+        let before = item.passkeys.len();
+        item.passkeys
+            .retain(|passkey| !(passkey.rp_id == rp_id && passkey.credential_id == credential_id));
         if item.passkeys.len() == before {
             return Err(Error::NotFound);
         }
@@ -1087,25 +1151,48 @@ impl Vault {
 
     /// Signs in to `rp_id` with a passkey of the item, of any of its
     /// current versions (see [`Passkey::assert`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_with_passkey(
         &self,
         item_id: &str,
         credential_id: &str,
         rp_id: &str,
         client_data_hash: &[u8; 32],
+        verification: UserVerification,
         verified: bool,
         now: u64,
     ) -> Result<Assertion> {
+        if verification == UserVerification::Required && !verified {
+            return Err(Error::UserVerificationRequired);
+        }
         let items = self.items_with_passkeys()?;
-        let passkey = items
+        let mut matching = items
             .iter()
             .filter(|item| item.id == item_id)
             .flat_map(|item| &item.passkeys)
-            .find(|passkey| passkey.credential_id == credential_id)
-            .ok_or(Error::NotFound)?;
-        if passkey.rp_id != rp_id {
-            return Err(Error::OriginMismatch);
+            .filter(|passkey| passkey.credential_id == credential_id)
+            .peekable();
+        if matching.peek().is_none() {
+            return Err(Error::NotFound);
         }
-        passkey.assert(client_data_hash, verified, now)
+        let passkey = matching
+            .find(|passkey| passkey.rp_id == rp_id)
+            .ok_or(Error::OriginMismatch)?;
+        let effective_now = if passkey.sign_count > 0 {
+            self.next_passkey_counter_time(&passkey.rp_id, &passkey.credential_id, now)
+        } else {
+            now
+        };
+        let assertion = passkey.assert(client_data_hash, verified, effective_now)?;
+        if passkey.sign_count > 0 {
+            if let Ok(bytes) = <[u8; 4]>::try_from(&assertion.authenticator_data[33..37]) {
+                self.record_passkey_counter(
+                    &passkey.rp_id,
+                    &passkey.credential_id,
+                    u32::from_be_bytes(bytes),
+                );
+            }
+        }
+        Ok(assertion)
     }
 }

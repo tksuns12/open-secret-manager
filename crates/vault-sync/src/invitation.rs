@@ -116,12 +116,16 @@ impl InvitationStore {
         Self::from_connection(Connection::open_in_memory()?, policy)
     }
 
-    fn from_connection(connection: Connection, policy: InvitationPolicy) -> Result<Self> {
-        crate::claim_store_version(&connection, STORE_VERSION)?;
+    fn from_connection(mut connection: Connection, policy: InvitationPolicy) -> Result<Self> {
+        let found = crate::check_store_version(&connection, STORE_VERSION)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS invitations (
+             PRAGMA synchronous = FULL;",
+        )?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let found = crate::check_store_version(&tx, STORE_VERSION)?.max(found);
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS invitations (
                  token_hash BLOB PRIMARY KEY CHECK(length(token_hash) = 32),
                  vault_id BLOB NOT NULL CHECK(length(vault_id) = 32),
                  recipient BLOB CHECK(recipient IS NULL OR length(recipient) = 32),
@@ -130,6 +134,10 @@ impl InvitationStore {
                  used_at INTEGER
              ) STRICT;",
         )?;
+        if found < STORE_VERSION {
+            crate::set_store_version(&tx, STORE_VERSION)?;
+        }
+        tx.commit()?;
         Ok(Self { connection, policy })
     }
 
@@ -171,9 +179,8 @@ impl InvitationStore {
         let expires_at = sql_time(expires_at)?;
 
         for _ in 0..4 {
-            let mut secret = [0u8; 32];
-            getrandom::fill(&mut secret).map_err(|_| Error::Randomness)?;
-            let token = InvitationToken(secret);
+            let mut token = InvitationToken([0u8; 32]);
+            getrandom::fill(&mut token.0).map_err(|_| Error::Randomness)?;
             let changed = self.connection.execute(
                 "INSERT OR IGNORE INTO invitations
                  (token_hash, vault_id, recipient, created_at, expires_at, used_at)

@@ -613,6 +613,7 @@ impl Desk {
                 credential_id,
                 &signing.rp_id,
                 &passkey::client_data_hash(&client_data),
+                signing.user_verification,
                 verified,
                 unix_now(),
             )
@@ -974,6 +975,7 @@ fn passkey_choices(
 fn vault_refused(error: osm_vault_core::Error) -> Refused {
     match error {
         osm_vault_core::Error::Locked => Refused::Locked,
+        osm_vault_core::Error::UserVerificationRequired => Refused::NotVerified,
         osm_vault_core::Error::NotFound
         | osm_vault_core::Error::OriginMismatch
         | osm_vault_core::Error::Unresolved => Refused::NotForThisPage,

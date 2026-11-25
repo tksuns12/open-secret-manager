@@ -1,8 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use base64ct::{Base64UrlUnpadded, Encoding};
@@ -39,16 +41,42 @@ struct Saved<'a> {
     saved_at: u64,
 }
 
+struct CountingWriter(usize);
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serializes `value` into a pre-sized `Zeroizing<Vec<u8>>` using two passes
+/// so `Vec` never reallocates and leaves unzeroized plaintext fragments on the
+/// heap.
+fn to_zeroizing_json_vec<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>> {
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(counter.0));
+    serde_json::to_writer(&mut *bytes, value)?;
+    Ok(bytes)
+}
+
 pub(crate) fn version_plaintext(
     item: Option<&Item>,
     saved_at: Option<u64>,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    Ok(Zeroizing::new(match (item, saved_at) {
-        (Some(item), Some(saved_at)) => serde_json::to_vec(&Saved { item, saved_at })?,
-        (Some(item), None) => serde_json::to_vec(item)?,
-        (None, Some(saved_at)) => format!("{{\"saved_at\":{saved_at}}}").into_bytes(),
-        (None, None) => Vec::new(),
-    }))
+    match (item, saved_at) {
+        (Some(item), Some(saved_at)) => to_zeroizing_json_vec(&Saved { item, saved_at }),
+        (Some(item), None) => to_zeroizing_json_vec(item),
+        (None, Some(saved_at)) => Ok(Zeroizing::new(
+            format!("{{\"saved_at\":{saved_at}}}").into_bytes(),
+        )),
+        (None, None) => Ok(Zeroizing::new(Vec::new())),
+    }
 }
 
 /// When a version says it was saved: `None` if it does not say, or says
@@ -125,8 +153,15 @@ struct RelaySetting {
     saved_at: u64,
     relay: Option<String>,
 }
-/// Upper bound on held revisions awaiting owner review.
+
+impl Drop for RelaySetting {
+    fn drop(&mut self) {
+        self.relay.zeroize();
+    }
+}
+/// Upper bounds on held revisions awaiting owner review.
 const MAX_QUARANTINE: i64 = 10_000;
+const MAX_QUARANTINE_BYTES: i64 = 128 * 1024 * 1024;
 /// Bounds on received revisions awaiting processing.
 const MAX_INGRESS: i64 = 100_000;
 const MAX_INGRESS_BYTES: i64 = 512 * 1024 * 1024;
@@ -489,6 +524,10 @@ pub struct Vault {
     /// guarding against unauthenticated `vault_meta.current_epoch` /
     /// `write_fence` rollbacks.
     max_accepted_epoch: u64,
+    /// Monotonic in-memory sign_count floor for imported passkeys (`sign_count > 0`)
+    /// so repeated logins within the same second or small backwards clock steps
+    /// never emit a non-increasing counter.
+    passkey_counters: Mutex<BTreeMap<(String, String), u32>>,
 }
 
 /// Seals revisions for one author. Borrowing the keys separately from the
@@ -658,7 +697,33 @@ impl Vault {
             recipient_secret: None,
             session: None,
             max_accepted_epoch: FIRST_EPOCH,
+            passkey_counters: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn next_passkey_counter_time(&self, rp_id: &str, cred_id: &str, now: u64) -> u64 {
+        let counters = self
+            .passkey_counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match counters
+            .get(&(rp_id.to_owned(), cred_id.to_owned()))
+            .copied()
+        {
+            Some(last) => now.max(u64::from(last.saturating_add(1))),
+            None => now,
+        }
+    }
+
+    pub(crate) fn record_passkey_counter(&self, rp_id: &str, cred_id: &str, emitted: u32) {
+        let mut counters = self
+            .passkey_counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counters
+            .entry((rp_id.to_owned(), cred_id.to_owned()))
+            .and_modify(|last| *last = (*last).max(emitted))
+            .or_insert(emitted);
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -1801,10 +1866,10 @@ impl Vault {
         if code.is_some_and(|code| code.is_empty() || code.len() > MAX_RELAY_CODE) {
             return Err(Error::InvalidItem("that is not a relay code".into()));
         }
-        let plaintext = Zeroizing::new(serde_json::to_vec(&RelaySetting {
+        let plaintext = to_zeroizing_json_vec(&RelaySetting {
             saved_at: now(),
             relay: code.map(str::to_owned),
-        })?);
+        })?;
         self.note(RELAY_ID, &plaintext)
     }
 
@@ -1834,7 +1899,9 @@ impl Vault {
                 latest = Some(setting);
             }
         }
-        Ok(latest.and_then(|setting| setting.relay).map(Zeroizing::new))
+        Ok(latest
+            .and_then(|mut setting| setting.relay.take())
+            .map(Zeroizing::new))
     }
 
     /// Writes a note of the vault's own under the reserved `id`: a deletion
@@ -2174,7 +2241,12 @@ impl Vault {
                     return Err(Error::InvalidItem("resolution is for another item".into()));
                 }
                 let followed = self.versions_followed(item_id, &parents)?;
-                passkey::keep_all(&mut item, &followed);
+                let ancestor_creds = if parents.len() > 1 {
+                    self.common_ancestor_passkeys(item_id, &parents)?
+                } else {
+                    BTreeSet::new()
+                };
+                passkey::keep_all(&mut item, &followed, &ancestor_creds);
                 read.extend(followed);
                 passkey::check_written(&item, &read)?;
                 (item, false)
@@ -2186,6 +2258,79 @@ impl Vault {
             }
         };
         self.write_item(item, parents, tombstone, LocalWrite::Resolve)
+    }
+
+    /// `(rp_id, credential_id)` pairs present on the lowest common ancestor(s)
+    /// (merge bases) of `parents` for `item_id`. Passkeys already present in a
+    /// merge base but absent from the kept branch were intentionally deleted
+    /// and must not be resurrected by [`passkey::keep_all`].
+    fn common_ancestor_passkeys(
+        &self,
+        item_id: &str,
+        parents: &[String],
+    ) -> Result<BTreeSet<(String, String)>> {
+        let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = self
+                .connection
+                .prepare("SELECT revision, parents FROM revisions WHERE item_id=?")?;
+            let mut rows = stmt.query([item_id])?;
+            while let Some(row) = rows.next()? {
+                let rev: String = row.get(0)?;
+                let raw_parents: String = row.get(1)?;
+                let parsed = split_parents(&raw_parents).ok_or(Error::Crypto)?;
+                parent_map.insert(rev, parsed);
+            }
+        }
+        let mut common: Option<HashSet<String>> = None;
+        for head in parents {
+            let mut visited = HashSet::new();
+            let mut stack = vec![head.clone()];
+            while let Some(cur) = stack.pop() {
+                if !visited.insert(cur.clone()) {
+                    continue;
+                }
+                if let Some(ps) = parent_map.get(&cur) {
+                    for p in ps {
+                        if !visited.contains(p) {
+                            stack.push(p.clone());
+                        }
+                    }
+                }
+            }
+            common = Some(match common {
+                None => visited,
+                Some(prev) => prev.intersection(&visited).cloned().collect(),
+            });
+        }
+        let common = common.unwrap_or_default();
+        if common.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        // Keep only maximal common ancestors (merge bases): exclude any `c`
+        // that is a direct parent of another common ancestor.
+        let mut dominated: HashSet<String> = HashSet::new();
+        for c in &common {
+            if let Some(ps) = parent_map.get(c) {
+                for p in ps {
+                    if common.contains(p) {
+                        dominated.insert(p.clone());
+                    }
+                }
+            }
+        }
+        let mut creds = BTreeSet::new();
+        for base in common.into_iter().filter(|c| !dominated.contains(c)) {
+            if let Some(stored) = revision_by_id(&self.connection, &base)? {
+                if stored.item_id == item_id && !stored.tombstone {
+                    let base_item = self.open_item(&stored)?;
+                    for pk in &base_item.passkeys {
+                        creds.insert((pk.rp_id.clone(), pk.credential_id.clone()));
+                    }
+                }
+            }
+        }
+        Ok(creds)
     }
 
     /// The items of the versions of an item named in `revisions`, as this
@@ -2251,6 +2396,12 @@ impl Vault {
             .ok_or(Error::RecoveryNotEnabled)?;
         let payload = BackupPayload {
             current_epoch: self.header.current_epoch,
+            write_fence: Some(
+                self.header
+                    .write_fence
+                    .max(self.header.current_epoch)
+                    .max(self.max_accepted_epoch),
+            ),
             epoch_keys: self
                 .epoch_keys
                 .iter()
@@ -2271,7 +2422,7 @@ impl Vault {
             quarantine: quarantined_revisions(&self.connection)?,
             revoked: self.revoked.iter().copied().collect(),
         };
-        let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
+        let plaintext = to_zeroizing_json_vec(&payload)?;
         if plaintext.len() as u64 > MAX_BACKUP_BYTES {
             return Err(Error::InvalidBackup("backup is too large".into()));
         }
@@ -2426,9 +2577,23 @@ impl Vault {
         {
             return Err(Error::InvalidBackup("too many revisions".into()));
         }
+        if !(FIRST_EPOCH..=MAX_EPOCH).contains(&payload.current_epoch)
+            || payload
+                .write_fence
+                .is_some_and(|fence| !(FIRST_EPOCH..=MAX_EPOCH).contains(&fence))
+        {
+            return Err(Error::InvalidBackup("invalid epoch".into()));
+        }
+        let quarantine_bytes = payload.quarantine.iter().fold(0_i64, |acc, r| {
+            acc.saturating_add(i64::try_from(r.ciphertext.len()).unwrap_or(i64::MAX))
+        });
+        if quarantine_bytes > MAX_QUARANTINE_BYTES {
+            return Err(Error::InvalidBackup("quarantine is too large".into()));
+        }
         if payload
             .revisions
             .iter()
+            .chain(payload.quarantine.iter())
             .any(|revision| revision.vault_id != vault_id)
         {
             return Err(Error::InvalidBackup("vault identity mismatch".into()));
@@ -2448,6 +2613,20 @@ impl Vault {
         recovery: &RecoveryKey,
         payload: BackupPayload,
     ) -> Result<Self> {
+        let max_rev_epoch = payload
+            .revisions
+            .iter()
+            .map(|revision| revision.key_epoch)
+            .max()
+            .unwrap_or(FIRST_EPOCH);
+        if max_rev_epoch > MAX_EPOCH {
+            return Err(Error::InvalidBackup("invalid revision epoch".into()));
+        }
+        let write_fence = payload
+            .write_fence
+            .unwrap_or(payload.current_epoch)
+            .max(payload.current_epoch)
+            .max(max_rev_epoch);
         let connection = open_connection(path)?;
         create_schema(&connection)?;
         // A restored vault is a new device: a fresh root key and signing
@@ -2477,7 +2656,7 @@ impl Vault {
             current_epoch: payload.current_epoch,
             device: Some(device),
             recipient: Some(recipient),
-            write_fence: payload.current_epoch,
+            write_fence,
             rows_changed: false,
         };
         insert_header(&connection, &header)?;
@@ -2503,11 +2682,15 @@ impl Vault {
         for device_id in payload.revoked {
             vault.revoke_device(device_id)?;
         }
+        // Held revisions are restored directly into `quarantine` rather than
+        // applied, so active-author held entries (e.g. MissingParent) neither
+        // fail restore nor get silently promoted into `revisions`.
         for held in payload.quarantine {
-            match vault.apply_encrypted_revision(held) {
-                Ok(_) | Err(Error::Quarantined) => {}
-                Err(error) => return Err(error),
+            held.validate_shape(&vault_id)?;
+            if revision_by_id(&vault.connection, &held.revision_id())?.is_some() {
+                continue;
             }
+            vault.quarantine(held)?;
         }
         Ok(vault)
     }
@@ -2549,31 +2732,37 @@ impl Vault {
     }
 
     /// Applies held revisions whose authors are now authorized and not
-    /// revoked, as-is. Call after authorizing devices. A held revision still
-    /// missing a parent, or that fails verification, stays held. Returns
-    /// how many were applied.
+    /// revoked, as-is, in a single topological pass loading one row at a time.
+    /// Call after authorizing devices. A held revision still missing a parent,
+    /// or that fails verification, stays held. Returns how many were applied.
     pub fn retry_quarantined(&mut self) -> Result<usize> {
         self.key()?;
+        let metas = queued_metadata(&self.connection, "quarantine")?;
+        let ordered = kahn_topological_order(metas);
+        let mut blocked: HashSet<String> = HashSet::new();
         let mut applied = 0;
-        loop {
-            let mut progressed = false;
-            for held in quarantined_revisions(&self.connection)? {
-                if !self.is_active_author(&held.author_device_id) {
-                    continue;
-                }
-                match self.commit_revision(held, None, None) {
-                    Ok(_) => {
-                        applied += 1;
-                        progressed = true;
-                    }
-                    Err(error) if error_keeps_hold(&error) => {}
-                    Err(error) => return Err(error),
-                }
+        for meta in ordered {
+            if !self.is_active_author(&meta.author_device_id) {
+                continue;
             }
-            if !progressed {
-                return Ok(applied);
+            if !self.epoch_keys.contains_key(&meta.key_epoch)
+                || meta.parents.iter().any(|p| blocked.contains(p))
+            {
+                blocked.insert(meta.revision);
+                continue;
+            }
+            let Some(held) = quarantined_by_id(&self.connection, &meta.revision)? else {
+                continue;
+            };
+            match self.commit_revision(held, None, None) {
+                Ok(_) => applied += 1,
+                Err(error) if error_keeps_hold(&error) => {
+                    blocked.insert(meta.revision);
+                }
+                Err(error) => return Err(error),
             }
         }
+        Ok(applied)
     }
 
     /// Writes, as this device, a revision with the same content as each
@@ -2613,7 +2802,14 @@ impl Vault {
     }
 
     fn quarantine(&mut self, revision: EncryptedRevision) -> Result<()> {
-        let plaintext = self.decrypt_unverified(&revision)?;
+        // If the claimed author is a known (e.g. revoked) device whose verifying
+        // key is authenticated in `self.devices`, enforce its Ed25519 signature
+        // before quarantining so forged revisions cannot spoof a known device.
+        let plaintext = if self.devices.contains_key(&revision.author_device_id) {
+            self.open_revision(&revision)?
+        } else {
+            self.decrypt_unverified(&revision)?
+        };
         if !revision.tombstone {
             let item: Item = serde_json::from_slice(&plaintext).map_err(|_| Error::Crypto)?;
             item.validate()?;
@@ -2626,9 +2822,13 @@ impl Vault {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if quarantined_by_id(&transaction, &id)?.is_none() {
-            let held: i64 =
-                transaction.query_row("SELECT COUNT(*) FROM quarantine", [], |row| row.get(0))?;
-            if held >= MAX_QUARANTINE {
+            let (held, bytes): (i64, i64) = transaction.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(ciphertext)), 0) FROM quarantine",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let added = i64::try_from(revision.ciphertext.len()).unwrap_or(i64::MAX);
+            if held >= MAX_QUARANTINE || bytes.saturating_add(added) > MAX_QUARANTINE_BYTES {
                 return Err(Error::QuarantineFull);
             }
             insert_revision(&transaction, "quarantine", &revision, &id)?;
@@ -3162,6 +3362,10 @@ impl Drop for EpochKeyRecord {
 #[derive(Serialize, Deserialize)]
 struct BackupPayload {
     current_epoch: u64,
+    /// Write fence epoch carried forward across backup/restore so an active
+    /// fence ahead of `current_epoch` is not lowered on restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_fence: Option<u64>,
     epoch_keys: Vec<EpochKeyRecord>,
     devices: Vec<DeviceRecord>,
     revisions: Vec<EncryptedRevision>,
@@ -4974,7 +5178,8 @@ impl Vault {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if count >= MAX_INGRESS || bytes + revision.ciphertext.len() as i64 > MAX_INGRESS_BYTES {
+        let added = i64::try_from(revision.ciphertext.len()).unwrap_or(i64::MAX);
+        if count >= MAX_INGRESS || bytes.saturating_add(added) > MAX_INGRESS_BYTES {
             return Err(Error::IngressFull);
         }
         insert_revision(&transaction, "ingress", &revision, &id)?;
@@ -5001,45 +5206,59 @@ impl Vault {
             .into_iter()
             .chain(self.staged_revision_ids()?)
             .collect();
-        let missing: BTreeSet<String> = staged_revisions(&self.connection)?
-            .into_iter()
-            .flat_map(|revision| revision.parents)
-            .filter(|parent| !known.contains(parent))
-            .collect();
+        let mut statement = self.connection.prepare("SELECT parents FROM ingress")?;
+        let mut rows = statement.query([])?;
+        let mut missing = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            for parent in split_parents(&raw).ok_or(Error::Crypto)? {
+                if !known.contains(&parent) {
+                    missing.insert(parent);
+                }
+            }
+        }
         Ok(missing.into_iter().collect())
     }
 
-    /// Verifies and applies staged revisions in arrival order, repeating
-    /// while any progress is made. Each accepted or quarantined revision
-    /// leaves the queue in the same transaction that stores it. A revision
-    /// that fails verification is discarded; one still missing a parent
-    /// stays staged. Storage failures stop processing and leave the queue
-    /// and the vault as they were for that revision.
+    /// Verifies and applies staged revisions in topological order (breaking
+    /// ties by arrival order), loading one ciphertext at a time. Each accepted
+    /// or quarantined revision leaves the queue in the same transaction that
+    /// stores it. A revision that fails verification is discarded; one still
+    /// missing a parent or epoch key stays staged. Storage failures stop
+    /// processing and leave the queue and the vault as they were for that
+    /// revision.
     pub fn process_staged(&mut self) -> Result<IngressReport> {
         self.key()?;
         let mut report = IngressReport::default();
-        loop {
-            let mut progressed = false;
-            for revision in staged_revisions(&self.connection)? {
-                let id = revision.revision_id();
-                match self.apply_encrypted_revision(revision) {
-                    Ok(_) => report.applied += 1,
-                    Err(Error::Quarantined) => report.quarantined += 1,
-                    // Wait for the parent, or for this device to receive
-                    // the epoch's key.
-                    Err(Error::MissingParent | Error::MissingEpochKey) => continue,
-                    Err(error) if is_rejection(&error) => {
-                        self.connection
-                            .execute("DELETE FROM ingress WHERE revision=?", [&id])?;
-                        report.rejected += 1;
-                        report.first_rejection.get_or_insert(error);
-                    }
-                    Err(error) => return Err(error),
-                }
-                progressed = true;
+        let metas = queued_metadata(&self.connection, "ingress")?;
+        let ordered = kahn_topological_order(metas);
+        let mut blocked: HashSet<String> = HashSet::new();
+        for meta in ordered {
+            if self.is_active_author(&meta.author_device_id)
+                && (!self.epoch_keys.contains_key(&meta.key_epoch)
+                    || meta.parents.iter().any(|p| blocked.contains(p)))
+            {
+                blocked.insert(meta.revision);
+                continue;
             }
-            if !progressed {
-                break;
+            let Some(revision) = staged_by_id(&self.connection, &meta.revision)? else {
+                continue;
+            };
+            let id = revision.revision_id();
+            match self.apply_encrypted_revision(revision) {
+                Ok(_) => report.applied += 1,
+                Err(Error::Quarantined) => report.quarantined += 1,
+                // Wait for the parent, or for this device to receive the epoch's key.
+                Err(Error::MissingParent | Error::MissingEpochKey) => {
+                    blocked.insert(id);
+                }
+                Err(error) if is_rejection(&error) => {
+                    self.connection
+                        .execute("DELETE FROM ingress WHERE revision=?", [&id])?;
+                    report.rejected += 1;
+                    report.first_rejection.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
             }
         }
         report.pending = self.staged_revision_ids()?.len();
@@ -5061,12 +5280,101 @@ fn is_rejection(error: &Error) -> bool {
     )
 }
 
-fn staged_revisions(connection: &Connection) -> Result<Vec<EncryptedRevision>> {
+struct QueuedMeta {
+    revision: String,
+    parents: Vec<String>,
+    author_device_id: [u8; DEVICE_ID_LEN],
+    key_epoch: u64,
+}
+
+fn queued_metadata(connection: &Connection, table: &str) -> Result<Vec<QueuedMeta>> {
+    debug_assert!(matches!(table, "ingress" | "quarantine"));
     let mut statement = connection.prepare(&format!(
-        "SELECT {REVISION_COLUMNS} FROM ingress r ORDER BY r.rowid"
+        "SELECT revision, parents, author_device_id, key_epoch FROM {table} ORDER BY rowid"
     ))?;
-    let staged = statement
-        .query_map([], row_to_revision)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(staged)
+    let mut rows = statement.query([])?;
+    let mut metas = Vec::new();
+    while let Some(row) = rows.next()? {
+        let revision: String = row.get(0)?;
+        let raw_parents: String = row.get(1)?;
+        let author_raw: Vec<u8> = row.get(2)?;
+        let epoch_raw: i64 = row.get(3)?;
+        let parents = split_parents(&raw_parents).ok_or(Error::Crypto)?;
+        let author_device_id =
+            <[u8; DEVICE_ID_LEN]>::try_from(author_raw.as_slice()).map_err(|_| Error::Crypto)?;
+        let key_epoch = u64::try_from(epoch_raw).map_err(|_| Error::Crypto)?;
+        metas.push(QueuedMeta {
+            revision,
+            parents,
+            author_device_id,
+            key_epoch,
+        });
+    }
+    Ok(metas)
+}
+
+/// Orders queued revisions parent-before-child while preserving arrival order
+/// among ready nodes (Kahn's algorithm with a min-heap over arrival indices).
+/// Any nodes in a cycle are appended at the end in arrival order.
+fn kahn_topological_order(rows: Vec<QueuedMeta>) -> Vec<QueuedMeta> {
+    let n = rows.len();
+    if n <= 1 {
+        return rows;
+    }
+    let mut index_by_id: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (idx, meta) in rows.iter().enumerate() {
+        index_by_id.insert(meta.revision.as_str(), idx);
+    }
+    let mut in_degree = vec![0_usize; n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (idx, meta) in rows.iter().enumerate() {
+        let mut seen_parents = HashSet::new();
+        for parent in &meta.parents {
+            if let Some(&p_idx) = index_by_id.get(parent.as_str()) {
+                if p_idx != idx && seen_parents.insert(p_idx) {
+                    in_degree[idx] += 1;
+                    children[p_idx].push(idx);
+                }
+            }
+        }
+    }
+    let mut ready = BinaryHeap::new();
+    for (idx, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(Reverse(idx));
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    let mut emitted = vec![false; n];
+    while let Some(Reverse(idx)) = ready.pop() {
+        emitted[idx] = true;
+        order.push(idx);
+        for &child in &children[idx] {
+            in_degree[child] -= 1;
+            if in_degree[child] == 0 {
+                ready.push(Reverse(child));
+            }
+        }
+    }
+    for (idx, was_emitted) in emitted.into_iter().enumerate() {
+        if !was_emitted {
+            order.push(idx);
+        }
+    }
+    let mut slots: Vec<Option<QueuedMeta>> = rows.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|idx| slots[idx].take())
+        .collect()
+}
+
+fn staged_by_id(connection: &Connection, revision_id: &str) -> Result<Option<EncryptedRevision>> {
+    connection
+        .query_row(
+            &format!("SELECT {REVISION_COLUMNS} FROM ingress r WHERE r.revision=?"),
+            [revision_id],
+            row_to_revision,
+        )
+        .optional()
+        .map_err(Into::into)
 }

@@ -37,6 +37,10 @@ pub enum Error {
     TimeOutOfRange,
     #[error("a revision identifier was reused with different signed content")]
     RevisionCollision,
+    #[error("locked inbox is full")]
+    InboxFull,
+    #[error("revision vault identity does not match")]
+    VaultMismatch,
     #[error("invalid membership transition")]
     InvalidMembershipTransition,
     #[error("consensus position did not advance")]

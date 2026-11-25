@@ -779,6 +779,7 @@ impl Runtime {
             credential_id,
             &request.rp_id,
             &hash,
+            request.user_verification,
             verified,
             now(),
         )?;

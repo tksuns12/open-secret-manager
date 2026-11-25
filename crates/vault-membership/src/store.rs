@@ -148,8 +148,6 @@ impl AsyncWrite for BoundedSnapshotData {
 }
 
 const SCHEMA: &str = "
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
 CREATE TABLE IF NOT EXISTS raft_vote (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     vote TEXT NOT NULL
@@ -364,11 +362,23 @@ pub fn open(
 ) -> Result<(LogStore, StateMachineStore)> {
     let path = path.as_ref();
     precreate_owner_only(path);
-    let connection = Connection::open(path).map_err(read_error)?;
-    osm_vault_sync::claim_store_version(&connection, STORE_VERSION).map_err(read_error)?;
-    connection.execute_batch(SCHEMA).map_err(write_error)?;
-    restrict_db_permissions(path);
-    let mut state = match connection
+    let mut connection = Connection::open(path).map_err(read_error)?;
+    let found =
+        osm_vault_sync::check_store_version(&connection, STORE_VERSION).map_err(read_error)?;
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;",
+        )
+        .map_err(write_error)?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(write_error)?;
+    let found = osm_vault_sync::check_store_version(&tx, STORE_VERSION)
+        .map_err(read_error)?
+        .max(found);
+    tx.execute_batch(SCHEMA).map_err(write_error)?;
+    let mut state = match tx
         .query_row(
             "SELECT state FROM control_state WHERE singleton = 1",
             [],
@@ -383,6 +393,11 @@ pub fn open(
     if state.vault_id != vault_id {
         return Err(wrong_vault());
     }
+    if found < STORE_VERSION {
+        osm_vault_sync::set_store_version(&tx, STORE_VERSION).map_err(write_error)?;
+    }
+    tx.commit().map_err(write_error)?;
+    restrict_db_permissions(path);
     populate_legacy_enrolled(&connection, &mut state)?;
     let (applied, _) = watch::channel(state.last_applied);
     let db = Arc::new(Mutex::new(connection));
