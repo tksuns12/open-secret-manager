@@ -49,7 +49,7 @@ fn socket(home: &Path) -> PathBuf {
 }
 
 fn extension() -> String {
-    format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")
+    format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/")
 }
 
 /// The host, started as a browser starts it.

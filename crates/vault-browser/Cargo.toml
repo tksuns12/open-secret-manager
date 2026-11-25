@@ -17,6 +17,9 @@ serde_json = "1.0.149"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 zeroize = "1.8.2"
 
+[target.'cfg(unix)'.dependencies]
+getrandom = "0.3"
+
 [target.'cfg(windows)'.dependencies]
 osm-win-pipe-acl = { path = "../win-pipe-acl" }
 

@@ -38,16 +38,26 @@ pub fn own_user() -> u32 {
 }
 
 /// Connects to the desktop session listening at `path`. Fails if nothing
-/// listens there or if what is there is not a socket of this account.
+/// listens there, if what is there is not a socket of this account, or if
+/// the connected peer's kernel credentials do not match this account.
 pub fn connect(path: &Path) -> io::Result<UnixStream> {
+    let own = own_user();
     let found = std::fs::symlink_metadata(path)?;
-    if !found.file_type().is_socket() || found.uid() != own_user() {
+    if !found.file_type().is_socket() || found.uid() != own {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "not a socket of this account",
         ));
     }
-    UnixStream::connect(path)
+    let stream = UnixStream::connect(path)?;
+    let peer = osm_unix_peer_cred::peer_uid(&stream)?;
+    if peer != own {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "connected peer does not belong to this account",
+        ));
+    }
+    Ok(stream)
 }
 
 #[cfg(test)]

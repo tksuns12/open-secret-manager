@@ -233,6 +233,7 @@ proptest! {
     fn only_the_allowed_extension_is_let_through(arguments in prop::collection::vec(
         prop_oneof![
             Just(format!("chrome-extension://{}/", crate::CHROMIUM_EXTENSION_ID)),
+            Just(format!("chrome-extension://{}/", crate::CHROMIUM_STORE_EXTENSION_ID)),
             Just(crate::FIREFOX_EXTENSION_ID.to_owned()),
             "chrome-extension://[a-p]{0,34}/?",
             ".{0,40}",
@@ -241,10 +242,12 @@ proptest! {
     )) {
         if let Some(caller) = Caller::from_args(&arguments).filter(Caller::is_allowed) {
             match caller {
-                Caller::Chromium(origin) => prop_assert_eq!(
-                    origin,
-                    format!("chrome-extension://{}/", crate::CHROMIUM_EXTENSION_ID)
-                ),
+                Caller::Chromium(origin) => {
+                    let allowed = crate::CHROMIUM_EXTENSION_IDS
+                        .iter()
+                        .any(|id| origin == format!("chrome-extension://{id}/"));
+                    prop_assert!(allowed, "unexpected allowed origin: {origin}");
+                }
                 Caller::Firefox(extension) => {
                     prop_assert_eq!(extension, crate::FIREFOX_EXTENSION_ID);
                     prop_assert!(arguments.len() >= 2);

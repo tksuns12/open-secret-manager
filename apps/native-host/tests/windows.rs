@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use osm_browser_link::{endpoint, frame::Prefix, CHROMIUM_EXTENSION_ID};
+use osm_browser_link::{endpoint, frame::Prefix, CHROMIUM_STORE_EXTENSION_ID};
 use osm_vault_browser::{bind, serve, Config, Desk};
 use osm_vault_core::{Item, Vault};
 use serde_json::{json, Value};
@@ -42,7 +42,7 @@ impl Drop for Host {
 impl Host {
     fn start() -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_osm-native-host"))
-            .arg(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"))
+            .arg(format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"))
             .arg("--parent-window=0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

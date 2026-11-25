@@ -3597,6 +3597,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
  "osm-origin",
+ "osm-unix-peer-cred",
  "rustix",
  "serde",
  "serde_json",
@@ -3629,10 +3630,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "osm-unix-peer-cred"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "osm-vault-browser"
 version = "0.1.0"
 dependencies = [
  "base64ct",
+ "getrandom 0.3.4",
  "osm-browser-link",
  "osm-vault-core",
  "osm-win-pipe-acl",

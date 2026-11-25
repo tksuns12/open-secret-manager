@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { base64url, CHANNEL, creationJSON, isAnswer, isAsk, isForTheApp, isOutcome, isWithdraw, outcomeOf, requestJSON, unbase64url, waitFor } from "./passkey.ts";
+import { base64url, CHANNEL, creationJSON, isAnswer, isAsk, isForTheApp, isOutcome, isWithdraw, outcomeOf, requestJSON, siteKeyOf, unbase64url, waitFor } from "./passkey.ts";
 
 const bytes = (...values: number[]) => new Uint8Array(values);
 
@@ -65,4 +65,13 @@ test("the page's script and the bridge take only messages of their own shape", (
   assert.equal(isOutcome(outcomeOf("denied")), true);
   assert.equal(isOutcome(outcomeOf("anything else")), true);
   assert.deepEqual(outcomeOf("desktop_session_unavailable"), { fallback: true, waitForFocus: false });
+});
+
+test("siteKeyOf groups subdomains by valid rpId or parent domain", () => {
+  assert.equal(siteKeyOf("https://a.login.test", JSON.stringify({ rpId: "login.test" })), "site:login.test");
+  assert.equal(siteKeyOf("https://b.login.test", JSON.stringify({ rp: { id: "login.test" } })), "site:login.test");
+  assert.equal(siteKeyOf("https://www.login.test"), "site:login.test");
+  assert.equal(siteKeyOf("https://other.test"), "site:other.test");
+  // An unrelated rpId cannot redirect cooldown to another site.
+  assert.equal(siteKeyOf("https://evil.test", JSON.stringify({ rpId: "login.test" })), "site:evil.test");
 });

@@ -2,8 +2,9 @@
 //! only connections from this account may use.
 
 use std::{
+    fs::DirBuilder,
     io,
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -41,14 +42,30 @@ impl Bound {
 
 /// Binds the session's socket at `path`. A socket left there by a session
 /// that is gone is replaced; one that still answers is another running
-/// session, and anything else in that place is left alone.
+/// session, and anything else in that place is left alone. The socket is
+/// bound to a short random sibling, tightened to `0o600`, and atomically
+/// renamed into place so no world-accessible window exists.
 pub fn bind(path: &Path) -> io::Result<Bound> {
-    if let Some(folder) = path.parent() {
-        std::fs::create_dir_all(folder)?;
-        let _ = std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700));
-    }
+    let own = endpoint::own_user();
+    let folder = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path has no parent directory",
+        )
+    })?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(folder)?;
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
     match std::fs::symlink_metadata(path) {
         Ok(found) if found.file_type().is_socket() => {
+            if found.uid() != own {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "existing socket is owned by another account",
+                ));
+            }
             if std::os::unix::net::UnixStream::connect(path).is_ok() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
@@ -66,11 +83,21 @@ pub fn bind(path: &Path) -> io::Result<Bound> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    let mut suffix = [0_u8; 4];
+    getrandom::fill(&mut suffix).map_err(|error| io::Error::other(error.to_string()))?;
+    let tmp_name = format!(
+        ".b-{:02x}{:02x}{:02x}{:02x}.sock",
+        suffix[0], suffix[1], suffix[2], suffix[3]
+    );
+    let tmp = folder.join(tmp_name);
+    let listener = std::os::unix::net::UnixListener::bind(&tmp)?;
+    if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| std::fs::rename(&tmp, path))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     let unlink = Unlink(path.to_owned());
-    // Who may connect is decided per connection, by its account. This only
-    // keeps the file from looking like an invitation.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     Ok(Bound { listener, unlink })
 }

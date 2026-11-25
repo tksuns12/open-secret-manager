@@ -166,3 +166,39 @@ export function isForTheApp(options: unknown): options is { publicKey: Record<st
 export function waitFor(timeout: number | null): number {
   return Math.min(120_000, Math.max(10_000, timeout ?? 120_000));
 }
+
+/**
+ * Site/RP-level cooldown key for a passkey request so subdomain rotation
+ * cannot bypass per-origin cooldowns or `no_passkey` limits. Uses an explicit
+ * valid `rpId` / `rp.id` suffix of the origin's hostname when present, else
+ * falls back to the last two labels (or hostname).
+ */
+export function siteKeyOf(origin: string, optionsJson?: string): string {
+  let host = origin;
+  try {
+    host = new URL(origin).hostname.toLowerCase().replace(/\.+$/, "");
+  } catch {
+    return origin;
+  }
+  if (optionsJson) {
+    try {
+      const parsed: unknown = JSON.parse(optionsJson);
+      if (isRecord(parsed)) {
+        const candidate = typeof parsed.rpId === "string"
+          ? parsed.rpId
+          : isRecord(parsed.rp) && typeof parsed.rp.id === "string"
+            ? parsed.rp.id
+            : null;
+        if (candidate) {
+          const rp = candidate.trim().toLowerCase().replace(/\.+$/, "");
+          if (rp && rp.includes(".") && (host === rp || host.endsWith(`.${rp}`))) {
+            return `site:${rp}`;
+          }
+        }
+      }
+    } catch { /* fall through to hostname */ }
+  }
+  const labels = host.split(".").filter(Boolean);
+  const site = labels.length >= 2 ? labels.slice(-2).join(".") : host;
+  return `site:${site}`;
+}

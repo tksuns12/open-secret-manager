@@ -272,9 +272,10 @@ impl Known {
         if self.firefox {
             manifest["allowed_extensions"] = serde_json::json!([FIREFOX_EXTENSION_ID]);
         } else {
-            manifest["allowed_origins"] = serde_json::json!(
-                CHROMIUM_EXTENSION_IDS.map(|id| format!("chrome-extension://{id}/"))
-            );
+            manifest["allowed_origins"] = serde_json::json!(CHROMIUM_EXTENSION_IDS
+                .iter()
+                .map(|id| format!("chrome-extension://{id}/"))
+                .collect::<Vec<_>>());
         }
         manifest
     }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/origin",
+    "crates/unix-peer-cred",
     "crates/browser-link",
     "crates/win-pipe-acl",
     "crates/vault-core",

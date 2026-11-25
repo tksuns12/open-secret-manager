@@ -185,7 +185,10 @@ fn the_messages_of_a_fill_are_the_frozen_ones() {
     for (name, browser) in [("from_chromium", "Chromium"), ("from_firefox", "Firefox")] {
         let forwarded: Forwarded =
             serde_json::from_slice(&frozen_text("host_to_session", name)).unwrap();
+        #[cfg(any(debug_assertions, feature = "allow-unpacked-chromium"))]
         assert!(forwarded.caller.is_allowed());
+        #[cfg(not(any(debug_assertions, feature = "allow-unpacked-chromium")))]
+        assert_eq!(forwarded.caller.is_allowed(), browser == "Firefox");
         assert_eq!(forwarded.caller.browser(), browser);
         assert_eq!(forwarded.request, request());
     }
@@ -330,7 +333,10 @@ fn the_messages_of_a_card_fill_are_the_frozen_ones() {
     for (name, browser) in [("from_chromium", "Chromium"), ("from_firefox", "Firefox")] {
         let forwarded: ForwardedCard =
             serde_json::from_slice(&frozen_text("host_to_session", name)).unwrap();
+        #[cfg(any(debug_assertions, feature = "allow-unpacked-chromium"))]
         assert!(forwarded.caller.is_allowed());
+        #[cfg(not(any(debug_assertions, feature = "allow-unpacked-chromium")))]
+        assert_eq!(forwarded.caller.is_allowed(), browser == "Firefox");
         assert_eq!(forwarded.caller.browser(), browser);
         assert_eq!(forwarded.card, card_request());
         // Not taken for a login's.
@@ -473,7 +479,10 @@ fn the_messages_of_a_passkey_are_the_frozen_ones() {
     ] {
         let forwarded: ForwardedPasskey =
             serde_json::from_slice(&frozen_text("host_to_session", name)).unwrap();
+        #[cfg(any(debug_assertions, feature = "allow-unpacked-chromium"))]
         assert!(forwarded.caller.is_allowed());
+        #[cfg(not(any(debug_assertions, feature = "allow-unpacked-chromium")))]
+        assert_eq!(forwarded.caller.is_allowed(), browser == "Firefox");
         assert_eq!(forwarded.caller.browser(), browser);
         assert_eq!(forwarded.ceremony, ceremony);
         // Not taken for a login's or a card's.

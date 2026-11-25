@@ -1,0 +1,16 @@
+[package]
+name = "osm-unix-peer-cred"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Isolated Unix domain socket peer credential (UID) verification wrapper"
+
+# Isolates the minimal `unsafe` FFI (`getpeereid` / `SO_PEERCRED`) needed to
+# verify the connecting client's peer UID on Unix domain sockets while keeping
+# `unsafe_code = "forbid"` on `osm-browser-link` and all other crates.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

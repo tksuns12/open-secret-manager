@@ -11,7 +11,7 @@ use osm_browser_link::{
     endpoint,
     frame::{self, Prefix, MAX_FRAME},
     Caller, CardField, CardFrame, CardRequest, Ceremony, FillRequest, Forwarded, ForwardedCard,
-    ForwardedPasskey, PasskeyRequest, Refusal, Response, CARD_VERSION, CHROMIUM_EXTENSION_ID,
+    ForwardedPasskey, PasskeyRequest, Refusal, Response, CARD_VERSION, CHROMIUM_STORE_EXTENSION_ID,
     PASSKEY_VERSION, VERSION,
 };
 use osm_vault_core::{Item, ItemKind, Vault};
@@ -211,7 +211,7 @@ impl Client {
 }
 
 fn extension() -> Caller {
-    Caller::Chromium(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"))
+    Caller::Chromium(format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"))
 }
 
 fn request(id: &str, origin: &str) -> FillRequest {
@@ -1329,4 +1329,65 @@ async fn passkey_sign_in_with_allow_credentials_does_not_probe_holds_and_bound_t
 
     // Avoid unused warning on `mut vault`.
     let _ = &mut vault;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approve_passkey_create_refuses_cross_rp_login_and_subdomain_no_passkey_shares_rp_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let session = Session::start(Config::default());
+    let mut example = Item::new("Example");
+    example.url = "https://example.com/login".into();
+    let mut other = Item::new("Other");
+    other.url = "https://other.test/login".into();
+    let mut vault = vault_with(session.dir.path(), &[example, other]);
+    let listed = vault.list().unwrap();
+    let other_id = listed
+        .iter()
+        .find(|item| item.title == "Other")
+        .unwrap()
+        .id
+        .clone();
+
+    // Attaching a passkey for `example.com` into a login for `other.test` must be refused.
+    let mut client = Client::bring_passkey(
+        &session,
+        &passkey_request("cross-rp-create", Ceremony::Create, |_| {}),
+    )
+    .await;
+    assert_eq!(client.next().await, waiting("cross-rp-create"));
+    let unlock = session.asked(Some(&vault)).await.session.unwrap();
+    assert!(matches!(
+        session.desk.approve_passkey_create(
+            "cross-rp-create",
+            unlock,
+            &mut vault,
+            Some(&other_id),
+            true,
+        ),
+        Err(Refused::NotForThisPage)
+    ));
+    assert!(session.desk.deny("cross-rp-create"));
+    assert_eq!(
+        client.last().await,
+        refusal("cross-rp-create", Refusal::Denied)
+    );
+
+    // Subdomain rotation sharing the same rpId shares the 3/60s `no_passkey` limit.
+    let holds_calls = Arc::new(AtomicUsize::new(0));
+    let counter = holds_calls.clone();
+    session.desk.answer_sign_ins_with(Box::new(move |_, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Some(false)
+    }));
+    for index in 0..5 {
+        let id = format!("sub-disc-{index}");
+        let mut req = passkey_request(&id, Ceremony::Get, |options| {
+            options["rpId"] = serde_json::json!("example.com");
+        });
+        req.passkey.origin = format!("https://s{index}.example.com");
+        let mut c = Client::bring_passkey(&session, &req).await;
+        assert_eq!(c.next().await, refusal(&id, Refusal::NoPasskey));
+    }
+    assert_eq!(holds_calls.load(Ordering::SeqCst), 3);
 }

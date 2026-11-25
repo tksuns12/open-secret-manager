@@ -13,6 +13,14 @@ type Target = { username: HTMLInputElement | null; password: HTMLInputElement | 
 /** Names this document. A navigation loads another, with another name. */
 const documentId = crypto.randomUUID();
 
+// Cache un-clobberable DOM prototype descriptors so page elements with
+// `id`/`name` matching `activeElement`, `querySelectorAll`, `elements`, or
+// `form` cannot spoof form discovery.
+const getActiveElement = Object.getOwnPropertyDescriptor(Document.prototype, "activeElement")?.get;
+const docQuerySelectorAll = Document.prototype.querySelectorAll;
+const getFormElements = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements")?.get;
+const getInputForm = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "form")?.get;
+
 /** An input or select the owner can see and type into now. */
 function isVisibleControl(element: CardElement): boolean {
   if (element.disabled || (element instanceof HTMLInputElement && element.readOnly)) return false;
@@ -128,10 +136,17 @@ function among(inputs: HTMLInputElement[], focused: Element | null): Target | nu
 
 /** The login form the owner means: the one being typed into, else the first one in the page. */
 function findTarget(): Target | null {
-  const focused = document.activeElement;
-  const form = focused instanceof HTMLInputElement ? focused.form : null;
-  const inForm = form ? among(Array.from(form.elements).filter((element): element is HTMLInputElement => element instanceof HTMLInputElement), focused) : null;
-  return inForm ?? among(Array.from(document.querySelectorAll("input")), focused);
+  const focused = (getActiveElement ? getActiveElement.call(document) : document.activeElement) as Element | null;
+  const form = focused instanceof HTMLInputElement
+    ? ((getInputForm ? getInputForm.call(focused) : focused.form) as HTMLFormElement | null)
+    : null;
+  const formControls = form instanceof HTMLFormElement
+    ? Array.from((getFormElements ? getFormElements.call(form) : form.elements) as HTMLFormControlsCollection)
+    : null;
+  const inForm = formControls
+    ? among(formControls.filter((element): element is HTMLInputElement => element instanceof HTMLInputElement), focused)
+    : null;
+  return inForm ?? among(Array.from(docQuerySelectorAll.call(document, "input") as NodeListOf<HTMLInputElement>), focused);
 }
 
 /** Puts `value` into `input` the way typing would, so that the page notices. */
@@ -204,7 +219,7 @@ function shown(element: CardElement): boolean {
 /** The card form's fields in this document, if it has any. */
 function findCard(): CardTarget {
   const found: CardTarget = new Map();
-  for (const element of Array.from(document.querySelectorAll("input, select"))) {
+  for (const element of Array.from(docQuerySelectorAll.call(document, "input, select"))) {
     if (!(element instanceof HTMLSelectElement) && !(element instanceof HTMLInputElement && CARD_INPUTS.has(element.type))) continue;
     if (!shown(element)) continue;
     const field = cardFieldOf(element);
@@ -311,7 +326,7 @@ function attachPort(port: chrome.runtime.Port) {
     target = null;
     card = null;
     port.disconnect();
-  }, { once: true });
+  }, { once: true, capture: true });
   port.onMessage.addListener((message: ToPage) => {
     if (message.type === "prepare") {
       target = isTopHttpsDocument() ? findTarget() : null;

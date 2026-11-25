@@ -17,7 +17,7 @@ async function asked(browser) {
 describe(`a site's passkeys in ${BROWSER}, once the extension has access to all sites`, () => {
   let browser;
   before(async () => {
-    browser = await start({ logins: [["site", "https://login.test/login"]], access: true });
+    browser = await start({ logins: [["site", "https://login.test/login"], ["other", "https://other.test/login"]], access: true });
   });
   after(() => browser?.close());
 
@@ -67,11 +67,13 @@ describe(`a site's passkeys in ${BROWSER}, once the extension has access to all 
     const loading = await browser.open("https://login.test/passkeys?on-load");
     await browser.app.quiet(1_500);
     // A message shaped as the page's script's, posted by the page itself
-    // without activation, is answered with the browser's own.
+    // without activation over a private MessageChannel, is answered with the
+    // browser's own without broadcasting on `window`.
     const answer = await loading.run(`new Promise((resolve) => {
       const id = crypto.randomUUID();
-      addEventListener("message", (event) => { if (event.data?.type === "answer" && event.data.id === id) resolve(event.data.outcome); });
-      postMessage({ channel: "osm-passkey", type: "ask", id, kind: "get", options: "{}", timeout: null }, location.origin);
+      const ch = new MessageChannel();
+      ch.port1.onmessage = (event) => { if (event.data?.type === "answer" && event.data.id === id) resolve(event.data.outcome); };
+      postMessage({ channel: "osm-passkey", type: "ask", id, kind: "get", options: "{}", timeout: null }, location.origin, [ch.port2]);
     })`);
     assert.deepEqual(answer, { fallback: true, waitForFocus: false });
     await loading.close();
@@ -86,13 +88,13 @@ describe(`a site's passkeys in ${BROWSER}, once the extension has access to all 
     assert.deepEqual(await framed.run("window.answers"), []);
     await framed.close();
 
-    // A page left while its request waits withdraws it. (Of another
-    // origin under the site: the denial above paused login.test's.)
-    const leaving = await browser.open("https://www.login.test/passkeys?leaving");
+    // A page left while its request waits withdraws it. (Of a distinct site:
+    // the denial above paused all of login.test, including its subdomains.)
+    const leaving = await browser.open("https://other.test/passkeys?leaving");
     await leaving.click("#register");
     const waiting = await asked(browser);
     await browser.app.expect("LOGIN");
-    await leaving.goto("https://www.login.test/empty");
+    await leaving.goto("https://other.test/empty");
     assert.equal(await browser.app.expect("ENDED"), waiting.id);
     await leaving.close();
   });

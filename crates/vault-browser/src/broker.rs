@@ -185,7 +185,10 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
-    use osm_browser_link::{Forwarded, CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, VERSION};
+    use osm_browser_link::{
+        Forwarded, CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID,
+        VERSION,
+    };
 
     use super::*;
 
@@ -199,7 +202,7 @@ mod tests {
     const LIMIT: Duration = Duration::from_secs(120);
 
     fn extension() -> Caller {
-        Caller::Chromium(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"))
+        Caller::Chromium(format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"))
     }
 
     fn request(id: &str, origin: &str) -> FillRequest {

@@ -1487,6 +1487,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
  "osm-origin",
+ "osm-unix-peer-cred",
  "rustix",
  "serde",
  "serde_json",
@@ -1513,6 +1514,13 @@ name = "osm-origin"
 version = "0.1.0"
 dependencies = [
  "url",
+]
+
+[[package]]
+name = "osm-unix-peer-cred"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

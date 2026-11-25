@@ -470,12 +470,19 @@ impl Desk {
             )?;
             return Err(Refused::Exists);
         }
-        if let Some(id) = into {
-            let found = vault.get(id).map_err(vault_refused)?;
-            if found.item.kind != ItemKind::Login || found.conflict {
-                return Err(Refused::NotForThisPage);
+        let into_revision = match into {
+            Some(id) => {
+                let found = vault.get(id).map_err(vault_refused)?;
+                let matches_rp = Origin::of_url(&found.item.url).is_some_and(|login_origin| {
+                    passkey::rp_id_allowed(&registering.rp_id, &login_origin)
+                });
+                if found.item.kind != ItemKind::Login || found.conflict || !matches_rp {
+                    return Err(Refused::NotForThisPage);
+                }
+                Some(found.revision)
             }
-        }
+            None => None,
+        };
         let created = registering
             .create(verified, unix_now())
             .map_err(Refused::Vault)?;
@@ -487,14 +494,13 @@ impl Desk {
         let credential = created.registration.response_json(&client_data);
         // Saved before it is sent: a passkey the site has is one the vault
         // has.
-        match into {
-            Some(id) => {
-                let revision = vault.get(id).map_err(vault_refused)?.revision;
+        match (into, into_revision) {
+            (Some(id), Some(revision)) => {
                 vault
                     .add_passkey(id, &revision, created.passkey)
                     .map_err(vault_refused)?;
             }
-            None => {
+            _ => {
                 vault
                     .save_passkey_as_login(created.passkey, &registering.rp_id)
                     .map_err(vault_refused)?;
@@ -840,14 +846,16 @@ impl Desk {
                 .filter(|signing| signing.allowed.is_empty())
                 .map(|signing| {
                     let origin_str = origin.to_string();
-                    let limited = state.is_no_passkey_limited(&origin_str, now);
+                    let rp_key = format!("rp:{}", signing.rp_id);
+                    let limited = state.is_no_passkey_limited(&origin_str, now)
+                        || state.is_no_passkey_limited(&rp_key, now);
                     if limited {
                         state.broker.remember(&request_id);
                     }
-                    (signing.rp_id, origin_str, limited)
+                    (signing.rp_id, origin_str, rp_key, limited)
                 })
         };
-        if let Some((rp_id, origin_str, limited)) = discoverable_rp_id {
+        if let Some((rp_id, origin_str, rp_key, limited)) = discoverable_rp_id {
             if limited {
                 return Err(Failure::new(&request_id, Refusal::NoPasskey));
             }
@@ -862,13 +870,20 @@ impl Desk {
             };
             if holds_none {
                 let mut state = self.state();
-                state.record_no_passkey(&origin_str, Instant::now());
+                let recorded_at = Instant::now();
+                state.record_no_passkey(&origin_str, recorded_at);
+                state.record_no_passkey(&rp_key, recorded_at);
                 state.broker.remember(&request_id);
                 return Err(Failure::new(&request_id, Refusal::NoPasskey));
             }
         }
         let now = Instant::now();
         let mut state = self.state();
+        // Re-check replay under the lock before preempting a pending page
+        // request so a racing duplicate ID cannot evict an honest request.
+        if state.broker.has_seen(&request_id) {
+            return Err(Failure::new(&request_id, Refusal::Replayed));
+        }
         // A fill the owner starts takes the place of a request a page
         // started, which the page's browser then answers itself.
         let from_page = state
@@ -888,9 +903,17 @@ impl Desk {
         }
         let (ticket, deadline) = match state.broker.submit(caller, asked, now) {
             Ok(pending) => (pending.ticket, pending.deadline),
-            // An ID that is not a plain one is not repeated back.
-            Err(Refusal::InvalidMessage) => return Err(Failure::unnamed(Refusal::InvalidMessage)),
-            Err(code) => return Err(Failure::new(&request_id, code)),
+            Err(code) => {
+                drop(state);
+                if from_page.is_some() {
+                    self.announce();
+                }
+                // An ID that is not a plain one is not repeated back.
+                return Err(match code {
+                    Refusal::InvalidMessage => Failure::unnamed(Refusal::InvalidMessage),
+                    code => Failure::new(&request_id, code),
+                });
+            }
         };
         let (answer, answered) = oneshot::channel();
         // A request whose time ran out just now may not have been told yet.

@@ -13,7 +13,7 @@
 
 import { answers, answersCard, answersPasskey, cancel, cardRequest, explain, fillRequest, GIVE_UP_AFTER_MS, MAX_CARD_FRAMES, MAX_PASSKEY_OPTIONS, NATIVE_HOST, pageOrigin, passkeyRequest, readResponse, type CardField, type CardFrame, type CardReply, type CardRequest, type CardValues, type FillReply, type FillRequest, type PasskeyRequest } from "./protocol";
 import { isFilled, isFilledCard, isPrepared, type Field, type Prepared, type ToPage } from "./page";
-import { outcomeOf, toBrowser, waitFor, type Outcome } from "./passkey";
+import { outcomeOf, siteKeyOf, toBrowser, waitFor, type Outcome } from "./passkey";
 
 /**
  * A request the owner has yet to decide in the app: a login's, with the
@@ -45,9 +45,10 @@ const PAGE_ANSWERS_WITHIN_MS = 5_000;
 const FILLED_MARK_MS = 6_000;
 /** How long a site's requests for passkeys go to the browser's own after the owner turned one down, or let it run out. */
 const PASSKEY_PAUSE_MS = 60_000;
-/** How many silent `no_passkey` responses in a window trigger a per-origin cooldown. */
+/** How many silent `no_passkey` responses in a window trigger a per-origin/site cooldown. */
 const NO_PASSKEY_LIMIT = 3;
 const NO_PASSKEY_WINDOW_MS = 60_000;
+const SESSION_STATE_KEY = "osmPasskeyThrottle";
 /** The access the owner gives on the options page: every https site, which is all the extension ever serves. */
 const ALL_SITES = ["https://*/*"];
 
@@ -58,12 +59,92 @@ const CARD_FIELD_NAMES: Record<CardField, string> = {
 
 const waiting = new Map<string, Waiting>();
 let host: chrome.runtime.Port | undefined;
-/** Until when each origin's requests for passkeys are the browser's own. */
+/** Until when each origin or site's requests for passkeys are the browser's own. */
 const paused = new Map<string, number>();
-/** Recent `no_passkey` response timestamps per origin, to bound probing. */
+/** Recent `no_passkey` response timestamps per origin and site, to bound probing. */
 const noPasskeyHits = new Map<string, number[]>();
 /** Reverse-connect handshakes waiting for content scripts to connect back. */
 const pendingFillPorts = new Map<string, PendingFillPort>();
+
+function sessionStorageArea(): chrome.storage.StorageArea | undefined {
+  return (chrome.storage as { session?: chrome.storage.StorageArea } | undefined)?.session;
+}
+
+/** Loads persisted cooldown state on service-worker wake so restarts cannot reset throttling. */
+const throttleReady: Promise<void> = (async () => {
+  const area = sessionStorageArea();
+  if (!area) return;
+  try {
+    const stored = await area.get(SESSION_STATE_KEY);
+    const saved = stored?.[SESSION_STATE_KEY] as { paused?: Record<string, number>; hits?: Record<string, number[]> } | undefined;
+    const now = Date.now();
+    if (saved?.paused && typeof saved.paused === "object") {
+      for (const [key, until] of Object.entries(saved.paused)) {
+        if (typeof until === "number" && until > now) paused.set(key, until);
+      }
+    }
+    if (saved?.hits && typeof saved.hits === "object") {
+      for (const [key, list] of Object.entries(saved.hits)) {
+        if (Array.isArray(list)) {
+          const recent = list.filter((at): at is number => typeof at === "number" && now - at < NO_PASSKEY_WINDOW_MS);
+          if (recent.length > 0) noPasskeyHits.set(key, recent);
+        }
+      }
+    }
+  } catch { /* in-memory fallback */ }
+})();
+
+function saveThrottle() {
+  const area = sessionStorageArea();
+  if (!area) return;
+  const now = Date.now();
+  const pausedObj: Record<string, number> = {};
+  for (const [key, until] of paused) {
+    if (until > now) pausedObj[key] = until;
+    else paused.delete(key);
+  }
+  const hitsObj: Record<string, number[]> = {};
+  for (const [key, list] of noPasskeyHits) {
+    const recent = list.filter((at) => now - at < NO_PASSKEY_WINDOW_MS);
+    if (recent.length > 0) {
+      noPasskeyHits.set(key, recent);
+      hitsObj[key] = recent;
+    } else {
+      noPasskeyHits.delete(key);
+    }
+  }
+  void area.set({ [SESSION_STATE_KEY]: { paused: pausedObj, hits: hitsObj } }).catch(() => {});
+}
+
+function throttleKeys(origin: string, options?: string): [string, string] {
+  return [origin, siteKeyOf(origin, options)];
+}
+
+function isPasskeyPaused(origin: string, options?: string): boolean {
+  const now = Date.now();
+  return throttleKeys(origin, options).some((key) => (paused.get(key) ?? 0) > now);
+}
+
+function pausePasskey(origin: string, options?: string) {
+  const until = Date.now() + PASSKEY_PAUSE_MS;
+  for (const key of throttleKeys(origin, options)) paused.set(key, until);
+  saveThrottle();
+}
+
+function recordNoPasskeyHit(origin: string, options?: string) {
+  const now = Date.now();
+  let exceeded = false;
+  for (const key of throttleKeys(origin, options)) {
+    const recent = (noPasskeyHits.get(key) ?? []).filter((at) => now - at < NO_PASSKEY_WINDOW_MS);
+    recent.push(now);
+    noPasskeyHits.set(key, recent);
+    if (recent.length >= NO_PASSKEY_LIMIT) exceeded = true;
+  }
+  if (exceeded) {
+    for (const key of throttleKeys(origin, options)) paused.set(key, now + PASSKEY_PAUSE_MS);
+  }
+  saveThrottle();
+}
 
 /** Says on the toolbar button, for one tab, how its request stands. */
 function show(tabId: number, mark: Mark, text: string) {
@@ -342,15 +423,13 @@ function fromHost(message: unknown) {
   }
   if (response.type === "error") {
     if (request.kind === "passkey") {
-      // A request the owner turned down, or let run out, is not asked
-      // again at once: the page may not ask over and over.
-      if (response.code === "denied" || response.code === "expired") paused.set(request.request.origin, Date.now() + PASSKEY_PAUSE_MS);
+      // A request the owner turned down, deferred to the browser, or let run
+      // out is not asked again at once: the site may not nag across subdomains.
+      if (response.code === "denied" || response.code === "expired" || response.code === "use_browser") {
+        pausePasskey(request.request.origin, request.request.options);
+      }
       if (response.code === "no_passkey") {
-        const now = Date.now();
-        const recent = (noPasskeyHits.get(request.request.origin) ?? []).filter((at) => now - at < NO_PASSKEY_WINDOW_MS);
-        recent.push(now);
-        noPasskeyHits.set(request.request.origin, recent);
-        if (recent.length >= NO_PASSKEY_LIMIT) paused.set(request.request.origin, now + PASSKEY_PAUSE_MS);
+        recordNoPasskeyHit(request.request.origin, request.request.options);
       }
       end(response.requestId, response.code === "denied" ? "problem" : "none", response.code === "denied" ? "You turned down the page's request for a passkey." : "", false, outcomeOf(response.code));
       return;
@@ -461,8 +540,13 @@ async function deliverCard(request: Waiting & { kind: "card" }, reply: CardReply
   else finish(request, "problem", "The card form is gone. Nothing was filled.");
 }
 
-/** Hands the page the credential, if the tab still shows a page of the origin that asked; the connection is its document's. */
+/** Hands the page the credential, if access is still granted and the tab still shows a page of the origin that asked. */
 async function deliverPasskey(request: Waiting & { kind: "passkey" }, credential: string) {
+  const granted = await chrome.permissions.contains({ origins: ALL_SITES }).catch(() => false);
+  if (!granted) {
+    finish(request, "none", "", toBrowser());
+    return;
+  }
   if (await originNow(request.tabId) !== request.request.origin) {
     finish(request, "problem", "The page changed before the passkey's answer arrived. Nothing was sent.");
     return;
@@ -483,8 +567,8 @@ function isBridgeAsk(message: unknown): message is { type: "ask"; kind: "create"
  * origin is the browser's: what it reports for the connection's sender,
  * which must be the page itself, of an https address, and the origin of
  * both that document's address and the tab's. One request per tab, and
- * none from a site while it is paused; anything else goes on to the
- * browser's own passkeys.
+ * none from a site while it is paused or after all-sites access is revoked;
+ * anything else goes on to the browser's own passkeys.
  */
 function servePasskey(port: chrome.runtime.Port) {
   const sender = port.sender;
@@ -498,26 +582,51 @@ function servePasskey(port: chrome.runtime.Port) {
     return;
   }
   let requestId: string | null = null;
+  let requestOptions: string | undefined;
+  let starting = false;
+  let disconnected = false;
   port.onMessage.addListener((message: unknown) => {
     if (requestId !== null) {
-      // The page's call was aborted.
-      if ((message as { type?: unknown } | null)?.type === "withdraw") end(requestId, "none", "", true, outcomeOf("cancelled"));
+      // The page's call was aborted: throttle repeat nag loops on withdraw too.
+      if ((message as { type?: unknown } | null)?.type === "withdraw") {
+        pausePasskey(origin, requestOptions);
+        end(requestId, "none", "", true, outcomeOf("cancelled"));
+      }
       return;
     }
-    if (!isBridgeAsk(message) || [...waiting.values()].some((other) => other.tabId === tabId) || (paused.get(origin) ?? 0) > Date.now()) {
+    if (starting) return;
+    if (!isBridgeAsk(message)) {
       refuse();
       return;
     }
-    const id = crypto.randomUUID();
-    requestId = id;
-    const giveUp = setTimeout(() => {
-      paused.set(origin, Date.now() + PASSKEY_PAUSE_MS);
-      end(id, "none", "", true, outcomeOf("expired"));
-    }, waitFor(message.timeout));
-    begin(id, { kind: "passkey", request: passkeyRequest(message.kind, id, tabId, origin, message.options), page: port, tabId, giveUp });
+    starting = true;
+    void (async () => {
+      await throttleReady;
+      const granted = await chrome.permissions.contains({ origins: ALL_SITES }).catch(() => false);
+      if (
+        disconnected
+        || !granted
+        || [...waiting.values()].some((other) => other.tabId === tabId)
+        || isPasskeyPaused(origin, message.options)
+      ) {
+        if (!disconnected) refuse();
+        return;
+      }
+      const id = crypto.randomUUID();
+      requestId = id;
+      requestOptions = message.options;
+      const giveUp = setTimeout(() => {
+        pausePasskey(origin, message.options);
+        end(id, "none", "", true, outcomeOf("expired"));
+      }, waitFor(message.timeout));
+      begin(id, { kind: "passkey", request: passkeyRequest(message.kind, id, tabId, origin, message.options), page: port, tabId, giveUp });
+    })();
   });
   // The document went: a navigation, a reload, or the tab closing.
-  port.onDisconnect.addListener(() => { if (requestId !== null) end(requestId, "none", "", true); });
+  port.onDisconnect.addListener(() => {
+    disconnected = true;
+    if (requestId !== null) end(requestId, "none", "", true);
+  });
 }
 
 /** The scripts for passkeys, put into the page itself of every https page once the owner gives access to all sites. */
@@ -531,6 +640,11 @@ let following: Promise<void> = Promise.resolve();
 function followAccess() {
   following = following.then(async () => {
     const granted = await chrome.permissions.contains({ origins: ALL_SITES });
+    if (!granted) {
+      for (const [requestId, request] of [...waiting]) {
+        if (request.kind === "passkey") end(requestId, "none", "", true, toBrowser());
+      }
+    }
     const registered = await chrome.scripting.getRegisteredContentScripts({ ids: PASSKEY_SCRIPTS.map((script) => script.id) });
     if (granted && registered.length === PASSKEY_SCRIPTS.length) return;
     if (registered.length > 0) await chrome.scripting.unregisterContentScripts({ ids: registered.map((script) => script.id) });
@@ -538,7 +652,7 @@ function followAccess() {
   }).catch(() => { /* tried again at the next change or start */ });
 }
 
-/** Ends the request made in a tab, when the browser says the tab is gone. */
+/** Ends the request made in a tab, when the browser says the tab navigated or closed. */
 function tabLeft(tabId: number) {
   for (const [requestId, request] of waiting) {
     if (request.tabId === tabId) end(requestId, "none", "", true);
@@ -547,6 +661,10 @@ function tabLeft(tabId: number) {
 
 chrome.action.onClicked.addListener((tab) => { void ask(tab); });
 chrome.tabs.onRemoved.addListener(tabLeft);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading" || changeInfo.url !== undefined) tabLeft(tabId);
+});
+chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => tabLeft(removedTabId));
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "passkey") {
     servePasskey(port);

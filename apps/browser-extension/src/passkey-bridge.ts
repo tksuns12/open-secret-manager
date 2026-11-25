@@ -13,8 +13,13 @@ import { MAX_PASSKEY_OPTIONS } from "./protocol.ts";
 (() => {
   if (window.top !== window || location.protocol !== "https:" || self.origin !== location.origin) return;
   const origin = self.origin;
-  const asking = new Map<string, chrome.runtime.Port>();
-  const answer = (id: string, outcome: Outcome) => window.postMessage({ channel: CHANNEL, type: "answer", id, outcome }, origin);
+  const getVisibilityState = Object.getOwnPropertyDescriptor(Document.prototype, "visibilityState")?.get;
+  const docHasFocus = Document.prototype.hasFocus;
+  const asking = new Map<string, { bg: chrome.runtime.Port; reply: MessagePort }>();
+  const answer = (reply: MessagePort, id: string, outcome: Outcome) => {
+    try { reply.postMessage({ channel: CHANNEL, type: "answer", id, outcome }); } catch { /* port closed */ }
+    try { reply.close(); } catch { /* already closed */ }
+  };
 
   // Single-use trusted user gesture token in the isolated world so one click
   // or key press cannot trigger a burst of background passkey queries.
@@ -31,24 +36,26 @@ import { MAX_PASSKEY_OPTIONS } from "./protocol.ts";
     // Only the page's own window, not a frame in it, and only to this origin.
     if (event.source !== window || event.origin !== origin) return;
     const message: unknown = event.data;
-    if (isWithdraw(message)) {
-      asking.get(message.id)?.postMessage({ type: "withdraw" });
-      return;
-    }
     if (!isAsk(message) || asking.has(message.id)) return;
+    // Replies and withdrawals travel exclusively over the caller's private
+    // MessagePort rather than broadcasting on `window`.
+    const replyPort = event.ports?.[0];
+    if (!(replyPort instanceof MessagePort)) return;
     const { id } = message;
     const now = Date.now();
     const freshGesture = gestureAt > 0 && now - gestureAt <= GESTURE_TTL_MS;
+    const visibility = getVisibilityState ? getVisibilityState.call(document) : document.visibilityState;
+    const focused = docHasFocus.call(document);
     // A call the owner did not just make in the visible, focused page is the
     // browser's own. Consume the gesture so one click serves at most one ask.
     if (
-      document.visibilityState !== "visible"
-      || !document.hasFocus()
+      visibility !== "visible"
+      || !focused
       || !navigator.userActivation?.isActive
       || !freshGesture
       || message.options.length > MAX_PASSKEY_OPTIONS
     ) {
-      answer(id, toBrowser());
+      answer(replyPort, id, toBrowser());
       return;
     }
     gestureAt = 0;
@@ -56,18 +63,28 @@ import { MAX_PASSKEY_OPTIONS } from "./protocol.ts";
     try {
       port = chrome.runtime.connect({ name: "passkey" });
     } catch {
-      answer(id, toBrowser());
+      answer(replyPort, id, toBrowser());
       return;
     }
-    asking.set(id, port);
+    asking.set(id, { bg: port, reply: replyPort });
+    replyPort.onmessage = (portEvent) => {
+      if (isWithdraw(portEvent.data) && portEvent.data.id === id) {
+        asking.get(id)?.bg.postMessage({ type: "withdraw" });
+      }
+    };
     port.onMessage.addListener((told: unknown) => {
-      if (!asking.has(id) || !isOutcome(told)) return;
+      const entry = asking.get(id);
+      if (!entry || !isOutcome(told)) return;
       asking.delete(id);
       port.disconnect();
-      answer(id, told);
+      answer(entry.reply, id, told);
     });
     port.onDisconnect.addListener(() => {
-      if (asking.delete(id)) answer(id, toBrowser());
+      const entry = asking.get(id);
+      if (entry) {
+        asking.delete(id);
+        answer(entry.reply, id, toBrowser());
+      }
     });
     port.postMessage({ type: "ask", kind: message.kind, options: message.options, timeout: message.timeout });
   });
@@ -75,7 +92,10 @@ import { MAX_PASSKEY_OPTIONS } from "./protocol.ts";
   // Registered before the page's own scripts run, so a page cannot keep it
   // from hearing that the document goes.
   window.addEventListener("pagehide", () => {
-    for (const port of asking.values()) port.disconnect();
+    for (const entry of asking.values()) {
+      entry.bg.disconnect();
+      try { entry.reply.close(); } catch { /* already closed */ }
+    }
     asking.clear();
-  });
+  }, { capture: true });
 })();

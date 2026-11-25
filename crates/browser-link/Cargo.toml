@@ -8,6 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Release builds allow only the signed Chrome Web Store extension ID; enable
+# this feature (or run a debug build) to also allow the unpacked dev ID.
+allow-unpacked-chromium = []
+
 [dependencies]
 osm-origin = { path = "../origin" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -16,6 +21,7 @@ zeroize = "1.8.2"
 
 [target.'cfg(unix)'.dependencies]
 dirs = "6.0"
+osm-unix-peer-cred = { path = "../unix-peer-cred" }
 rustix = { version = "1.1", features = ["process"] }
 
 [dev-dependencies]

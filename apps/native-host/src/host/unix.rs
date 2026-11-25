@@ -91,7 +91,7 @@ fn relay(
         // else, a closed connection, and a long silence all mean there is
         // no session to trust with it.
         let answer = match Prefix::Socket.read(&mut session) {
-            Ok(Some(body)) => serde_json::from_slice::<Response>(&body)
+            Ok(Some(body)) => Response::read(&body)
                 .ok()
                 .filter(|response| answers(response)),
             _ => None,

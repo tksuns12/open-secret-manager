@@ -114,11 +114,13 @@ async function relyingParty(url, request, response) {
     body = JSON.parse(text);
   }
   const verification = url.searchParams.get("uv") ?? "preferred";
+  const host = (request.headers.host ?? RP_ID).split(":")[0];
+  const rpId = host === "other.test" ? "other.test" : RP_ID;
   try {
     switch (url.pathname) {
       case "/webauthn/register-options": {
         const options = await generateRegistrationOptions({
-          rpName: "Login test", rpID: RP_ID, userName: "site-user", userDisplayName: "Site User", userID: new TextEncoder().encode("site-user"),
+          rpName: "Login test", rpID: rpId, userName: "site-user", userDisplayName: "Site User", userID: new TextEncoder().encode("site-user"),
           attestationType: "none", authenticatorSelection: { residentKey: "required", userVerification: verification },
           excludeCredentials: url.searchParams.has("exclude") ? site.passkeys.map((passkey) => ({ id: passkey.id })) : [],
         });

@@ -56,21 +56,22 @@ pub(crate) async fn converse(mut stream: impl AsyncRead + AsyncWrite + Unpin, de
     let Ok(Ok(body)) = timeout(config.exchange_within, read_frame(&mut stream)).await else {
         return;
     };
-    // A login's request, a card's, or a passkey's.
-    let (caller, asked) = if let Ok(Forwarded { caller, request }) = serde_json::from_slice(&body) {
-        (caller, Asked::Login(request))
-    } else if let Ok(ForwardedCard { caller, card }) = serde_json::from_slice(&body) {
-        (caller, Asked::Card(card))
-    } else if let Ok(ForwardedPasskey {
-        caller,
-        ceremony,
-        passkey,
-    }) = serde_json::from_slice(&body)
-    {
-        (caller, Asked::Passkey(ceremony, passkey))
-    } else {
-        return;
-    };
+    // A login's request, a card's, or a passkey's (strict duplicate-key rejection).
+    let (caller, asked) =
+        if let Ok(Forwarded { caller, request }) = osm_browser_link::read_strict(&body) {
+            (caller, Asked::Login(request))
+        } else if let Ok(ForwardedCard { caller, card }) = osm_browser_link::read_strict(&body) {
+            (caller, Asked::Card(card))
+        } else if let Ok(ForwardedPasskey {
+            caller,
+            ceremony,
+            passkey,
+        }) = osm_browser_link::read_strict(&body)
+        {
+            (caller, Asked::Passkey(ceremony, passkey))
+        } else {
+            return;
+        };
     let request_id = asked.request_id().to_owned();
     let (ticket, deadline, mut answered) = match desk.submit(caller, asked) {
         Ok(taken) => taken,

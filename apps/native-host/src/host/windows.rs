@@ -153,7 +153,7 @@ async fn relay<W: Write>(
             read = timeout(SILENCE_LIMIT, read_frame(&mut session)) => read.ok().and_then(Result::ok),
         };
         let answer = body.and_then(|body| {
-            serde_json::from_slice::<Response>(&body)
+            Response::read(&body)
                 .ok()
                 .filter(|response| answers(response))
         });

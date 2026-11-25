@@ -13,7 +13,7 @@ use osm_browser_link::{
     frame::{self, Prefix},
     Caller, CardField, CardFrame, CardRequest, Ceremony, FillRequest, Forwarded, ForwardedCard,
     ForwardedPasskey, PasskeyRequest, Refusal, Response, Waiting, CARD_VERSION,
-    CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID, PASSKEY_VERSION,
+    CHROMIUM_EXTENSION_IDS, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID, PASSKEY_VERSION,
     VERSION,
 };
 use osm_vault_core::{Item, ItemKind, Vault};
@@ -79,7 +79,7 @@ async fn unlock(app: &AppHandle<MockRuntime>) {
 
 fn request(id: &str, origin: &str) -> Forwarded {
     Forwarded {
-        caller: Caller::Chromium(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")),
+        caller: Caller::Chromium(format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/")),
         request: FillRequest {
             version: VERSION,
             request_id: id.into(),
@@ -409,7 +409,7 @@ fn a_card_request_shows_its_documents_and_cards_and_sends_the_card_chosen() {
         browser::start(&handle);
         unlock(&handle).await;
         let wanted = ForwardedCard {
-            caller: Caller::Chromium(format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")),
+            caller: Caller::Chromium(format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/")),
             card: CardRequest {
                 version: CARD_VERSION,
                 request_id: "card".into(),
@@ -806,10 +806,10 @@ fn a_browser_is_connected_by_writing_the_hosts_manifest_into_its_folder() {
                 "description": "Open Secret Manager native messaging host",
                 "path": host,
                 "type": "stdio",
-                "allowed_origins": [
-                    format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"),
-                    format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"),
-                ],
+                "allowed_origins": CHROMIUM_EXTENSION_IDS
+                    .iter()
+                    .map(|id| format!("chrome-extension://{id}/"))
+                    .collect::<Vec<_>>(),
             })
         );
         browser::connect_browser("firefox".into(), handle.state())

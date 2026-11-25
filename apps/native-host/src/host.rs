@@ -150,7 +150,7 @@ impl<W: Write + Send + 'static> Host<W> {
 mod tests {
     use std::io;
 
-    use osm_browser_link::{Failure, CHROMIUM_EXTENSION_ID};
+    use osm_browser_link::{Failure, CHROMIUM_STORE_EXTENSION_ID};
     use proptest::prelude::*;
 
     use super::*;
@@ -182,7 +182,7 @@ mod tests {
 
     fn allowed() -> Option<Caller> {
         Some(Caller::Chromium(format!(
-            "chrome-extension://{CHROMIUM_EXTENSION_ID}/"
+            "chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"
         )))
     }
 

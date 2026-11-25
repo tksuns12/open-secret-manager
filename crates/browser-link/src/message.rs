@@ -37,9 +37,17 @@ pub const CHROMIUM_EXTENSION_ID: &str = "hjgekjgkjnakgmiopldddikdkcjhnmge";
 /// an ID of its own and keeps its key.
 pub const CHROMIUM_STORE_EXTENSION_ID: &str = "pnjdoenkfffomcidikbkcegcpgipdjog";
 
-/// The Chromium extensions the host answers: the copy loaded unpacked and
-/// the Chrome Web Store's.
-pub const CHROMIUM_EXTENSION_IDS: [&str; 2] = [CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID];
+/// The Chromium extensions the host answers: in debug builds (or with the
+/// `allow-unpacked-chromium` feature) both the unpacked development copy and
+/// the Chrome Web Store's; in release builds only the Chrome Web Store's.
+#[cfg(any(debug_assertions, feature = "allow-unpacked-chromium"))]
+pub const CHROMIUM_EXTENSION_IDS: &[&str] = &[CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID];
+
+/// The Chromium extensions the host answers: in release builds only the Chrome
+/// Web Store's extension ID is trusted (enable `allow-unpacked-chromium` for
+/// local unpacked development against a release binary).
+#[cfg(not(any(debug_assertions, feature = "allow-unpacked-chromium")))]
+pub const CHROMIUM_EXTENSION_IDS: &[&str] = &[CHROMIUM_STORE_EXTENSION_ID];
 
 /// The one Firefox extension the host answers: the ID in the extension's
 /// Firefox manifest.
@@ -300,12 +308,112 @@ pub enum Request {
     PasskeyGet(PasskeyRequest),
 }
 
+/// A `serde_json::Value` wrapper whose `Deserialize` implementation rejects
+/// duplicate object keys at every nesting depth (preventing JSON key-smuggling
+/// differentials between `serde_json` last-key-wins and strict parsers).
+struct StrictValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for StrictValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StrictVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+            type Value = serde_json::Value;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any valid JSON value without duplicate object keys")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Bool(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Number(v.into()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Number(v.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::String(v.to_owned()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::String(v))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut vec = Vec::new();
+                while let Some(StrictValue(elem)) = seq.next_element()? {
+                    vec.push(elem);
+                }
+                Ok(serde_json::Value::Array(vec))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some((key, StrictValue(val))) = map.next_entry::<String, StrictValue>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate JSON object key"));
+                    }
+                    values.insert(key, val);
+                }
+                Ok(serde_json::Value::Object(values))
+            }
+        }
+
+        deserializer.deserialize_any(StrictVisitor).map(StrictValue)
+    }
+}
+
+/// Parses `body` as a single JSON value, rejecting duplicate object keys at
+/// every nesting level and any trailing bytes.
+fn parse_strict_json(body: &[u8]) -> Result<serde_json::Value, ()> {
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let StrictValue(value) = StrictValue::deserialize(&mut de).map_err(|_| ())?;
+    de.end().map_err(|_| ())?;
+    Ok(value)
+}
+
+/// Deserializes `T` from JSON `body`, rejecting duplicate object keys at every
+/// nesting depth and any trailing bytes.
+pub fn read_strict<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Refusal> {
+    let value = parse_strict_json(body).map_err(|()| Refusal::InvalidMessage)?;
+    serde_json::from_value(value).map_err(|_| Refusal::InvalidMessage)
+}
+
 impl Request {
     /// Reads and checks one message from the extension. A refusal names
-    /// the request it refuses when the message named one.
+    /// the request it refuses when the message named one. Duplicate JSON keys
+    /// at any nesting level are refused as [`Refusal::InvalidMessage`].
     pub fn read(body: &[u8]) -> Result<Self, Failure> {
-        let value: serde_json::Value =
-            serde_json::from_slice(body).map_err(|_| Failure::unnamed(Refusal::InvalidMessage))?;
+        let value =
+            parse_strict_json(body).map_err(|()| Failure::unnamed(Refusal::InvalidMessage))?;
         let field = |name: &str| value.as_object().and_then(|object| object.get(name));
         let request_id = field("requestId")
             .and_then(serde_json::Value::as_str)
@@ -514,6 +622,12 @@ pub enum Response {
 }
 
 impl Response {
+    /// Parses one JSON response frame, rejecting duplicate object keys at
+    /// every nesting level and any trailing bytes.
+    pub fn read(body: &[u8]) -> Result<Self, Refusal> {
+        read_strict(body)
+    }
+
     pub fn refusal(request_id: &str, code: Refusal) -> Self {
         Self::Error(Failure::new(request_id, code))
     }
@@ -1047,13 +1161,22 @@ mod tests {
 
     #[test]
     fn only_the_one_extension_of_each_browser_is_allowed() {
-        let chromium = format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/");
-        let caller = Caller::from_args(&arguments(&[&chromium])).unwrap();
-        assert_eq!(caller, Caller::Chromium(chromium.clone()));
+        let unpacked = format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/");
+        let unpacked_caller = Caller::from_args(&arguments(&[&unpacked])).unwrap();
+        assert_eq!(unpacked_caller, Caller::Chromium(unpacked.clone()));
+        assert_eq!(
+            unpacked_caller.is_allowed(),
+            cfg!(any(debug_assertions, feature = "allow-unpacked-chromium"))
+        );
+
+        // The Chrome Web Store's copy is allowed in every build profile.
+        let store = format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/");
+        let caller = Caller::from_args(&arguments(&[&store])).unwrap();
+        assert_eq!(caller, Caller::Chromium(store.clone()));
         assert!(caller.is_allowed());
         // On Windows a Chromium browser adds a window handle.
         assert!(
-            Caller::from_args(&arguments(&[&chromium, "--parent-window=0"]))
+            Caller::from_args(&arguments(&[&store, "--parent-window=0"]))
                 .unwrap()
                 .is_allowed()
         );
@@ -1064,16 +1187,11 @@ mod tests {
         .unwrap();
         assert_eq!(firefox, Caller::Firefox(FIREFOX_EXTENSION_ID.into()));
         assert!(firefox.is_allowed());
-        // The Chrome Web Store's copy, with its own ID.
-        let store = format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/");
-        assert!(Caller::from_args(&arguments(&[&store]))
-            .unwrap()
-            .is_allowed());
 
         for forged in [
             arguments(&["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"]),
-            arguments(&[&chromium[..chromium.len() - 1]]),
-            arguments(&[&format!("{chromium}x")]),
+            arguments(&[&unpacked[..unpacked.len() - 1]]),
+            arguments(&[&format!("{unpacked}x")]),
             arguments(&[&format!(
                 "chrome-extension://{CHROMIUM_EXTENSION_ID}.evil.test/"
             )]),
@@ -1083,7 +1201,7 @@ mod tests {
             arguments(&[&format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}")]),
             arguments(&["/path/to/manifest.json", CHROMIUM_STORE_EXTENSION_ID]),
             arguments(&["/path/to/manifest.json", "another@example.org"]),
-            arguments(&["/path/to/manifest.json", &chromium]),
+            arguments(&["/path/to/manifest.json", &unpacked]),
             arguments(&[FIREFOX_EXTENSION_ID, "another@example.org"]),
         ] {
             let caller = Caller::from_args(&forged).unwrap();
@@ -1096,6 +1214,19 @@ mod tests {
             Caller::from_args(&arguments(&["https://example.com/"])),
             None
         );
+    }
+
+    #[test]
+    fn duplicate_json_keys_are_rejected_in_requests_and_responses() {
+        let dup_top = r#"{"type":"fill_request","version":1,"requestId":"abc","tabId":1,"frameId":0,"documentId":"d","origin":"https://evil.test","origin":"https://good.test"}"#;
+        assert_eq!(refused(dup_top), (None, Refusal::InvalidMessage));
+
+        let dup_nested = r#"{"type":"card_request","version":2,"requestId":"abc","tabId":1,"topOrigin":"https://shop.test","frames":[{"frameId":0,"documentId":"d","origin":"https://evil.test","origin":"https://shop.test","fields":["number"]}]}"#;
+        assert_eq!(refused(dup_nested), (None, Refusal::InvalidMessage));
+
+        let dup_response = r#"{"type":"waiting","requestId":"a","requestId":"b"}"#;
+        assert!(Response::read(dup_response.as_bytes()).is_err());
+        assert!(Response::read(br#"{"type":"waiting","requestId":"a"}"#).is_ok());
     }
 
     #[test]

@@ -29,18 +29,21 @@ type Credential = {
   const original = { create: container.create, get: container.get };
   const origin = self.origin;
 
-  /** Asks the app, through the bridge, and waits for how the call ends. */
+  /** Asks the app, through the bridge over a per-request private MessageChannel, and waits for how the call ends. */
   function ask(kind: Kind, options: string, timeout: number | null, signal?: AbortSignal): Promise<Outcome> {
     const id = crypto.randomUUID();
+    const channel = new MessageChannel();
     return new Promise((resolve) => {
-      const heard = (event: MessageEvent) => {
-        if (event.source !== window || event.origin !== origin || !isAnswer(event.data) || event.data.id !== id) return;
-        window.removeEventListener("message", heard);
+      channel.port1.onmessage = (event: MessageEvent) => {
+        if (!isAnswer(event.data) || event.data.id !== id) return;
+        channel.port1.onmessage = null;
+        channel.port1.close();
         resolve(event.data.outcome);
       };
-      window.addEventListener("message", heard);
-      signal?.addEventListener("abort", () => window.postMessage({ channel: CHANNEL, type: "withdraw", id }, origin), { once: true });
-      window.postMessage({ channel: CHANNEL, type: "ask", id, kind, options, timeout }, origin);
+      signal?.addEventListener("abort", () => {
+        try { channel.port1.postMessage({ channel: CHANNEL, type: "withdraw", id }); } catch { /* port closed */ }
+      }, { once: true });
+      window.postMessage({ channel: CHANNEL, type: "ask", id, kind, options, timeout }, origin, [channel.port2]);
     });
   }
 
