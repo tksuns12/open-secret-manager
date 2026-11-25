@@ -479,6 +479,7 @@ private fun PasswordChange(state: UiState, session: VaultSession) {
     }
 }
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 internal fun Unlock(
     state: UiState,
@@ -498,7 +499,7 @@ internal fun Unlock(
         onPauseOrDispose { }
     }
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        Modifier.fillMaxSize().semantics { testTagsAsResourceId = true }.verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterVertically),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {

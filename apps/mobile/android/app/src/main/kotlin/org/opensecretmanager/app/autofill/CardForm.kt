@@ -218,13 +218,25 @@ data class CardForm(
                 group.any { it.field.part == CardPart.NUMBER }
             }
             val chosen = groups.firstOrNull { group -> group.any { it.focused } } ?: groups.firstOrNull() ?: return null
+            // Only card number may span split inputs (e.g., 4x4 digits). Single-value
+            // card parts (especially CVC) are deduplicated to one field (preferring a
+            // focused input, else the first visible one) so duplicate decoy inputs in
+            // the same WebView cannot silently harvest a card's security code.
+            val keptSingle = CardPart.entries
+                .filter { it != CardPart.NUMBER }
+                .mapNotNull { part ->
+                    val ofPart = chosen.filter { it.field.part == part }
+                    ofPart.firstOrNull { it.focused } ?: ofPart.firstOrNull()
+                }
+                .toSet()
+            val retained = chosen.filter { it.field.part == CardPart.NUMBER || it in keptSingle }
             val scope = chosen.first().scope
             return CardForm(
                 structure.activityComponent.packageName,
                 scope.origin?.domain,
                 scope.origin?.scheme,
-                chosen.map { it.field },
-                chosen.any { it.focused },
+                retained.map { it.field },
+                retained.any { it.focused },
             )
         }
 

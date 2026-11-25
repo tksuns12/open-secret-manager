@@ -141,16 +141,46 @@ data class Form(
         }
 
         /**
+         * Whether an inline HTML `style` attribute hides an element via
+         * `display: none`, `visibility: hidden`/`collapse`, or low `opacity`.
+         */
+        internal fun isHiddenInlineStyle(style: String): Boolean {
+            for (declaration in style.split(';')) {
+                val colon = declaration.indexOf(':')
+                if (colon <= 0) continue
+                val property = declaration.substring(0, colon).trim().lowercase()
+                val rawValue = declaration.substring(colon + 1)
+                    .substringBefore('!')
+                    .trim()
+                    .lowercase()
+                when (property) {
+                    "display" -> if (rawValue == "none") return true
+                    "visibility" -> if (rawValue == "hidden" || rawValue == "collapse") return true
+                    "opacity" -> {
+                        val alpha = if (rawValue.endsWith('%')) {
+                            rawValue.dropLast(1).trim().toFloatOrNull()?.div(100f)
+                        } else {
+                            rawValue.toFloatOrNull()
+                        }
+                        if (alpha != null && alpha < MIN_VISIBLE_ALPHA) return true
+                    }
+                }
+            }
+            return false
+        }
+
+        /**
          * Whether [node] (and therefore its entire subtree) is hidden from the
-         * owner: invisible/gone, near-transparent, or marked `hidden` /
-         * `aria-hidden="true"` in HTML.
+         * owner: invisible/gone, near-transparent, marked `hidden` /
+         * `aria-hidden="true"` in HTML, or hidden via inline CSS `style`.
          */
         internal fun isHiddenNode(node: AssistStructure.ViewNode): Boolean {
             if (node.visibility != View.VISIBLE || node.alpha < MIN_VISIBLE_ALPHA) return true
             val attrs = node.htmlInfo?.attributes.orEmpty()
             return attrs.any { attr ->
                 attr.first.equals("hidden", ignoreCase = true) ||
-                    (attr.first.equals("aria-hidden", ignoreCase = true) && attr.second.equals("true", ignoreCase = true))
+                    (attr.first.equals("aria-hidden", ignoreCase = true) && attr.second.equals("true", ignoreCase = true)) ||
+                    (attr.first.equals("style", ignoreCase = true) && isHiddenInlineStyle(attr.second.orEmpty()))
             }
         }
 

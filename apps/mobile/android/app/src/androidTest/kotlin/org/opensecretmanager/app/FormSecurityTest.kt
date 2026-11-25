@@ -83,4 +83,18 @@ class FormSecurityTest {
         assertFalse(asker.linkedTo("www.exact.test"))
         assertFalse(asker.linkedTo(""))
     }
+
+    @Test
+    fun hiddenInlineStyleRejectsLowOpacityDisplayNoneAndVisibilityHidden() {
+        assertTrue(Form.isHiddenInlineStyle("opacity: 0.01"))
+        assertTrue(Form.isHiddenInlineStyle("color: red; opacity: 0;"))
+        assertTrue(Form.isHiddenInlineStyle("opacity: 5% !important"))
+        assertTrue(Form.isHiddenInlineStyle("display: none"))
+        assertTrue(Form.isHiddenInlineStyle("visibility: hidden"))
+        assertTrue(Form.isHiddenInlineStyle("visibility: collapse"))
+        assertFalse(Form.isHiddenInlineStyle("opacity: 0.5"))
+        assertFalse(Form.isHiddenInlineStyle("opacity: 1"))
+        assertFalse(Form.isHiddenInlineStyle("display: block; visibility: visible"))
+        assertFalse(Form.isHiddenInlineStyle(""))
+    }
 }
